@@ -117,30 +117,41 @@ https://vettid.dev/a/K7x9Qm
 **Shortlink lifecycle:**
 
 ```
- Owner's App                    vettid.dev Web App               Agent Operator
- ───────────                    ──────────────────               ──────────────
+ Owner's App                    vettid.dev API                   Agent Operator
+ ───────────                    ──────────────                   ──────────────
 
- 1. App requests shortlink
-    via vault → web app API:
+ 1. App sends create_agent_invitation
+    to vault via NATS
+    │
+ 2. Vault creates connection +
+    invitation records, returns
+    details to app:
     {
-      invite_token: "<token>",
-      messagespace_uri: "nats://ms.vettid.dev:4222",
-      invitation_id: "<uuid>",
-      ttl_seconds: 120
+      connection_id, invitation_id,
+      invite_token, owner_guid,
+      vault_public_key, expires_at
     }
     │
- 2. Web app generates short code,
-    stores mapping in memory/cache
-    (NOT persistent DB — ephemeral only)
+ 3. App calls POST /vault/agent/shortlink
+    (authenticated with Cognito JWT):
+    {
+      owner_guid, invitation_id,
+      invite_token, messagespace_uri,
+      vault_public_key
+    }
     │
- 3. Returns to app:
-    { shortlink: "vettid.dev/a/K7x9Qm" }
+ 4. Lambda validates JWT, checks
+    owner_guid matches caller,
+    creates 2-min shortlink in DynamoDB
     │
- 4. App displays shortlink as:
+ 5. Returns to app:
+    { code, url, expires_at }
+    │
+ 6. App displays shortlink as:
     - Copyable text string
     - QR code (for local device use)
     │
- 5. 2-minute countdown shown in app
+ 7. 2-minute countdown shown in app
     │                                                            6. Operator runs:
     │                                                               $ vettid-agent init vettid.dev/a/K7x9Qm
     │                                                               │
@@ -226,8 +237,9 @@ With a 2-minute TTL and 6-character Base62 codes, brute-force scanning must be r
     - One-time invitation token (256-bit)
     - Invitation ID (for tracking)
     │
- 4. Vault registers shortlink via
-    vettid.dev web app (see 3.2)
+ 4. App receives invitation details from vault
+    and calls POST /vault/agent/shortlink
+    (authenticated) to create shortlink
     │
  5. App displays to owner:
     ┌─────────────────────────────────┐
@@ -833,10 +845,11 @@ The vault also maintains its own audit log (three-layer audit as designed), givi
 5. Machine fingerprint collection and platform key derivation
 6. NATS MessageSpace integration (publish requests, subscribe to responses)
 7. Connection key exchange during registration
-8. Shortlink resolver endpoint on vettid.dev web app (`/a/{code}`) with:
-   - Ephemeral in-memory storage (Redis or equivalent)
-   - 2-minute TTL, single-use consumption
-   - Rate limiting and IP-based escalating blocks
+8. Shortlink creation via authenticated Lambda endpoint (POST /vault/agent/shortlink)
+   called by mobile app after receiving invitation details from vault-manager.
+   Resolution via public rate-limited endpoint (GET /vault/agent/shortlink/{code}).
+   - DynamoDB storage with 2-minute TTL, single-use consumption
+   - Rate limiting and IP-based escalating blocks on resolve endpoint
 9. Mobile app: "Connect Agent" UI (invitation + shortlink generation, agent review screen, connection contract editor)
 10. Vault: Agent connection message handlers (register, approve with contract, request, respond)
 
