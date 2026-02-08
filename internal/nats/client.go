@@ -54,7 +54,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 }
 
 func (c *Client) PublishToOwner(data []byte) error {
-	subject := fmt.Sprintf("MessageSpace.%s.forOwner", c.ownerGUID)
+	subject := fmt.Sprintf("MessageSpace.%s.forOwner.agent", c.ownerGUID)
 	if err := c.conn.Publish(subject, data); err != nil {
 		return fmt.Errorf("publish to owner: %w", err)
 	}
