@@ -706,7 +706,68 @@ GET /v1/agents/messages  (Phase 3+)
   }
 ```
 
-### 4.5 Message Flow: Secret Request
+### 4.5 Secret Access Models
+
+The Agent Connector supports two security models for accessing vault secrets, controlled per-secret by the owner via `allowed_actions` on each catalog entry.
+
+#### Model 1: Retrieve (Direct Access)
+
+The agent receives the actual secret value.
+
+- **Endpoint:** `POST /v1/secrets/request`
+- **Use case:** Agent needs to use the secret in its own process (e.g., setting environment variables, passing to SDK constructors)
+- **Risk:** Secret is exposed outside the enclave boundary
+- **Owner control:** `allowed_actions: ["retrieve"]` or `["retrieve", "use"]`
+
+#### Model 2: Use-in-Enclave (Proxy Execution)
+
+The secret never leaves the enclave. The agent sends operation details; the enclave executes using the secret and returns only the result.
+
+- **Endpoint:** `POST /v1/secrets/use`
+- **Owner control:** `allowed_actions: ["use"]` (secret can never be retrieved) or `["retrieve", "use"]`
+- **Supported operations:**
+  - **HTTP Proxy** (`action: "http_request"`): Agent provides method, URL, headers, body, and where to inject the secret (`bearer`, `header`, `query`, `basic_auth`). Enclave makes the HTTP request with the secret injected and returns the response.
+  - **Cryptographic Signing** (`action: "sign"`): Agent provides data to sign and algorithm (`ed25519`, `hmac-sha256`). Enclave signs with the secret key and returns only the signature.
+
+#### Security Comparison
+
+| Property | Retrieve | Use-in-Enclave |
+|----------|----------|----------------|
+| Secret exposed to agent | Yes | No |
+| Requires enclave online | Only for request | For every operation |
+| Latency | Lower (one round trip) | Higher (enclave proxies) |
+| Flexibility | Agent can use secret anywhere | Limited to supported operations |
+| Audit trail | "Agent retrieved secret X" | "Agent used secret X for HTTP call to Y" |
+| Recommended for | Dev/test, trusted agents | Production, sensitive keys |
+
+### 4.6 Secret Catalog
+
+The vault pushes a `SecretCatalog` to the agent at connection time and on changes. The agent caches the catalog locally (metadata only, never secret values) and AI agents browse it via `GET /v1/secrets` before requesting access.
+
+Each catalog entry includes:
+- `secret_id` — Unique identifier for the secret
+- `name` — Human-readable name
+- `category` — Category (e.g., `api_keys`, `ssh_keys`)
+- `description` — Optional description
+- `tags` — Optional tags for filtering
+- `allowed_actions` — Which access models are permitted: `["retrieve"]`, `["use"]`, or `["retrieve", "use"]`
+
+The agent can request a catalog refresh via `POST /v1/secrets/refresh`.
+
+#### Updated API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/secrets` | GET | List available secrets from catalog (metadata only) |
+| `/v1/secrets/request` | POST | Retrieve a secret value (Model 1) |
+| `/v1/secrets/use` | POST | Execute action with secret in enclave (Model 2) |
+| `/v1/secrets/refresh` | POST | Request catalog refresh from vault |
+| `/v1/requests/{id}` | GET | Poll async request status |
+| `/v1/status` | GET | Connection health and info |
+| `/v1/ws` | GET | WebSocket endpoint (JSON-RPC) |
+| `/v1/connection/disconnect` | POST | Cleanly disconnect from vault |
+
+### 4.7 Message Flow: Secret Request
 
 ```
 AI Agent                Connector              NATS MessageSpace        Vault                  App
@@ -757,7 +818,7 @@ AI Agent                Connector              NATS MessageSpace        Vault   
    │◄──────────────────────│                        │                     │                     │
 ```
 
-### 4.6 Key Rotation
+### 4.8 Key Rotation
 
 The Connector participates in VettID's standard connection key rotation:
 
@@ -768,7 +829,7 @@ The Connector participates in VettID's standard connection key rotation:
 
 This follows the same periodic rotation cadence as user-to-user connections.
 
-### 4.7 Local Audit Log
+### 4.9 Local Audit Log
 
 Every request through the Connector is logged to `agent.log` (encrypted with the connection key):
 

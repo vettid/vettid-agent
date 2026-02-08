@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -199,9 +200,23 @@ and begins serving the local API and WebSocket endpoint.`,
 
 			log.Info().Msg("Connected to MessageSpace")
 
-			// Start API server
+			// Determine request timeout from config
+			requestTimeout := time.Duration(cfg.Security.RequestTimeoutSeconds) * time.Second
+			if requestTimeout == 0 {
+				requestTimeout = 30 * time.Second
+			}
+
+			// Start API server with all dependencies
 			server, err := api.NewServer(&api.ServerConfig{
-				Listen: cfg.API.Listen,
+				Listen:         cfg.API.Listen,
+				NATSClient:     client,
+				ConnKey:        creds.ConnectionKey,
+				KeyID:          creds.KeyID,
+				ConnectionID:   creds.ConnectionID,
+				OwnerGUID:      creds.OwnerGUID,
+				Scope:          creds.Scope,
+				ApprovalMode:   creds.ApprovalMode,
+				RequestTimeout: requestTimeout,
 			})
 			if err != nil {
 				return fmt.Errorf("create API server: %w", err)
@@ -211,9 +226,9 @@ and begins serving the local API and WebSocket endpoint.`,
 				return fmt.Errorf("start API server: %w", err)
 			}
 
-			// Subscribe to responses (handler is a no-op for now — Step 8)
+			// Subscribe to NATS responses and dispatch to tracker/catalog
 			if err := client.SubscribeResponses(func(data []byte) {
-				log.Debug().Int("bytes", len(data)).Msg("Received response from vault")
+				handleNATSResponse(data, server, creds.ConnectionKey)
 			}); err != nil {
 				return fmt.Errorf("subscribe to responses: %w", err)
 			}
@@ -342,6 +357,114 @@ func promptAgentType() string {
 	}
 
 	return types[choice-1]
+}
+
+// handleNATSResponse decodes incoming NATS envelopes and dispatches them
+// to the appropriate handler (tracker or catalog).
+func handleNATSResponse(data []byte, server *api.Server, connKey []byte) {
+	env, err := vettidnats.DecodeEnvelope(data)
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to decode NATS response envelope")
+		return
+	}
+
+	switch env.Type {
+	case vettidnats.MsgSecretResponse:
+		plaintext, err := crypto.Decrypt(connKey, env.Payload, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to decrypt secret response")
+			return
+		}
+		defer crypto.ZeroBytes(plaintext)
+
+		var resp vettidnats.SecretResponse
+		if err := json.Unmarshal(plaintext, &resp); err != nil {
+			log.Error().Err(err).Msg("Failed to unmarshal secret response")
+			return
+		}
+
+		result := &api.TrackedResult{
+			RequestID:   resp.RequestID,
+			SecretValue: resp.SecretValue,
+			ExpiresAt:   resp.ExpiresAt,
+			Reason:      resp.Reason,
+		}
+
+		switch resp.Status {
+		case "approved":
+			result.Status = api.StatusApproved
+		case "denied":
+			result.Status = api.StatusDenied
+		case "pending_approval":
+			result.Status = api.StatusPendingApproval
+		default:
+			result.Status = api.StatusError
+			if result.Reason == "" {
+				result.Reason = "unknown status: " + resp.Status
+			}
+		}
+
+		server.Tracker().Resolve(resp.RequestID, result)
+
+	case vettidnats.MsgAgentActionResponse:
+		plaintext, err := crypto.Decrypt(connKey, env.Payload, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to decrypt action response")
+			return
+		}
+		defer crypto.ZeroBytes(plaintext)
+
+		var resp vettidnats.ActionResponse
+		if err := json.Unmarshal(plaintext, &resp); err != nil {
+			log.Error().Err(err).Msg("Failed to unmarshal action response")
+			return
+		}
+
+		result := &api.TrackedResult{
+			RequestID: resp.RequestID,
+			Result:    resp.Result,
+			Reason:    resp.Reason,
+		}
+
+		switch resp.Status {
+		case "completed":
+			result.Status = api.StatusCompleted
+		case "denied":
+			result.Status = api.StatusDenied
+		case "error":
+			result.Status = api.StatusError
+		default:
+			result.Status = api.StatusError
+			if result.Reason == "" {
+				result.Reason = "unknown status: " + resp.Status
+			}
+		}
+
+		server.Tracker().Resolve(resp.RequestID, result)
+
+	case vettidnats.MsgAgentSecretCatalog:
+		plaintext, err := crypto.Decrypt(connKey, env.Payload, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to decrypt secret catalog")
+			return
+		}
+		defer crypto.ZeroBytes(plaintext)
+
+		var catalog vettidnats.SecretCatalog
+		if err := json.Unmarshal(plaintext, &catalog); err != nil {
+			log.Error().Err(err).Msg("Failed to unmarshal secret catalog")
+			return
+		}
+
+		server.Catalog().Update(&catalog)
+		log.Info().
+			Uint64("version", catalog.Version).
+			Int("entries", len(catalog.Entries)).
+			Msg("Secret catalog updated")
+
+	default:
+		log.Debug().Str("type", string(env.Type)).Msg("Ignoring unknown NATS message type")
+	}
 }
 
 func binaryFingerprint() (string, error) {

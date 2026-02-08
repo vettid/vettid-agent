@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+// MessageType constants for NATS envelope types.
+
 type MessageType string
 
 const (
@@ -16,6 +18,10 @@ const (
 	MsgSecretResponse         MessageType = "agent_secret_response"
 	MsgKeyRotationInitiate    MessageType = "key_rotation_initiate"
 	MsgKeyRotationAck         MessageType = "key_rotation_ack"
+	MsgAgentSecretCatalog     MessageType = "agent_secret_catalog"    // vault → agent: pushed catalog
+	MsgAgentCatalogRequest    MessageType = "agent_catalog_request"   // agent → vault: refresh request
+	MsgAgentActionRequest     MessageType = "agent_action_request"    // agent → vault: use-in-enclave
+	MsgAgentActionResponse    MessageType = "agent_action_response"   // vault → agent: action result
 )
 
 type Envelope struct {
@@ -68,11 +74,12 @@ type RateLimit struct {
 
 type SecretRequest struct {
 	RequestID  string `json:"request_id"`
-	SecretType string `json:"secret_type"`
-	SecretName string `json:"secret_name"`
+	SecretID   string `json:"secret_id,omitempty"`   // preferred: from catalog
+	SecretType string `json:"secret_type,omitempty"` // fallback: category
+	SecretName string `json:"secret_name,omitempty"` // fallback: name
 	Purpose    string `json:"purpose"`
 	TTL        int    `json:"ttl"`
-	Action     string `json:"action"` // "retrieve" or "use"
+	Action     string `json:"action"` // "retrieve"
 }
 
 type SecretResponse struct {
@@ -81,6 +88,75 @@ type SecretResponse struct {
 	SecretValue string `json:"secret_value,omitempty"`
 	ExpiresAt   string `json:"expires_at,omitempty"`
 	Reason      string `json:"reason,omitempty"`
+}
+
+// SecretCatalogEntry describes a single secret available to the agent.
+type SecretCatalogEntry struct {
+	SecretID       string   `json:"secret_id"`
+	Name           string   `json:"name"`
+	Category       string   `json:"category"`
+	Description    string   `json:"description,omitempty"`
+	Tags           []string `json:"tags,omitempty"`
+	AllowedActions []string `json:"allowed_actions"` // ["retrieve"], ["use"], or ["retrieve","use"]
+	UpdatedAt      string   `json:"updated_at,omitempty"`
+}
+
+// SecretCatalog is a versioned list of secrets pushed from the vault.
+type SecretCatalog struct {
+	Entries   []SecretCatalogEntry `json:"entries"`
+	Version   uint64               `json:"version"`
+	UpdatedAt string               `json:"updated_at"`
+}
+
+// CatalogRefreshRequest asks the vault to re-push the catalog.
+type CatalogRefreshRequest struct {
+	CurrentVersion uint64 `json:"current_version"`
+}
+
+// ActionRequest sends an operation to be executed in the enclave using a secret.
+type ActionRequest struct {
+	RequestID string          `json:"request_id"`
+	SecretID  string          `json:"secret_id"`
+	Action    string          `json:"action"`  // "http_request", "sign"
+	Purpose   string          `json:"purpose"`
+	Params    json.RawMessage `json:"params"` // action-specific parameters
+}
+
+// HTTPRequestParams specifies an HTTP request to be made by the enclave.
+type HTTPRequestParams struct {
+	Method          string            `json:"method"`
+	URL             string            `json:"url"`
+	Headers         map[string]string `json:"headers,omitempty"`
+	Body            string            `json:"body,omitempty"`
+	SecretPlacement string            `json:"secret_placement"` // "bearer", "header", "query", "basic_auth"
+	SecretField     string            `json:"secret_field,omitempty"`
+}
+
+// SignRequestParams specifies data to be signed by the enclave.
+type SignRequestParams struct {
+	Data      string `json:"data"`      // base64-encoded
+	Algorithm string `json:"algorithm"` // "ed25519", "hmac-sha256"
+}
+
+// ActionResponse is the vault's response to an ActionRequest.
+type ActionResponse struct {
+	RequestID string          `json:"request_id"`
+	Status    string          `json:"status"` // "completed", "denied", "error"
+	Result    json.RawMessage `json:"result,omitempty"`
+	Reason    string          `json:"reason,omitempty"`
+}
+
+// HTTPResponseResult is the result of an HTTP request executed by the enclave.
+type HTTPResponseResult struct {
+	StatusCode int               `json:"status_code"`
+	Headers    map[string]string `json:"headers,omitempty"`
+	Body       string            `json:"body"`
+}
+
+// SignResult is the result of a signing operation executed by the enclave.
+type SignResult struct {
+	Signature string `json:"signature"` // base64-encoded
+	Algorithm string `json:"algorithm"`
 }
 
 // EncodeEnvelope marshals an Envelope with the given fields and current timestamp.

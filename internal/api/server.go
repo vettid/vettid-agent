@@ -9,27 +9,65 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/rs/zerolog/log"
+
+	vettidnats "github.com/vettid/vettid-agent/internal/nats"
 )
 
 type Server struct {
-	httpServer *http.Server
-	listener   net.Listener
-	wsToken    string
+	httpServer   *http.Server
+	listener     net.Listener
+	wsToken      string
+	natsClient   *vettidnats.Client
+	connKey      []byte
+	keyID        string
+	connectionID string
+	ownerGUID    string
+	scope        []string
+	approvalMode string
+	catalog      *CatalogCache
+	tracker      *RequestTracker
+	sequence     atomic.Uint64
+	startTime    time.Time
 }
 
 type ServerConfig struct {
-	Listen  string // "unix:///path/to/socket" or "tcp://127.0.0.1:7443"
-	WSToken string
+	Listen         string // "unix:///path/to/socket" or "tcp://127.0.0.1:7443"
+	WSToken        string
+	NATSClient     *vettidnats.Client
+	ConnKey        []byte
+	KeyID          string
+	ConnectionID   string
+	OwnerGUID      string
+	Scope          []string
+	ApprovalMode   string
+	RequestTimeout time.Duration
 }
 
 func NewServer(cfg *ServerConfig) (*Server, error) {
 	mux := http.NewServeMux()
 
+	requestTimeout := cfg.RequestTimeout
+	if requestTimeout == 0 {
+		requestTimeout = 30 * time.Second
+	}
+
 	s := &Server{
-		httpServer: &http.Server{Handler: mux},
-		wsToken:    cfg.WSToken,
+		httpServer:   &http.Server{Handler: mux},
+		wsToken:      cfg.WSToken,
+		natsClient:   cfg.NATSClient,
+		connKey:      cfg.ConnKey,
+		keyID:        cfg.KeyID,
+		connectionID: cfg.ConnectionID,
+		ownerGUID:    cfg.OwnerGUID,
+		scope:        cfg.Scope,
+		approvalMode: cfg.ApprovalMode,
+		catalog:      NewCatalogCache(),
+		tracker:      NewRequestTracker(requestTimeout),
+		startTime:    time.Now(),
 	}
 
 	registerRoutes(mux, s)
@@ -81,5 +119,21 @@ func (s *Server) Start(listenAddr string) error {
 }
 
 func (s *Server) Stop(ctx context.Context) error {
+	s.tracker.Stop()
 	return s.httpServer.Shutdown(ctx)
+}
+
+// Tracker returns the request tracker for resolving NATS responses.
+func (s *Server) Tracker() *RequestTracker {
+	return s.tracker
+}
+
+// Catalog returns the secret catalog cache.
+func (s *Server) Catalog() *CatalogCache {
+	return s.catalog
+}
+
+// nextSequence returns the next monotonic sequence number for NATS messages.
+func (s *Server) nextSequence() uint64 {
+	return s.sequence.Add(1)
 }

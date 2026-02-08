@@ -113,6 +113,69 @@ func (c *Client) SubscribeRegistration(invitationID string, handler func(*Envelo
 	return sub, nil
 }
 
+// PublishSecretRequest encrypts a SecretRequest with the connection key and publishes it.
+func (c *Client) PublishSecretRequest(secretReq *SecretRequest, connKey []byte, keyID string, seq uint64) error {
+	plaintext, err := json.Marshal(secretReq)
+	if err != nil {
+		return fmt.Errorf("marshal secret request: %w", err)
+	}
+	defer crypto.ZeroBytes(plaintext)
+
+	encrypted, err := crypto.Encrypt(connKey, plaintext, nil)
+	if err != nil {
+		return fmt.Errorf("encrypt secret request: %w", err)
+	}
+
+	envelope, err := EncodeEnvelope(MsgSecretRequest, keyID, encrypted, seq)
+	if err != nil {
+		return fmt.Errorf("encode envelope: %w", err)
+	}
+
+	return c.PublishToOwner(envelope)
+}
+
+// PublishActionRequest encrypts an ActionRequest with the connection key and publishes it.
+func (c *Client) PublishActionRequest(actionReq *ActionRequest, connKey []byte, keyID string, seq uint64) error {
+	plaintext, err := json.Marshal(actionReq)
+	if err != nil {
+		return fmt.Errorf("marshal action request: %w", err)
+	}
+	defer crypto.ZeroBytes(plaintext)
+
+	encrypted, err := crypto.Encrypt(connKey, plaintext, nil)
+	if err != nil {
+		return fmt.Errorf("encrypt action request: %w", err)
+	}
+
+	envelope, err := EncodeEnvelope(MsgAgentActionRequest, keyID, encrypted, seq)
+	if err != nil {
+		return fmt.Errorf("encode envelope: %w", err)
+	}
+
+	return c.PublishToOwner(envelope)
+}
+
+// PublishCatalogRequest encrypts a CatalogRefreshRequest with the connection key and publishes it.
+func (c *Client) PublishCatalogRequest(req *CatalogRefreshRequest, connKey []byte, keyID string, seq uint64) error {
+	plaintext, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshal catalog request: %w", err)
+	}
+	defer crypto.ZeroBytes(plaintext)
+
+	encrypted, err := crypto.Encrypt(connKey, plaintext, nil)
+	if err != nil {
+		return fmt.Errorf("encrypt catalog request: %w", err)
+	}
+
+	envelope, err := EncodeEnvelope(MsgAgentCatalogRequest, keyID, encrypted, seq)
+	if err != nil {
+		return fmt.Errorf("encode envelope: %w", err)
+	}
+
+	return c.PublishToOwner(envelope)
+}
+
 // Conn returns the underlying NATS connection for drain/close operations.
 func (c *Client) Conn() *nats.Conn {
 	return c.conn
