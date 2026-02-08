@@ -1,0 +1,39 @@
+# Binaries (root only — don't match cmd/vettid-agent/)
+/vettid-agent
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/dist/
+/build/
+
+# Test
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# VettID agent runtime files (never commit these)
+connection.enc
+config.toml
+agent.log
+connector.lock
+pending.json
+*.enc
+*.sock
