@@ -2,10 +2,13 @@
 package nats
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
+
+	"github.com/vettid/vettid-agent/internal/crypto"
 )
 
 type Client struct {
@@ -67,6 +70,52 @@ func (c *Client) SubscribeResponses(handler func([]byte)) error {
 		return fmt.Errorf("subscribe to responses: %w", err)
 	}
 	return nil
+}
+
+// PublishRegistration ECIES-encrypts a ConnectionRequest with the vault's public key
+// and publishes it to the owner's forOwner topic.
+func (c *Client) PublishRegistration(connReq *ConnectionRequest, vaultPubKey []byte) error {
+	plaintext, err := json.Marshal(connReq)
+	if err != nil {
+		return fmt.Errorf("marshal connection request: %w", err)
+	}
+	defer crypto.ZeroBytes(plaintext)
+
+	// SECURITY: ECIES-encrypt with vault's public key so only the enclave can read it
+	encrypted, err := crypto.ECIESEncrypt(vaultPubKey, plaintext, crypto.DomainAgent)
+	if err != nil {
+		return fmt.Errorf("ECIES encrypt registration: %w", err)
+	}
+
+	envelope, err := EncodeEnvelope(MsgAgentConnectionRequest, "", encrypted, 0)
+	if err != nil {
+		return fmt.Errorf("encode envelope: %w", err)
+	}
+
+	return c.PublishToOwner(envelope)
+}
+
+// SubscribeRegistration subscribes to the invitation-specific response topic
+// and calls handler for each received envelope.
+func (c *Client) SubscribeRegistration(invitationID string, handler func(*Envelope)) (*nats.Subscription, error) {
+	subject := fmt.Sprintf("MessageSpace.%s.forOwner.agent.invitation.%s", c.ownerGUID, invitationID)
+	sub, err := c.conn.Subscribe(subject, func(msg *nats.Msg) {
+		env, err := DecodeEnvelope(msg.Data)
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to decode registration response envelope")
+			return
+		}
+		handler(env)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("subscribe to invitation %s: %w", invitationID, err)
+	}
+	return sub, nil
+}
+
+// Conn returns the underlying NATS connection for drain/close operations.
+func (c *Client) Conn() *nats.Conn {
+	return c.conn
 }
 
 func (c *Client) Close() {

@@ -14,6 +14,8 @@ type ShortlinkPayload struct {
 	MessageSpaceURI string `json:"messagespace_uri"`
 	InviteToken     string `json:"invite_token"`
 	InvitationID    string `json:"invitation_id"`
+	VaultPublicKey  string `json:"vault_public_key"` // Hex-encoded X25519 public key
+	OwnerGUID       string `json:"owner_guid"`       // Vault owner identifier
 }
 
 func ResolveShortlink(shortlink string) (*ShortlinkPayload, error) {
@@ -56,7 +58,8 @@ func ResolveShortlink(shortlink string) (*ShortlinkPayload, error) {
 		return nil, fmt.Errorf("parse shortlink payload: %w", err)
 	}
 
-	if payload.MessageSpaceURI == "" || payload.InviteToken == "" {
+	if payload.MessageSpaceURI == "" || payload.InviteToken == "" || payload.InvitationID == "" ||
+		payload.VaultPublicKey == "" || payload.OwnerGUID == "" {
 		return nil, fmt.Errorf("shortlink payload missing required fields")
 	}
 

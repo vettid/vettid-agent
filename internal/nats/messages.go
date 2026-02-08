@@ -1,6 +1,10 @@
 package nats
 
-import "time"
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+)
 
 type MessageType string
 
@@ -77,4 +81,35 @@ type SecretResponse struct {
 	SecretValue string `json:"secret_value,omitempty"`
 	ExpiresAt   string `json:"expires_at,omitempty"`
 	Reason      string `json:"reason,omitempty"`
+}
+
+// EncodeEnvelope marshals an Envelope with the given fields and current timestamp.
+func EncodeEnvelope(msgType MessageType, keyID string, payload []byte, seq uint64) ([]byte, error) {
+	env := Envelope{
+		Type:      msgType,
+		KeyID:     keyID,
+		Payload:   payload,
+		Timestamp: time.Now().UTC(),
+		Sequence:  seq,
+	}
+
+	data, err := json.Marshal(&env)
+	if err != nil {
+		return nil, fmt.Errorf("encode envelope: %w", err)
+	}
+	return data, nil
+}
+
+// DecodeEnvelope unmarshals data into an Envelope and validates required fields.
+func DecodeEnvelope(data []byte) (*Envelope, error) {
+	var env Envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, fmt.Errorf("decode envelope: %w", err)
+	}
+
+	if env.Type == "" {
+		return nil, fmt.Errorf("decode envelope: missing type field")
+	}
+
+	return &env, nil
 }
