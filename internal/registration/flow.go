@@ -255,13 +255,33 @@ func (f *RegistrationFlow) Run() error {
 	}
 }
 
-// handleApproval processes an approval envelope: decrypts connection key, prompts for passphrase, saves credentials.
+// handleApproval processes an approval envelope: derives connection key via X25519+HKDF,
+// decrypts the approval payload, prompts for passphrase, and saves credentials.
 func (f *RegistrationFlow) handleApproval(env *vettidnats.Envelope, agentPrivKey, agentPubKey, vaultPubKey []byte, payload *ShortlinkPayload) error {
 	f.state = StateApproved
 	fmt.Println("\nConnection approved!")
 
-	// SECURITY: ECIES-decrypt the approval payload with agent's private key
-	decrypted, err := crypto.ECIESDecrypt(agentPrivKey, env.Payload, crypto.DomainConnection)
+	// SECURITY: Derive connection key from X25519 shared secret via HKDF.
+	// Both sides independently compute the same key from their ECDH shared secret.
+	sharedSecret, err := crypto.ComputeSharedSecret(agentPrivKey, vaultPubKey)
+	if err != nil {
+		f.state = StateFailed
+		f.err = fmt.Errorf("compute shared secret: %w", err)
+		return f.err
+	}
+	defer crypto.ZeroBytes(sharedSecret)
+
+	connectionKey, err := crypto.DeriveConnectionKey(sharedSecret)
+	if err != nil {
+		f.state = StateFailed
+		f.err = fmt.Errorf("derive connection key: %w", err)
+		return f.err
+	}
+	defer crypto.ZeroBytes(connectionKey)
+
+	// SECURITY: Decrypt approval payload with the derived connection key (XChaCha20-Poly1305).
+	// The vault encrypted this with the same connection key derived from the same shared secret.
+	decrypted, err := crypto.Decrypt(connectionKey, env.Payload, nil)
 	if err != nil {
 		f.state = StateFailed
 		f.err = fmt.Errorf("decrypt approval: %w", err)
@@ -275,15 +295,6 @@ func (f *RegistrationFlow) handleApproval(env *vettidnats.Envelope, agentPrivKey
 		f.err = fmt.Errorf("parse approval: %w", err)
 		return f.err
 	}
-
-	// Decrypt connection key (ECIES-encrypted with agent's public key)
-	connectionKey, err := crypto.ECIESDecrypt(agentPrivKey, approval.ConnectionKeyEncrypted, crypto.DomainConnection)
-	if err != nil {
-		f.state = StateFailed
-		f.err = fmt.Errorf("decrypt connection key: %w", err)
-		return f.err
-	}
-	defer crypto.ZeroBytes(connectionKey)
 
 	log.Info().
 		Str("connection_id", approval.ConnectionID).
@@ -309,15 +320,20 @@ func (f *RegistrationFlow) handleApproval(env *vettidnats.Envelope, agentPrivKey
 	}
 	defer crypto.ZeroBytes(platformKey)
 
+	// SECURITY: Copy connection key for credentials — the deferred ZeroBytes above
+	// will wipe the original, but credentials need a live copy for Save.
+	connKeyCopy := make([]byte, len(connectionKey))
+	copy(connKeyCopy, connectionKey)
+
 	// Build credentials
 	creds := &credential.ConnectionCredentials{
 		ConnectionID:      approval.ConnectionID,
-		ConnectionKey:     connectionKey,
+		ConnectionKey:     connKeyCopy,
 		KeyID:             approval.KeyID,
 		AgentPrivateKey:   agentPrivKey,
 		AgentPublicKey:    agentPubKey,
 		VaultPublicKey:    vaultPubKey,
-		MessageSpaceToken: approval.MessageSpaceToken,
+		MessageSpaceToken: payload.InviteToken,
 		MessageSpaceURL:   payload.MessageSpaceURI,
 		OwnerGUID:         payload.OwnerGUID,
 		Scope:             approval.Contract.Scope,

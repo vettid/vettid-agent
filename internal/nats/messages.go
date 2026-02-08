@@ -49,12 +49,9 @@ type ConnectionRequest struct {
 }
 
 type ConnectionApproval struct {
-	ConnectionID          string   `json:"connection_id"`
-	ConnectionKeyEncrypted []byte  `json:"connection_key_encrypted"`
-	KeyID                 string   `json:"key_id"`
-	MessageSpaceToken     string   `json:"messagespace_token"`
-	TokenExpires          string   `json:"token_expires"`
-	Contract              Contract `json:"contract"`
+	ConnectionID string   `json:"connection_id"`
+	KeyID        string   `json:"key_id"`
+	Contract     Contract `json:"contract"`
 }
 
 type ConnectionDenial struct {
