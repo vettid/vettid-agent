@@ -41,6 +41,12 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		}),
 	}
 
+	// SECURITY: Enable TLS for NATS connection when configured
+	if cfg.TLS {
+		opts = append(opts, nats.Secure())
+		log.Info().Msg("NATS TLS enabled")
+	}
+
 	conn, err := nats.Connect(cfg.URL, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("connect to NATS: %w", err)

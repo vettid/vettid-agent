@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -192,6 +193,7 @@ and begins serving the local API and WebSocket endpoint.`,
 				Token:        creds.MessageSpaceToken,
 				ConnectionID: creds.ConnectionID,
 				OwnerGUID:    creds.OwnerGUID,
+				TLS:          cfg.NATS.TLSEnabled,
 			})
 			if err != nil {
 				return fmt.Errorf("connect to NATS: %w", err)
@@ -206,9 +208,20 @@ and begins serving the local API and WebSocket endpoint.`,
 				requestTimeout = 30 * time.Second
 			}
 
+			// Parse allowed origins from config
+			var allowedOrigins []string
+			if cfg.WebSocket.AllowedOrigins != "" {
+				for _, o := range strings.Split(cfg.WebSocket.AllowedOrigins, ",") {
+					if trimmed := strings.TrimSpace(o); trimmed != "" {
+						allowedOrigins = append(allowedOrigins, trimmed)
+					}
+				}
+			}
+
 			// Start API server with all dependencies
 			server, err := api.NewServer(&api.ServerConfig{
 				Listen:         cfg.API.Listen,
+				AllowedOrigins: allowedOrigins,
 				NATSClient:     client,
 				ConnKey:        creds.ConnectionKey,
 				KeyID:          creds.KeyID,

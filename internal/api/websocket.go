@@ -13,11 +13,26 @@ import (
 	vettidnats "github.com/vettid/vettid-agent/internal/nats"
 )
 
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		// Origin validation will be configured via allowed_origins setting
-		return true
-	},
+// newUpgrader creates a WebSocket upgrader with origin validation.
+func newUpgrader(allowedOrigins []string) websocket.Upgrader {
+	return websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				// No origin header — allow (non-browser clients)
+				return true
+			}
+			for _, allowed := range allowedOrigins {
+				if origin == allowed ||
+					origin == "http://"+allowed ||
+					origin == "https://"+allowed {
+					return true
+				}
+			}
+			log.Warn().Str("origin", origin).Msg("WebSocket origin rejected")
+			return false
+		},
+	}
 }
 
 // wsRequest is a JSON-RPC style request from a WebSocket client.
@@ -59,7 +74,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	wsUpgrader := newUpgrader(s.allowedOrigins)
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Error().Err(err).Msg("WebSocket upgrade failed")
 		return

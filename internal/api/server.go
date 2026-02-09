@@ -18,25 +18,27 @@ import (
 )
 
 type Server struct {
-	httpServer   *http.Server
-	listener     net.Listener
-	wsToken      string
-	natsClient   *vettidnats.Client
-	connKey      []byte
-	keyID        string
-	connectionID string
-	ownerGUID    string
-	scope        []string
-	approvalMode string
-	catalog      *CatalogCache
-	tracker      *RequestTracker
-	sequence     atomic.Uint64
-	startTime    time.Time
+	httpServer     *http.Server
+	listener       net.Listener
+	wsToken        string
+	allowedOrigins []string
+	natsClient     *vettidnats.Client
+	connKey        []byte
+	keyID          string
+	connectionID   string
+	ownerGUID      string
+	scope          []string
+	approvalMode   string
+	catalog        *CatalogCache
+	tracker        *RequestTracker
+	sequence       atomic.Uint64
+	startTime      time.Time
 }
 
 type ServerConfig struct {
 	Listen         string // "unix:///path/to/socket" or "tcp://127.0.0.1:7443"
 	WSToken        string
+	AllowedOrigins []string // WebSocket origin validation
 	NATSClient     *vettidnats.Client
 	ConnKey        []byte
 	KeyID          string
@@ -56,18 +58,19 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 	}
 
 	s := &Server{
-		httpServer:   &http.Server{Handler: mux},
-		wsToken:      cfg.WSToken,
-		natsClient:   cfg.NATSClient,
-		connKey:      cfg.ConnKey,
-		keyID:        cfg.KeyID,
-		connectionID: cfg.ConnectionID,
-		ownerGUID:    cfg.OwnerGUID,
-		scope:        cfg.Scope,
-		approvalMode: cfg.ApprovalMode,
-		catalog:      NewCatalogCache(),
-		tracker:      NewRequestTracker(requestTimeout),
-		startTime:    time.Now(),
+		httpServer:     &http.Server{Handler: mux},
+		wsToken:        cfg.WSToken,
+		allowedOrigins: cfg.AllowedOrigins,
+		natsClient:     cfg.NATSClient,
+		connKey:        cfg.ConnKey,
+		keyID:          cfg.KeyID,
+		connectionID:   cfg.ConnectionID,
+		ownerGUID:      cfg.OwnerGUID,
+		scope:          cfg.Scope,
+		approvalMode:   cfg.ApprovalMode,
+		catalog:        NewCatalogCache(),
+		tracker:        NewRequestTracker(requestTimeout),
+		startTime:      time.Now(),
 	}
 
 	registerRoutes(mux, s)
