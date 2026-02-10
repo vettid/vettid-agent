@@ -106,6 +106,14 @@ Requires Go 1.24+.
 
 See [docs/vettid-agent-connector-design.md](docs/vettid-agent-connector-design.md) for the full design document.
 
+## Related Repositories
+
+- [vettid-dev](https://github.com/vettid/vettid-dev) - Backend infrastructure
+- [vettid-android](https://github.com/vettid/vettid-android) - Android app
+- [vettid-ios](https://github.com/vettid/vettid-ios) - iOS app
+- [vettid-desktop](https://github.com/vettid/vettid-desktop) - Desktop app (Tauri/Rust/Svelte)
+- [vettid-service-vault](https://github.com/vettid/vettid-service-vault) - Service integration layer
+
 ## License
 
 [AGPL-3.0](LICENSE)

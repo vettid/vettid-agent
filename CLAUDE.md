@@ -89,6 +89,8 @@ The connector never stores secrets. All policy enforcement happens in the vault.
 - `vettid-dev` — Backend infrastructure (CDK, Lambda, Enclave, NATS)
 - `vettid-android` — Android mobile app
 - `vettid-ios` — iOS mobile app
+- `vettid-desktop` — Desktop app (Tauri/Rust/Svelte)
+- `vettid-service-vault` — Service integration layer
 
 ## Security Patterns
 
