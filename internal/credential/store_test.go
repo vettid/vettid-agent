@@ -11,18 +11,19 @@ import (
 
 func testCreds() *ConnectionCredentials {
 	return &ConnectionCredentials{
-		ConnectionID:      "conn-abc123",
-		ConnectionKey:     bytes.Repeat([]byte{0x42}, 32),
-		KeyID:             "key-001",
-		AgentPrivateKey:   bytes.Repeat([]byte{0x11}, 32),
-		AgentPublicKey:    bytes.Repeat([]byte{0x22}, 32),
-		VaultPublicKey:    bytes.Repeat([]byte{0x33}, 32),
-		MessageSpaceToken: "nats-token-abc",
-		MessageSpaceURL:   "nats://ms.vettid.dev:4222",
-		OwnerGUID:         "owner-guid-123",
-		OwnerName:         "Jane D.",
-		Scope:             []string{"api_keys", "ssh_keys"},
-		ApprovalMode:      "auto_within_contract",
+		ConnectionID:    "conn-abc123",
+		ConnectionKey:   bytes.Repeat([]byte{0x42}, 32),
+		KeyID:           "key-001",
+		AgentPrivateKey: bytes.Repeat([]byte{0x11}, 32),
+		AgentPublicKey:  bytes.Repeat([]byte{0x22}, 32),
+		VaultPublicKey:  bytes.Repeat([]byte{0x33}, 32),
+		JWT:             "eyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5In0",
+		Seed:            "SUAB1234567890",
+		MessageSpaceURL: "nats://ms.vettid.dev:4222",
+		OwnerGUID:       "owner-guid-123",
+		OwnerName:       "Jane D.",
+		Scope:           []string{"api_keys", "ssh_keys"},
+		ApprovalMode:    "auto_within_contract",
 	}
 }
 
@@ -74,8 +75,11 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	if !bytes.Equal(loaded.VaultPublicKey, creds.VaultPublicKey) {
 		t.Error("VaultPublicKey mismatch")
 	}
-	if loaded.MessageSpaceToken != creds.MessageSpaceToken {
-		t.Errorf("MessageSpaceToken = %q, want %q", loaded.MessageSpaceToken, creds.MessageSpaceToken)
+	if loaded.JWT != creds.JWT {
+		t.Errorf("JWT = %q, want %q", loaded.JWT, creds.JWT)
+	}
+	if loaded.Seed != creds.Seed {
+		t.Errorf("Seed = %q, want %q", loaded.Seed, creds.Seed)
 	}
 	if loaded.MessageSpaceURL != creds.MessageSpaceURL {
 		t.Errorf("MessageSpaceURL = %q, want %q", loaded.MessageSpaceURL, creds.MessageSpaceURL)
@@ -281,8 +285,8 @@ func TestSave_EncryptedOnDisk(t *testing.T) {
 	if bytes.Contains(data, []byte(creds.ConnectionID)) {
 		t.Error("raw file contains plaintext ConnectionID")
 	}
-	if bytes.Contains(data, []byte(creds.MessageSpaceToken)) {
-		t.Error("raw file contains plaintext MessageSpaceToken")
+	if bytes.Contains(data, []byte(creds.JWT)) {
+		t.Error("raw file contains plaintext JWT")
 	}
 	if bytes.Contains(data, []byte(creds.OwnerName)) {
 		t.Error("raw file contains plaintext OwnerName")

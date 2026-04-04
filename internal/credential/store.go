@@ -29,18 +29,19 @@ const (
 
 // ConnectionCredentials holds all sensitive material for a vault connection.
 type ConnectionCredentials struct {
-	ConnectionID      string   `json:"connection_id"`
-	ConnectionKey     []byte   `json:"connection_key"`
-	KeyID             string   `json:"key_id"`
-	AgentPrivateKey   []byte   `json:"agent_private_key"`
-	AgentPublicKey    []byte   `json:"agent_public_key"`
-	VaultPublicKey    []byte   `json:"vault_public_key"`
-	MessageSpaceToken string   `json:"messagespace_token"`
-	MessageSpaceURL   string   `json:"messagespace_url"`
-	OwnerGUID         string   `json:"owner_guid"`
-	OwnerName         string   `json:"owner_name"`
-	Scope             []string `json:"scope"`
-	ApprovalMode      string   `json:"approval_mode"`
+	ConnectionID    string   `json:"connection_id"`
+	ConnectionKey   []byte   `json:"connection_key"`
+	KeyID           string   `json:"key_id"`
+	AgentPrivateKey []byte   `json:"agent_private_key"`
+	AgentPublicKey  []byte   `json:"agent_public_key"`
+	VaultPublicKey  []byte   `json:"vault_public_key"`
+	JWT             string   `json:"jwt"`              // NATS JWT for authentication
+	Seed            string   `json:"seed"`             // NATS seed for signing
+	MessageSpaceURL string   `json:"messagespace_url"` // NATS server URI
+	OwnerGUID       string   `json:"owner_guid"`
+	OwnerName       string   `json:"owner_name"`
+	Scope           []string `json:"scope"`
+	ApprovalMode    string   `json:"approval_mode"`
 }
 
 // Zero wipes all sensitive byte fields in the credentials.

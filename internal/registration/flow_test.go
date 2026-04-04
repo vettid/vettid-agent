@@ -48,13 +48,13 @@ func TestApprovalDecrypt_MatchesVaultEncrypt(t *testing.T) {
 	}
 
 	// Both sides derive the same connection key
-	vaultConnKey, err := crypto.DeriveConnectionKey(vaultShared)
+	vaultConnKey, err := crypto.DeriveConnectionKey(vaultShared, "conn-test")
 	if err != nil {
 		t.Fatalf("vault derive connection key: %v", err)
 	}
 	defer crypto.ZeroBytes(vaultConnKey)
 
-	agentConnKey, err := crypto.DeriveConnectionKey(agentShared)
+	agentConnKey, err := crypto.DeriveConnectionKey(agentShared, "conn-test")
 	if err != nil {
 		t.Fatalf("agent derive connection key: %v", err)
 	}
@@ -147,7 +147,7 @@ func TestApprovalDecrypt_WrongKey(t *testing.T) {
 	}
 	defer crypto.ZeroBytes(vaultShared)
 
-	vaultConnKey, err := crypto.DeriveConnectionKey(vaultShared)
+	vaultConnKey, err := crypto.DeriveConnectionKey(vaultShared, "conn-test")
 	if err != nil {
 		t.Fatalf("derive connection key: %v", err)
 	}
@@ -171,7 +171,7 @@ func TestApprovalDecrypt_WrongKey(t *testing.T) {
 	}
 	defer crypto.ZeroBytes(wrongShared)
 
-	wrongConnKey, err := crypto.DeriveConnectionKey(wrongShared)
+	wrongConnKey, err := crypto.DeriveConnectionKey(wrongShared, "conn-test")
 	if err != nil {
 		t.Fatalf("derive wrong connection key: %v", err)
 	}

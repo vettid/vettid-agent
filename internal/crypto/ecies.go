@@ -46,7 +46,7 @@ func ECIESEncrypt(recipientPublicKey []byte, plaintext []byte, domain string) ([
 	defer ZeroBytes(sharedSecret)
 
 	// 3. HKDF
-	encKey, err := DeriveKeyHKDF(sharedSecret, domain)
+	encKey, err := DeriveKeyHKDF(sharedSecret, nil, domain)
 	if err != nil {
 		return nil, fmt.Errorf("derive encryption key: %w", err)
 	}
@@ -101,7 +101,7 @@ func ECIESDecrypt(recipientPrivateKey []byte, data []byte, domain string) ([]byt
 	defer ZeroBytes(sharedSecret)
 
 	// HKDF
-	encKey, err := DeriveKeyHKDF(sharedSecret, domain)
+	encKey, err := DeriveKeyHKDF(sharedSecret, nil, domain)
 	if err != nil {
 		return nil, fmt.Errorf("derive encryption key: %w", err)
 	}

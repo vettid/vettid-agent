@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/term"
 
@@ -22,10 +23,11 @@ type State int
 
 const (
 	StateIdle State = iota
-	StateResolvingShortlink
+	StateResolvingInvite
 	StateConnectingNATS
-	StateSendingRequest
+	StateStoringCredentials
 	StateWaitingApproval
+	StateKeyExchange
 	StateApproved
 	StateDenied
 	StateFailed
@@ -35,14 +37,16 @@ func (s State) String() string {
 	switch s {
 	case StateIdle:
 		return "idle"
-	case StateResolvingShortlink:
-		return "resolving_shortlink"
+	case StateResolvingInvite:
+		return "resolving_invite"
 	case StateConnectingNATS:
 		return "connecting_nats"
-	case StateSendingRequest:
-		return "sending_request"
+	case StateStoringCredentials:
+		return "storing_credentials"
 	case StateWaitingApproval:
 		return "waiting_approval"
+	case StateKeyExchange:
+		return "key_exchange"
 	case StateApproved:
 		return "approved"
 	case StateDenied:
@@ -63,6 +67,8 @@ type FlowConfig struct {
 }
 
 // RegistrationFlow manages the full agent registration state machine.
+// Uses the same P2P connection pattern as mobile apps and the desktop client:
+// resolve invite → connect with JWT+seed → store-credentials → key exchange → save.
 type RegistrationFlow struct {
 	state     State
 	shortlink string
@@ -83,51 +89,44 @@ func NewFlow(cfg FlowConfig) *RegistrationFlow {
 	}
 }
 
-// State returns the current state of the registration flow.
 func (f *RegistrationFlow) State() State { return f.state }
+func (f *RegistrationFlow) Err() error   { return f.err }
 
-// Err returns the error that caused the flow to fail, if any.
-func (f *RegistrationFlow) Err() error { return f.err }
-
-// Run executes the full registration flow, blocking until approval, denial, or timeout.
+// Run executes the full registration flow using the P2P connection pattern.
+//
+// Phases:
+// 1. Resolve invite code → get NATS JWT+seed credentials + connection info
+// 2. Connect to NATS with JWT+seed (same as mobile peer connections)
+// 3. Publish connection.store-credentials with agent metadata as peer_profile
+// 4. Wait for vault to accept and phone user to approve
+// 5. Receive key exchange with vault's X25519 public key
+// 6. Compute shared secret, derive connection key, save encrypted credentials
 func (f *RegistrationFlow) Run() error {
-	// Phase 1: Resolve shortlink
-	f.state = StateResolvingShortlink
-	fmt.Println("Resolving shortlink...")
+	// Phase 1: Resolve invite code
+	f.state = StateResolvingInvite
+	fmt.Println("Resolving invite code...")
 
-	payload, err := ResolveShortlink(f.shortlink)
+	invitation, err := ResolveInviteCode(f.shortlink)
 	if err != nil {
 		f.state = StateFailed
-		f.err = fmt.Errorf("resolve shortlink: %w", err)
-		return f.err
-	}
-
-	// Decode vault public key from hex
-	vaultPubKey, err := hex.DecodeString(payload.VaultPublicKey)
-	if err != nil {
-		f.state = StateFailed
-		f.err = fmt.Errorf("decode vault public key: %w", err)
-		return f.err
-	}
-	if len(vaultPubKey) != crypto.KeySize {
-		f.state = StateFailed
-		f.err = fmt.Errorf("vault public key must be %d bytes, got %d", crypto.KeySize, len(vaultPubKey))
+		f.err = fmt.Errorf("resolve invite: %w", err)
 		return f.err
 	}
 
 	log.Info().
-		Str("invitation_id", payload.InvitationID).
-		Str("messagespace", payload.MessageSpaceURI).
-		Msg("Shortlink resolved")
+		Str("connection_id", invitation.ConnectionID).
+		Str("owner_space", invitation.OwnerSpace).
+		Msg("Invite resolved")
 
-	// Phase 2: Connect to NATS
+	// Phase 2: Connect to NATS with JWT+seed credentials
 	f.state = StateConnectingNATS
 	fmt.Println("Connecting to MessageSpace...")
 
 	client, err := vettidnats.NewClient(&vettidnats.ClientConfig{
-		URL:       payload.MessageSpaceURI,
-		Token:     payload.InviteToken,
-		OwnerGUID: payload.OwnerGUID,
+		URL:       invitation.NATSEndpoint,
+		JWT:       invitation.JWT,
+		Seed:      invitation.Seed,
+		OwnerGUID: invitation.OwnerSpace,
 	})
 	if err != nil {
 		f.state = StateFailed
@@ -136,27 +135,11 @@ func (f *RegistrationFlow) Run() error {
 	}
 	defer client.Close()
 
-	// Subscribe to invitation-specific response topic
-	resultCh := make(chan *vettidnats.Envelope, 1)
-	sub, err := client.SubscribeRegistration(payload.InvitationID, func(env *vettidnats.Envelope) {
-		select {
-		case resultCh <- env:
-		default:
-			log.Warn().Msg("Duplicate registration response received, ignoring")
-		}
-	})
-	if err != nil {
-		f.state = StateFailed
-		f.err = fmt.Errorf("subscribe to registration responses: %w", err)
-		return f.err
-	}
-	defer sub.Unsubscribe()
+	log.Info().Msg("Connected to MessageSpace with JWT credentials")
 
-	log.Info().Msg("Connected to MessageSpace")
-
-	// Phase 3: Build and send registration request
-	f.state = StateSendingRequest
-	fmt.Println("Sending registration request...")
+	// Phase 3: Generate keypair and publish store-credentials
+	f.state = StateStoringCredentials
+	fmt.Println("Sending connection request...")
 
 	// Generate agent X25519 keypair
 	agentKP, err := crypto.GenerateX25519KeyPair()
@@ -165,146 +148,207 @@ func (f *RegistrationFlow) Run() error {
 		f.err = fmt.Errorf("generate agent keypair: %w", err)
 		return f.err
 	}
-	// SECURITY: zero private key after we're done with it (unless approved)
 	var agentPrivKey [crypto.KeySize]byte
 	copy(agentPrivKey[:], agentKP.PrivateKey[:])
 
-	// Collect machine attributes
-	attrs, err := fingerprint.CollectMachineAttributes()
-	if err != nil {
-		crypto.ZeroBytes(agentPrivKey[:])
-		f.state = StateFailed
-		f.err = fmt.Errorf("collect machine attributes: %w", err)
-		return f.err
-	}
-
-	machineFingerprint := fingerprint.ComputeMachineFingerprintHex(attrs)
-
+	// Collect machine/agent metadata
+	hostname, _ := os.Hostname()
 	binaryFP, err := fingerprint.BinaryFingerprint()
 	if err != nil {
 		binaryFP = "unavailable"
-		log.Warn().Err(err).Msg("Could not compute binary fingerprint")
 	}
+	attrs, _ := fingerprint.CollectMachineAttributes()
+	machineFP := fingerprint.ComputeMachineFingerprintHex(attrs)
 
-	hostname, _ := os.Hostname()
-	ipAddr := detectLocalIP()
+	// Build store-credentials payload (same format as mobile/desktop)
+	requestID := hex.EncodeToString(crypto.RandomBytes(16))
+	natsCredsString := fmt.Sprintf(
+		"-----BEGIN NATS USER JWT-----\n%s\n------END NATS USER JWT------\n\n-----BEGIN USER NKEY SEED-----\n%s\n------END USER NKEY SEED------",
+		invitation.JWT, invitation.Seed,
+	)
 
-	connReq := &vettidnats.ConnectionRequest{
-		InvitationID:   payload.InvitationID,
-		AgentPublicKey: agentKP.PublicKey[:],
-		Registration: vettidnats.AgentRegistration{
-			AgentType:          f.agentType,
-			IPAddress:          ipAddr,
-			Hostname:           hostname,
-			Platform:           fingerprint.Platform(),
-			BinaryFingerprint:  binaryFP,
-			MachineFingerprint: machineFingerprint,
+	storePayload := map[string]interface{}{
+		"connection_id":        invitation.ConnectionID,
+		"peer_guid":            fmt.Sprintf("agent-%s", hex.EncodeToString(crypto.RandomBytes(8))),
+		"label":                hostname,
+		"nats_credentials":     natsCredsString,
+		"peer_owner_space_id":  invitation.OwnerSpace,
+		"peer_message_space_id": invitation.MessageSpace,
+		"peer_profile": map[string]interface{}{
+			"_system_first_name": hostname,
+			"_system_last_name":  "Agent",
+			"agent_type":         f.agentType,
+			"hostname":           hostname,
+			"platform":           fingerprint.Platform(),
+			"binary_fingerprint":  binaryFP,
+			"machine_fingerprint": machineFP,
+			"ip_address":          detectLocalIP(),
 		},
-		Timestamp: time.Now().UTC(),
+		"e2e_public_key":  hex.EncodeToString(agentKP.PublicKey[:]),
+		"connection_type": "agent",
 	}
 
-	// ECIES-encrypt and publish
-	if err := client.PublishRegistration(connReq, vaultPubKey); err != nil {
+	vaultMessage := map[string]interface{}{
+		"id":        requestID,
+		"type":      "connection.store-credentials",
+		"payload":   storePayload,
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+
+	messageBytes, err := json.Marshal(vaultMessage)
+	if err != nil {
 		crypto.ZeroBytes(agentPrivKey[:])
 		f.state = StateFailed
-		f.err = fmt.Errorf("publish registration request: %w", err)
+		f.err = fmt.Errorf("marshal store-credentials: %w", err)
 		return f.err
 	}
 
-	log.Info().Msg("Registration request sent, waiting for owner approval...")
+	// Publish to MessageSpace (not OwnerSpace — agents use MessageSpace like peers)
+	storeSubject := fmt.Sprintf("MessageSpace.%s.forOwner.connection.store-credentials", invitation.OwnerSpace)
+	if err := client.PublishTo(storeSubject, messageBytes); err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
+		f.state = StateFailed
+		f.err = fmt.Errorf("publish store-credentials: %w", err)
+		return f.err
+	}
 
-	// Phase 4: Wait for approval
+	log.Info().Msg("Store-credentials request sent, waiting for approval...")
+
+	// Phase 4: Wait for store-credentials response
 	f.state = StateWaitingApproval
 	fmt.Printf("Waiting for owner approval (timeout: %s)...\n", f.timeout)
 
-	timer := time.NewTimer(f.timeout)
-	defer timer.Stop()
+	// Subscribe to store-credentials response
+	storeResponseSubject := fmt.Sprintf("MessageSpace.%s.forOwner.connection.store-credentials.response", invitation.OwnerSpace)
+	storeResponseCh := make(chan []byte, 1)
+	storeSub, err := client.SubscribeTo(storeResponseSubject, func(msg *nats.Msg) {
+		select {
+		case storeResponseCh <- msg.Data:
+		default:
+		}
+	})
+	if err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
+		f.state = StateFailed
+		f.err = fmt.Errorf("subscribe to store response: %w", err)
+		return f.err
+	}
+	defer storeSub.Unsubscribe()
+
+	// Subscribe to connection events (key exchange, activation)
+	connEventSubject := fmt.Sprintf("MessageSpace.%s.forOwner.connection.>", invitation.OwnerSpace)
+	connEventCh := make(chan []byte, 10)
+	connSub, err := client.SubscribeTo(connEventSubject, func(msg *nats.Msg) {
+		select {
+		case connEventCh <- msg.Data:
+		default:
+		}
+	})
+	if err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
+		f.state = StateFailed
+		f.err = fmt.Errorf("subscribe to connection events: %w", err)
+		return f.err
+	}
+	defer connSub.Unsubscribe()
+
+	// Wait for store-credentials response
+	timer := time.NewTimer(30 * time.Second)
+	select {
+	case <-timer.C:
+		crypto.ZeroBytes(agentPrivKey[:])
+		f.state = StateFailed
+		f.err = fmt.Errorf("timed out waiting for store-credentials response")
+		return f.err
+	case data := <-storeResponseCh:
+		timer.Stop()
+		var result map[string]interface{}
+		if err := json.Unmarshal(data, &result); err != nil {
+			crypto.ZeroBytes(agentPrivKey[:])
+			f.state = StateFailed
+			f.err = fmt.Errorf("parse store response: %w", err)
+			return f.err
+		}
+		success, _ := result["success"].(bool)
+		if !success {
+			errMsg, _ := result["error"].(string)
+			if errMsg == "" {
+				errMsg = "store-credentials rejected"
+			}
+			crypto.ZeroBytes(agentPrivKey[:])
+			f.state = StateDenied
+			f.err = fmt.Errorf("connection denied: %s", errMsg)
+			return f.err
+		}
+		log.Info().Msg("Store-credentials accepted")
+	}
+
+	// Phase 5: Wait for key exchange message
+	f.state = StateKeyExchange
+	fmt.Println("Waiting for key exchange...")
+
+	keyExchangeTimer := time.NewTimer(f.timeout)
+	var vaultPublicKeyHex string
 
 	for {
 		select {
-		case <-timer.C:
+		case <-keyExchangeTimer.C:
 			crypto.ZeroBytes(agentPrivKey[:])
 			f.state = StateFailed
-			f.err = fmt.Errorf("timed out waiting for owner approval after %s", f.timeout)
+			f.err = fmt.Errorf("timed out waiting for key exchange after %s", f.timeout)
 			return f.err
 
-		case env := <-resultCh:
-			switch env.Type {
-			case vettidnats.MsgAgentConnectionApproved:
-				// Phase 5: Save credentials
-				err := f.handleApproval(env, agentPrivKey[:], agentKP.PublicKey[:], vaultPubKey, payload)
-				crypto.ZeroBytes(agentPrivKey[:])
-				return err
-
-			case vettidnats.MsgAgentConnectionDenied:
-				crypto.ZeroBytes(agentPrivKey[:])
-				var denial vettidnats.ConnectionDenial
-				if jsonErr := json.Unmarshal(env.Payload, &denial); jsonErr != nil {
-					f.state = StateDenied
-					f.err = fmt.Errorf("connection denied (could not parse reason)")
-					return f.err
-				}
-				f.state = StateDenied
-				f.err = fmt.Errorf("connection denied by owner: %s", denial.Reason)
-				return f.err
-
-			default:
-				log.Warn().Str("type", string(env.Type)).Msg("Unexpected message type during registration, ignoring")
+		case data := <-connEventCh:
+			var event map[string]interface{}
+			if err := json.Unmarshal(data, &event); err != nil {
+				continue
+			}
+			// Look for e2e_public_key in the event
+			if pubKey, ok := event["e2e_public_key"].(string); ok && pubKey != "" {
+				vaultPublicKeyHex = pubKey
+				keyExchangeTimer.Stop()
+				goto keyExchangeReceived
 			}
 		}
 	}
-}
 
-// handleApproval processes an approval envelope: derives connection key via X25519+HKDF,
-// decrypts the approval payload, prompts for passphrase, and saves credentials.
-func (f *RegistrationFlow) handleApproval(env *vettidnats.Envelope, agentPrivKey, agentPubKey, vaultPubKey []byte, payload *ShortlinkPayload) error {
+keyExchangeReceived:
 	f.state = StateApproved
-	fmt.Println("\nConnection approved!")
+	fmt.Println("\nConnection approved! Key exchange complete.")
 
-	// SECURITY: Derive connection key from X25519 shared secret via HKDF.
-	// Both sides independently compute the same key from their ECDH shared secret.
-	sharedSecret, err := crypto.ComputeSharedSecret(agentPrivKey, vaultPubKey)
+	// Phase 6: Compute shared secret and save credentials
+	vaultPubKeyBytes, err := hex.DecodeString(vaultPublicKeyHex)
+	if err != nil || len(vaultPubKeyBytes) != crypto.KeySize {
+		crypto.ZeroBytes(agentPrivKey[:])
+		f.state = StateFailed
+		f.err = fmt.Errorf("invalid vault public key in key exchange")
+		return f.err
+	}
+
+	// X25519 ECDH shared secret
+	sharedSecret, err := crypto.ComputeSharedSecret(agentPrivKey[:], vaultPubKeyBytes)
 	if err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
 		f.state = StateFailed
 		f.err = fmt.Errorf("compute shared secret: %w", err)
 		return f.err
 	}
 	defer crypto.ZeroBytes(sharedSecret)
 
-	connectionKey, err := crypto.DeriveConnectionKey(sharedSecret)
+	// HKDF-SHA256 with connection_id as salt
+	connectionKey, err := crypto.DeriveConnectionKey(sharedSecret, invitation.ConnectionID)
 	if err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
 		f.state = StateFailed
 		f.err = fmt.Errorf("derive connection key: %w", err)
 		return f.err
 	}
 	defer crypto.ZeroBytes(connectionKey)
 
-	// SECURITY: Decrypt approval payload with the derived connection key (XChaCha20-Poly1305).
-	// The vault encrypted this with the same connection key derived from the same shared secret.
-	decrypted, err := crypto.Decrypt(connectionKey, env.Payload, nil)
-	if err != nil {
-		f.state = StateFailed
-		f.err = fmt.Errorf("decrypt approval: %w", err)
-		return f.err
-	}
-	defer crypto.ZeroBytes(decrypted)
-
-	var approval vettidnats.ConnectionApproval
-	if err := json.Unmarshal(decrypted, &approval); err != nil {
-		f.state = StateFailed
-		f.err = fmt.Errorf("parse approval: %w", err)
-		return f.err
-	}
-
-	log.Info().
-		Str("connection_id", approval.ConnectionID).
-		Str("key_id", approval.KeyID).
-		Str("approval_mode", approval.Contract.ApprovalMode).
-		Msg("Connection details received")
-
 	// Prompt for passphrase
 	passphrase, err := readPassphrase()
 	if err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
 		f.state = StateFailed
 		f.err = fmt.Errorf("read passphrase: %w", err)
 		return f.err
@@ -314,34 +358,34 @@ func (f *RegistrationFlow) handleApproval(env *vettidnats.Envelope, agentPrivKey
 	// Derive platform key
 	platformKey, err := fingerprint.DerivePlatformKey("")
 	if err != nil {
+		crypto.ZeroBytes(agentPrivKey[:])
 		f.state = StateFailed
 		f.err = fmt.Errorf("derive platform key: %w", err)
 		return f.err
 	}
 	defer crypto.ZeroBytes(platformKey)
 
-	// SECURITY: Copy connection key for credentials — the deferred ZeroBytes above
-	// will wipe the original, but credentials need a live copy for Save.
+	// Build and save credentials
 	connKeyCopy := make([]byte, len(connectionKey))
 	copy(connKeyCopy, connectionKey)
 
-	// Build credentials
 	creds := &credential.ConnectionCredentials{
-		ConnectionID:      approval.ConnectionID,
-		ConnectionKey:     connKeyCopy,
-		KeyID:             approval.KeyID,
-		AgentPrivateKey:   agentPrivKey,
-		AgentPublicKey:    agentPubKey,
-		VaultPublicKey:    vaultPubKey,
-		MessageSpaceToken: payload.InviteToken,
-		MessageSpaceURL:   payload.MessageSpaceURI,
-		OwnerGUID:         payload.OwnerGUID,
-		Scope:             approval.Contract.Scope,
-		ApprovalMode:      approval.Contract.ApprovalMode,
+		ConnectionID:    invitation.ConnectionID,
+		ConnectionKey:   connKeyCopy,
+		KeyID:           hex.EncodeToString(agentKP.PublicKey[:]),
+		AgentPrivateKey: agentPrivKey[:],
+		AgentPublicKey:  agentKP.PublicKey[:],
+		VaultPublicKey:  vaultPubKeyBytes,
+		JWT:             invitation.JWT,
+		Seed:            invitation.Seed,
+		MessageSpaceURL: invitation.NATSEndpoint,
+		OwnerGUID:       invitation.OwnerSpace,
+		OwnerName:       invitation.Label,
+		Scope:           []string{}, // Set by vault after contract review
+		ApprovalMode:    "always_ask",
 	}
 	defer creds.Zero()
 
-	// Save encrypted credentials
 	if err := credential.Save(f.configDir, creds, passphrase, platformKey); err != nil {
 		f.state = StateFailed
 		f.err = fmt.Errorf("save credentials: %w", err)

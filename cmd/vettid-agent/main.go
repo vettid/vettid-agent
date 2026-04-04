@@ -190,7 +190,8 @@ and begins serving the local API and WebSocket endpoint.`,
 			// Connect to NATS
 			client, err := vettidnats.NewClient(&vettidnats.ClientConfig{
 				URL:          creds.MessageSpaceURL,
-				Token:        creds.MessageSpaceToken,
+				JWT:          creds.JWT,
+				Seed:         creds.Seed,
 				ConnectionID: creds.ConnectionID,
 				OwnerGUID:    creds.OwnerGUID,
 				TLS:          cfg.NATS.TLSEnabled,
