@@ -177,6 +177,27 @@ func (c *Client) PublishCatalogRequest(req *CatalogRefreshRequest, connKey []byt
 	return c.PublishToOwner(envelope)
 }
 
+// PublishMessage sends a text message or approval request to the vault owner.
+func (c *Client) PublishMessage(msg *AgentTextMessage, connKey []byte, keyID string, seq uint64) error {
+	plaintext, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("marshal message: %w", err)
+	}
+	defer crypto.ZeroBytes(plaintext)
+
+	encrypted, err := crypto.Encrypt(connKey, plaintext, nil)
+	if err != nil {
+		return fmt.Errorf("encrypt message: %w", err)
+	}
+
+	envelope, err := EncodeEnvelope(MsgAgentMessage, keyID, encrypted, seq)
+	if err != nil {
+		return fmt.Errorf("encode envelope: %w", err)
+	}
+
+	return c.PublishToOwner(envelope)
+}
+
 // Conn returns the underlying NATS connection for drain/close operations.
 func (c *Client) Conn() *nats.Conn {
 	return c.conn

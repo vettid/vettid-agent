@@ -22,6 +22,8 @@ const (
 	MsgAgentCatalogRequest    MessageType = "agent_catalog_request"   // agent → vault: refresh request
 	MsgAgentActionRequest     MessageType = "agent_action_request"    // agent → vault: use-in-enclave
 	MsgAgentActionResponse    MessageType = "agent_action_response"   // vault → agent: action result
+	MsgAgentMessage           MessageType = "agent_message"           // agent → vault: text/approval message
+	MsgAgentMessageResponse   MessageType = "agent_message_response"  // vault → agent: user reply
 )
 
 type Envelope struct {
@@ -154,6 +156,30 @@ type HTTPResponseResult struct {
 type SignResult struct {
 	Signature string `json:"signature"` // base64-encoded
 	Algorithm string `json:"algorithm"`
+}
+
+// AgentTextMessage is a message sent from the agent to the vault owner.
+type AgentTextMessage struct {
+	MessageID   string          `json:"message_id"`
+	ContentType string          `json:"content_type"` // "text" or "approval_request"
+	Content     string          `json:"content"`
+	Approval    json.RawMessage `json:"approval,omitempty"`
+}
+
+// ApprovalPayload is the structured content for an approval_request message.
+type ApprovalPayload struct {
+	Title       string            `json:"title"`
+	Description string            `json:"description"`
+	Options     []string          `json:"options"` // e.g., ["approve", "deny"]
+	Metadata    map[string]string `json:"metadata,omitempty"`
+}
+
+// AgentMessageResponse is a reply from the vault owner to an agent message.
+type AgentMessageResponse struct {
+	MessageID    string `json:"message_id"`
+	ReplyTo      string `json:"reply_to,omitempty"`
+	ReplyContent string `json:"reply_content,omitempty"`
+	Action       string `json:"action,omitempty"` // "approve" or "deny" for approval responses
 }
 
 // EncodeEnvelope marshals an Envelope with the given fields and current timestamp.

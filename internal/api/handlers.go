@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"time"
@@ -21,6 +22,7 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /v1/requests/{requestID}", s.handleGetRequest)
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
 	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
+	mux.HandleFunc("POST /v1/messages/send", s.handleSendMessage)
 	mux.HandleFunc("POST /v1/connection/disconnect", s.handleDisconnect)
 }
 
@@ -420,6 +422,56 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"catalog_version": s.catalog.Version(),
 		"catalog_secrets": s.catalog.Count(),
 		"uptime_seconds":  math.Round(uptime),
+	})
+}
+
+// handleSendMessage sends a text message or approval request to the vault owner.
+func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Content     string          `json:"content"`
+		ContentType string          `json:"content_type"` // "text" (default) or "approval_request"
+		Approval    json.RawMessage `json:"approval,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+
+	if req.Content == "" && req.Approval == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content or approval is required"})
+		return
+	}
+	if req.ContentType == "" {
+		req.ContentType = "text"
+	}
+
+	messageID, err := generateRequestID()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate message ID"})
+		return
+	}
+
+	msg := &vettidnats.AgentTextMessage{
+		MessageID:   messageID,
+		ContentType: req.ContentType,
+		Content:     req.Content,
+		Approval:    req.Approval,
+	}
+
+	seq := s.nextSequence()
+	if err := s.natsClient.PublishMessage(msg, s.connKey, s.keyID, seq); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to send: %v", err)})
+		return
+	}
+
+	// Register in tracker if approval request (caller may want to wait for response)
+	if req.ContentType == "approval_request" {
+		s.tracker.Add(messageID, 5*time.Minute) // 5 min timeout for approval
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"message_id": messageID,
+		"status":     "sent",
 	})
 }
 
