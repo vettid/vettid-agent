@@ -83,11 +83,15 @@ func getConfigDir(cmd *cobra.Command) (string, error) {
 
 func newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "init <shortlink>",
-		Short: "Register with a vault using a shortlink",
-		Long: `Resolves the one-time shortlink, connects to the owner's MessageSpace,
-performs key exchange, sends registration details, and waits for owner approval.
-On approval, prompts for an encryption passphrase and writes encrypted credentials.`,
+		Use:   "init <invite-code>",
+		Short: "Register with a vault using an invite code",
+		Long: `Registers this agent with a vault using a one-time invite code
+generated from the vault owner's app.
+
+Pairing is not yet implemented — the previous HTTP-broker flow has been
+removed and the replacement NATS-based flow is pending design. See
+vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md for the parallel desktop design
+this agent flow will mirror.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configDir, err := getConfigDir(cmd)
@@ -109,10 +113,10 @@ On approval, prompts for an encryption passphrase and writes encrypted credentia
 			timeout := time.Duration(timeoutSecs) * time.Second
 
 			flow := registration.NewFlow(registration.FlowConfig{
-				Shortlink: args[0],
-				AgentType: agentType,
-				Timeout:   timeout,
-				ConfigDir: configDir,
+				InviteCode: args[0],
+				AgentType:  agentType,
+				Timeout:    timeout,
+				ConfigDir:  configDir,
 			})
 
 			if err := flow.Run(); err != nil {
@@ -142,7 +146,7 @@ and begins serving the local API and WebSocket endpoint.`,
 
 			// Check credentials exist
 			if !credential.Exists(configDir) {
-				return fmt.Errorf("not registered. Run 'vettid-agent init <shortlink>' first")
+				return fmt.Errorf("not registered. Run 'vettid-agent init <invite-code>' first")
 			}
 
 			// Load config

@@ -45,8 +45,7 @@ internal/
     handlers.go               # Route handlers
     websocket.go              # WebSocket endpoint
   registration/
-    shortlink.go              # Shortlink resolver
-    flow.go                   # Registration state machine
+    flow.go                   # Registration state machine (pairing flow pending redesign)
 ```
 
 ## Crypto Stack
@@ -70,7 +69,7 @@ The connector never stores secrets. All policy enforcement happens in the vault.
 
 | Command | Description |
 |---------|-------------|
-| `init <shortlink>` | Register with a vault using a shortlink |
+| `init <invite-code>` | Register with a vault using an invite code (pending redesign) |
 | `start` | Start the connector and local API |
 | `status` | Show connection status and health |
 | `rebind` | Re-bind credentials after hardware changes |

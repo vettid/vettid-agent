@@ -15,7 +15,7 @@ Secure sidecar for AI agent vault access. Enables AI agents to request secrets a
 
 The Agent Connector runs alongside your AI agent as a sidecar process. It handles:
 
-- **Registration** — One-time setup via a shortlink from the vault owner's mobile app
+- **Registration** — One-time setup via an invite code from the vault owner's mobile app (pairing flow pending redesign — see status below)
 - **Key exchange** — X25519 key agreement, ChaCha20-Poly1305 encryption
 - **NATS messaging** — Publishes encrypted requests, subscribes to responses
 - **Local API** — REST (Unix socket or TCP) and WebSocket for the agent to use
@@ -25,17 +25,24 @@ The vault owner controls everything: what secrets are accessible, whether reques
 
 ## Quick Start
 
+> **Pairing status (2026-04-18):** the previous HTTP-broker pairing flow
+> (`https://vett.id/<code>`) has been removed because that domain was never
+> registered and the flow never worked. A replacement NATS-based flow is
+> pending design — it will mirror the desktop design at
+> `vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md`. Until then, `vettid-agent init`
+> returns a "not yet implemented" error.
+
 ### 1. Owner creates invitation (mobile app)
 
-Tap **Connect Agent** → a 2-minute shortlink appears.
+Tap **Connect Agent** → a 2-minute invite code appears.
 
 ### 2. Operator registers
 
 ```bash
-vettid-agent init vettid.dev/a/K7x9Qm --type coding_assistant
+vettid-agent init <invite-code> --type coding_assistant
 ```
 
-The connector resolves the shortlink, performs key exchange, and waits for owner approval.
+The connector resolves the invite code via NATS, performs key exchange, and waits for owner approval.
 
 ### 3. Owner approves (mobile app)
 

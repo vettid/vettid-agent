@@ -2,7 +2,16 @@
 
 **Version:** 1.0
 **Date:** 2026-02-08
-**Status:** Final
+**Status:** Superseded (pairing sections only) — 2026-04-18
+
+> **Pairing sections superseded (§3.1–§3.3 below):** the shortlink-via-HTTPS
+> pairing flow described here was never implemented against a live backend —
+> the `https://vett.id/<code>` domain referenced throughout was never
+> registered. The replacement pairing flow will mirror the desktop design
+> documented at `vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md` (two-stage
+> NATS-only, owner-approves-via-QR, cryptographic session expiry). The
+> remainder of this document (architecture, policy model, wire format,
+> security considerations) is unchanged.
 
 ---
 
