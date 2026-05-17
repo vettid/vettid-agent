@@ -22,6 +22,12 @@ type Server struct {
 	listener       net.Listener
 	wsToken        string
 	allowedOrigins []string
+	// SECURITY (#63): when the API listens on TCP every inbound REST
+	// request is also required to carry the wsToken in the
+	// Authorization: Bearer / X-VettID-Token header. Unix-socket mode
+	// skips this — the socket file's 0600 perms (set in Start()) are
+	// the authentication surface.
+	requireRESTAuth bool
 	natsClient     *vettidnats.Client
 	connKey        []byte
 	keyID          string
@@ -63,14 +69,22 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 	// secret-request handler. Real requests are well under 64 KB.
 	// SECURITY (#110): rate-limit chained outside the body cap so a
 	// flood of valid-sized requests also fails fast.
+	// SECURITY (#63): TCP listener requires REST auth on top of the
+	// body+rate guards. Decided by listen-prefix below.
+	requireREST := strings.HasPrefix(cfg.Listen, "tcp://")
 	rateLimiter := newAPIRateLimiter()
-	chained := rateLimitMiddleware(bodyLimitMiddleware(mux, maxRequestBytes), rateLimiter)
+	var chained http.Handler = bodyLimitMiddleware(mux, maxRequestBytes)
+	chained = rateLimitMiddleware(chained, rateLimiter)
+	if requireREST {
+		chained = restAuthMiddleware(chained, cfg.WSToken)
+	}
 
 	s := &Server{
-		httpServer:     &http.Server{Handler: chained},
-		wsToken:        cfg.WSToken,
-		allowedOrigins: cfg.AllowedOrigins,
-		natsClient:     cfg.NATSClient,
+		httpServer:      &http.Server{Handler: chained},
+		wsToken:         cfg.WSToken,
+		allowedOrigins:  cfg.AllowedOrigins,
+		requireRESTAuth: requireREST,
+		natsClient:      cfg.NATSClient,
 		connKey:        cfg.ConnKey,
 		keyID:          cfg.KeyID,
 		connectionID:   cfg.ConnectionID,
@@ -148,6 +162,41 @@ func (s *Server) Catalog() *CatalogCache {
 // nextSequence returns the next monotonic sequence number for NATS messages.
 func (s *Server) nextSequence() uint64 {
 	return s.sequence.Add(1)
+}
+
+// SECURITY (#63): bearer-token auth for REST endpoints when the API
+// listens on TCP. Skips /v1/ws because the WebSocket handler does its
+// own token validation (and gorilla/websocket reads the Authorization
+// header before the upgrade anyway). Also skips OPTIONS preflights so
+// browser clients can negotiate CORS without a credential.
+func restAuthMiddleware(next http.Handler, token string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions || r.URL.Path == "/v1/ws" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		supplied := extractBearerToken(r)
+		if supplied == "" || supplied != token {
+			log.Warn().Str("path", r.URL.Path).Str("method", r.Method).Msg("REST auth failed — rejecting")
+			w.Header().Set("WWW-Authenticate", `Bearer realm="vettid-agent"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// extractBearerToken pulls a token from Authorization: Bearer or
+// X-VettID-Token. Mirrors the WebSocket handler's order so a single
+// shipping client only has to set one header.
+func extractBearerToken(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		const bearer = "Bearer "
+		if len(auth) > len(bearer) && auth[:len(bearer)] == bearer {
+			return auth[len(bearer):]
+		}
+	}
+	return r.Header.Get("X-VettID-Token")
 }
 
 // SECURITY (#62): cap on inbound request bodies for the local REST API.
