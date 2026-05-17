@@ -6,7 +6,6 @@ import (
 	"bufio"
 	"net"
 	"os"
-	"os/exec"
 	"strings"
 )
 
@@ -40,9 +39,23 @@ func collectLinuxCPU() string {
 }
 
 // collectLinuxDiskSerial reads the root disk serial using lsblk.
+//
+// SECURITY (#115): every exec.Command goes through safeCommand which
+// resolves the binary via exec.LookPath and refuses any path outside
+// the trusted system dirs — defeats $PATH-hijack attacks where a
+// shadow `lsblk` planted in a user-writable directory would otherwise
+// run.
 func collectLinuxDiskSerial() string {
+	run := func(args ...string) ([]byte, error) {
+		cmd, err := safeCommand("lsblk", args...)
+		if err != nil {
+			return nil, err
+		}
+		return cmd.Output()
+	}
+
 	// Try lsblk first (most reliable)
-	out, err := exec.Command("lsblk", "--nodeps", "-o", "SERIAL", "-n", "/dev/sda").Output()
+	out, err := run("--nodeps", "-o", "SERIAL", "-n", "/dev/sda")
 	if err == nil {
 		serial := strings.TrimSpace(string(out))
 		if serial != "" {
@@ -51,7 +64,7 @@ func collectLinuxDiskSerial() string {
 	}
 
 	// Fallback: try nvme0n1 (common on modern systems)
-	out, err = exec.Command("lsblk", "--nodeps", "-o", "SERIAL", "-n", "/dev/nvme0n1").Output()
+	out, err = run("--nodeps", "-o", "SERIAL", "-n", "/dev/nvme0n1")
 	if err == nil {
 		serial := strings.TrimSpace(string(out))
 		if serial != "" {
@@ -60,7 +73,7 @@ func collectLinuxDiskSerial() string {
 	}
 
 	// Fallback: try to find the root disk
-	out, err = exec.Command("lsblk", "--nodeps", "-o", "NAME,SERIAL", "-n").Output()
+	out, err = run("--nodeps", "-o", "NAME,SERIAL", "-n")
 	if err == nil {
 		lines := strings.Split(strings.TrimSpace(string(out)), "\n")
 		for _, line := range lines {

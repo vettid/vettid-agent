@@ -4,9 +4,14 @@ package fingerprint
 
 import (
 	"net"
-	"os/exec"
 	"strings"
 )
+
+// SECURITY (#115): every exec.Command in this file goes through
+// safeCommand which resolves the binary via exec.LookPath and refuses
+// any path outside trustedExecDirs. Defeats $PATH-hijack attacks
+// where a shadow `ioreg` / `sysctl` / `diskutil` planted in a
+// user-writable directory would otherwise run.
 
 func collectPlatformAttributes(attrs *MachineAttributes) {
 	attrs.MachineID = collectDarwinMachineID()
@@ -17,7 +22,11 @@ func collectPlatformAttributes(attrs *MachineAttributes) {
 
 // collectDarwinMachineID reads the IOPlatformUUID via ioreg.
 func collectDarwinMachineID() string {
-	out, err := exec.Command("ioreg", "-rd1", "-c", "IOPlatformExpertDevice").Output()
+	cmd, err := safeCommand("ioreg", "-rd1", "-c", "IOPlatformExpertDevice")
+	if err != nil {
+		return ""
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -37,7 +46,11 @@ func collectDarwinMachineID() string {
 
 // collectDarwinCPU reads the CPU brand string via sysctl.
 func collectDarwinCPU() string {
-	out, err := exec.Command("sysctl", "-n", "machdep.cpu.brand_string").Output()
+	cmd, err := safeCommand("sysctl", "-n", "machdep.cpu.brand_string")
+	if err != nil {
+		return ""
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
@@ -46,7 +59,11 @@ func collectDarwinCPU() string {
 
 // collectDarwinDiskSerial reads the root disk serial via diskutil.
 func collectDarwinDiskSerial() string {
-	out, err := exec.Command("diskutil", "info", "/").Output()
+	cmd, err := safeCommand("diskutil", "info", "/")
+	if err != nil {
+		return ""
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return ""
 	}
