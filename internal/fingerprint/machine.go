@@ -7,6 +7,49 @@
 //
 // Platform-specific collection is in machine_linux.go and machine_darwin.go
 // (selected by build tags). Unsupported platforms use machine_other.go.
+//
+// # SECURITY (#65): threat model — binding, not secret
+//
+// Every attribute used here (hostname, machine-id, CPU brand, disk
+// serial, MAC) is readable by any process running as the same user,
+// and is trivially spoofable by root. The fingerprint is NOT a
+// secret — an attacker with root on the box can mint the same key
+// material the agent uses and decrypt connection.enc directly.
+//
+// What the fingerprint actually defends against:
+//   - File-level exfiltration: copying connection.enc off the
+//     machine yields ciphertext that won't decrypt elsewhere
+//     because the platform_key differs.
+//   - Backup-restore-to-wrong-machine accidents: the audit-trail
+//     mistake class. Users who restore to a new laptop can't
+//     accidentally activate two agents under one identity.
+//
+// What it does NOT defend against:
+//   - Same-machine root-level theft (the threat model assumes the
+//     box itself is trusted).
+//   - State-level adversaries with disk forensics.
+//
+// # SECURITY (#112): 4-of-5 tolerance decision
+//
+// FourOfFiveCombinations exists because hardware changes happen —
+// NIC swap, OS upgrade that rewrites /etc/machine-id, etc. — and
+// without tolerance the agent would brick on benign churn.
+// Decision: keep the 4-of-5 tolerance. The strictness trade-off:
+//
+//   - 5-of-5 strict: every attribute change forces re-registration.
+//     Brutal UX for an attack surface that isn't load-bearing
+//     (per #65 — fingerprint isn't a secret).
+//   - 4-of-5 (current): one attribute change is recoverable. Two
+//     attribute changes force re-registration. Two simultaneous
+//     changes are rare enough that the UX/security trade is right.
+//   - 3-of-5: weakens binding too far — attacker who can flip 2
+//     attributes (e.g. mac change + hostname change in a VM
+//     restore) gets in.
+//
+// Auto-heal: when the 4-of-5 path succeeds, LoadWithTolerance
+// re-encrypts under the current full fingerprint so subsequent
+// loads use the strict path — drift accumulates only across
+// further changes.
 package fingerprint
 
 import (
