@@ -19,11 +19,15 @@ type Config struct {
 	Logging   LoggingConfig   `toml:"logging"`
 }
 
+// APIConfig configures the local REST + WebSocket listener.
+//
+// SECURITY (#64): historical MTLSEnabled / MTLSCert / MTLSKey fields
+// were removed — they were parsed but never consumed by any
+// transport setup code. A future mTLS rollout will land alongside
+// the actual TLS-configured listener so the surface advertised by
+// config matches the surface the binary actually enforces.
 type APIConfig struct {
-	Listen      string `toml:"listen"`
-	MTLSEnabled bool   `toml:"mtls_enabled"`
-	MTLSCert    string `toml:"mtls_cert"`
-	MTLSKey     string `toml:"mtls_key"`
+	Listen string `toml:"listen"`
 }
 
 type WebSocketConfig struct {
