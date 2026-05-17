@@ -29,7 +29,7 @@ func testCreds() *ConnectionCredentials {
 
 func TestSaveLoad_RoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	passphrase := []byte("test-passphrase")
+	passphrase := []byte("Test-Pass-1234!")
 	platformKey := bytes.Repeat([]byte{0xAA}, 32)
 	creds := testCreds()
 
@@ -102,11 +102,15 @@ func TestLoad_WrongPassphrase(t *testing.T) {
 	dir := t.TempDir()
 	platformKey := bytes.Repeat([]byte{0xAA}, 32)
 
-	if err := Save(dir, testCreds(), []byte("correct"), platformKey); err != nil {
+	if err := Save(dir, testCreds(), []byte("Correct-Pass-1234!"), platformKey); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
 
-	_, err := Load(dir, []byte("wrong"), platformKey)
+	// Load with a wrong passphrase — Load does not enforce strength so
+	// short attempts are still rejected via AEAD failure, not a strength
+	// gate. This documents the asymmetry: Save is strict, Load is
+	// permissive so legacy installs still decrypt.
+	_, err := Load(dir, []byte("Wrong-Pass-9999@"), platformKey)
 	if err == nil {
 		t.Error("expected error with wrong passphrase")
 	}
@@ -114,7 +118,7 @@ func TestLoad_WrongPassphrase(t *testing.T) {
 
 func TestLoad_WrongPlatformKey(t *testing.T) {
 	dir := t.TempDir()
-	passphrase := []byte("test-passphrase")
+	passphrase := []byte("Test-Pass-1234!")
 
 	if err := Save(dir, testCreds(), passphrase, bytes.Repeat([]byte{0xAA}, 32)); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -129,7 +133,7 @@ func TestLoad_WrongPlatformKey(t *testing.T) {
 func TestLoad_NoFile(t *testing.T) {
 	dir := t.TempDir()
 
-	_, err := Load(dir, []byte("pass"), []byte("key"))
+	_, err := Load(dir, []byte("Test-Pass-1234!"), []byte("key"))
 	if err == nil {
 		t.Error("expected error when no credential file exists")
 	}
@@ -143,7 +147,7 @@ func TestExists(t *testing.T) {
 	}
 
 	// Create the file
-	Save(dir, testCreds(), []byte("pass"), bytes.Repeat([]byte{0xAA}, 32))
+	Save(dir, testCreds(), []byte("Test-Pass-1234!"), bytes.Repeat([]byte{0xAA}, 32))
 
 	if !Exists(dir) {
 		t.Error("Exists should return true after Save")
@@ -153,7 +157,7 @@ func TestExists(t *testing.T) {
 func TestDelete(t *testing.T) {
 	dir := t.TempDir()
 
-	Save(dir, testCreds(), []byte("pass"), bytes.Repeat([]byte{0xAA}, 32))
+	Save(dir, testCreds(), []byte("Test-Pass-1234!"), bytes.Repeat([]byte{0xAA}, 32))
 
 	if !Exists(dir) {
 		t.Fatal("file should exist after Save")
@@ -175,7 +179,7 @@ func TestDelete(t *testing.T) {
 
 func TestLoadWithTolerance_FullMatch(t *testing.T) {
 	dir := t.TempDir()
-	passphrase := "test-passphrase"
+	passphrase := "Test-Pass-1234!"
 
 	// Create a platform key file for deterministic testing
 	keyFile := filepath.Join(dir, "platform.key")
@@ -247,7 +251,7 @@ func TestStoreVersion(t *testing.T) {
 	dir := t.TempDir()
 	platformKey := bytes.Repeat([]byte{0xAA}, 32)
 
-	Save(dir, testCreds(), []byte("pass"), platformKey)
+	Save(dir, testCreds(), []byte("Test-Pass-1234!"), platformKey)
 
 	// Read the raw store to check version
 	store, err := readStore(dir)
@@ -277,7 +281,7 @@ func TestSave_EncryptedOnDisk(t *testing.T) {
 	platformKey := bytes.Repeat([]byte{0xAA}, 32)
 	creds := testCreds()
 
-	Save(dir, creds, []byte("pass"), platformKey)
+	Save(dir, creds, []byte("Test-Pass-1234!"), platformKey)
 
 	// Raw file should not contain plaintext credential values
 	data, _ := os.ReadFile(filepath.Join(dir, credentialFile))

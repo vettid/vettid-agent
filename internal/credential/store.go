@@ -62,7 +62,15 @@ type EncryptedStore struct {
 
 // Save encrypts credentials and writes them to connection.enc in configDir.
 // The encryption key is derived from passphrase + platformKey via Argon2id.
+//
+// SECURITY (#60): refuses to seal credentials under a weak passphrase.
+// See ValidatePassphraseStrength for the rules. Existing weak-pass
+// installs can keep loading via Load (this gate only applies to
+// Save) — the next rotation will require a stronger one.
 func Save(configDir string, creds *ConnectionCredentials, passphrase, platformKey []byte) error {
+	if err := ValidatePassphraseStrength(passphrase); err != nil {
+		return err
+	}
 	plaintext, err := json.Marshal(creds)
 	if err != nil {
 		return fmt.Errorf("marshal credentials: %w", err)
