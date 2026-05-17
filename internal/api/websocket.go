@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"math"
 	"net/http"
@@ -107,6 +108,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
+	// SECURITY (#113): connCtx is cancelled when this handler returns
+	// (client disconnect, network error, server shutdown). The
+	// per-request goroutines below select on <-connCtx.Done() so they
+	// don't park forever waiting on a tracker channel that will never
+	// resolve. Without this cancel, a client that connects → fires a
+	// secrets.request → drops the TCP socket leaks one goroutine per
+	// request indefinitely.
+	connCtx, cancelConn := context.WithCancel(r.Context())
+	defer cancelConn()
+
 	wc := &wsConn{conn: conn}
 	log.Info().Msg("WebSocket client connected")
 
@@ -137,16 +148,16 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		// Dispatch based on method — blocking methods run in goroutines
+		// Dispatch based on method — blocking methods run in goroutines.
+		// Each blocking handler receives connCtx so it can bail out
+		// when the client disconnects.
 		switch req.Method {
 		case "secrets.list":
 			s.wsHandleListSecrets(wc, req)
 		case "secrets.request":
-			// Blocking — runs in goroutine
-			go s.wsHandleSecretRequest(wc, req)
+			go s.wsHandleSecretRequest(connCtx, wc, req)
 		case "secrets.use":
-			// Blocking — runs in goroutine
-			go s.wsHandleSecretUse(wc, req)
+			go s.wsHandleSecretUse(connCtx, wc, req)
 		case "secrets.refresh":
 			s.wsHandleCatalogRefresh(wc, req)
 		case "requests.get":
@@ -186,7 +197,7 @@ func (s *Server) wsHandleListSecrets(wc *wsConn, req wsRequest) {
 	})
 }
 
-func (s *Server) wsHandleSecretRequest(wc *wsConn, req wsRequest) {
+func (s *Server) wsHandleSecretRequest(ctx context.Context, wc *wsConn, req wsRequest) {
 	var body secretRequestBody
 	if err := json.Unmarshal(req.Params, &body); err != nil {
 		wc.writeJSON(wsResponse{
@@ -265,7 +276,15 @@ func (s *Server) wsHandleSecretRequest(wc *wsConn, req wsRequest) {
 		return
 	}
 
-	result := <-ch
+	// SECURITY (#113): bail out if the WS client disconnected while
+	// we were waiting on the vault.
+	var result *TrackedResult
+	select {
+	case result = <-ch:
+	case <-ctx.Done():
+		log.Debug().Str("request_id", requestID).Msg("WS secrets.request abandoned — client disconnected")
+		return
+	}
 
 	resp := map[string]any{
 		"status":     result.Status,
@@ -286,7 +305,7 @@ func (s *Server) wsHandleSecretRequest(wc *wsConn, req wsRequest) {
 	wc.writeJSON(wsResponse{ID: req.ID, Result: resp})
 }
 
-func (s *Server) wsHandleSecretUse(wc *wsConn, req wsRequest) {
+func (s *Server) wsHandleSecretUse(ctx context.Context, wc *wsConn, req wsRequest) {
 	var body actionUseBody
 	if err := json.Unmarshal(req.Params, &body); err != nil {
 		wc.writeJSON(wsResponse{
@@ -373,7 +392,15 @@ func (s *Server) wsHandleSecretUse(wc *wsConn, req wsRequest) {
 		return
 	}
 
-	result := <-ch
+	// SECURITY (#113): bail out if the WS client disconnected while
+	// we were waiting on the vault.
+	var result *TrackedResult
+	select {
+	case result = <-ch:
+	case <-ctx.Done():
+		log.Debug().Str("request_id", requestID).Msg("WS secrets.use abandoned — client disconnected")
+		return
+	}
 
 	resp := map[string]any{
 		"status":     result.Status,
