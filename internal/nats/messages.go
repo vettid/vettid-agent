@@ -3,6 +3,7 @@ package nats
 import (
 	"encoding/json"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -211,4 +212,73 @@ func DecodeEnvelope(data []byte) (*Envelope, error) {
 	}
 
 	return &env, nil
+}
+
+// SECURITY (#56 + #57): bounds for inbound envelope validation.
+//   • maxInboundSkew: how far in the past/future a timestamp may sit
+//     before we treat the envelope as a replay attempt. The vault
+//     stamps Timestamp at publish; clock skew across enclave +
+//     parent + agent in steady state is well under a minute, but we
+//     leave a wider window to survive load-related queue delays.
+//   • maxFutureSkew: a separate, tighter cap on future-skew because
+//     no honest sender produces messages from the future.
+const (
+	maxInboundSkew = 5 * time.Minute
+	maxFutureSkew  = 30 * time.Second
+)
+
+// EnvelopeValidator enforces:
+//
+//	#56 — monotonic inbound sequence numbers. The vault stamps Sequence
+//	      on every outbound envelope; the agent refuses any inbound
+//	      Sequence that is not strictly greater than the previous
+//	      accepted one. Defeats replay of captured envelopes.
+//	#57 — bounded inbound Timestamp. Refuses envelopes whose Timestamp
+//	      is more than maxInboundSkew in the past or maxFutureSkew in
+//	      the future. Defeats long-stored replays even if the attacker
+//	      could mint a fresh-looking Sequence (they can't, but defence
+//	      in depth).
+//
+// The validator is process-scoped — there is only one MessageSpace
+// subscription per agent instance — and is reset on every agent
+// restart (sequence-counter persistence across restarts is the
+// vault's job; the agent crashing and resubscribing is not a replay).
+type EnvelopeValidator struct {
+	mu          sync.Mutex
+	lastSeqSeen uint64
+	now         func() time.Time
+}
+
+func NewEnvelopeValidator() *EnvelopeValidator {
+	return &EnvelopeValidator{now: time.Now}
+}
+
+// Validate rejects envelopes that fail sequence or timestamp checks.
+// Returns nil on accept. Updates lastSeqSeen on accept; rejects do
+// not advance the counter so a transient out-of-order packet doesn't
+// permanently lock out a legitimate later one.
+func (v *EnvelopeValidator) Validate(env *Envelope) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	now := v.now().UTC()
+	if env.Timestamp.IsZero() {
+		return fmt.Errorf("envelope timestamp missing")
+	}
+	age := now.Sub(env.Timestamp)
+	if age > maxInboundSkew {
+		return fmt.Errorf("envelope too old: %s past tolerance", age-maxInboundSkew)
+	}
+	if -age > maxFutureSkew {
+		return fmt.Errorf("envelope future-dated: %s ahead of tolerance", -age-maxFutureSkew)
+	}
+
+	if env.Sequence == 0 {
+		return fmt.Errorf("envelope sequence missing")
+	}
+	if env.Sequence <= v.lastSeqSeen {
+		return fmt.Errorf("envelope sequence %d <= last seen %d (replay?)", env.Sequence, v.lastSeqSeen)
+	}
+	v.lastSeqSeen = env.Sequence
+	return nil
 }

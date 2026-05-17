@@ -244,9 +244,15 @@ and begins serving the local API and WebSocket endpoint.`,
 				return fmt.Errorf("start API server: %w", err)
 			}
 
+			// SECURITY (#56 + #57): one shared validator for the
+			// process so sequence-monotonicity is enforced across
+			// every inbound envelope, and timestamp skew is checked
+			// at the same point.
+			validator := vettidnats.NewEnvelopeValidator()
+
 			// Subscribe to NATS responses and dispatch to tracker/catalog
 			if err := client.SubscribeResponses(func(data []byte) {
-				handleNATSResponse(data, server, creds.ConnectionKey)
+				handleNATSResponse(data, server, creds.ConnectionKey, validator)
 			}); err != nil {
 				return fmt.Errorf("subscribe to responses: %w", err)
 			}
@@ -379,10 +385,23 @@ func promptAgentType() string {
 
 // handleNATSResponse decodes incoming NATS envelopes and dispatches them
 // to the appropriate handler (tracker or catalog).
-func handleNATSResponse(data []byte, server *api.Server, connKey []byte) {
+func handleNATSResponse(data []byte, server *api.Server, connKey []byte, validator *vettidnats.EnvelopeValidator) {
 	env, err := vettidnats.DecodeEnvelope(data)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to decode NATS response envelope")
+		return
+	}
+
+	// SECURITY (#56 + #57): refuse envelopes that fail sequence
+	// monotonicity or timestamp-skew bounds. Drops the message
+	// silently after logging; the vault will resend if it actually
+	// needed a reply.
+	if err := validator.Validate(env); err != nil {
+		log.Warn().Err(err).
+			Str("type", string(env.Type)).
+			Uint64("sequence", env.Sequence).
+			Time("timestamp", env.Timestamp).
+			Msg("Envelope validation failed — dropping")
 		return
 	}
 
