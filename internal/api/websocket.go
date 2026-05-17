@@ -67,8 +67,33 @@ func (wc *wsConn) writeJSON(v any) error {
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Validate session token
-	token := r.URL.Query().Get("token")
+	// SECURITY (#61): WebSocket session token must arrive in the
+	// Authorization header (Bearer scheme) or the X-VettID-Token
+	// header. Previously the token rode the URL query string —
+	// which gets logged into access logs, browser history, and
+	// process-args style telemetry — exposing the secret to any
+	// component that can read those streams.
+	//
+	// Backwards-compat path: still accept ?token= for one release
+	// so existing clients keep working; log a Warn so the migration
+	// is visible to operators. Remove the query-string path once
+	// every shipped client has moved.
+	var token string
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		const bearer = "Bearer "
+		if len(auth) > len(bearer) && auth[:len(bearer)] == bearer {
+			token = auth[len(bearer):]
+		}
+	}
+	if token == "" {
+		token = r.Header.Get("X-VettID-Token")
+	}
+	if token == "" {
+		token = r.URL.Query().Get("token")
+		if token != "" {
+			log.Warn().Msg("WebSocket token supplied via deprecated ?token= query string — switch to Authorization: Bearer or X-VettID-Token header")
+		}
+	}
 	if token == "" || token != s.wsToken {
 		http.Error(w, "invalid or missing token", http.StatusUnauthorized)
 		return
