@@ -20,6 +20,27 @@ const (
 )
 
 // TrackedResult is the outcome of a secret or action request.
+//
+// SECURITY (#67 + #108): SecretValue is `string` because the JSON
+// wire format requires it — both the vault-side and the AI client
+// consume it as text. String immutability in Go means we cannot
+// scrub the underlying byte storage from this side; the
+// `result.SecretValue = ""` calls in the handlers drop the only
+// application-side reference so GC can reclaim it, but the value
+// is still on the heap until the next collection cycle, and
+// json.Unmarshal at the inbound boundary leaves its own copy.
+//
+// Lifecycle defences in place:
+//   - Decrypt path uses ZeroBytes(plaintext) on the AEAD output —
+//     that scrubs the byte buffer json.Unmarshal copied from.
+//   - Tracker hands ownership to the HTTP/WS handler, which clears
+//     SecretValue immediately after writing the response.
+//   - Tracker.Resolve only delivers each result once; subsequent
+//     reads return nil (see tracker_test.go).
+//
+// To meaningfully strengthen this we'd need a wire-format change
+// to []byte-typed secret values plus a SecureBytes wrapper threaded
+// through every consumer — a future refactor.
 type TrackedResult struct {
 	Status      RequestStatus   `json:"status"`
 	RequestID   string          `json:"request_id"`

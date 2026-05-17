@@ -16,6 +16,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"fmt"
+	"runtime"
 
 	"golang.org/x/crypto/curve25519"
 )
@@ -81,11 +82,25 @@ func GenerateRandomBytes(n int) ([]byte, error) {
 }
 
 // ZeroBytes overwrites a byte slice with zeros.
-// SECURITY: Use this to wipe keys, secrets, and other sensitive data from memory.
+//
+// SECURITY (#104): the explicit loop + runtime.KeepAlive(b) is what
+// keeps the Go compiler from eliding the writes as a dead store.
+// Without KeepAlive a sufficiently smart optimizer can prove the
+// caller never reads b after this returns and drop the zeroing
+// entirely. KeepAlive is documented in the runtime package as the
+// supported way to extend a value's lifetime for exactly this kind
+// of side-effect-only write.
+//
+// SECURITY (#67): callers should pair this with a try/finally /
+// defer pattern that runs even on error paths. Audit goal: every
+// path that holds a derived AEAD key, password hash, or shared
+// secret either calls ZeroBytes via defer before returning, or
+// passes ownership to a wrapper (SecurePassword-style) that does.
 func ZeroBytes(b []byte) {
 	for i := range b {
 		b[i] = 0
 	}
+	runtime.KeepAlive(b)
 }
 
 // TimingSafeEqual performs a constant-time comparison of two byte slices.
