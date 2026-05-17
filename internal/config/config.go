@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/BurntSushi/toml"
+	"github.com/rs/zerolog/log"
 )
 
 type Config struct {
@@ -92,8 +94,35 @@ func Load(configDir string) (*Config, error) {
 	cfg := DefaultConfig()
 
 	configPath := filepath.Join(configDir, "config.toml")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+	info, statErr := os.Stat(configPath)
+	if os.IsNotExist(statErr) {
 		return cfg, nil
+	}
+	if statErr != nil {
+		return nil, fmt.Errorf("stat config %s: %w", configPath, statErr)
+	}
+
+	// SECURITY (#111): refuse a config file readable by anyone other
+	// than the owning user. The file carries Argon2 params + transport
+	// listen addresses + (when mTLS lands) certificate paths; a world-
+	// readable mode means a sibling local user can enumerate the
+	// agent's deployment shape. Required mode is 0600 (owner rw only)
+	// on POSIX; on Windows os.FileMode bits don't carry the same
+	// semantics so we skip the check there.
+	if runtime.GOOS != "windows" {
+		mode := info.Mode().Perm()
+		if mode&0o077 != 0 {
+			return nil, fmt.Errorf(
+				"config %s has permissions %#o — must be 0600 (owner rw only); fix with: chmod 600 %s",
+				configPath, mode, configPath,
+			)
+		}
+		if mode != 0o600 && mode != 0o400 {
+			log.Warn().
+				Stringer("mode", mode).
+				Str("path", configPath).
+				Msg("config permissions tighter than 0600 work but 0600 is the documented baseline")
+		}
 	}
 
 	if _, err := toml.DecodeFile(configPath, cfg); err != nil {
