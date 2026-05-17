@@ -484,7 +484,13 @@ func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	// SECURITY (#114): surface encode failures rather than swallow them.
+	// A short-write or hostile io.Pipe peer would otherwise produce a
+	// successful-looking response while the client got a truncated /
+	// malformed body — masks bugs and complicates incident triage.
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Warn().Err(err).Int("status", status).Msg("writeJSON: encode failed")
+	}
 }
 
 // generateRequestID returns a 128-bit random hex string.
