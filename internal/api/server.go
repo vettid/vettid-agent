@@ -57,8 +57,14 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		requestTimeout = 30 * time.Second
 	}
 
+	// SECURITY (#62): cap inbound request bodies at maxRequestBytes
+	// so a misbehaving client (or an adversarial AI tool acting as one)
+	// can't blow up the agent's RSS by streaming megabytes into a
+	// secret-request handler. Real requests are well under 64 KB.
+	bounded := bodyLimitMiddleware(mux, maxRequestBytes)
+
 	s := &Server{
-		httpServer:     &http.Server{Handler: mux},
+		httpServer:     &http.Server{Handler: bounded},
 		wsToken:        cfg.WSToken,
 		allowedOrigins: cfg.AllowedOrigins,
 		natsClient:     cfg.NATSClient,
@@ -139,4 +145,26 @@ func (s *Server) Catalog() *CatalogCache {
 // nextSequence returns the next monotonic sequence number for NATS messages.
 func (s *Server) nextSequence() uint64 {
 	return s.sequence.Add(1)
+}
+
+// SECURITY (#62): cap on inbound request bodies for the local REST API.
+// 1 MiB is several orders of magnitude over the largest legitimate
+// request (secret-request payloads are < 4 KB), but small enough that
+// even a hostile client can't drain RSS by streaming.
+const maxRequestBytes = 1 << 20
+
+// bodyLimitMiddleware wraps every inbound request body in
+// http.MaxBytesReader before the handler reads from r.Body. Reads past
+// the limit fail the underlying ReadAt with a *http.MaxBytesError
+// which the JSON decoder propagates as the request's own error — the
+// handler returns whatever 4xx it had ready (typically 400 Bad
+// Request). Skips the WebSocket upgrade path because gorilla/websocket
+// hijacks the conn before reading bodies.
+func bodyLimitMiddleware(next http.Handler, limit int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
 }
