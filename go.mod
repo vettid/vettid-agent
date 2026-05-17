@@ -8,7 +8,7 @@ require (
 	github.com/nats-io/nats.go v1.38.0
 	github.com/rs/zerolog v1.33.0
 	github.com/spf13/cobra v1.8.1
-	golang.org/x/crypto v0.31.0
+	golang.org/x/crypto v0.45.0
 	golang.org/x/term v0.39.0
 )
 

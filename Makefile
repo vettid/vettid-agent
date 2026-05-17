@@ -4,7 +4,7 @@ COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 LDFLAGS := -ldflags "-X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)"
 
-.PHONY: build test lint clean release
+.PHONY: build test lint vuln clean release
 
 build:
 	go build $(LDFLAGS) -o $(BINARY_NAME) ./cmd/vettid-agent
@@ -15,6 +15,18 @@ test:
 lint:
 	go vet ./...
 	@if command -v staticcheck >/dev/null 2>&1; then staticcheck ./...; fi
+
+# Scan deps for known CVEs. Fails on any Symbol-level finding (vuln
+# in code the agent's call graph actually reaches); Module-level
+# findings (vuln version in go.sum but unused) come through as
+# warnings. Install: `go install golang.org/x/vuln/cmd/govulncheck@latest`.
+vuln:
+	@command -v govulncheck >/dev/null 2>&1 || { \
+		echo "govulncheck not on PATH — install with:" >&2; \
+		echo "  go install golang.org/x/vuln/cmd/govulncheck@latest" >&2; \
+		exit 2; \
+	}
+	govulncheck ./...
 
 clean:
 	rm -f $(BINARY_NAME)
