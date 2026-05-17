@@ -11,6 +11,7 @@
 package credential
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -86,7 +87,14 @@ func Save(configDir string, creds *ConnectionCredentials, passphrase, platformKe
 	key := crypto.DeriveKey(passphrase, platformKey, salt, params)
 	defer crypto.ZeroBytes(key)
 
-	ciphertext, err := crypto.Encrypt(key, plaintext, nil)
+	// SECURITY (#107): bind the cleartext envelope fields into the
+	// AEAD tag so any tamper with version / salt / argon2_params on
+	// disk fails decryption. Without this, an attacker can swap
+	// argon2_params (also see #55) or swap salts to confuse a future
+	// version-routing reader; only the ciphertext bytes themselves
+	// were AEAD-protected.
+	aad := envelopeAAD(storeVersion, salt, *params)
+	ciphertext, err := crypto.Encrypt(key, plaintext, aad)
 	if err != nil {
 		return fmt.Errorf("encrypt credentials: %w", err)
 	}
@@ -232,9 +240,17 @@ func decryptStore(store *EncryptedStore, passphrase, platformKey []byte) (*Conne
 	key := crypto.DeriveKey(passphrase, platformKey, store.Salt, params)
 	defer crypto.ZeroBytes(key)
 
-	plaintext, err := crypto.Decrypt(key, store.Ciphertext, nil)
+	// SECURITY (#107): try envelope-bound AAD first; fall back to nil
+	// AAD for legacy stores written before this gate landed. Once
+	// every shipping store has been re-encrypted (any successful Save
+	// after this commit upgrades it), the fallback can be removed.
+	aad := envelopeAAD(store.Version, store.Salt, store.Argon2Params)
+	plaintext, err := crypto.Decrypt(key, store.Ciphertext, aad)
 	if err != nil {
-		return nil, fmt.Errorf("decrypt: %w", err)
+		plaintext, err = crypto.Decrypt(key, store.Ciphertext, nil)
+		if err != nil {
+			return nil, fmt.Errorf("decrypt: %w", err)
+		}
 	}
 	defer crypto.ZeroBytes(plaintext)
 
@@ -244,4 +260,34 @@ func decryptStore(store *EncryptedStore, passphrase, platformKey []byte) (*Conne
 	}
 
 	return &creds, nil
+}
+
+// SECURITY (#107): envelopeAAD builds the additional-authenticated-
+// data passed to AEAD encrypt + decrypt. It binds the cleartext
+// envelope fields (version, salt, argon2 params) to the ciphertext
+// tag so any tampering with those fields fails decryption.
+//
+// Format is a fixed-size canonical encoding so an attacker can't
+// produce an ambiguous AAD via field-reordering or padding tricks.
+// Bytes laid out as:
+//   [magic "vagentaad/v1" (12)]
+//   [version uint32 LE]
+//   [salt-len uint32 LE][salt-bytes]
+//   [argon2.Time uint32 LE][argon2.Memory uint32 LE][argon2.Threads uint8]
+func envelopeAAD(version int, salt []byte, params crypto.Argon2Params) []byte {
+	const magic = "vagentaad/v1"
+	out := make([]byte, 0, len(magic)+4+4+len(salt)+4+4+1)
+	out = append(out, []byte(magic)...)
+	var u32 [4]byte
+	binary.LittleEndian.PutUint32(u32[:], uint32(version))
+	out = append(out, u32[:]...)
+	binary.LittleEndian.PutUint32(u32[:], uint32(len(salt)))
+	out = append(out, u32[:]...)
+	out = append(out, salt...)
+	binary.LittleEndian.PutUint32(u32[:], params.Time)
+	out = append(out, u32[:]...)
+	binary.LittleEndian.PutUint32(u32[:], params.Memory)
+	out = append(out, u32[:]...)
+	out = append(out, params.Threads)
+	return out
 }

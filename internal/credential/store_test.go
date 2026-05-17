@@ -2,6 +2,7 @@ package credential
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -304,4 +305,45 @@ func readPlatformKey(path string) ([]byte, error) {
 		return nil, err
 	}
 	return data[:32], nil
+}
+
+// SECURITY (#107): tamper with the cleartext argon2_params field on
+// disk after a successful Save and confirm the next Load refuses to
+// decrypt. Pre-#107 the AEAD tag only covered the ciphertext bytes,
+// so this attack was silent.
+func TestEnvelopeAAD_RejectsParamTamper(t *testing.T) {
+	dir := t.TempDir()
+	platformKey := bytes.Repeat([]byte{0xAA}, 32)
+	passphrase := []byte("Test-Pass-1234!")
+
+	if err := Save(dir, testCreds(), passphrase, platformKey); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	path := filepath.Join(dir, credentialFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	var store EncryptedStore
+	if err := json.Unmarshal(data, &store); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	// Flip Argon2 Time to 1 — passes the bounds check IF a hostile
+	// store would set it that low, but #55 will catch that. Use a
+	// higher value that still differs from the canonical default so
+	// the tamper-detect path is what fires, not the bounds check.
+	store.Argon2Params.Time = 7
+	tampered, err := json.Marshal(store)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if err := os.WriteFile(path, tampered, 0600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	if _, err := Load(dir, passphrase, platformKey); err == nil {
+		t.Errorf("Load accepted store with tampered argon2 params")
+	}
 }
