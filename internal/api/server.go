@@ -61,10 +61,13 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 	// so a misbehaving client (or an adversarial AI tool acting as one)
 	// can't blow up the agent's RSS by streaming megabytes into a
 	// secret-request handler. Real requests are well under 64 KB.
-	bounded := bodyLimitMiddleware(mux, maxRequestBytes)
+	// SECURITY (#110): rate-limit chained outside the body cap so a
+	// flood of valid-sized requests also fails fast.
+	rateLimiter := newAPIRateLimiter()
+	chained := rateLimitMiddleware(bodyLimitMiddleware(mux, maxRequestBytes), rateLimiter)
 
 	s := &Server{
-		httpServer:     &http.Server{Handler: bounded},
+		httpServer:     &http.Server{Handler: chained},
 		wsToken:        cfg.WSToken,
 		allowedOrigins: cfg.AllowedOrigins,
 		natsClient:     cfg.NATSClient,
