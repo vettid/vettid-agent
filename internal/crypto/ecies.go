@@ -93,8 +93,11 @@ func ECIESDecrypt(recipientPrivateKey []byte, data []byte, domain string) ([]byt
 	nonce := data[KeySize : KeySize+chacha20poly1305.NonceSizeX]
 	ciphertext := data[KeySize+chacha20poly1305.NonceSizeX:]
 
-	// ECDH
-	sharedSecret, err := curve25519.X25519(recipientPrivateKey, ephPub)
+	// ECDH.
+	// SECURITY (#83): ephPub is wire-supplied — reject small-order
+	// points before the ECDH so a malicious sender can't probe the
+	// recipient's long-lived private key via contributory behavior.
+	sharedSecret, err := safeX25519(recipientPrivateKey, ephPub)
 	if err != nil {
 		return nil, fmt.Errorf("ECDH key exchange: %w", err)
 	}
