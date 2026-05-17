@@ -10,6 +10,12 @@ import (
 // ECIES format: ephemeral_pubkey (32 bytes) || nonce (24 bytes) || ciphertext+tag
 const eciesOverhead = KeySize + chacha20poly1305.NonceSizeX // 32 + 24 = 56
 
+// SECURITY (#72): AEAD additional-authenticated-data binding.
+// Encrypt always seals with eciesAADv1. Decrypt tries v1 first then
+// falls back to nil for ciphertexts produced before this change, so
+// existing agent credentials sealed under nil AAD still decrypt.
+var eciesAADv1 = []byte("vettid-ecies-aad-v1")
+
 // ECIESEncrypt encrypts plaintext for a recipient identified by their X25519 public key.
 //
 // Uses ECIES (Elliptic Curve Integrated Encryption Scheme):
@@ -63,7 +69,9 @@ func ECIESEncrypt(recipientPublicKey []byte, plaintext []byte, domain string) ([
 		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
 
-	ciphertext := aead.Seal(nil, nonce, plaintext, nil)
+	// SECURITY (#72): bind to eciesAADv1 — the vault-side decrypt
+	// path accepts this and falls back to nil for legacy blobs.
+	ciphertext := aead.Seal(nil, nonce, plaintext, eciesAADv1)
 
 	// 5. Assemble: ephemeral_public (32) || nonce (24) || ciphertext+tag
 	result := make([]byte, 0, len(ephPub)+len(nonce)+len(ciphertext))
@@ -116,9 +124,15 @@ func ECIESDecrypt(recipientPrivateKey []byte, data []byte, domain string) ([]byt
 		return nil, fmt.Errorf("create cipher: %w", err)
 	}
 
-	plaintext, err := aead.Open(nil, nonce, ciphertext, nil)
+	// SECURITY (#72): try eciesAADv1 first, fall back to nil AAD for
+	// blobs produced before this change.
+	plaintext, err := aead.Open(nil, nonce, ciphertext, eciesAADv1)
 	if err != nil {
-		return nil, fmt.Errorf("ECIES decrypt: %w", err)
+		fbPlaintext, fbErr := aead.Open(nil, nonce, ciphertext, nil)
+		if fbErr != nil {
+			return nil, fmt.Errorf("ECIES decrypt: %w", err)
+		}
+		plaintext = fbPlaintext
 	}
 
 	return plaintext, nil
