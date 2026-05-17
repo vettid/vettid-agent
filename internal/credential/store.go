@@ -218,6 +218,16 @@ func readStore(configDir string) (*EncryptedStore, error) {
 }
 
 func decryptStore(store *EncryptedStore, passphrase, platformKey []byte) (*ConnectionCredentials, error) {
+	// SECURITY (#55): refuse to derive a key under tampered-down
+	// Argon2 parameters. The stored argon2_params field rides in
+	// the cleartext envelope so an attacker with file access can
+	// flip Time to 1 to make offline brute-force feasible — even
+	// though they can't decrypt the ciphertext directly, a
+	// weakened param-set lets them precompute against the
+	// captured salt + ciphertext. Bound-check before deriving.
+	if err := crypto.ValidateArgon2Params(store.Argon2Params); err != nil {
+		return nil, fmt.Errorf("untrusted argon2 params on disk: %w", err)
+	}
 	params := &store.Argon2Params
 	key := crypto.DeriveKey(passphrase, platformKey, store.Salt, params)
 	defer crypto.ZeroBytes(key)
