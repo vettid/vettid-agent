@@ -9,11 +9,13 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/vettid/vettid-agent/internal/credential"
 	vettidnats "github.com/vettid/vettid-agent/internal/nats"
 )
 
@@ -28,18 +30,68 @@ type Server struct {
 	// skips this — the socket file's 0600 perms (set in Start()) are
 	// the authentication surface.
 	requireRESTAuth bool
-	natsClient     *vettidnats.Client
-	connKey        []byte
-	keyID          string
-	connectionID   string
-	ownerGUID      string
-	scope          []string
-	approvalMode   string
-	catalog        *CatalogCache
-	tracker        *RequestTracker
-	sequence       atomic.Uint64
-	startTime      time.Time
+	natsClient      *vettidnats.Client
+
+	// Persistence + identity material needed by /v1/pair/extend. These
+	// don't rotate, so they live alongside the rotatable sessionState
+	// rather than inside it. NATS creds (JWT/Seed) survive across
+	// extends — the per-pair scope was minted at init time and isn't
+	// revoked unless the connection itself is revoked.
+	messageSpaceURL string
+	scopedJWT       string
+	scopedSeed      string
+	agentPriv       []byte
+	agentPub        []byte
+	vaultPub        []byte
+	persist         Persister
+
+	// Session state (rotatable). Phase 5 split this out so the
+	// /v1/pair/extend endpoint can hot-rotate the session key after a
+	// successful extend round-trip without forcing a process restart.
+	//
+	// Every handler reads through Snapshot(); the extend handler swaps
+	// via RotateSession(). The mutex is RW because the snapshot is hot
+	// (every request) and the swap is cold (once per session lifetime).
+	//
+	// The stored ConnectionID + OwnerGUID never change after init —
+	// they're under the same mutex purely so a single read snapshot
+	// gets a consistent view of every credential field at once.
+	sessionMu    sync.RWMutex
+	sessionState sessionState
+
+	catalog   *CatalogCache
+	tracker   *RequestTracker
+	sequence  atomic.Uint64
+	startTime time.Time
 }
+
+// sessionState is the rotatable credential view a handler sees. Pulled
+// via Server.Snapshot(); zero value is meaningless (always set in
+// NewServer before any handler runs).
+type sessionState struct {
+	ConnKey         []byte
+	KeyID           string
+	ConnectionID    string
+	OwnerGUID       string
+	Scope           []string
+	ApprovalMode    string
+	SessionID       string
+	ExpiresAt       int64
+	DurationSeconds int64
+}
+
+// Persister re-seals the rotated credentials to disk after a successful
+// hot-rotate via POST /v1/pair/extend. main.go provides a closure that
+// captures the passphrase + platform key so the API package doesn't
+// have to know about secrets it can't justify holding.
+//
+// Returning a non-nil error from the persister is non-fatal — the
+// running daemon has already adopted the new session key in memory, so
+// returning success keeps the AI agent unblocked. The error is logged
+// for operator visibility, and the next `vettid-agent extend` (or
+// daemon restart) reconciles disk. Persister implementations should
+// log internally too if they want detail beyond what the handler logs.
+type Persister func(creds *credential.ConnectionCredentials) error
 
 type ServerConfig struct {
 	Listen         string // "unix:///path/to/socket" or "tcp://127.0.0.1:7443"
@@ -52,7 +104,30 @@ type ServerConfig struct {
 	OwnerGUID      string
 	Scope          []string
 	ApprovalMode   string
-	RequestTimeout time.Duration
+	// Optional session-state fields (added Phase 5 for /v1/pair/extend
+	// + `status`). Existing callers that don't set these still work —
+	// status simply reports "session info unavailable".
+	SessionID              string
+	SessionExpiresAt       int64
+	SessionDurationSeconds int64
+	RequestTimeout         time.Duration
+
+	// MessageSpaceURL / JWT / Seed / AgentPrivateKey / AgentPublicKey /
+	// VaultPublicKey carry the rest of ConnectionCredentials that the
+	// /v1/pair/extend handler needs to build a fresh InviteSession for
+	// the rotate round-trip (without re-reading the encrypted store).
+	MessageSpaceURL string
+	JWT             string
+	Seed            string
+	AgentPrivateKey []byte
+	AgentPublicKey  []byte
+	VaultPublicKey  []byte
+
+	// Persist re-seals the rotated credentials back to disk. If nil,
+	// the /v1/pair/extend endpoint succeeds at hot-rotating in-memory
+	// but returns a `persisted:false` flag so the caller knows the
+	// next daemon restart will have to re-extend.
+	Persist Persister
 }
 
 func NewServer(cfg *ServerConfig) (*Server, error) {
@@ -85,20 +160,71 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		allowedOrigins:  cfg.AllowedOrigins,
 		requireRESTAuth: requireREST,
 		natsClient:      cfg.NATSClient,
-		connKey:        cfg.ConnKey,
-		keyID:          cfg.KeyID,
-		connectionID:   cfg.ConnectionID,
-		ownerGUID:      cfg.OwnerGUID,
-		scope:          cfg.Scope,
-		approvalMode:   cfg.ApprovalMode,
-		catalog:        NewCatalogCache(),
-		tracker:        NewRequestTracker(requestTimeout),
-		startTime:      time.Now(),
+		sessionState: sessionState{
+			ConnKey:         cfg.ConnKey,
+			KeyID:           cfg.KeyID,
+			ConnectionID:    cfg.ConnectionID,
+			OwnerGUID:       cfg.OwnerGUID,
+			Scope:           cfg.Scope,
+			ApprovalMode:    cfg.ApprovalMode,
+			SessionID:       cfg.SessionID,
+			ExpiresAt:       cfg.SessionExpiresAt,
+			DurationSeconds: cfg.SessionDurationSeconds,
+		},
+		messageSpaceURL: cfg.MessageSpaceURL,
+		scopedJWT:       cfg.JWT,
+		scopedSeed:      cfg.Seed,
+		agentPriv:       cfg.AgentPrivateKey,
+		agentPub:        cfg.AgentPublicKey,
+		vaultPub:        cfg.VaultPublicKey,
+		persist:         cfg.Persist,
+		catalog:         NewCatalogCache(),
+		tracker:   NewRequestTracker(requestTimeout),
+		startTime: time.Now(),
 	}
 
 	registerRoutes(mux, s)
 
 	return s, nil
+}
+
+// Snapshot returns a consistent view of the rotatable session state.
+// Cheap (RLock + struct copy); call once per handler invocation rather
+// than re-snapshotting between reads so all the returned fields refer
+// to the same vault-side AgentSession.
+//
+// The returned ConnKey slice header is a copy — but the underlying
+// byte array IS the live key. Handlers should not mutate it (encrypt /
+// decrypt don't); they may pass it directly to the crypto package
+// which only reads.
+func (s *Server) Snapshot() sessionState {
+	s.sessionMu.RLock()
+	defer s.sessionMu.RUnlock()
+	return s.sessionState
+}
+
+// RotateSession swaps the active session state under the write lock.
+//
+// Called by the /v1/pair/extend handler after a successful extend
+// round-trip with the vault. The old ConnKey's underlying bytes are NOT
+// zeroed here — an in-flight handler that captured the old slice
+// before the swap still holds a pointer to those bytes, and zeroing
+// would corrupt its encrypt. The old slice gets GC'd naturally once
+// every in-flight handler returns.
+//
+// The non-rotating fields (ConnectionID, KeyID, OwnerGUID) are
+// preserved from the prior snapshot — the extend flow never changes
+// them, but defensively keeping the old values means a caller that
+// forgets to populate the next field doesn't accidentally blank it.
+func (s *Server) RotateSession(newConnKey []byte, newScope []string, newApprovalMode, newSessionID string, newExpiresAt, newDurationSeconds int64) {
+	s.sessionMu.Lock()
+	defer s.sessionMu.Unlock()
+	s.sessionState.ConnKey = newConnKey
+	s.sessionState.Scope = newScope
+	s.sessionState.ApprovalMode = newApprovalMode
+	s.sessionState.SessionID = newSessionID
+	s.sessionState.ExpiresAt = newExpiresAt
+	s.sessionState.DurationSeconds = newDurationSeconds
 }
 
 func (s *Server) Start(listenAddr string) error {

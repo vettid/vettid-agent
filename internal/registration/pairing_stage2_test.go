@@ -14,6 +14,13 @@ import (
 	"github.com/vettid/vettid-agent/internal/crypto"
 )
 
+// keyPair is a small helper for tests that need a real X25519 keypair
+// without dragging the full GenerateX25519KeyPair signature into every
+// test body.
+func keyPair() (*crypto.X25519KeyPair, error) {
+	return crypto.GenerateX25519KeyPair()
+}
+
 // TestDeriveAgentSessionKey_MatchesVaultWiring verifies the agent's HKDF
 // inputs (salt + info) match what vault-manager/agent_pairing.go's
 // deriveSessionKey produces. The vault uses:
@@ -259,6 +266,31 @@ func TestCollectAgentMetadata_RejectsEmptyAgentType(t *testing.T) {
 	if _, err := CollectAgentMetadata("", "0.1.0"); err == nil {
 		t.Fatal("expected error for empty agent_type")
 	}
+}
+
+// TestExtendOutcome_ZeroIsIdempotent — the outcome holds the rotated
+// session key. Zero MUST wipe it (and survive a second call + a nil
+// receiver, matching PairingRuntime.Zero's contract).
+func TestExtendOutcome_ZeroIsIdempotent(t *testing.T) {
+	kp, err := keyPair()
+	if err != nil {
+		t.Fatalf("keypair: %v", err)
+	}
+	o := &ExtendOutcome{
+		SessionKey:   bytes.Repeat([]byte{0xCA}, 32),
+		AgentKeyPair: kp,
+	}
+	o.Zero()
+	o.Zero() // idempotent
+
+	for _, b := range o.SessionKey {
+		if b != 0 {
+			t.Fatalf("session key byte not zeroed: %x", o.SessionKey)
+		}
+	}
+	// nil receiver safe
+	var nilOutcome *ExtendOutcome
+	nilOutcome.Zero()
 }
 
 // TestCollectAgentMetadata_PopulatesRequiredFields — both fingerprints

@@ -29,6 +29,12 @@ const (
 )
 
 // ConnectionCredentials holds all sensitive material for a vault connection.
+//
+// Session-state fields (SessionID / SessionExpiresAt / SessionDurationSeconds)
+// were added in Phase 5. Existing connection.enc files written before that
+// commit deserialize cleanly with these as zero — `status` reports
+// "session info unavailable" for those installs until the next extend
+// rewrites the store.
 type ConnectionCredentials struct {
 	ConnectionID    string   `json:"connection_id"`
 	ConnectionKey   []byte   `json:"connection_key"`
@@ -43,6 +49,17 @@ type ConnectionCredentials struct {
 	OwnerName       string   `json:"owner_name"`
 	Scope           []string `json:"scope"`
 	ApprovalMode    string   `json:"approval_mode"`
+	// SessionID is the active AgentSession.SessionKeyID (vault-side).
+	// Rotates on every extend. Stored so `status` / `extend` can show
+	// the current handle without a round-trip to the vault.
+	SessionID              string `json:"session_id,omitempty"`
+	// SessionExpiresAt is the unix-seconds wall-clock at which the
+	// active session expires. Stored so `status` can compute seconds-
+	// remaining without hitting the network.
+	SessionExpiresAt       int64  `json:"session_expires_at,omitempty"`
+	// SessionDurationSeconds is the duration the owner granted on the
+	// current session (or its most recent extend). Display-only.
+	SessionDurationSeconds int64  `json:"session_duration_seconds,omitempty"`
 }
 
 // Zero wipes all sensitive byte fields in the credentials.

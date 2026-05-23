@@ -99,15 +99,31 @@ The only new pieces are:
 
 ## 3. Agent Registration Flow
 
-Registration follows the existing VettID connection invitation pattern, adapted for agents. The flow is designed to be simple (a single command for the operator) while giving the owner full visibility and control — including defining the connection contract only after reviewing the agent's actual details.
+> **Implementation status (2026-05-23):** the protocol below is the *current* shipped implementation. It supersedes the original shortlink-based design that this document started life describing (an April 2026 design that was never implemented — the `vettid.dev/a/<code>` shortlink host never went live, see "Historical context" at the end of this section).
+>
+> The canonical reference is **[`docs/AGENT-PAIRING-FLOW.md`](AGENT-PAIRING-FLOW.md)**, which gives a phase-by-phase implementation roadmap, the four locked design decisions, the formal scope vocabulary, and the doc-vs-shipped drift table for the desktop reference. Read that first — this document keeps the higher-level rationale + threat model + agent-program details (§4 onward) that don't belong in the protocol doc.
+
+Registration is a two-stage NATS round-trip mirroring the shipped desktop pairing flow. The summary:
+
+- **Stage 1 — Invite resolution.** Owner taps "Connect Agent" in the mobile app; the vault mints a 12-character invite code (ambiguity-safe alphabet) + per-pair scoped NATS credentials and publishes the invite payload to `INVITATIONS` JetStream. The operator pastes the code into `vettid-agent init <code>`. The connector calls the public bootstrap Lambda (`POST /pair/device/bootstrap` with `kind:"agent"`), receives 60-second-TTL guest NATS creds scoped to JetStream consumer ops on `INVITATIONS`, and reads its own `invite.<code>` payload. The connector then generates an ephemeral X25519 keypair + 32-byte approval token.
+
+- **Stage 2 — Session authorization.** Reconnect with the per-pair scoped JWT/seed. Subscribe to `forApp.agent.<conn>.activated` and `.revoked` **before** publishing. Publish `agent.request-session` carrying the agent's metadata (agent type, binary + machine fingerprints, OS, hostname, app version), `agent_pubkey`, `approval_token`, and `requested_scope` / `requested_approval_mode` / `requested_duration_s` hints. The vault stores `AgentPendingAuth` and publishes `agent.pending-authorization` to the phone. The owner reviews the identity card on the **AuthorizeAgentScreen** (per-token scope picker, approval mode, duration picker) and taps Approve. The phone posts `agent.authorize-session` carrying the final `granted_scope` / `approval_mode` / `rate_limit` / `duration_seconds`. The vault runs X25519 + HKDF (domain `vettid-agent-session-v1`), writes the `ConnectionContract`, publishes `agent.session.activated` carrying the vault's public key + new `session_id` + `expires_at`. The connector derives the session key (salt = `connection_id`, info = `vettid-agent-session-v1|<session_id>`), populates `ConnectionCredentials` with `KeyID = ConnectionID` (NOT session_id — known footgun), and seals to disk under passphrase + machine-fingerprint-derived platform key.
+
+- **Stage 3 — Extension / revocation.** `POST /v1/pair/extend` on the running daemon triggers a fresh `agent.request-session` against the existing `connection_id`; owner re-approves; vault rotates the session key under the same connection record. Daemon hot-rotates in memory (`Server.RotateSession`) and re-seals `connection.enc`. `vettid-agent revoke` publishes `agent.revoke` and wipes `connection.enc`. `vettid-agent extend` does the same round-trip offline (process stopped).
 
 ### 3.1 Prerequisites
 
 - Owner has a provisioned VettID vault with an active OwnerSpace and MessageSpace
-- Owner has the VettID mobile app installed and authenticated
+- Owner has the VettID mobile app installed and authenticated (Android Phase 4 shipped)
 - Agent operator has downloaded the Agent Connector binary
 
-### 3.2 One-Time Shortlink
+### 3.2 Historical context — the abandoned shortlink design
+
+The original April 2026 design (preserved below from §3.2 onward of older revisions) routed invitations through an HTTP shortlink at `https://vettid.dev/a/<code>`. That domain was never registered and the flow never reached production. The replacement uses NATS-native invite delivery (vault publishes to `INVITATIONS` JetStream; agent reads via per-pair scoped guest credentials minted by the bootstrap Lambda) — same security boundary (unguessable code + short TTL + scoped credentials), but no dependency on an external HTTP host.
+
+The shortlink prose below is kept as historical context for the original design intent + threat model only. The actually-shipped flow is described in `AGENT-PAIRING-FLOW.md`; do not implement against the shortlink description.
+
+### 3.2-historical One-Time Shortlink (NOT IMPLEMENTED — see §3 above)
 
 To avoid requiring operators to type long URIs and tokens into remote terminals, the invitation is delivered as a **one-time shortlink** hosted on the existing VettID web application:
 

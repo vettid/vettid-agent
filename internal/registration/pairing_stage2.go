@@ -451,18 +451,21 @@ func CompletePairing(
 	// not found" — the foot-gun called out in AGENT-PAIRING-FLOW.md's
 	// doc-vs-shipped drift table.
 	creds := &credential.ConnectionCredentials{
-		ConnectionID:    session.ConnectionID,
-		ConnectionKey:   sessionKey,
-		KeyID:           session.ConnectionID,
-		AgentPrivateKey: append([]byte(nil), runtimeState.AgentKeyPair.PrivateKey[:]...),
-		AgentPublicKey:  append([]byte(nil), runtimeState.AgentKeyPair.PublicKey[:]...),
-		VaultPublicKey:  vaultPub,
-		JWT:             session.ScopedJWT,
-		Seed:            session.ScopedSeed,
-		MessageSpaceURL: session.NATSURL,
-		OwnerGUID:       session.OwnerSpace,
-		Scope:           activated.GrantedScope,
-		ApprovalMode:    activated.ApprovalMode,
+		ConnectionID:           session.ConnectionID,
+		ConnectionKey:          sessionKey,
+		KeyID:                  session.ConnectionID,
+		AgentPrivateKey:        append([]byte(nil), runtimeState.AgentKeyPair.PrivateKey[:]...),
+		AgentPublicKey:         append([]byte(nil), runtimeState.AgentKeyPair.PublicKey[:]...),
+		VaultPublicKey:         vaultPub,
+		JWT:                    session.ScopedJWT,
+		Seed:                   session.ScopedSeed,
+		MessageSpaceURL:        session.NATSURL,
+		OwnerGUID:              session.OwnerSpace,
+		Scope:                  activated.GrantedScope,
+		ApprovalMode:           activated.ApprovalMode,
+		SessionID:              activated.SessionID,
+		SessionExpiresAt:       activated.ExpiresAt,
+		SessionDurationSeconds: activated.DurationSecs,
 	}
 	defer creds.Zero()
 

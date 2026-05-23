@@ -267,8 +267,9 @@ func (s *Server) wsHandleSecretRequest(ctx context.Context, wc *wsConn, req wsRe
 		return
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishSecretRequest(secretReq, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishSecretRequest(secretReq, snap.ConnKey, snap.KeyID, seq); err != nil {
 		wc.writeJSON(wsResponse{
 			ID:    req.ID,
 			Error: &wsError{Code: -32002, Message: "failed to send request to vault"},
@@ -383,8 +384,9 @@ func (s *Server) wsHandleSecretUse(ctx context.Context, wc *wsConn, req wsReques
 		return
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishActionRequest(actionReq, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishActionRequest(actionReq, snap.ConnKey, snap.KeyID, seq); err != nil {
 		wc.writeJSON(wsResponse{
 			ID:    req.ID,
 			Error: &wsError{Code: -32002, Message: "failed to send request to vault"},
@@ -429,8 +431,9 @@ func (s *Server) wsHandleCatalogRefresh(wc *wsConn, req wsRequest) {
 		CurrentVersion: s.catalog.Version(),
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishCatalogRequest(catalogReq, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishCatalogRequest(catalogReq, snap.ConnKey, snap.KeyID, seq); err != nil {
 		wc.writeJSON(wsResponse{
 			ID:    req.ID,
 			Error: &wsError{Code: -32002, Message: "failed to send refresh request"},
@@ -477,18 +480,31 @@ func (s *Server) wsHandleGetRequest(wc *wsConn, req wsRequest) {
 }
 
 func (s *Server) wsHandleStatus(wc *wsConn, req wsRequest) {
+	snap := s.Snapshot()
 	uptime := time.Since(s.startTime).Seconds()
 
-	wc.writeJSON(wsResponse{
-		ID: req.ID,
-		Result: map[string]any{
-			"connected":       s.natsClient != nil,
-			"connection_id":   s.connectionID,
-			"scope":           s.scope,
-			"approval_mode":   s.approvalMode,
-			"catalog_version": s.catalog.Version(),
-			"catalog_secrets": s.catalog.Count(),
-			"uptime_seconds":  math.Round(uptime),
-		},
-	})
+	result := map[string]any{
+		"connected":       s.natsClient != nil,
+		"connection_id":   snap.ConnectionID,
+		"scope":           snap.Scope,
+		"approval_mode":   snap.ApprovalMode,
+		"catalog_version": s.catalog.Version(),
+		"catalog_secrets": s.catalog.Count(),
+		"uptime_seconds":  math.Round(uptime),
+	}
+	if snap.SessionID != "" {
+		result["session_id"] = snap.SessionID
+	}
+	if snap.ExpiresAt > 0 {
+		result["session_expires_at"] = snap.ExpiresAt
+		secondsRemaining := snap.ExpiresAt - time.Now().Unix()
+		if secondsRemaining < 0 {
+			secondsRemaining = 0
+		}
+		result["session_seconds_remaining"] = secondsRemaining
+	}
+	if snap.DurationSeconds > 0 {
+		result["session_duration_seconds"] = snap.DurationSeconds
+	}
+	wc.writeJSON(wsResponse{ID: req.ID, Result: result})
 }

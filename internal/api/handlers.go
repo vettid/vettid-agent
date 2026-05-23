@@ -1,17 +1,21 @@
 package api
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
 
+	"github.com/vettid/vettid-agent/internal/credential"
 	"github.com/vettid/vettid-agent/internal/crypto"
 	vettidnats "github.com/vettid/vettid-agent/internal/nats"
+	"github.com/vettid/vettid-agent/internal/registration"
 )
 
 func registerRoutes(mux *http.ServeMux, s *Server) {
@@ -24,6 +28,7 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
 	mux.HandleFunc("POST /v1/messages/send", s.handleSendMessage)
 	mux.HandleFunc("POST /v1/connection/disconnect", s.handleDisconnect)
+	mux.HandleFunc("POST /v1/pair/extend", s.handlePairExtend)
 }
 
 // handleListSecrets returns catalog entries (metadata only). Optional ?category= filter.
@@ -130,8 +135,9 @@ func (s *Server) handleSecretRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishSecretRequest(secretReq, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishSecretRequest(secretReq, snap.ConnKey, snap.KeyID, seq); err != nil {
 		log.Error().Err(err).Msg("Failed to publish secret request")
 		writeJSON(w, http.StatusBadGateway, map[string]string{
 			"error": "failed to send request to vault",
@@ -309,8 +315,9 @@ func (s *Server) handleSecretUse(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishActionRequest(actionReq, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishActionRequest(actionReq, snap.ConnKey, snap.KeyID, seq); err != nil {
 		log.Error().Err(err).Msg("Failed to publish action request")
 		writeJSON(w, http.StatusBadGateway, map[string]string{
 			"error": "failed to send request to vault",
@@ -369,8 +376,9 @@ func (s *Server) handleCatalogRefresh(w http.ResponseWriter, r *http.Request) {
 		CurrentVersion: s.catalog.Version(),
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishCatalogRequest(req, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishCatalogRequest(req, snap.ConnKey, snap.KeyID, seq); err != nil {
 		log.Error().Err(err).Msg("Failed to publish catalog refresh request")
 		writeJSON(w, http.StatusBadGateway, map[string]string{
 			"error": "failed to send refresh request to vault",
@@ -412,17 +420,33 @@ func (s *Server) handleGetRequest(w http.ResponseWriter, r *http.Request) {
 
 // handleStatus returns connection health and metadata.
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	snap := s.Snapshot()
 	uptime := time.Since(s.startTime).Seconds()
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"connected":       s.natsClient != nil,
-		"connection_id":   s.connectionID,
-		"scope":           s.scope,
-		"approval_mode":   s.approvalMode,
+		"connection_id":   snap.ConnectionID,
+		"scope":           snap.Scope,
+		"approval_mode":   snap.ApprovalMode,
 		"catalog_version": s.catalog.Version(),
 		"catalog_secrets": s.catalog.Count(),
 		"uptime_seconds":  math.Round(uptime),
-	})
+	}
+	if snap.SessionID != "" {
+		resp["session_id"] = snap.SessionID
+	}
+	if snap.ExpiresAt > 0 {
+		resp["session_expires_at"] = snap.ExpiresAt
+		secondsRemaining := snap.ExpiresAt - time.Now().Unix()
+		if secondsRemaining < 0 {
+			secondsRemaining = 0
+		}
+		resp["session_seconds_remaining"] = secondsRemaining
+	}
+	if snap.DurationSeconds > 0 {
+		resp["session_duration_seconds"] = snap.DurationSeconds
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handleSendMessage sends a text message or approval request to the vault owner.
@@ -458,8 +482,9 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		Approval:    req.Approval,
 	}
 
+	snap := s.Snapshot()
 	seq := s.nextSequence()
-	if err := s.natsClient.PublishMessage(msg, s.connKey, s.keyID, seq); err != nil {
+	if err := s.natsClient.PublishMessage(msg, snap.ConnKey, snap.KeyID, seq); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to send: %v", err)})
 		return
 	}
@@ -473,6 +498,187 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		"message_id": messageID,
 		"status":     "sent",
 	})
+}
+
+// extendRequestBody is the JSON body for POST /v1/pair/extend. All
+// fields are optional — sensible defaults come from the existing
+// session.
+type extendRequestBody struct {
+	RequestedDurationSeconds int64    `json:"requested_duration_seconds"`
+	RequestedScope           []string `json:"requested_scope"`
+	RequestedApprovalMode    string   `json:"requested_approval_mode"`
+	// TimeoutSeconds caps how long the embedded AI agent is willing to
+	// wait for the owner to approve. Defaults to 300s (the registration
+	// package default). Bounded server-side at [10s, 600s] to keep a
+	// misbehaving caller from holding an HTTP socket open indefinitely.
+	TimeoutSeconds int64 `json:"timeout_seconds"`
+}
+
+// handlePairExtend triggers an agent.request-session round-trip
+// against the vault, waits for the owner to re-approve on their phone,
+// hot-rotates the running daemon's session key in-memory, and (if
+// configured) persists the rotated credentials to connection.enc.
+//
+// Embedded AI agents call this when they detect a session expiring
+// soon (or have already hit a vault error indicating the session is
+// dead). The endpoint blocks until activation, denial, or timeout —
+// the AI is expected to surface a "waiting for phone approval" UI
+// while it's open.
+//
+// On success the response carries the new session metadata; the
+// caller's next encrypted op uses the rotated key automatically (every
+// handler reads through Snapshot() before each publish).
+func (s *Server) handlePairExtend(w http.ResponseWriter, r *http.Request) {
+	if s.scopedJWT == "" || s.scopedSeed == "" || s.messageSpaceURL == "" {
+		// Server was constructed without the persistence material —
+		// /v1/pair/extend isn't usable. This branch exists so older
+		// callers of NewServer (or tests) get a clean 501 rather than
+		// a confusing "missing NATS creds" deeper in the registration
+		// path.
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "server not configured for hot-rotate (extend disabled)",
+		})
+		return
+	}
+
+	var body extendRequestBody
+	if r.Body != nil && r.ContentLength != 0 {
+		// Body is optional — a bare POST is the common "use defaults"
+		// case. Reject malformed JSON but tolerate an empty body.
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+	}
+	if body.RequestedApprovalMode == "" {
+		// Default to the policy already in force — most callers don't
+		// want to renegotiate approval semantics on extend.
+		body.RequestedApprovalMode = s.Snapshot().ApprovalMode
+	}
+	timeout := time.Duration(body.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = registration.DefaultApprovalWait
+	}
+	if timeout < 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	if timeout > 10*time.Minute {
+		timeout = 10 * time.Minute
+	}
+
+	// Build a transient ConnectionCredentials snapshot for the
+	// registration helper. The handler doesn't have access to the
+	// passphrase, so this lives entirely in memory and is never sealed
+	// via this object (the persister closure does the seal).
+	snap := s.Snapshot()
+	creds := &credential.ConnectionCredentials{
+		ConnectionID:           snap.ConnectionID,
+		ConnectionKey:          snap.ConnKey,
+		KeyID:                  snap.KeyID,
+		AgentPrivateKey:        s.agentPriv,
+		AgentPublicKey:         s.agentPub,
+		VaultPublicKey:         s.vaultPub,
+		JWT:                    s.scopedJWT,
+		Seed:                   s.scopedSeed,
+		MessageSpaceURL:        s.messageSpaceURL,
+		OwnerGUID:              snap.OwnerGUID,
+		Scope:                  snap.Scope,
+		ApprovalMode:           snap.ApprovalMode,
+		SessionID:              snap.SessionID,
+		SessionExpiresAt:       snap.ExpiresAt,
+		SessionDurationSeconds: snap.DurationSeconds,
+	}
+
+	// Tie the helper's deadline to the HTTP request's context so a
+	// disconnected client (AI agent crashed, parent process killed)
+	// cancels the round-trip promptly rather than holding the pull
+	// consumer + NATS connection until timeout. 30s grace above the
+	// approval-wait window lets ExtendSession run its bookkeeping
+	// (subscribe-flush, HKDF, etc.) after the inner deadline fires.
+	ctx, cancel := context.WithTimeout(r.Context(), timeout+30*time.Second)
+	defer cancel()
+
+	outcome, err := registration.ExtendSession(ctx, creds, registration.CompletePairingOptions{
+		Timeout:               timeout,
+		RequestedScope:        body.RequestedScope,
+		RequestedApprovalMode: body.RequestedApprovalMode,
+		RequestedDurationSecs: body.RequestedDurationSeconds,
+	})
+	if err != nil {
+		log.Warn().Err(err).Msg("pair/extend failed")
+		// Map a few common shapes to a useful status code. Anything
+		// else is 502 Bad Gateway — the vault is reachable but didn't
+		// give us a clean activation.
+		status := http.StatusBadGateway
+		if isDeniedError(err) {
+			status = http.StatusForbidden
+		} else if isTimeoutError(err) {
+			status = http.StatusGatewayTimeout
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
+		return
+	}
+
+	// Adopt the new session in memory before doing anything else. From
+	// this point on, every handler sees the rotated key.
+	s.RotateSession(
+		outcome.SessionKey,
+		outcome.GrantedScope,
+		outcome.ApprovalMode,
+		outcome.SessionID,
+		outcome.ExpiresAt,
+		outcome.DurationSeconds,
+	)
+	// Update the persistence material in step — vaultPub and the
+	// agent keypair changed too, and the persister needs to seal the
+	// fresh values.
+	s.sessionMu.Lock()
+	s.agentPriv = append([]byte(nil), outcome.AgentKeyPair.PrivateKey[:]...)
+	s.agentPub = append([]byte(nil), outcome.AgentKeyPair.PublicKey[:]...)
+	s.vaultPub = outcome.VaultPubKey
+	s.sessionMu.Unlock()
+
+	persisted := false
+	if s.persist != nil {
+		persistCreds := &credential.ConnectionCredentials{
+			ConnectionID:           snap.ConnectionID,
+			ConnectionKey:          outcome.SessionKey,
+			KeyID:                  snap.KeyID,
+			AgentPrivateKey:        append([]byte(nil), outcome.AgentKeyPair.PrivateKey[:]...),
+			AgentPublicKey:         append([]byte(nil), outcome.AgentKeyPair.PublicKey[:]...),
+			VaultPublicKey:         outcome.VaultPubKey,
+			JWT:                    s.scopedJWT,
+			Seed:                   s.scopedSeed,
+			MessageSpaceURL:        s.messageSpaceURL,
+			OwnerGUID:              snap.OwnerGUID,
+			Scope:                  outcome.GrantedScope,
+			ApprovalMode:           outcome.ApprovalMode,
+			SessionID:              outcome.SessionID,
+			SessionExpiresAt:       outcome.ExpiresAt,
+			SessionDurationSeconds: outcome.DurationSeconds,
+		}
+		if perr := s.persist(persistCreds); perr != nil {
+			log.Warn().Err(perr).Msg("pair/extend: in-memory rotate OK but persist failed; restart will require manual extend")
+		} else {
+			persisted = true
+		}
+		// The persistCreds object owns copies — zero them now that
+		// they've been written. The Server-held copies of agentPriv
+		// remain live.
+		persistCreds.Zero()
+	}
+
+	resp := map[string]any{
+		"connection_id":            snap.ConnectionID,
+		"session_id":               outcome.SessionID,
+		"expires_at":               outcome.ExpiresAt,
+		"duration_seconds":         outcome.DurationSeconds,
+		"granted_scope":            outcome.GrantedScope,
+		"approval_mode":            outcome.ApprovalMode,
+		"hot_rotated":              true,
+		"persisted":                persisted,
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleDisconnect(w http.ResponseWriter, r *http.Request) {
@@ -510,4 +716,22 @@ func actionAllowed(allowedActions []string, action string) bool {
 		}
 	}
 	return false
+}
+
+// isDeniedError matches the error shape registration.ExtendSession returns
+// when the owner taps Deny — "owner denied extend: <reason>".
+func isDeniedError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "owner denied")
+}
+
+// isTimeoutError matches the timeout-on-approval shape from
+// registration.ExtendSession. Doesn't catch every timeout (network-level
+// errors look different), but those are correctly classified as 502s by
+// the default branch.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded")
 }

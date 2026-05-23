@@ -55,6 +55,7 @@ connectivity, and vault communication.`,
 		newStatusCmd(),
 		newRebindCmd(),
 		newRevokeCmd(),
+		newExtendCmd(),
 		newVersionCmd(),
 	)
 
@@ -296,6 +297,24 @@ and begins serving the local API and WebSocket endpoint.`,
 				log.Info().Msg("Credentials re-encrypted with current machine fingerprint")
 			}
 
+			// Derive the platform key separately and keep it alive for
+			// the daemon's lifetime so /v1/pair/extend can re-seal
+			// connection.enc on hot-rotate. Mirrors what
+			// LoadWithTolerance did internally; either uses the
+			// --platform-key-file or recomputes from machine attrs.
+			//
+			// SECURITY: this keeps both the passphrase and platform
+			// key in memory for as long as `start` runs. That's the
+			// trade-off for hot-rotate — without these, /v1/pair/extend
+			// can only rotate in-memory and the next restart would
+			// have to re-extend manually. Zeroed on shutdown via the
+			// existing defer above + the new one below.
+			platformKey, err := fingerprint.DerivePlatformKey(platformKeyFile)
+			if err != nil {
+				return fmt.Errorf("derive platform key: %w", err)
+			}
+			defer crypto.ZeroBytes(platformKey)
+
 			log.Info().
 				Str("connection_id", creds.ConnectionID).
 				Str("approval_mode", creds.ApprovalMode).
@@ -333,18 +352,35 @@ and begins serving the local API and WebSocket endpoint.`,
 				}
 			}
 
+			// Closure that re-seals connection.enc on hot-rotate.
+			// Captures passphrase + platformKey by reference; both
+			// stay live until the daemon's shutdown defers fire.
+			persist := func(newCreds *credential.ConnectionCredentials) error {
+				return credential.Save(configDir, newCreds, passphrase, platformKey)
+			}
+
 			// Start API server with all dependencies
 			server, err := api.NewServer(&api.ServerConfig{
-				Listen:         cfg.API.Listen,
-				AllowedOrigins: allowedOrigins,
-				NATSClient:     client,
-				ConnKey:        creds.ConnectionKey,
-				KeyID:          creds.KeyID,
-				ConnectionID:   creds.ConnectionID,
-				OwnerGUID:      creds.OwnerGUID,
-				Scope:          creds.Scope,
-				ApprovalMode:   creds.ApprovalMode,
-				RequestTimeout: requestTimeout,
+				Listen:                 cfg.API.Listen,
+				AllowedOrigins:         allowedOrigins,
+				NATSClient:             client,
+				ConnKey:                creds.ConnectionKey,
+				KeyID:                  creds.KeyID,
+				ConnectionID:           creds.ConnectionID,
+				OwnerGUID:              creds.OwnerGUID,
+				Scope:                  creds.Scope,
+				ApprovalMode:           creds.ApprovalMode,
+				SessionID:              creds.SessionID,
+				SessionExpiresAt:       creds.SessionExpiresAt,
+				SessionDurationSeconds: creds.SessionDurationSeconds,
+				MessageSpaceURL:        creds.MessageSpaceURL,
+				JWT:                    creds.JWT,
+				Seed:                   creds.Seed,
+				AgentPrivateKey:        creds.AgentPrivateKey,
+				AgentPublicKey:         creds.AgentPublicKey,
+				VaultPublicKey:         creds.VaultPublicKey,
+				Persist:                persist,
+				RequestTimeout:         requestTimeout,
 			})
 			if err != nil {
 				return fmt.Errorf("create API server: %w", err)
@@ -360,9 +396,12 @@ and begins serving the local API and WebSocket endpoint.`,
 			// at the same point.
 			validator := vettidnats.NewEnvelopeValidator()
 
-			// Subscribe to NATS responses and dispatch to tracker/catalog
+			// Subscribe to NATS responses and dispatch to tracker/catalog.
+			// Reads the active ConnKey from server.Snapshot() per envelope
+			// so a Phase-5 hot-rotate takes effect immediately on inbound
+			// messages without forcing a process restart.
 			if err := client.SubscribeResponses(func(data []byte) {
-				handleNATSResponse(data, server, creds.ConnectionKey, validator)
+				handleNATSResponse(data, server, validator)
 			}); err != nil {
 				return fmt.Errorf("subscribe to responses: %w", err)
 			}
@@ -398,15 +437,112 @@ and begins serving the local API and WebSocket endpoint.`,
 	return cmd
 }
 
+// loadCredsForCLI is the shared boilerplate every offline credential-
+// using command needs: read --config-dir, check the store exists, read
+// --passphrase-file or prompt once interactively, decrypt with the full
+// machine fingerprint (4-of-5 tolerance via LoadWithTolerance).
+//
+// Returns the loaded creds AND the raw passphrase, since most callers
+// need the passphrase again to re-Save after a state change (extend
+// rotates the session key; rebind rebuilds the platform key). Caller is
+// responsible for zeroing both.
+func loadCredsForCLI(cmd *cobra.Command, configDir string) (*credential.ConnectionCredentials, []byte, error) {
+	if !credential.Exists(configDir) {
+		return nil, nil, fmt.Errorf("not registered (no credentials at %s). Run 'vettid-agent init <invite-code>' first", configDir)
+	}
+
+	passphraseFile, _ := cmd.Flags().GetString("passphrase-file")
+	platformKeyFile, _ := cmd.Flags().GetString("platform-key-file")
+
+	var passphrase []byte
+	var err error
+	if passphraseFile != "" {
+		passphrase, err = os.ReadFile(passphraseFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read passphrase file: %w", err)
+		}
+		if n := len(passphrase); n > 0 && passphrase[n-1] == '\n' {
+			passphrase = passphrase[:n-1]
+		}
+	} else {
+		fmt.Print("Enter passphrase: ")
+		passphrase, err = term.ReadPassword(int(syscall.Stdin))
+		fmt.Println()
+		if err != nil {
+			return nil, nil, fmt.Errorf("read passphrase: %w", err)
+		}
+	}
+
+	creds, _, err := credential.LoadWithTolerance(configDir, string(passphrase), platformKeyFile)
+	if err != nil {
+		crypto.ZeroBytes(passphrase)
+		return nil, nil, fmt.Errorf("load credentials: %w", err)
+	}
+	return creds, passphrase, nil
+}
+
 func newStatusCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "status",
-		Short: "Show connection status and health",
+		Short: "Show pairing status and session expiry",
+		Long: `Reads the local connection.enc and reports the current
+connection_id, granted scope, approval mode, and session expiry.
+
+This is offline-only: it doesn't dial the vault. Run while the daemon
+('vettid-agent start') is also running — the same file is opened
+read-only and there's no contention.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("not yet implemented")
+			configDir, err := getConfigDir(cmd)
+			if err != nil {
+				return err
+			}
+			creds, passphrase, err := loadCredsForCLI(cmd, configDir)
+			if err != nil {
+				return err
+			}
+			defer crypto.ZeroBytes(passphrase)
+			defer creds.Zero()
+
+			fmt.Printf("Connection\n")
+			fmt.Printf("  connection_id: %s\n", creds.ConnectionID)
+			fmt.Printf("  owner:         %s\n", creds.OwnerGUID)
+			fmt.Printf("  vault:         %s\n", creds.MessageSpaceURL)
+			fmt.Printf("\nSession\n")
+			if creds.SessionID != "" {
+				fmt.Printf("  session_id:    %s\n", creds.SessionID)
+			} else {
+				fmt.Printf("  session_id:    (not recorded — predates Phase 5)\n")
+			}
+			if creds.SessionExpiresAt > 0 {
+				expiresAt := time.Unix(creds.SessionExpiresAt, 0)
+				remaining := time.Until(expiresAt)
+				if remaining < 0 {
+					fmt.Printf("  expires_at:    %s (EXPIRED %s ago)\n",
+						expiresAt.Format(time.RFC3339),
+						(-remaining).Truncate(time.Second))
+				} else {
+					fmt.Printf("  expires_at:    %s\n", expiresAt.Format(time.RFC3339))
+					fmt.Printf("  remaining:     %s\n", remaining.Truncate(time.Second))
+				}
+			} else {
+				fmt.Printf("  expires_at:    (not recorded — predates Phase 5)\n")
+			}
+			if creds.SessionDurationSeconds > 0 {
+				fmt.Printf("  duration:      %s\n", time.Duration(creds.SessionDurationSeconds)*time.Second)
+			}
+			fmt.Printf("\nPolicy\n")
+			fmt.Printf("  approval_mode: %s\n", creds.ApprovalMode)
+			if len(creds.Scope) == 0 {
+				fmt.Printf("  scope:         (none)\n")
+			} else {
+				fmt.Printf("  scope:         %s\n", strings.Join(creds.Scope, ", "))
+			}
 			return nil
 		},
 	}
+	cmd.Flags().String("passphrase-file", "", "Read passphrase from file")
+	cmd.Flags().String("platform-key-file", "", "Platform key file for containers/VMs")
+	return cmd
 }
 
 func newRebindCmd() *cobra.Command {
@@ -426,15 +562,166 @@ change, etc.) that cause normal startup to fail.`,
 func newRevokeCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "revoke",
-		Short: "Disconnect from vault and clean up credentials",
-		Long: `Sends disconnect notification to vault, invalidates local credentials,
-and removes encrypted config files.`,
+		Short: "Disconnect from vault and wipe local credentials",
+		Long: `Publishes agent.revoke to the vault and deletes connection.enc.
+
+Stop the running daemon ('vettid-agent start') before revoking — the
+daemon will start failing all encrypted ops the moment the vault
+processes the revoke, and leaving it running just floods the log with
+"connection not found" errors until you Ctrl-C it.
+
+The vault still wipes its session key and audit-logs the revoke even if
+this publish fails to reach NATS (the vault expires it server-side once
+the session TTL elapses), so the local cleanup happens unconditionally —
+'revoke' never leaves an unusable connection.enc behind.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("not yet implemented")
+			configDir, err := getConfigDir(cmd)
+			if err != nil {
+				return err
+			}
+			confirm, _ := cmd.Flags().GetBool("confirm")
+			reason, _ := cmd.Flags().GetString("reason")
+			if reason == "" {
+				reason = "user_revoked"
+			}
+
+			if !confirm {
+				fmt.Printf("This will disconnect this agent from the vault and delete %s/connection.enc.\nContinue? [y/N]: ", configDir)
+				var resp string
+				fmt.Scanln(&resp)
+				resp = strings.ToLower(strings.TrimSpace(resp))
+				if resp != "y" && resp != "yes" {
+					fmt.Println("Cancelled.")
+					return nil
+				}
+			}
+
+			creds, passphrase, err := loadCredsForCLI(cmd, configDir)
+			if err != nil {
+				return err
+			}
+			defer crypto.ZeroBytes(passphrase)
+			defer creds.Zero()
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
+			defer cancel()
+
+			pubErr := registration.PublishRevoke(ctx, creds, reason)
+			if pubErr != nil {
+				// Log + continue. The local cleanup is the user-
+				// facing point of `revoke`; the publish is best-
+				// effort.
+				log.Warn().Err(pubErr).Msg("revoke publish failed — proceeding with local wipe")
+			} else {
+				fmt.Fprintln(os.Stderr, "▸ revoke published to vault")
+			}
+
+			if err := credential.Delete(configDir); err != nil {
+				return fmt.Errorf("delete connection.enc: %w", err)
+			}
+			fmt.Println("Local credentials wiped.")
 			return nil
 		},
 	}
 	cmd.Flags().Bool("confirm", false, "Skip confirmation prompt")
+	cmd.Flags().String("reason", "", `Reason logged on the vault (default "user_revoked")`)
+	cmd.Flags().String("passphrase-file", "", "Read passphrase from file")
+	cmd.Flags().String("platform-key-file", "", "Platform key file for containers/VMs")
+	return cmd
+}
+
+func newExtendCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "extend",
+		Short: "Renew the active session via owner approval",
+		Long: `Publishes a fresh agent.request-session to the vault, waits for the owner
+to re-approve on their phone, and rewrites connection.enc with the new
+session key.
+
+Stop the running daemon ('vettid-agent start') before extending — the
+extend rotates the session key, and the running process can't pick up
+the new key without restarting. Use the HTTP endpoint POST /v1/pair/extend
+for hot-rotate against a running daemon (no restart required).`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			configDir, err := getConfigDir(cmd)
+			if err != nil {
+				return err
+			}
+			timeoutSecs, _ := cmd.Flags().GetInt("timeout")
+			timeout := time.Duration(timeoutSecs) * time.Second
+			durationSecs, _ := cmd.Flags().GetInt64("duration")
+			scope, _ := cmd.Flags().GetStringSlice("scope")
+			approvalMode, _ := cmd.Flags().GetString("approval-mode")
+			platformKeyFile, _ := cmd.Flags().GetString("platform-key-file")
+
+			creds, passphrase, err := loadCredsForCLI(cmd, configDir)
+			if err != nil {
+				return err
+			}
+			defer crypto.ZeroBytes(passphrase)
+			defer creds.Zero()
+
+			platformKey, err := fingerprint.DerivePlatformKey(platformKeyFile)
+			if err != nil {
+				return fmt.Errorf("derive platform key: %w", err)
+			}
+			defer crypto.ZeroBytes(platformKey)
+
+			ctx, cancel := context.WithTimeout(cmd.Context(), timeout+30*time.Second)
+			defer cancel()
+
+			fmt.Fprintln(os.Stderr, "▸ request-session sent; awaiting owner approval on phone")
+
+			outcome, err := registration.ExtendSession(ctx, creds, registration.CompletePairingOptions{
+				Timeout:               timeout,
+				RequestedScope:        scope,
+				RequestedApprovalMode: approvalMode,
+				RequestedDurationSecs: durationSecs,
+			})
+			if err != nil {
+				return fmt.Errorf("extend: %w", err)
+			}
+			defer outcome.Zero()
+
+			// Swap the rotatable session-state fields, keep
+			// everything else (NATS creds + connection_id + agent
+			// keypair persisted at init time still apply).
+			creds.ConnectionKey = outcome.SessionKey
+			creds.AgentPrivateKey = append([]byte(nil), outcome.AgentKeyPair.PrivateKey[:]...)
+			creds.AgentPublicKey = append([]byte(nil), outcome.AgentKeyPair.PublicKey[:]...)
+			creds.VaultPublicKey = outcome.VaultPubKey
+			creds.Scope = outcome.GrantedScope
+			creds.ApprovalMode = outcome.ApprovalMode
+			creds.SessionID = outcome.SessionID
+			creds.SessionExpiresAt = outcome.ExpiresAt
+			creds.SessionDurationSeconds = outcome.DurationSeconds
+
+			if err := credential.Save(configDir, creds, passphrase, platformKey); err != nil {
+				return fmt.Errorf("re-seal connection.enc: %w", err)
+			}
+
+			fmt.Fprintln(os.Stderr, "▸ activated")
+			fmt.Println()
+			fmt.Printf("Extend complete.\n")
+			fmt.Printf("  session_id:    %s\n", outcome.SessionID)
+			fmt.Printf("  expires_at:    %s (%ds)\n",
+				time.Unix(outcome.ExpiresAt, 0).Format(time.RFC3339),
+				outcome.DurationSeconds)
+			fmt.Printf("  approval_mode: %s\n", outcome.ApprovalMode)
+			if len(outcome.GrantedScope) == 0 {
+				fmt.Printf("  scope:         (none)\n")
+			} else {
+				fmt.Printf("  scope:         %s\n", strings.Join(outcome.GrantedScope, ", "))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().Int("timeout", 300, "Approval wait timeout in seconds")
+	cmd.Flags().Int64("duration", registration.DefaultRequestedDurationSecs, "Requested session duration in seconds (hint; phone caps at 24h)")
+	cmd.Flags().StringSlice("scope", nil, "Requested scope tokens (repeatable; hints only — phone picks the final set)")
+	cmd.Flags().String("approval-mode", "always_ask", `Requested approval mode hint: "always_ask" or "auto_within_contract"`)
+	cmd.Flags().String("passphrase-file", "", "Read passphrase from file")
+	cmd.Flags().String("platform-key-file", "", "Platform key file for containers/VMs")
 	return cmd
 }
 
@@ -495,7 +782,7 @@ func promptAgentType() string {
 
 // handleNATSResponse decodes incoming NATS envelopes and dispatches them
 // to the appropriate handler (tracker or catalog).
-func handleNATSResponse(data []byte, server *api.Server, connKey []byte, validator *vettidnats.EnvelopeValidator) {
+func handleNATSResponse(data []byte, server *api.Server, validator *vettidnats.EnvelopeValidator) {
 	env, err := vettidnats.DecodeEnvelope(data)
 	if err != nil {
 		log.Warn().Err(err).Msg("Failed to decode NATS response envelope")
@@ -514,6 +801,14 @@ func handleNATSResponse(data []byte, server *api.Server, connKey []byte, validat
 			Msg("Envelope validation failed — dropping")
 		return
 	}
+
+	// Snapshot the rotatable session state ONCE per inbound envelope.
+	// Phase 5 hot-rotate: after /v1/pair/extend swaps server's session
+	// key, a freshly-arriving envelope must decrypt with the new key.
+	// Capturing connKey at subscribe time (the pre-Phase-5 shape) would
+	// have left this path stuck on the previous session forever — until
+	// process restart.
+	connKey := server.Snapshot().ConnKey
 
 	switch env.Type {
 	case vettidnats.MsgSecretResponse:

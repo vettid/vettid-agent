@@ -15,12 +15,14 @@ import (
 // No NATS client is connected (nil).
 func newTestServer() *Server {
 	return &Server{
-		catalog:      NewCatalogCache(),
-		tracker:      NewRequestTracker(5 * time.Second),
-		connectionID: "test-conn-id",
-		scope:        []string{"api_keys", "ssh_keys"},
-		approvalMode: "auto_within_contract",
-		startTime:    time.Now(),
+		catalog: NewCatalogCache(),
+		tracker: NewRequestTracker(5 * time.Second),
+		sessionState: sessionState{
+			ConnectionID: "test-conn-id",
+			Scope:        []string{"api_keys", "ssh_keys"},
+			ApprovalMode: "auto_within_contract",
+		},
+		startTime: time.Now(),
 	}
 }
 
