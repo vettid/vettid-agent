@@ -57,6 +57,7 @@ connectivity, and vault communication.`,
 		newRevokeCmd(),
 		newExtendCmd(),
 		newVersionCmd(),
+		newDemoCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
