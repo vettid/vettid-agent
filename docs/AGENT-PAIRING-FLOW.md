@@ -33,7 +33,7 @@ Last updated: 2026-05-23.
 
 3. **Separate vault handlers, shared helpers.** New `enclave/vault-manager/agent_pairing.go` parallel to `device_pairing.go`. Helpers `GenerateAgentCredentials` and `deriveAgentSessionKey` share a core with their device equivalents parameterized on a domain constant (`DomainAgentSession = "vettid-agent-session-v1"`). Keeps scope-binding logic out of the device path; cleaner audit surface.
 
-4. **Bootstrap Lambda extended for agent flavor.** Locate the Lambda backing `api.vettid.dev/pair/device/bootstrap` in `vettid-dev/cdk/lambda/handlers/public/` *before* Phase 2. If it hardcodes device-scoped guest creds, add `?kind=agent` or a parallel `/pair/agent/bootstrap` so agent invites are read with NATS creds scoped to `invite.>` filtered by `type:"vettid_agent"`.
+4. **Bootstrap Lambda extended for agent flavor.** Audited 2026-05-23 — see Phase 0 below for the actual shape (the Lambda lives at `cdk/lambda/handlers/vault/bootstrapDevicePairing.ts`, not `handlers/public/`). The Lambda is already device/agent-agnostic at the NATS-scope level; subject-prefix or stream-level isolation between device and agent invites is **not enforceable** with current JetStream scoping (`type` is a payload field, not a subject). Decision: accept `kind` in the JSON body of the existing endpoint, log it for audit, otherwise mint identical scope. Security boundary stays the unguessable 12-char code + 60s JWT TTL + 2-min invite TTL.
 
 ---
 
@@ -183,14 +183,32 @@ The owner authorizes by **tap on phone**, no QR. The trust anchor is the agent's
 
 ## Phased implementation plan
 
-### Phase 0 — Bootstrap Lambda audit (~1 hour)
+### Phase 0 — Bootstrap Lambda audit — DONE 2026-05-23
 
-Locate the Lambda backing `api.vettid.dev/pair/device/bootstrap` in `vettid-dev/cdk/lambda/handlers/public/`. Determine:
+**Lambda:** `vettid-dev/cdk/lambda/handlers/vault/bootstrapDevicePairing.ts` (the canonical plan originally guessed `handlers/public/`; corrected).
+**Route:** `cdk/lib/vault-stack.ts:1732` → `POST /pair/device/bootstrap`. No authorizer. Lambda wired at `:426`.
+**Current contract:**
+- Request body: `{ "code": "<12 chars, ABCDEFGHJKLMNPQRSTUVWXYZ23456789>" }`
+- Response: `{ nats_endpoint, jwt, seed, expires_in: 60 }`
+- Mints a fresh ephemeral NATS user keypair per call, signs a 60s-TTL JWT with the guest account seed from Secrets Manager (`vettid/nats/operator-key` → `guest_account_seed`, 5-min Lambda-container cache).
+- JWT scope: JetStream RPC on the `INVITATIONS` stream (`$JS.API.STREAM.INFO.INVITATIONS`, `$JS.API.CONSUMER.CREATE.INVITATIONS[.>]`, `$JS.API.CONSUMER.DURABLE.CREATE.INVITATIONS.>`, `$JS.API.CONSUMER.MSG.NEXT.INVITATIONS.>`, `$JS.API.CONSUMER.DELETE.INVITATIONS.>`) + `_INBOX.>`. Subscribe scope: `_INBOX.>` only.
+- **Deliberately does NOT verify the code exists** in JetStream (avoids being an "is X a live invite" oracle). Preserve this property for agents.
 
-- Does it hardcode device-scoped NATS guest creds?
-- Is there a `kind` parameter / different code path for agent?
+**Findings:**
 
-Outcome: either add `?kind=agent` branch (preferred — single endpoint) or land a new `/pair/agent/bootstrap` route. Agent guest creds should be scoped to `INVITATIONS` reads filtered to entries with `type:"vettid_agent"` to prevent guest creds from being used to read device invites.
+1. **Already device/agent-agnostic at the NATS layer.** A desktop bootstrap response could read any `invite.<code>` payload — there is no per-`type` JetStream isolation today.
+2. **Payload-type filtering at the NATS scope level is NOT achievable.** `type:"vettid_agent"` is a payload field, not a subject. NATS JWT scope governs subjects only; the JetStream consumer `filter_subject` is client-chosen at create time and not validated against scope. True device/agent isolation would require *either* a separate JetStream subject prefix *and* enforcement at the publish path, *or* a separate stream (e.g., `AGENT_INVITATIONS`). Neither buys much over the existing boundary.
+3. **Today's security boundary** is the unguessable invite code (12 chars × log2(32) alphabet ≈ 60 bits) + 2-min invite TTL + 60s JWT TTL. Same boundary works for agent invites unchanged.
+4. **Current `HandleCreateAgentInvite` (connections.go:1994) is unusable for the new flow** — confirmed. Mints the dead 32-byte shortlink token, does not publish to JetStream, does not mint scoped creds. Phase 1 rewrites from scratch.
+5. **No Lambda-level rate limiting.** Only API Gateway stage throttling. Tracked as a follow-up (see "Open follow-ups not blocking this work" below).
+
+**Decision (locked 2026-05-23):** Same Lambda, accept `kind` in the JSON body (default `"device"` for backwards compat with the shipped desktop). Differentiate logs/audit by `kind`; mint identical scope. Defer subject-prefix or separate-stream isolation — not worth the publish-path churn for the same effective security boundary.
+
+**Touchpoints for the actual change (done in Phase 1's CDK pass or earlier):**
+- `bootstrapDevicePairing.ts:84-96` — read `kind` from body, validate `kind ∈ {"device","agent"}`, default `"device"`.
+- `bootstrapDevicePairing.ts:101-105` — add `kind` to the `console.info` log block.
+- `bootstrapDevicePairing.ts:135` — embed `kind` in the JWT name prefix for traceability (e.g., `agent-bootstrap-<code-prefix>-…`).
+- No CDK changes required (same route, same Lambda).
 
 ### Phase 1 — Vault handlers + Android invite creation (no agent code yet)
 
@@ -271,7 +289,7 @@ Files to create / modify in `vettid-agent`:
 
 - **Per-tool scope grammar.** `agent.action.<tool>` is parameterized but the toolset itself isn't versioned. If a tool's parameter shape changes, granted scopes might silently mean something different. Worth a follow-up design pass after Phase 5.
 - **Cross-device agent visibility.** Owner with multiple phones — does each see `agent.pending-authorization`? Today, OwnerSpaceClient subscribes per device. Confirm during Phase 4 implementation.
-- **Bootstrap rate-limiting.** A leaked agent binary calling `fetchBootstrapCreds` in a loop should be rate-limited at the Lambda. Track during Phase 0 audit.
+- **Bootstrap rate-limiting.** A leaked agent binary calling `fetchBootstrapCreds` in a loop should be rate-limited at the Lambda. Phase 0 audit confirmed only API Gateway stage throttling is in place (no per-IP). Deferred from this work; track separately. Likely DynamoDB-backed per-IP token bucket on `bootstrapDevicePairing.ts`.
 
 ---
 
