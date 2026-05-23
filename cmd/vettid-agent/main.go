@@ -23,6 +23,7 @@ import (
 	"github.com/vettid/vettid-agent/internal/config"
 	"github.com/vettid/vettid-agent/internal/credential"
 	"github.com/vettid/vettid-agent/internal/crypto"
+	"github.com/vettid/vettid-agent/internal/fingerprint"
 	vettidnats "github.com/vettid/vettid-agent/internal/nats"
 	"github.com/vettid/vettid-agent/internal/registration"
 )
@@ -85,13 +86,17 @@ func newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init <invite-code>",
 		Short: "Register with a vault using an invite code",
-		Long: `Registers this agent with a vault using a one-time invite code
-generated from the vault owner's app.
+		Long: `Registers this agent with a vault using a one-time 12-character
+invite code displayed in the vault owner's app.
 
-Pairing is not yet implemented — the previous HTTP-broker flow has been
-removed and the replacement NATS-based flow is pending design. See
-vettid-dev/docs/DESKTOP-CONNECTION-FLOW.md for the parallel desktop design
-this agent flow will mirror.`,
+Two-stage NATS pairing:
+  1. Stage 1 mints scoped guest creds via the bootstrap endpoint, fetches
+     the invite payload from JetStream, and tears down the guest connection.
+  2. Stage 2 reconnects with the per-pair scoped creds, publishes
+     agent.request-session, waits for the owner to approve on the phone,
+     does X25519+HKDF, and seals connection.enc under the local passphrase.
+
+See vettid-agent/docs/AGENT-PAIRING-FLOW.md for the full protocol.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			configDir, err := getConfigDir(cmd)
@@ -99,7 +104,6 @@ this agent flow will mirror.`,
 				return err
 			}
 
-			// Check if already registered
 			if credential.Exists(configDir) {
 				return fmt.Errorf("already registered (credentials exist at %s). Use 'vettid-agent revoke' first", configDir)
 			}
@@ -112,24 +116,130 @@ this agent flow will mirror.`,
 			timeoutSecs, _ := cmd.Flags().GetInt("timeout")
 			timeout := time.Duration(timeoutSecs) * time.Second
 
-			flow := registration.NewFlow(registration.FlowConfig{
-				InviteCode: args[0],
-				AgentType:  agentType,
-				Timeout:    timeout,
-				ConfigDir:  configDir,
-			})
+			scope, _ := cmd.Flags().GetStringSlice("scope")
+			approvalMode, _ := cmd.Flags().GetString("approval-mode")
+			durationSecs, _ := cmd.Flags().GetInt64("duration")
+			platformKeyFile, _ := cmd.Flags().GetString("platform-key-file")
+			passphraseFile, _ := cmd.Flags().GetString("passphrase-file")
 
-			if err := flow.Run(); err != nil {
-				return err
+			ctx, cancel := context.WithTimeout(cmd.Context(), timeout+30*time.Second)
+			defer cancel()
+
+			// Stage 1 — resolve invite via the guest bootstrap path.
+			fmt.Fprintln(os.Stderr, "▸ resolving invite")
+			session, runtimeState, err := registration.ResolveInvite(ctx, args[0])
+			if err != nil {
+				return fmt.Errorf("stage 1: %w", err)
+			}
+			defer runtimeState.Zero()
+
+			// Build the identity card the phone shows the owner.
+			metadata, err := registration.CollectAgentMetadata(agentType, version)
+			if err != nil {
+				return fmt.Errorf("collect agent metadata: %w", err)
 			}
 
-			fmt.Println("\nRegistration complete. Run 'vettid-agent start' to begin.")
+			// Derive the platform key the credential store will encrypt under.
+			// We do this before reading the passphrase so a misconfigured
+			// platform-key-file fails fast.
+			platformKey, err := fingerprint.DerivePlatformKey(platformKeyFile)
+			if err != nil {
+				return fmt.Errorf("derive platform key: %w", err)
+			}
+			defer crypto.ZeroBytes(platformKey)
+
+			passphrase, err := readPassphraseForInit(passphraseFile)
+			if err != nil {
+				return err
+			}
+			defer crypto.ZeroBytes(passphrase)
+
+			fmt.Fprintln(os.Stderr, "▸ request-session sent; awaiting owner approval on phone")
+
+			outcome, err := registration.CompletePairing(
+				ctx,
+				session,
+				runtimeState,
+				metadata,
+				registration.CompletePairingOptions{
+					Timeout:               timeout,
+					RequestedScope:        scope,
+					RequestedApprovalMode: approvalMode,
+					RequestedDurationSecs: durationSecs,
+				},
+				configDir,
+				passphrase,
+				platformKey,
+			)
+			if err != nil {
+				return fmt.Errorf("stage 2: %w", err)
+			}
+
+			fmt.Fprintln(os.Stderr, "▸ activated")
+			fmt.Println()
+			fmt.Printf("Registration complete.\n")
+			fmt.Printf("  connection_id: %s\n", outcome.ConnectionID)
+			fmt.Printf("  session_id:    %s\n", outcome.SessionID)
+			fmt.Printf("  expires_at:    %s (%ds)\n",
+				time.Unix(outcome.ExpiresAt, 0).Format(time.RFC3339),
+				outcome.DurationSeconds)
+			fmt.Printf("  approval_mode: %s\n", outcome.ApprovalMode)
+			if len(outcome.GrantedScope) == 0 {
+				fmt.Printf("  scope:         (none — phone granted no scope tokens)\n")
+			} else {
+				fmt.Printf("  scope:         %s\n", strings.Join(outcome.GrantedScope, ", "))
+			}
+			fmt.Println("\nRun 'vettid-agent start' to begin.")
 			return nil
 		},
 	}
-	cmd.Flags().String("type", "", "Agent type (coding_assistant, data_pipeline, automation, monitoring, custom)")
+	cmd.Flags().String("type", "", "Agent type label shown to the owner (e.g. claude-code, cursor, self-hosted-llm)")
 	cmd.Flags().Int("timeout", 300, "Approval wait timeout in seconds")
+	cmd.Flags().StringSlice("scope", nil, "Requested scope tokens (repeatable; hints only — phone picks the final set). Vocabulary: secrets.catalog.read, secrets.get, secrets.put, message.send, message.recv, call.history, connection.list, connection.get, agent.action.<tool>")
+	cmd.Flags().String("approval-mode", "always_ask", `Requested approval mode hint: "always_ask" or "auto_within_contract"`)
+	cmd.Flags().Int64("duration", registration.DefaultRequestedDurationSecs, "Requested session duration in seconds (hint; phone caps at 24h)")
+	cmd.Flags().String("passphrase-file", "", "Read passphrase from file instead of prompting (init only)")
+	cmd.Flags().String("platform-key-file", "", "Platform key file for containers/VMs (skips machine-attribute collection)")
 	return cmd
+}
+
+// readPassphraseForInit reads a passphrase for credential.Save during init.
+// Either reads from a file (CI/automated install) or prompts twice and
+// requires confirmation. The two-prompt path is *only* on init — start
+// reads once because there's nothing to confirm against.
+func readPassphraseForInit(file string) ([]byte, error) {
+	if file != "" {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("read passphrase file: %w", err)
+		}
+		// Strip a single trailing newline if present (common when shell
+		// users do `echo > file` to populate it).
+		if n := len(data); n > 0 && data[n-1] == '\n' {
+			data = data[:n-1]
+		}
+		return data, nil
+	}
+	fmt.Print("Choose a passphrase to seal connection.enc: ")
+	first, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Println()
+	if err != nil {
+		return nil, fmt.Errorf("read passphrase: %w", err)
+	}
+	fmt.Print("Confirm passphrase: ")
+	second, err := term.ReadPassword(int(syscall.Stdin))
+	fmt.Println()
+	if err != nil {
+		crypto.ZeroBytes(first)
+		return nil, fmt.Errorf("read passphrase confirmation: %w", err)
+	}
+	if string(first) != string(second) {
+		crypto.ZeroBytes(first)
+		crypto.ZeroBytes(second)
+		return nil, fmt.Errorf("passphrases did not match")
+	}
+	crypto.ZeroBytes(second)
+	return first, nil
 }
 
 func newStartCmd() *cobra.Command {
