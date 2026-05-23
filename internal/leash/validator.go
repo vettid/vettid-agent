@@ -47,7 +47,11 @@ type VerifyCheck struct {
 // verification rejections come back with Verified=false (still a
 // successful HTTP exchange — the demo wants to render the failure
 // chain, not throw).
-func PostVerify(validatorURL string, key *AgentKey, leash string, action string, timeout time.Duration) (*VerifyResponse, error) {
+//
+// `sessionToken`, when non-empty, is sent as the `X-Demo-Session`
+// header so the validator appends this result to that session's
+// poll list — used by the live-tester mode on vettid.dev.
+func PostVerify(validatorURL string, key *AgentKey, leash string, action string, sessionToken string, timeout time.Duration) (*VerifyResponse, error) {
 	nonceBytes := make([]byte, 16)
 	if _, err := rand.Read(nonceBytes); err != nil {
 		return nil, fmt.Errorf("generate nonce: %w", err)
@@ -79,6 +83,9 @@ func PostVerify(validatorURL string, key *AgentKey, leash string, action string,
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if sessionToken != "" {
+		req.Header.Set("X-Demo-Session", sessionToken)
+	}
 
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)

@@ -57,6 +57,7 @@ func newDemoValidateCmd() *cobra.Command {
 		action       string
 		jsonOut      bool
 		timeoutSecs  int
+		session      string
 	)
 	cmd := &cobra.Command{
 		Use:   "validate",
@@ -93,6 +94,7 @@ the LEASH verified); a non-zero exit means a network or 5xx error.`,
 				key,
 				leashJWT,
 				action,
+				session,
 				time.Duration(timeoutSecs)*time.Second,
 			)
 			if err != nil {
@@ -113,6 +115,7 @@ the LEASH verified); a non-zero exit means a network or 5xx error.`,
 	cmd.Flags().StringVar(&action, "action", "", "scope token to verify against (required; e.g. profile.email:read)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit raw JSON response instead of human-readable chain")
 	cmd.Flags().IntVar(&timeoutSecs, "timeout", 15, "HTTP timeout in seconds")
+	cmd.Flags().StringVar(&session, "session", "", "optional demo session token (ses_…) — emits the result to vettid.dev's live tester page")
 	return cmd
 }
 
