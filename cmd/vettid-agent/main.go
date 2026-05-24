@@ -277,6 +277,13 @@ and begins serving the local API and WebSocket endpoint.`,
 				if err != nil {
 					return fmt.Errorf("read passphrase file: %w", err)
 				}
+				// init + loadCredsForCLI both strip a single trailing
+				// newline (common when users do `echo > file`); start
+				// must do the same or it decrypts with a different
+				// passphrase than the one init sealed under.
+				if n := len(passphrase); n > 0 && passphrase[n-1] == '\n' {
+					passphrase = passphrase[:n-1]
+				}
 			} else {
 				fmt.Print("Enter passphrase: ")
 				passphrase, err = term.ReadPassword(int(syscall.Stdin))
