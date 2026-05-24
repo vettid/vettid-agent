@@ -27,8 +27,41 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /v1/status", s.handleStatus)
 	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
 	mux.HandleFunc("POST /v1/messages/send", s.handleSendMessage)
+	mux.HandleFunc("GET /v1/messages/inbox", s.handleMessagesInbox)
 	mux.HandleFunc("POST /v1/connection/disconnect", s.handleDisconnect)
 	mux.HandleFunc("POST /v1/pair/extend", s.handlePairExtend)
+}
+
+// handleMessagesInbox drains the in-memory buffer of owner→agent chat
+// messages. The buffer is fed by the NATS dispatch loop in main.go
+// (case MsgAgentMessageResponse). Default behavior is drain — the
+// returned messages are removed from the buffer. Pass ?peek=1 to read
+// without draining; useful for polling the count without consuming.
+//
+// Response shape:
+//
+//	{"messages": [...], "dropped_since_last_drain": 0}
+//
+// `dropped_since_last_drain` is non-zero when the buffer's bounded
+// capacity (256) is reached and the oldest message was evicted to
+// make room. AI processes can detect this and warn the owner that
+// messages may have been lost.
+func (s *Server) handleMessagesInbox(w http.ResponseWriter, r *http.Request) {
+	peek := r.URL.Query().Get("peek") == "1"
+	var msgs []OwnerMessage
+	var dropped uint64
+	if peek {
+		msgs, dropped = s.inbox.Peek()
+	} else {
+		msgs, dropped = s.inbox.Drain()
+	}
+	if msgs == nil {
+		msgs = []OwnerMessage{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"messages":                 msgs,
+		"dropped_since_last_drain": dropped,
+	})
 }
 
 // handleListSecrets returns catalog entries (metadata only). Optional ?category= filter.

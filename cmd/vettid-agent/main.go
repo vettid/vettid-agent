@@ -912,6 +912,38 @@ func handleNATSResponse(data []byte, server *api.Server, validator *vettidnats.E
 			Int("entries", len(catalog.Entries)).
 			Msg("Secret catalog updated")
 
+	case vettidnats.MsgAgentMessageResponse:
+		// Owner→agent chat message (or owner's reply to an
+		// agent-initiated message). Decrypt with the current session
+		// key and stash in the inbox; AI process drains via
+		// GET /v1/messages/inbox.
+		plaintext, err := crypto.Decrypt(connKey, env.Payload, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to decrypt owner message")
+			return
+		}
+		defer crypto.ZeroBytes(plaintext)
+
+		var resp vettidnats.AgentMessageResponse
+		if err := json.Unmarshal(plaintext, &resp); err != nil {
+			log.Error().Err(err).Msg("Failed to unmarshal owner message")
+			return
+		}
+
+		server.Inbox().Push(api.OwnerMessage{
+			MessageID:  resp.MessageID,
+			ReplyTo:    resp.ReplyTo,
+			Content:    resp.ReplyContent,
+			Action:     resp.Action,
+			ReceivedAt: time.Now().UTC(),
+		})
+		log.Info().
+			Str("message_id", resp.MessageID).
+			Str("reply_to", resp.ReplyTo).
+			Bool("has_content", resp.ReplyContent != "").
+			Str("action", resp.Action).
+			Msg("Owner message received")
+
 	default:
 		log.Debug().Str("type", string(env.Type)).Msg("Ignoring unknown NATS message type")
 	}

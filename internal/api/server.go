@@ -61,6 +61,7 @@ type Server struct {
 
 	catalog   *CatalogCache
 	tracker   *RequestTracker
+	inbox     *MessageInbox
 	sequence  atomic.Uint64
 	startTime time.Time
 }
@@ -180,6 +181,7 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		persist:         cfg.Persist,
 		catalog:         NewCatalogCache(),
 		tracker:   NewRequestTracker(requestTimeout),
+		inbox:     NewMessageInbox(),
 		startTime: time.Now(),
 	}
 
@@ -283,6 +285,13 @@ func (s *Server) Tracker() *RequestTracker {
 // Catalog returns the secret catalog cache.
 func (s *Server) Catalog() *CatalogCache {
 	return s.catalog
+}
+
+// Inbox returns the in-memory buffer of owner→agent chat messages.
+// Pushed to by the NATS dispatch loop when MsgAgentMessageResponse
+// arrives; drained by GET /v1/messages/inbox.
+func (s *Server) Inbox() *MessageInbox {
+	return s.inbox
 }
 
 // nextSequence returns the next monotonic sequence number for NATS messages.
