@@ -276,6 +276,9 @@ func connectScoped(natsURL, jwt, seed string) (*nats.Conn, error) {
 		nats.Timeout(10 * time.Second),
 		nats.MaxReconnects(0),
 		nats.Secure(),
+		// See connectGuest in pairing.go for the explanation —
+		// the NLB requires TLS-from-byte-0.
+		nats.TLSHandshakeFirst(),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
 			log.Debug().Err(err).Msg("nats async error during stage-2 pairing")
 		}),

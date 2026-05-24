@@ -57,9 +57,14 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 		}),
 	}
 
-	// SECURITY: Enable TLS for NATS connection when configured
+	// SECURITY: Enable TLS for NATS connection when configured.
+	// TLSHandshakeFirst is required for the VettID NATS endpoint —
+	// the NLB terminates TLS at byte 0, so the library's default
+	// STARTTLS dance (read INFO in cleartext, then upgrade) deadlocks
+	// against the NLB. See internal/registration/pairing.go for the
+	// fuller explanation; same flag, same reason here.
 	if cfg.TLS {
-		opts = append(opts, nats.Secure())
+		opts = append(opts, nats.Secure(), nats.TLSHandshakeFirst())
 		log.Info().Msg("NATS TLS enabled")
 	}
 

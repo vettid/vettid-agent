@@ -221,6 +221,13 @@ func connectGuest(natsURL, jwt, seed string) (*nats.Conn, error) {
 		nats.Timeout(10 * time.Second),
 		nats.MaxReconnects(0), // single-shot: don't retry, just fail fast
 		nats.Secure(),
+		// The VettID NATS endpoint sits behind an NLB that terminates
+		// TLS at byte 0 — it never speaks plain NATS, so the library's
+		// default STARTTLS dance (read INFO in cleartext, then upgrade)
+		// deadlocks against the NLB. TLSHandshakeFirst tells nats.go
+		// to do TLS immediately, before reading INFO. Required for
+		// any Go client targeting nats.vettid.dev:443.
+		nats.TLSHandshakeFirst(),
 		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
 			log.Debug().Err(err).Msg("nats async error during bootstrap")
 		}),
