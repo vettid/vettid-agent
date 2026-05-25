@@ -61,10 +61,89 @@ type wsConn struct {
 	mu   sync.Mutex
 }
 
+// wsWriteDeadline bounds how long a single push write can stall. A
+// disappeared TCP socket (no FIN, no RST — common on mobile/WiFi
+// drops) would otherwise block writeJSON until the OS-level TCP
+// timeout, which is minutes. The broadcaster holds the per-conn write
+// mutex during a push and would chain-block other pushes; the bounded
+// deadline turns a wedged client into a fast failure that
+// BroadcastEvent can act on (drop the client, free the slot).
+const wsWriteDeadline = 5 * time.Second
+
 func (wc *wsConn) writeJSON(v any) error {
 	wc.mu.Lock()
 	defer wc.mu.Unlock()
+	if err := wc.conn.SetWriteDeadline(time.Now().Add(wsWriteDeadline)); err != nil {
+		return err
+	}
 	return wc.conn.WriteJSON(v)
+}
+
+// wsEvent is the envelope for server-originated push events. The
+// `event` discriminator distinguishes pushes from request/response
+// traffic (which uses `id`). Consumers should switch on `event` and
+// decode `data` accordingly.
+type wsEvent struct {
+	Event string `json:"event"`
+	Data  any    `json:"data"`
+}
+
+// registerWSClient adds a connected client to the broadcast set.
+// Idempotent. Pair every registerWSClient with an unregisterWSClient
+// in a defer to avoid leaking a dead client into the set after the
+// per-connection read loop returns.
+func (s *Server) registerWSClient(wc *wsConn) {
+	s.wsClientsMu.Lock()
+	defer s.wsClientsMu.Unlock()
+	s.wsClients[wc] = struct{}{}
+}
+
+func (s *Server) unregisterWSClient(wc *wsConn) {
+	s.wsClientsMu.Lock()
+	defer s.wsClientsMu.Unlock()
+	delete(s.wsClients, wc)
+}
+
+// BroadcastEvent pushes a server-originated event to every connected
+// WebSocket client. Per-client writes are bounded by wsWriteDeadline
+// (see wsConn.writeJSON) — a wedged client gets dropped from the set
+// so subsequent broadcasts don't try to wake the corpse.
+//
+// Called from the NATS dispatch loop (cmd/vettid-agent/main.go) when
+// vault-originated events arrive that the in-process AI cares about
+// in realtime — currently just owner_message (vault → agent chat).
+// MessageInbox push still happens alongside so an AI that connects
+// late (or drops the WS) can recover via GET /v1/messages/inbox.
+func (s *Server) BroadcastEvent(event string, data any) {
+	env := wsEvent{Event: event, Data: data}
+
+	// Snapshot the client set under RLock so the broadcast's per-client
+	// writes don't hold the registry lock — register/unregister stay
+	// fast while a slow client is being written to.
+	s.wsClientsMu.RLock()
+	clients := make([]*wsConn, 0, len(s.wsClients))
+	for c := range s.wsClients {
+		clients = append(clients, c)
+	}
+	s.wsClientsMu.RUnlock()
+
+	if len(clients) == 0 {
+		return
+	}
+
+	var dead []*wsConn
+	for _, c := range clients {
+		if err := c.writeJSON(env); err != nil {
+			log.Warn().Err(err).Str("event", event).Msg("WebSocket push failed — dropping client")
+			dead = append(dead, c)
+		}
+	}
+	for _, c := range dead {
+		s.unregisterWSClient(c)
+		// Best-effort close so the per-conn read loop unblocks and
+		// returns; its own defer will be a no-op unregister.
+		_ = c.conn.Close()
+	}
 }
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -119,6 +198,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	defer cancelConn()
 
 	wc := &wsConn{conn: conn}
+	s.registerWSClient(wc)
+	defer s.unregisterWSClient(wc)
 	log.Info().Msg("WebSocket client connected")
 
 	for {

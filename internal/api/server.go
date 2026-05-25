@@ -64,6 +64,14 @@ type Server struct {
 	inbox     *MessageInbox
 	sequence  atomic.Uint64
 	startTime time.Time
+
+	// Set of currently-connected WebSocket clients. BroadcastEvent
+	// iterates this to push server-originated events (owner messages,
+	// future: session lifecycle, etc.) to every connected AI
+	// process. Registered after the WS upgrade succeeds; unregistered
+	// when the per-conn read loop returns (defer in handleWebSocket).
+	wsClientsMu sync.RWMutex
+	wsClients   map[*wsConn]struct{}
 }
 
 // sessionState is the rotatable credential view a handler sees. Pulled
@@ -182,6 +190,7 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		catalog:         NewCatalogCache(),
 		tracker:   NewRequestTracker(requestTimeout),
 		inbox:     NewMessageInbox(),
+		wsClients: make(map[*wsConn]struct{}),
 		startTime: time.Now(),
 	}
 
