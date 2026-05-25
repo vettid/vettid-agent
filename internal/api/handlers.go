@@ -15,6 +15,7 @@ import (
 
 	"github.com/vettid/vettid-agent/internal/credential"
 	"github.com/vettid/vettid-agent/internal/crypto"
+	"github.com/vettid/vettid-agent/internal/leash"
 	vettidnats "github.com/vettid/vettid-agent/internal/nats"
 	"github.com/vettid/vettid-agent/internal/registration"
 )
@@ -32,6 +33,7 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /v1/messages", s.handleListMessages)
 	mux.HandleFunc("POST /v1/connection/disconnect", s.handleDisconnect)
 	mux.HandleFunc("POST /v1/pair/extend", s.handlePairExtend)
+	mux.HandleFunc("POST /v1/leash/mint", s.handleLeashMint)
 }
 
 // handleListMessages returns recent bidirectional conversation history
@@ -822,4 +824,158 @@ func isTimeoutError(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "timed out") || strings.Contains(msg, "deadline exceeded")
+}
+
+// leashMintRequestBody is the JSON body for POST /v1/leash/mint. The
+// AI process supplies the scope tokens and optional duration / reason;
+// the agent's Ed25519 pubkey is loaded from the local key file and
+// injected — the caller never sees or names the key.
+type leashMintRequestBody struct {
+	Scope        []string `json:"scope"`
+	DurationSecs int64    `json:"duration_secs,omitempty"`
+	Reason       string   `json:"reason,omitempty"`
+	TimeoutSecs  int64    `json:"timeout_secs,omitempty"`
+}
+
+// handleLeashMint drives the owner-approved LEASH mint flow from the
+// agent side. Publishes a leash_mint_request envelope to the vault,
+// blocks until the owner approves on their phone (or the timeout
+// fires), and returns the minted JWT.
+//
+// Flow:
+//   1. Validate request body, load Ed25519 pubkey from configDir.
+//   2. Register a tracker entry keyed by request_id.
+//   3. Publish an AgentTextMessage with ContentType=leash_mint_request
+//      and the payload embedded in LeashMintRequest. The vault stores a
+//      PendingLeashRequest and pushes a forApp.agent.leash-mint-pending
+//      notification to the phone.
+//   4. Wait on the tracker channel. The NATS listener resolves the
+//      tracker when AgentMsgLeashGranted (or AgentMsgLeashDenied)
+//      arrives on forOwner.agent.<conn>.
+//   5. Return the JWT (success) or a 4xx/5xx with the deny reason.
+//
+// Why goes through the message envelope and not a new agent op:
+// reusing agent.message keeps the wire path identical to existing
+// secret approval requests — same session-key encryption, same
+// dispatcher routing — only the content_type branch differs.
+func (s *Server) handleLeashMint(w http.ResponseWriter, r *http.Request) {
+	if s.configDir == "" {
+		writeJSON(w, http.StatusNotImplemented, map[string]string{
+			"error": "leash mint unavailable (daemon started without config dir)",
+		})
+		return
+	}
+
+	var req leashMintRequestBody
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
+		return
+	}
+	if len(req.Scope) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "scope is required (one or more LEASH scope tokens)"})
+		return
+	}
+	if req.DurationSecs <= 0 {
+		req.DurationSecs = 1800
+	}
+	timeout := time.Duration(req.TimeoutSecs) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+	if timeout > 10*time.Minute {
+		timeout = 10 * time.Minute
+	}
+
+	key, err := leash.LoadOrCreate(s.configDir)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("load agent leash key: %v", err),
+		})
+		return
+	}
+
+	requestID, err := generateRequestID()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "generate request id"})
+		return
+	}
+
+	mintPayload := vettidnats.LeashMintRequestPayload{
+		RequestID:      requestID,
+		AgentPubkey:    key.PublicB64,
+		RequestedScope: req.Scope,
+		DurationSecs:   req.DurationSecs,
+		Reason:         req.Reason,
+	}
+	mintPayloadJSON, err := json.Marshal(mintPayload)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "marshal mint payload"})
+		return
+	}
+
+	msg := &vettidnats.AgentTextMessage{
+		MessageID:        requestID,
+		ContentType:      "leash_mint_request",
+		LeashMintRequest: mintPayloadJSON,
+	}
+
+	// Register the tracker before publishing so a fast vault response
+	// (rare here — phone approval takes seconds) can't race the
+	// registration.
+	ch := s.tracker.Add(requestID, timeout)
+
+	snap := s.Snapshot()
+	seq := s.nextSequence()
+	if err := s.natsClient.PublishMessage(msg, snap.ConnKey, snap.KeyID, seq); err != nil {
+		s.tracker.Resolve(requestID, &TrackedResult{
+			RequestID: requestID,
+			Status:    StatusError,
+			Reason:    err.Error(),
+		})
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error": fmt.Sprintf("publish mint request: %v", err),
+		})
+		return
+	}
+
+	log.Info().
+		Str("request_id", requestID).
+		Int("scope_count", len(req.Scope)).
+		Int64("duration_secs", req.DurationSecs).
+		Msg("LEASH mint request sent; awaiting owner approval")
+
+	var result *TrackedResult
+	select {
+	case result = <-ch:
+	case <-r.Context().Done():
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "client disconnected"})
+		return
+	}
+	if result == nil {
+		writeJSON(w, http.StatusGatewayTimeout, map[string]string{"error": "owner approval timed out"})
+		return
+	}
+	switch result.Status {
+	case StatusCompleted, StatusApproved:
+		// Result.Result carries the AgentLeashGrantedPayload as JSON.
+		writeJSON(w, http.StatusOK, json.RawMessage(result.Result))
+	case StatusDenied:
+		reason := result.Reason
+		if reason == "" {
+			reason = "owner denied the request"
+		}
+		writeJSON(w, http.StatusForbidden, map[string]string{
+			"error":      reason,
+			"request_id": requestID,
+		})
+	default:
+		reason := result.Reason
+		if reason == "" {
+			reason = "mint failed"
+		}
+		writeJSON(w, http.StatusBadGateway, map[string]string{
+			"error":      reason,
+			"request_id": requestID,
+		})
+	}
 }

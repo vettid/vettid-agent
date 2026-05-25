@@ -26,6 +26,8 @@ const (
 	MsgAgentMessage           MessageType = "agent_message"           // agent → vault: text/approval message
 	MsgAgentMessageResponse   MessageType = "agent_message_response"  // vault → agent: user reply
 	MsgAgentMessageAck        MessageType = "agent_message_ack"       // vault → agent: delivery confirmation for an agent-sent message
+	MsgAgentLeashGranted      MessageType = "agent_leash_granted"     // vault → agent: approved LEASH JWT (agent-initiated mint flow)
+	MsgAgentLeashDenied       MessageType = "agent_leash_denied"      // vault → agent: mint request denied by owner
 )
 
 type Envelope struct {
@@ -162,10 +164,40 @@ type SignResult struct {
 
 // AgentTextMessage is a message sent from the agent to the vault owner.
 type AgentTextMessage struct {
-	MessageID   string          `json:"message_id"`
-	ContentType string          `json:"content_type"` // "text" or "approval_request"
-	Content     string          `json:"content"`
-	Approval    json.RawMessage `json:"approval,omitempty"`
+	MessageID        string          `json:"message_id"`
+	ContentType      string          `json:"content_type"` // "text", "approval_request", or "leash_mint_request"
+	Content          string          `json:"content,omitempty"`
+	Approval         json.RawMessage `json:"approval,omitempty"`
+	LeashMintRequest json.RawMessage `json:"leash_mint_request,omitempty"`
+}
+
+// LeashMintRequestPayload is the structured content for a leash_mint_request
+// message. The vault stores a PendingLeashRequest, notifies the owner's
+// phone, and on approve mints a LEASH bound to AgentPubkey and delivers
+// it back to the agent via MsgAgentLeashGranted.
+type LeashMintRequestPayload struct {
+	RequestID      string   `json:"request_id"`
+	AgentPubkey    string   `json:"agent_pubkey"`     // base64url Ed25519 pubkey
+	RequestedScope []string `json:"requested_scope"`
+	DurationSecs   int64    `json:"duration_secs"`
+	Reason         string   `json:"reason,omitempty"`
+}
+
+// AgentLeashGrantedPayload carries an approved LEASH back to the agent.
+// Mirrors vault-manager/agent_handler.go AgentLeashGrantedPayload.
+type AgentLeashGrantedPayload struct {
+	RequestID string `json:"request_id"`
+	Leash     string `json:"leash"`
+	JTI       string `json:"jti"`
+	Kid       string `json:"kid"`
+	IssuedAt  int64  `json:"issued_at"`
+	ExpiresAt int64  `json:"expires_at"`
+}
+
+// AgentLeashDeniedPayload tells the agent its mint request was rejected.
+type AgentLeashDeniedPayload struct {
+	RequestID string `json:"request_id"`
+	Reason    string `json:"reason"`
 }
 
 // ApprovalPayload is the structured content for an approval_request message.

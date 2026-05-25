@@ -58,6 +58,7 @@ connectivity, and vault communication.`,
 		newExtendCmd(),
 		newVersionCmd(),
 		newDemoCmd(),
+		newLeashCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -389,6 +390,7 @@ and begins serving the local API and WebSocket endpoint.`,
 				VaultPublicKey:         creds.VaultPublicKey,
 				Persist:                persist,
 				RequestTimeout:         requestTimeout,
+				ConfigDir:              configDir,
 			})
 			if err != nil {
 				return fmt.Errorf("create API server: %w", err)
@@ -983,6 +985,61 @@ func handleNATSResponse(data []byte, server *api.Server, validator *vettidnats.E
 			Bool("has_content", resp.ReplyContent != "").
 			Str("action", resp.Action).
 			Msg("Owner message received")
+
+	case vettidnats.MsgAgentLeashGranted:
+		// Owner approved a LEASH mint request. Decrypt + unmarshal the
+		// granted payload and resolve the tracker entry that POST
+		// /v1/leash/mint is blocking on. Server resolves by request_id;
+		// the request_id field is the original MessageID the mint
+		// request was published with.
+		plaintext, err := crypto.Decrypt(connKey, env.Payload, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to decrypt leash granted envelope")
+			return
+		}
+		defer crypto.ZeroBytes(plaintext)
+		var granted vettidnats.AgentLeashGrantedPayload
+		if err := json.Unmarshal(plaintext, &granted); err != nil {
+			log.Error().Err(err).Msg("Failed to unmarshal leash granted payload")
+			return
+		}
+		// Stash the entire granted payload as the tracker Result so the
+		// HTTP handler can return it verbatim to the AI process.
+		grantedJSON, _ := json.Marshal(granted)
+		server.Tracker().Resolve(granted.RequestID, &api.TrackedResult{
+			RequestID: granted.RequestID,
+			Status:    api.StatusCompleted,
+			Result:    grantedJSON,
+		})
+		log.Info().
+			Str("request_id", granted.RequestID).
+			Str("jti", granted.JTI).
+			Int64("expires_at", granted.ExpiresAt).
+			Msg("LEASH granted")
+
+	case vettidnats.MsgAgentLeashDenied:
+		// Owner denied a LEASH mint request — resolve the tracker with
+		// a denied status so the HTTP handler returns 403.
+		plaintext, err := crypto.Decrypt(connKey, env.Payload, nil)
+		if err != nil {
+			log.Error().Err(err).Msg("Failed to decrypt leash denied envelope")
+			return
+		}
+		defer crypto.ZeroBytes(plaintext)
+		var denied vettidnats.AgentLeashDeniedPayload
+		if err := json.Unmarshal(plaintext, &denied); err != nil {
+			log.Error().Err(err).Msg("Failed to unmarshal leash denied payload")
+			return
+		}
+		server.Tracker().Resolve(denied.RequestID, &api.TrackedResult{
+			RequestID: denied.RequestID,
+			Status:    api.StatusDenied,
+			Reason:    denied.Reason,
+		})
+		log.Info().
+			Str("request_id", denied.RequestID).
+			Str("reason", denied.Reason).
+			Msg("LEASH mint denied")
 
 	default:
 		log.Debug().Str("type", string(env.Type)).Msg("Ignoring unknown NATS message type")

@@ -44,6 +44,9 @@ type Server struct {
 	agentPub        []byte
 	vaultPub        []byte
 	persist         Persister
+	// configDir is used by handleLeashMint to load the agent's Ed25519
+	// LEASH keypair (leash_agent_key.json) lazily on first mint.
+	configDir       string
 
 	// Session state (rotatable). Phase 5 split this out so the
 	// /v1/pair/extend endpoint can hot-rotate the session key after a
@@ -138,6 +141,12 @@ type ServerConfig struct {
 	// but returns a `persisted:false` flag so the caller knows the
 	// next daemon restart will have to re-extend.
 	Persist Persister
+
+	// ConfigDir is the daemon's config directory — used to load the
+	// agent's Ed25519 LEASH keypair (leash_agent_key.json) when the
+	// AI initiates a LEASH mint via POST /v1/leash/mint. Optional; if
+	// unset the leash mint endpoint returns 501.
+	ConfigDir string
 }
 
 func NewServer(cfg *ServerConfig) (*Server, error) {
@@ -188,6 +197,7 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		agentPub:        cfg.AgentPublicKey,
 		vaultPub:        cfg.VaultPublicKey,
 		persist:         cfg.Persist,
+		configDir:       cfg.ConfigDir,
 		catalog:    NewCatalogCache(),
 		tracker:    NewRequestTracker(requestTimeout),
 		inbox:      NewMessageInbox(),
