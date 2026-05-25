@@ -912,6 +912,16 @@ func handleNATSResponse(data []byte, server *api.Server, validator *vettidnats.E
 			Int("entries", len(catalog.Entries)).
 			Msg("Secret catalog updated")
 
+	case vettidnats.MsgAgentMessageAck:
+		// Vault's delivery confirmation for a message THIS agent sent
+		// (the outer HandleAgentMessage publishes an ack envelope on
+		// the same forOwner.agent.<conn> subject the agent listens on).
+		// Don't inbox / log / broadcast — the agent already logged the
+		// outbound when it called PublishMessage. Logging at debug to
+		// preserve a trace for protocol debugging without spamming.
+		log.Debug().Str("type", string(env.Type)).Msg("Delivery ack received")
+		return
+
 	case vettidnats.MsgAgentMessageResponse:
 		// Owner→agent chat message (or owner's reply to an
 		// agent-initiated message). Decrypt with the current session
@@ -927,6 +937,19 @@ func handleNATSResponse(data []byte, server *api.Server, validator *vettidnats.E
 		var resp vettidnats.AgentMessageResponse
 		if err := json.Unmarshal(plaintext, &resp); err != nil {
 			log.Error().Err(err).Msg("Failed to unmarshal owner message")
+			return
+		}
+
+		// Pre-fix vaults still send delivery acks under
+		// MsgAgentMessageResponse rather than the dedicated
+		// MsgAgentMessageAck type — recognize the ack shape (only
+		// message_id populated, no reply_content / action / reply_to)
+		// and drop it so the agent doesn't echo its own sends back
+		// into the inbox + log + WebSocket broadcasts. Once every
+		// vault deployment carries the agent_message_ack type, this
+		// fallback can be removed.
+		if resp.ReplyContent == "" && resp.Action == "" && resp.ReplyTo == "" {
+			log.Debug().Str("message_id", resp.MessageID).Msg("Ignoring delivery ack on legacy message_response type")
 			return
 		}
 

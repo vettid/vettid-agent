@@ -25,6 +25,7 @@ const (
 	MsgAgentActionResponse    MessageType = "agent_action_response"   // vault → agent: action result
 	MsgAgentMessage           MessageType = "agent_message"           // agent → vault: text/approval message
 	MsgAgentMessageResponse   MessageType = "agent_message_response"  // vault → agent: user reply
+	MsgAgentMessageAck        MessageType = "agent_message_ack"       // vault → agent: delivery confirmation for an agent-sent message
 )
 
 type Envelope struct {
