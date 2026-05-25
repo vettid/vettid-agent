@@ -725,13 +725,19 @@ func (s *Server) handlePairExtend(w http.ResponseWriter, r *http.Request) {
 
 	persisted := false
 	if s.persist != nil {
+		// SECURITY: every []byte assigned here must be an independent copy.
+		// persistCreds.Zero() wipes the underlying bytes — aliasing
+		// outcome.SessionKey (just handed to RotateSession) or
+		// outcome.VaultPubKey would zero the LIVE session key on Server,
+		// silently breaking every subsequent decrypt until process
+		// restart reloads from disk.
 		persistCreds := &credential.ConnectionCredentials{
 			ConnectionID:           snap.ConnectionID,
-			ConnectionKey:          outcome.SessionKey,
+			ConnectionKey:          append([]byte(nil), outcome.SessionKey...),
 			KeyID:                  snap.KeyID,
 			AgentPrivateKey:        append([]byte(nil), outcome.AgentKeyPair.PrivateKey[:]...),
 			AgentPublicKey:         append([]byte(nil), outcome.AgentKeyPair.PublicKey[:]...),
-			VaultPublicKey:         outcome.VaultPubKey,
+			VaultPublicKey:         append([]byte(nil), outcome.VaultPubKey...),
 			JWT:                    s.scopedJWT,
 			Seed:                   s.scopedSeed,
 			MessageSpaceURL:        s.messageSpaceURL,
@@ -747,9 +753,6 @@ func (s *Server) handlePairExtend(w http.ResponseWriter, r *http.Request) {
 		} else {
 			persisted = true
 		}
-		// The persistCreds object owns copies — zero them now that
-		// they've been written. The Server-held copies of agentPriv
-		// remain live.
 		persistCreds.Zero()
 	}
 
