@@ -59,11 +59,12 @@ type Server struct {
 	sessionMu    sync.RWMutex
 	sessionState sessionState
 
-	catalog   *CatalogCache
-	tracker   *RequestTracker
-	inbox     *MessageInbox
-	sequence  atomic.Uint64
-	startTime time.Time
+	catalog    *CatalogCache
+	tracker    *RequestTracker
+	inbox      *MessageInbox
+	messageLog *MessageLog
+	sequence   atomic.Uint64
+	startTime  time.Time
 
 	// Set of currently-connected WebSocket clients. BroadcastEvent
 	// iterates this to push server-originated events (owner messages,
@@ -187,11 +188,12 @@ func NewServer(cfg *ServerConfig) (*Server, error) {
 		agentPub:        cfg.AgentPublicKey,
 		vaultPub:        cfg.VaultPublicKey,
 		persist:         cfg.Persist,
-		catalog:         NewCatalogCache(),
-		tracker:   NewRequestTracker(requestTimeout),
-		inbox:     NewMessageInbox(),
-		wsClients: make(map[*wsConn]struct{}),
-		startTime: time.Now(),
+		catalog:    NewCatalogCache(),
+		tracker:    NewRequestTracker(requestTimeout),
+		inbox:      NewMessageInbox(),
+		messageLog: NewMessageLog(),
+		wsClients:  make(map[*wsConn]struct{}),
+		startTime:  time.Now(),
 	}
 
 	registerRoutes(mux, s)
@@ -301,6 +303,15 @@ func (s *Server) Catalog() *CatalogCache {
 // arrives; drained by GET /v1/messages/inbox.
 func (s *Server) Inbox() *MessageInbox {
 	return s.inbox
+}
+
+// MessageLog returns the bidirectional history of recent owner↔agent
+// messages. Pushed to by both send (POST /v1/messages/send) and
+// receive (NATS dispatch case) paths; queried by GET /v1/messages.
+// Distinct from Inbox: log keeps every message until eviction, inbox
+// drains on read.
+func (s *Server) MessageLog() *MessageLog {
+	return s.messageLog
 }
 
 // nextSequence returns the next monotonic sequence number for NATS messages.

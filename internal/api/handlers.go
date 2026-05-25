@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,8 +29,49 @@ func registerRoutes(mux *http.ServeMux, s *Server) {
 	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
 	mux.HandleFunc("POST /v1/messages/send", s.handleSendMessage)
 	mux.HandleFunc("GET /v1/messages/inbox", s.handleMessagesInbox)
+	mux.HandleFunc("GET /v1/messages", s.handleListMessages)
 	mux.HandleFunc("POST /v1/connection/disconnect", s.handleDisconnect)
 	mux.HandleFunc("POST /v1/pair/extend", s.handlePairExtend)
+}
+
+// handleListMessages returns recent bidirectional conversation history
+// from the daemon-local log. Used by an AI process at startup to
+// recover context — what was the last thing the owner said? what did
+// I last say back?
+//
+// Query params:
+//   - limit: max messages to return (default 50, max 200)
+//   - before: cursor message_id; returns messages strictly older than
+//     this one. Omit for the most recent window.
+//
+// Response:
+//
+//	{"messages": [LoggedMessage, ...], "total_logged": N}
+//
+// total_logged is the current size of the in-memory log — useful for
+// detecting eviction (if total_logged == cap, the oldest messages
+// may have been dropped already).
+//
+// Limitation: the log is daemon-local and in-memory. Restarts of
+// `vettid-agent start` lose the history. Survives AI-process
+// restarts (the AI is a separate process from the daemon).
+func (s *Server) handleListMessages(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	var limit int
+	if l := q.Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil {
+			limit = n
+		}
+	}
+	before := q.Get("before")
+	msgs := s.messageLog.Recent(limit, before)
+	if msgs == nil {
+		msgs = []LoggedMessage{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"messages":     msgs,
+		"total_logged": s.messageLog.Len(),
+	})
 }
 
 // handleMessagesInbox drains the in-memory buffer of owner→agent chat
@@ -521,6 +563,16 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("failed to send: %v", err)})
 		return
 	}
+
+	// Append the outbound side to the bidirectional log so GET
+	// /v1/messages can reconstruct the conversation. Log only on
+	// publish success — failed sends shouldn't appear in history.
+	s.messageLog.Append(LoggedMessage{
+		MessageID: messageID,
+		Direction: "outgoing",
+		Content:   req.Content,
+		SentAt:    time.Now().UTC(),
+	})
 
 	// Register in tracker if approval request (caller may want to wait for response)
 	if req.ContentType == "approval_request" {

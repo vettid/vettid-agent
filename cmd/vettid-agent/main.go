@@ -930,20 +930,30 @@ func handleNATSResponse(data []byte, server *api.Server, validator *vettidnats.E
 			return
 		}
 
+		receivedAt := time.Now().UTC()
 		ownerMsg := api.OwnerMessage{
 			MessageID:  resp.MessageID,
 			ReplyTo:    resp.ReplyTo,
 			Content:    resp.ReplyContent,
 			Action:     resp.Action,
-			ReceivedAt: time.Now().UTC(),
+			ReceivedAt: receivedAt,
 		}
 		// Push to the inbox so a late-connecting or polling-only AI
 		// still gets every message via GET /v1/messages/inbox. The
 		// broadcast below delivers the same payload to any currently-
-		// connected WebSocket client in realtime — pick one, both, or
-		// switch between them; semantics are identical.
+		// connected WebSocket client in realtime. Then append to the
+		// bidirectional message log so GET /v1/messages can recover
+		// context after an AI restart.
 		server.Inbox().Push(ownerMsg)
 		server.BroadcastEvent("owner_message", ownerMsg)
+		server.MessageLog().Append(api.LoggedMessage{
+			MessageID: resp.MessageID,
+			Direction: "incoming",
+			Content:   resp.ReplyContent,
+			ReplyTo:   resp.ReplyTo,
+			Action:    resp.Action,
+			SentAt:    receivedAt,
+		})
 		log.Info().
 			Str("message_id", resp.MessageID).
 			Str("reply_to", resp.ReplyTo).
