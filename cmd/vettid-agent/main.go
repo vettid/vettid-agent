@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -83,6 +84,43 @@ func getConfigDir(cmd *cobra.Command) (string, error) {
 	}
 
 	return dir, nil
+}
+
+// loadOrCreateWSToken returns the persistent local-API auth token. On
+// first start it generates a 32-byte random token (hex-encoded) and
+// writes {configDir}/agent.token mode 0600 so AI tooling on the same
+// host can read it. Subsequent starts reuse the value, refusing to
+// load a file with looser permissions (defense-in-depth against a
+// co-resident attacker chmod-ing the file readable).
+// See SECURITY-REVIEW-2026-05-25.md A-HIGH-1.
+func loadOrCreateWSToken(configDir string) (string, error) {
+	path := filepath.Join(configDir, "agent.token")
+	if info, err := os.Stat(path); err == nil {
+		if perm := info.Mode().Perm(); perm&0o077 != 0 {
+			return "", fmt.Errorf("ws auth token %s has mode %o, expected 0600", path, perm)
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("read ws token: %w", err)
+		}
+		tok := strings.TrimSpace(string(b))
+		if tok == "" {
+			return "", fmt.Errorf("ws token file %s is empty", path)
+		}
+		return tok, nil
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat ws token: %w", err)
+	}
+	raw, err := crypto.GenerateRandomBytes(32)
+	if err != nil {
+		return "", fmt.Errorf("generate ws token: %w", err)
+	}
+	tok := hex.EncodeToString(raw)
+	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
+		return "", fmt.Errorf("write ws token: %w", err)
+	}
+	log.Info().Str("path", path).Msg("Generated new local-API auth token (share with AI tooling)")
+	return tok, nil
 }
 
 func newInitCmd() *cobra.Command {
@@ -368,9 +406,21 @@ and begins serving the local API and WebSocket endpoint.`,
 				return credential.Save(configDir, newCreds, passphrase, platformKey)
 			}
 
+			// Load or create the local-API auth token. Persisted at
+			// {configDir}/agent.token so AI tooling on the same host
+			// can read it without prompting. Without this, the WS
+			// auth check rejected every upgrade and the optional TCP
+			// REST auth middleware had no usable secret. See
+			// SECURITY-REVIEW-2026-05-25.md A-HIGH-1.
+			wsToken, err := loadOrCreateWSToken(configDir)
+			if err != nil {
+				return fmt.Errorf("load ws auth token: %w", err)
+			}
+
 			// Start API server with all dependencies
 			server, err := api.NewServer(&api.ServerConfig{
 				Listen:                 cfg.API.Listen,
+				WSToken:                wsToken,
 				AllowedOrigins:         allowedOrigins,
 				NATSClient:             client,
 				ConnKey:                creds.ConnectionKey,
@@ -628,6 +678,11 @@ the session TTL elapses), so the local cleanup happens unconditionally —
 
 			if err := credential.Delete(configDir); err != nil {
 				return fmt.Errorf("delete connection.enc: %w", err)
+			}
+			// Also wipe the local-API auth token. Leaving it would
+			// let stale AI tooling believe it has a live agent.
+			if err := os.Remove(filepath.Join(configDir, "agent.token")); err != nil && !os.IsNotExist(err) {
+				log.Warn().Err(err).Msg("Failed to remove agent.token (non-fatal)")
 			}
 			fmt.Println("Local credentials wiped.")
 			return nil

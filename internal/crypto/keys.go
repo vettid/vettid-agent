@@ -61,11 +61,19 @@ func (kp *X25519KeyPair) Zero() {
 
 // ComputeSharedSecret performs X25519 ECDH to derive a shared secret.
 // The caller must zero the returned secret after use.
+//
+// SECURITY: routes through safeX25519 so the peer public key (which
+// crosses a trust boundary every time — Stage-2 pairing and every
+// extend take a vault_pubkey from the wire) is rejected if it is one
+// of the 7 well-known small-order points. Without this check, a vault
+// impostor able to write to forApp.agent.<conn>.activated could force
+// a known shared secret, making every subsequent agent op decryptable
+// and forgeable. See SECURITY-REVIEW-2026-05-25.md A-HIGH-2.
 func ComputeSharedSecret(privateKey, peerPublicKey []byte) ([]byte, error) {
 	if len(privateKey) != KeySize || len(peerPublicKey) != KeySize {
 		return nil, fmt.Errorf("keys must be %d bytes", KeySize)
 	}
-	shared, err := curve25519.X25519(privateKey, peerPublicKey)
+	shared, err := safeX25519(privateKey, peerPublicKey)
 	if err != nil {
 		return nil, fmt.Errorf("compute shared secret: %w", err)
 	}
