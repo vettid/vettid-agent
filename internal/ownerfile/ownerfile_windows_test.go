@@ -179,7 +179,9 @@ func TestWriteFile_RetriesPastBriefReader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	time.AfterFunc(80*time.Millisecond, func() { f.Close() })
+	// Well inside the retry window (attempts at about 0, 50, 100, 150
+	// and 200 ms), to leave room for a slow runner.
+	time.AfterFunc(30*time.Millisecond, func() { f.Close() })
 
 	if err := WriteFile(path, []byte("new")); err != nil {
 		t.Fatalf("WriteFile with a brief reader: %v", err)
@@ -320,6 +322,15 @@ func TestMkdirAll_NewDirIsOwnerOnlyAndChildrenInherit(t *testing.T) {
 	if len(allowed) != 1 || allowed[0] != user {
 		t.Errorf("child allowed SIDs = %v, want only %s", allowed, user)
 	}
+}
+
+// PowerShell tab-completion appends a separator to directory names.
+func TestMkdirAll_TrailingSeparatorIsStillOwnerOnly(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "cfg")
+	if err := MkdirAll(dir + string(os.PathSeparator)); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	assertOnlyCurrentUser(t, dir)
 }
 
 func TestMkdirAll_LeavesExistingDirAlone(t *testing.T) {

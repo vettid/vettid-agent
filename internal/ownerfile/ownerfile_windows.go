@@ -61,8 +61,9 @@ func ownerOnlySA(inherit bool) (*windows.SecurityAttributes, error) {
 // new file beside the target, created owner-only from its first
 // moment, and that file is then renamed over the target. The rename
 // replaces whatever was at the path and carries the new file's owner
-// and DACL with it. If any step fails the previous file is left as it
-// was.
+// and DACL with it. If any step returns an error the previous file is
+// left as it was. The data is flushed to disk before the rename, so a
+// crash leaves either the old file or the complete new one.
 func WriteFile(path string, data []byte) error {
 	sa, err := ownerOnlySA(false)
 	if err != nil {
@@ -95,6 +96,11 @@ func WriteFile(path string, data []byte) error {
 		os.Remove(tmp)
 		return err
 	}
+	if err := windows.FlushFileBuffers(h); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return &os.PathError{Op: "flush", Path: tmp, Err: err}
+	}
 
 	// Another process (antivirus, an indexer, tooling reading the
 	// token) may hold the target open. A POSIX-style rename replaces
@@ -103,6 +109,10 @@ func WriteFile(path string, data []byte) error {
 	for attempt := 0; ; attempt++ {
 		err = renameOver(h, path)
 		if err == nil || attempt == 4 {
+			break
+		}
+		// Only a file in use is worth waiting for.
+		if !errors.Is(err, windows.ERROR_SHARING_VIOLATION) && !errors.Is(err, windows.ERROR_ACCESS_DENIED) {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -114,12 +124,6 @@ func WriteFile(path string, data []byte) error {
 	}
 	return f.Close()
 }
-
-const (
-	fileRenameInfoEx              = 22 // FILE_INFO_BY_HANDLE_CLASS
-	fileRenameFlagReplaceIfExists = 0x1
-	fileRenameFlagPosixSemantics  = 0x2
-)
 
 // fileRenameInfoHeader is FILE_RENAME_INFO up to, not including, the
 // variable-length FileName that follows it.
@@ -151,8 +155,8 @@ func renameOver(h windows.Handle, path string) error {
 	hdr.FileNameLength = uint32(nameBytes)
 	copy(buf[headerSize:], unsafe.Slice((*byte)(unsafe.Pointer(&name[0])), len(name)*2))
 
-	hdr.Flags = fileRenameFlagReplaceIfExists | fileRenameFlagPosixSemantics
-	err = windows.SetFileInformationByHandle(h, fileRenameInfoEx, &buf[0], uint32(len(buf)))
+	hdr.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
+	err = windows.SetFileInformationByHandle(h, windows.FileRenameInfoEx, &buf[0], uint32(len(buf)))
 	if err == nil {
 		return nil
 	}
@@ -171,6 +175,10 @@ func renameOver(h windows.Handle, path string) error {
 // inherit that. Missing parents are created with the access they
 // inherit. An existing directory is left as it is, as on POSIX.
 func MkdirAll(dir string) error {
+	// SECURITY: a trailing separator would make filepath.Dir return the
+	// directory itself, which would then be created below as a "parent"
+	// with inherited access.
+	dir = filepath.Clean(dir)
 	if info, err := os.Stat(dir); err == nil {
 		if !info.IsDir() {
 			return &os.PathError{Op: "mkdir", Path: dir, Err: errors.New("not a directory")}
