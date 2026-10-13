@@ -3,10 +3,13 @@
 package ownerfile
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -24,11 +27,11 @@ func currentUserSID() (*windows.SID, error) {
 	return tu.User.Sid, nil
 }
 
-// ownerOnlySD builds a security descriptor whose DACL is protected
-// (inherits nothing from the parent) and grants full access to the
-// current user alone. With inherit set, children created inside a
-// directory get the same single entry.
-func ownerOnlySD(inherit bool) (*windows.SECURITY_DESCRIPTOR, error) {
+// ownerOnlySA builds security attributes for a new object: owned by the
+// current user, with a protected DACL (nothing inherited from the
+// parent) that grants full access to that user alone. With inherit
+// set, children created inside a directory get the same single entry.
+func ownerOnlySA(inherit bool) (*windows.SecurityAttributes, error) {
 	sid, err := currentUserSID()
 	if err != nil {
 		return nil, err
@@ -42,76 +45,131 @@ func ownerOnlySD(inherit bool) (*windows.SECURITY_DESCRIPTOR, error) {
 	if err != nil {
 		return nil, fmt.Errorf("build security descriptor: %w", err)
 	}
-	return sd, nil
-}
-
-// restrict replaces the DACL of an open file with the owner-only one.
-// It works on the handle, not the name, so it cannot be redirected to a
-// different file between the open and the call.
-func restrict(h windows.Handle, sd *windows.SECURITY_DESCRIPTOR) error {
-	dacl, _, err := sd.DACL()
-	if err != nil {
-		return fmt.Errorf("read DACL: %w", err)
-	}
-	err = windows.SetSecurityInfo(
-		h, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
-		nil, nil, dacl, nil,
-	)
-	if err != nil {
-		return fmt.Errorf("set DACL: %w", err)
-	}
-	return nil
+	return &windows.SecurityAttributes{
+		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
+		SecurityDescriptor: sd,
+	}, nil
 }
 
 // WriteFile writes data to path so that only the current user can open
-// it. A new file is created with the restricted DACL already in place,
-// so there is no moment at which it carries the parent's inherited
-// entries. An existing file keeps its old DACL through the truncate, so
-// the DACL is replaced before any data is written.
+// it.
+//
+// SECURITY: the data is never written into an object that already
+// exists. An existing file keeps its owner and can keep handles that
+// were opened before its DACL changed, and a symlink or hard link at
+// the path would send the secret somewhere else. So the data goes to a
+// new file beside the target, created owner-only from its first
+// moment, and that file is then renamed over the target. The rename
+// replaces whatever was at the path and carries the new file's owner
+// and DACL with it. If any step fails the previous file is left as it
+// was.
 func WriteFile(path string, data []byte) error {
-	sd, err := ownerOnlySD(false)
+	sa, err := ownerOnlySA(false)
 	if err != nil {
 		return err
 	}
-	p, err := windows.UTF16PtrFromString(path)
+
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Errorf("random temp name: %w", err)
+	}
+	tmp := filepath.Join(filepath.Dir(path),
+		"."+filepath.Base(path)+"."+hex.EncodeToString(suffix[:])+".tmp")
+	p, err := windows.UTF16PtrFromString(tmp)
 	if err != nil {
 		return err
 	}
-	sa := &windows.SecurityAttributes{
-		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
-		SecurityDescriptor: sd,
-	}
+	// CREATE_NEW fails if anything, a link included, is already there.
+	// DELETE access is what lets the handle be renamed below.
 	h, err := windows.CreateFile(
-		p,
-		windows.GENERIC_WRITE|windows.WRITE_DAC,
-		0, // no sharing while we write
-		sa,
-		windows.CREATE_ALWAYS,
-		windows.FILE_ATTRIBUTE_NORMAL,
-		0,
+		p, windows.GENERIC_WRITE|windows.DELETE, 0, sa,
+		windows.CREATE_NEW, windows.FILE_ATTRIBUTE_NORMAL, 0,
 	)
 	if err != nil {
-		return &os.PathError{Op: "open", Path: path, Err: err}
+		return &os.PathError{Op: "create", Path: tmp, Err: err}
 	}
-	f := os.NewFile(uintptr(h), path)
+	f := os.NewFile(uintptr(h), tmp)
 
-	// SECURITY: CREATE_ALWAYS on an existing file ignores the security
-	// attributes, so set the DACL explicitly before writing.
-	if err := restrict(h, sd); err != nil {
-		f.Close()
-		return &os.PathError{Op: "restrict", Path: path, Err: err}
-	}
 	if _, err := f.Write(data); err != nil {
 		f.Close()
+		os.Remove(tmp)
 		return err
+	}
+
+	// Another process (antivirus, an indexer, tooling reading the
+	// token) may hold the target open. A POSIX-style rename replaces
+	// the target even then, provided the other process allowed
+	// deletion; retry briefly for the ones that did not.
+	for attempt := 0; ; attempt++ {
+		err = renameOver(h, path)
+		if err == nil || attempt == 4 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return &os.PathError{Op: "replace", Path: path, Err: err}
 	}
 	return f.Close()
 }
 
+const (
+	fileRenameInfoEx              = 22 // FILE_INFO_BY_HANDLE_CLASS
+	fileRenameFlagReplaceIfExists = 0x1
+	fileRenameFlagPosixSemantics  = 0x2
+)
+
+// fileRenameInfoHeader is FILE_RENAME_INFO up to, not including, the
+// variable-length FileName that follows it.
+type fileRenameInfoHeader struct {
+	Flags          uint32
+	RootDirectory  windows.Handle
+	FileNameLength uint32 // in bytes, without the terminating NUL
+}
+
+// renameOver renames the open file h to path, replacing a file that is
+// already there. It asks for POSIX semantics first, which succeed even
+// while the target is open elsewhere, and falls back to the classic
+// replace on file systems that do not support them (FAT, some network
+// shares). h must have been opened with DELETE access.
+func renameOver(h windows.Handle, path string) error {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return err
+	}
+	name, err := windows.UTF16FromString(abs)
+	if err != nil {
+		return err
+	}
+	nameBytes := (len(name) - 1) * 2
+
+	headerSize := int(unsafe.Offsetof(fileRenameInfoHeader{}.FileNameLength)) + 4
+	buf := make([]byte, headerSize+len(name)*2)
+	hdr := (*fileRenameInfoHeader)(unsafe.Pointer(&buf[0]))
+	hdr.FileNameLength = uint32(nameBytes)
+	copy(buf[headerSize:], unsafe.Slice((*byte)(unsafe.Pointer(&name[0])), len(name)*2))
+
+	hdr.Flags = fileRenameFlagReplaceIfExists | fileRenameFlagPosixSemantics
+	err = windows.SetFileInformationByHandle(h, fileRenameInfoEx, &buf[0], uint32(len(buf)))
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, windows.ERROR_INVALID_PARAMETER) && !errors.Is(err, windows.ERROR_NOT_SUPPORTED) &&
+		!errors.Is(err, windows.ERROR_INVALID_FUNCTION) {
+		return err
+	}
+	// FILE_RENAME_INFO: the same layout, where the first field is the
+	// ReplaceIfExists boolean.
+	hdr.Flags = 1
+	return windows.SetFileInformationByHandle(h, windows.FileRenameInfo, &buf[0], uint32(len(buf)))
+}
+
 // MkdirAll creates dir and any missing parents. If dir itself did not
 // exist it is created owner-only, and files later created inside it
-// inherit that. An existing directory is left as it is, as on POSIX.
+// inherit that. Missing parents are created with the access they
+// inherit. An existing directory is left as it is, as on POSIX.
 func MkdirAll(dir string) error {
 	if info, err := os.Stat(dir); err == nil {
 		if !info.IsDir() {
@@ -124,7 +182,7 @@ func MkdirAll(dir string) error {
 			return err
 		}
 	}
-	sd, err := ownerOnlySD(true)
+	sa, err := ownerOnlySA(true)
 	if err != nil {
 		return err
 	}
@@ -132,27 +190,34 @@ func MkdirAll(dir string) error {
 	if err != nil {
 		return err
 	}
-	sa := &windows.SecurityAttributes{
-		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
-		SecurityDescriptor: sd,
-	}
 	if err := windows.CreateDirectory(p, sa); err != nil {
 		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
-			return nil
+			// Something appeared between the Stat and the create. Accept
+			// it only if it is a directory, as os.MkdirAll does.
+			if info, statErr := os.Stat(dir); statErr == nil && info.IsDir() {
+				return nil
+			}
 		}
 		return &os.PathError{Op: "mkdir", Path: dir, Err: err}
 	}
 	return nil
 }
 
-// Check returns an error if the DACL of path lets anyone other than the
-// current user, SYSTEM or the Administrators group open it.
+// Check returns an error if path is owned by, or its DACL grants access
+// to, anyone other than the current user, SYSTEM or the Administrators
+// group.
 //
 // SYSTEM and Administrators are tolerated because a file created the
 // ordinary way under the user profile inherits entries for both, and
 // because an administrator can take ownership of any file regardless
 // of its DACL. This is the same rule OpenSSH for Windows applies to
 // private keys.
+//
+// It also rejects, by design, a file whose DACL names any other group:
+// Users, Authenticated Users, a domain administrators group, and so
+// on. To repair such a file:
+//
+//	icacls <path> /inheritance:r /grant:r "%USERNAME%:F"
 func Check(path string) error {
 	user, err := currentUserSID()
 	if err != nil {

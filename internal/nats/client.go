@@ -223,7 +223,9 @@ func (c *Client) Close() {
 		// Overwrite before removing
 		if data, err := os.ReadFile(c.credsFile); err == nil {
 			crypto.ZeroBytes(data)
-			ownerfile.WriteFile(c.credsFile, data)
+			// In place, not through ownerfile: that would write the
+			// zeros to a new file and leave the old blocks untouched.
+			os.WriteFile(c.credsFile, data, 0600)
 		}
 		os.Remove(c.credsFile)
 	}
