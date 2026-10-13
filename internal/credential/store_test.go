@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/vettid/vettid-agent/internal/crypto"
+	"github.com/vettid/vettid-agent/internal/ownerfile"
 )
 
 func testCreds() *ConnectionCredentials {
@@ -48,8 +50,13 @@ func TestSaveLoad_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if info.Mode().Perm() != 0600 {
+	// Mode bits are not an access control on Windows; ownerfile.Check
+	// reads the DACL there.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
 		t.Errorf("file permissions = %o, want 0600", info.Mode().Perm())
+	}
+	if err := ownerfile.Check(filepath.Join(dir, credentialFile)); err != nil {
+		t.Errorf("credential file is not owner-only: %v", err)
 	}
 
 	// Load should return identical credentials

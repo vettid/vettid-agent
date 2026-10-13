@@ -26,6 +26,7 @@ import (
 	"github.com/vettid/vettid-agent/internal/crypto"
 	"github.com/vettid/vettid-agent/internal/fingerprint"
 	vettidnats "github.com/vettid/vettid-agent/internal/nats"
+	"github.com/vettid/vettid-agent/internal/ownerfile"
 	"github.com/vettid/vettid-agent/internal/registration"
 )
 
@@ -68,7 +69,8 @@ connectivity, and vault communication.`,
 }
 
 // getConfigDir resolves the config directory from the --config-dir flag,
-// defaulting to ~/.vettid-agent, and creates it with 0700 permissions if needed.
+// defaulting to ~/.vettid-agent, and creates it owner-only (0700 on POSIX, a
+// protected DACL on Windows) if needed.
 func getConfigDir(cmd *cobra.Command) (string, error) {
 	dir, _ := cmd.Flags().GetString("config-dir")
 	if dir == "" {
@@ -79,7 +81,7 @@ func getConfigDir(cmd *cobra.Command) (string, error) {
 		dir = filepath.Join(home, ".vettid-agent")
 	}
 
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := ownerfile.MkdirAll(dir); err != nil {
 		return "", fmt.Errorf("create config directory %s: %w", dir, err)
 	}
 
@@ -95,9 +97,9 @@ func getConfigDir(cmd *cobra.Command) (string, error) {
 // See SECURITY-REVIEW-2026-05-25.md A-HIGH-1.
 func loadOrCreateWSToken(configDir string) (string, error) {
 	path := filepath.Join(configDir, "agent.token")
-	if info, err := os.Stat(path); err == nil {
-		if perm := info.Mode().Perm(); perm&0o077 != 0 {
-			return "", fmt.Errorf("ws auth token %s has mode %o, expected 0600", path, perm)
+	if _, err := os.Stat(path); err == nil {
+		if err := ownerfile.Check(path); err != nil {
+			return "", fmt.Errorf("ws auth token %s %v", path, err)
 		}
 		b, err := os.ReadFile(path)
 		if err != nil {
@@ -116,7 +118,7 @@ func loadOrCreateWSToken(configDir string) (string, error) {
 		return "", fmt.Errorf("generate ws token: %w", err)
 	}
 	tok := hex.EncodeToString(raw)
-	if err := os.WriteFile(path, []byte(tok+"\n"), 0o600); err != nil {
+	if err := ownerfile.WriteFile(path, []byte(tok+"\n")); err != nil {
 		return "", fmt.Errorf("write ws token: %w", err)
 	}
 	log.Info().Str("path", path).Msg("Generated new local-API auth token (share with AI tooling)")

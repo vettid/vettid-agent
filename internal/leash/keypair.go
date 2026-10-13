@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"github.com/vettid/vettid-agent/internal/ownerfile"
 )
 
 // KeyFileName is the on-disk name of the persisted agent keypair.
@@ -68,7 +70,7 @@ func LoadOrCreate(configDir string) (*AgentKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal keypair: %w", err)
 	}
-	if err := os.WriteFile(path, out, 0o600); err != nil {
+	if err := ownerfile.WriteFile(path, out); err != nil {
 		return nil, fmt.Errorf("write %s: %w", path, err)
 	}
 	return &AgentKey{

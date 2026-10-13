@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/vettid/vettid-agent/internal/ownerfile"
 )
 
 // TestLoadOrCreate_PersistsAndReloads — first call generates a fresh
@@ -36,8 +39,13 @@ func TestLoadOrCreate_PersistsAndReloads(t *testing.T) {
 	if err != nil {
 		t.Fatalf("key file not written: %v", err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Mode bits are not an access control on Windows; ownerfile.Check
+	// reads the DACL there.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Errorf("file perms: got %o want 0600", info.Mode().Perm())
+	}
+	if err := ownerfile.Check(path); err != nil {
+		t.Errorf("key file is not owner-only: %v", err)
 	}
 
 	// Second call should load the same key, not regenerate.

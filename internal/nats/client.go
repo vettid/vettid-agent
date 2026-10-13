@@ -11,6 +11,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/vettid/vettid-agent/internal/crypto"
+	"github.com/vettid/vettid-agent/internal/ownerfile"
 )
 
 type Client struct {
@@ -38,7 +39,7 @@ func NewClient(cfg *ClientConfig) (*Client, error) {
 
 	tmpDir := os.TempDir()
 	credsFile := filepath.Join(tmpDir, fmt.Sprintf("vettid-agent-%d.creds", os.Getpid()))
-	if err := os.WriteFile(credsFile, []byte(credsContent), 0600); err != nil {
+	if err := ownerfile.WriteFile(credsFile, []byte(credsContent)); err != nil {
 		return nil, fmt.Errorf("write temp credentials: %w", err)
 	}
 
@@ -222,7 +223,7 @@ func (c *Client) Close() {
 		// Overwrite before removing
 		if data, err := os.ReadFile(c.credsFile); err == nil {
 			crypto.ZeroBytes(data)
-			os.WriteFile(c.credsFile, data, 0600)
+			ownerfile.WriteFile(c.credsFile, data)
 		}
 		os.Remove(c.credsFile)
 	}

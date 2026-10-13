@@ -21,6 +21,7 @@ import (
 
 	"github.com/vettid/vettid-agent/internal/crypto"
 	"github.com/vettid/vettid-agent/internal/fingerprint"
+	"github.com/vettid/vettid-agent/internal/ownerfile"
 )
 
 const (
@@ -129,7 +130,7 @@ func Save(configDir string, creds *ConnectionCredentials, passphrase, platformKe
 	}
 
 	path := filepath.Join(configDir, credentialFile)
-	if err := os.WriteFile(path, data, 0600); err != nil {
+	if err := ownerfile.WriteFile(path, data); err != nil {
 		return fmt.Errorf("write %s: %w", path, err)
 	}
 
