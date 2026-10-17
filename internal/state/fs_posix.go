@@ -210,3 +210,7 @@ func lockDir(path string) (io.Closer, error) {
 	}
 	return f, nil
 }
+
+// flushRetries: a failed fsync is not retried on POSIX (see
+// retryDurable).
+const flushRetries = 0

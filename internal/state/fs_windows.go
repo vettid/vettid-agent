@@ -488,3 +488,6 @@ func lockDir(path string) (io.Closer, error) {
 	}
 	return &winLock{h: h}, nil
 }
+
+// flushRetries: FlushFileBuffers may be retried (see retryDurable).
+const flushRetries = 3

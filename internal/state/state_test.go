@@ -854,9 +854,13 @@ func TestNotDurable(t *testing.T) {
 	}
 }
 
-// CreateReplace with a flush that fails once after the rename: the
-// flush is retried, and once it succeeds the old bytes are overwritten.
+// CreateReplace with a flush that fails once after the rename: on
+// Windows the flush is retried, and once it succeeds the old bytes are
+// overwritten. (POSIX does not retry fsync; see TestCreateReplaceNeverDurable.)
 func TestCreateReplaceFlushRetried(t *testing.T) {
+	if flushRetries == 0 {
+		t.Skip("flushes are not retried on this system")
+	}
 	s, oldP, link, size := replaceSetup(t)
 	calls := 0
 	old, oldDelay := makeDurable, durableRetryDelay
@@ -884,8 +888,9 @@ func TestCreateReplaceFlushRetried(t *testing.T) {
 	}
 }
 
-// A flush that never succeeds: ErrNotDurable, the old bytes are left in
-// place, and the new state is loaded and readable.
+// A flush that never succeeds (on POSIX: a flush that fails once, as it
+// is not retried): ErrNotDurable, the old bytes are left in place, and
+// the new state is loaded and readable.
 func TestCreateReplaceNeverDurable(t *testing.T) {
 	s, oldP, link, _ := replaceSetup(t)
 	var before []byte
@@ -903,8 +908,8 @@ func TestCreateReplaceNeverDurable(t *testing.T) {
 	if !errors.Is(err, ErrNotDurable) {
 		t.Fatalf("CreateReplace = %v, want ErrNotDurable", err)
 	}
-	if calls != 4 {
-		t.Errorf("%d flush attempts, want 4 (one, then three retries)", calls)
+	if calls != 1+flushRetries {
+		t.Errorf("%d flush attempts, want %d", calls, 1+flushRetries)
 	}
 	if link != "" {
 		if got, _ := os.ReadFile(link); !bytes.Equal(got, before) {

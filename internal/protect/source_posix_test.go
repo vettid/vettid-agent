@@ -187,7 +187,8 @@ func writePrivate(t *testing.T, path, content string, mode os.FileMode) {
 
 // A named FIFO on disk passes only with no group or other permission
 // bits. (Every pipe must also belong to the current user; a pipe owned
-// by another user needs root to make, so that branch is not tested.)
+// by another user needs a second user to test, so that branch is not
+// tested here.)
 func TestReadFDRefusesWritableFIFO(t *testing.T) {
 	for _, c := range []struct {
 		mode os.FileMode

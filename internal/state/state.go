@@ -97,8 +97,9 @@ var (
 	// flush after the rename failed, so it may not survive a crash. The
 	// Store treats the new state as written (a following Save works, and
 	// a Create is not retried); saving again is the way to make it
-	// durable. From CreateReplace it means the flush also failed on
-	// retry, and the old state file's bytes were left in place (not
+	// durable (on POSIX a failed fsync is not retried, see retryDurable).
+	// From CreateReplace it means the flush failed (on Windows also on
+	// retry), and the old state file's bytes were left in place (not
 	// overwritten; where the replace had to overwrite first, because the
 	// file system cannot rename over an open file, they were already
 	// overwritten). For protectors whose Wipe deletes nothing (the
@@ -300,7 +301,8 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 		if old != nil && errors.Is(err, ErrNotDurable) {
 			// The new file is in place but not yet durable. The old
 			// bytes are overwritten only once a flush succeeds, so keep
-			// the handle and retry the flush a few times.
+			// the handle and retry the flush where that is sound
+			// (Windows; never on POSIX, see retryDurable).
 			if err = s.retryDurable(); err != nil {
 				// Never flushed: the old file's bytes are left in place
 				// (closing the handle releases the file). Protectors
@@ -330,12 +332,15 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 // file this process holds open; tests replace it.
 var probeReplaceOpen = replaceOpenFileSupport
 
-// retryDurable retries the flushes after a rename (makeDurable) up to
-// three more times, 20 ms apart; it returns ErrNotDurable if they all
-// fail.
+// retryDurable retries the flushes after a rename (makeDurable)
+// flushRetries more times, 20 ms apart; it returns ErrNotDurable if they
+// all fail. On POSIX flushRetries is 0: after a failed fsync, Linux can
+// report a later fsync as successful without the data being on disk, so
+// a failed flush is final there. On Windows FlushFileBuffers can be
+// retried.
 func (s *Store) retryDurable() error {
-	var err error
-	for i := 0; i < 3; i++ {
+	err := errors.New("flush failed")
+	for i := 0; i < flushRetries; i++ {
 		time.Sleep(durableRetryDelay)
 		if err = makeDurable(s.dir, s.Path()); err == nil {
 			return nil
