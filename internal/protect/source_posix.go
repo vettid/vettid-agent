@@ -36,8 +36,9 @@ func openPassphraseFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 }
 
-// checkPassphraseFD accepts a pipe, or a regular file that passes the
-// same owner-only check as --passphrase-file.
+// checkPassphraseFD accepts a pipe that only its owner can write to, or
+// a regular file that passes the same owner-only check as
+// --passphrase-file.
 func checkPassphraseFD(fd int) error {
 	var st syscall.Stat_t
 	if err := syscall.Fstat(fd, &st); err != nil {
@@ -45,6 +46,12 @@ func checkPassphraseFD(fd int) error {
 	}
 	switch st.Mode & syscall.S_IFMT {
 	case syscall.S_IFIFO:
+		// An anonymous pipe is mode 0600; a named FIFO on disk has its
+		// file mode. One that others can write to could carry their
+		// passphrase instead of the operator's.
+		if os.FileMode(st.Mode).Perm()&0o022 != 0 {
+			return errors.New("the pipe is writable by other users (a named FIFO must be mode 0600 or 0640)")
+		}
 		return nil
 	case syscall.S_IFREG:
 		if st.Uid != uint32(os.Geteuid()) {

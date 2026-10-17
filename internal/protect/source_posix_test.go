@@ -173,3 +173,52 @@ func TestReadFDRegularFileMustBeOwnerOnly(t *testing.T) {
 		t.Fatalf("Read of a 0644 file through a descriptor = %v", err)
 	}
 }
+
+// writePrivate writes content to path with exactly mode.
+func writePrivate(t *testing.T, path, content string, mode os.FileMode) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A named FIFO on disk passes only if no one else can write to it.
+func TestReadFDRefusesWritableFIFO(t *testing.T) {
+	for _, c := range []struct {
+		mode os.FileMode
+		ok   bool
+	}{{0o600, true}, {0o620, false}, {0o602, false}, {0o640, true}} {
+		path := filepath.Join(t.TempDir(), "fifo")
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Skipf("mkfifo: %v", err)
+		}
+		if err := os.Chmod(path, c.mode); err != nil {
+			t.Fatal(err)
+		}
+		r, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w, err := os.OpenFile(path, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		w.Write([]byte("Pass-Phrase-1\n"))
+		w.Close()
+		fd := dupOf(t, r)
+		_, err = PassphraseSource{FD: fd}.Read("", false)
+		r.Close()
+		if c.ok && err != nil {
+			t.Errorf("FIFO mode %04o: %v", c.mode, err)
+		}
+		if !c.ok {
+			syscall.Close(fd)
+			if err == nil || !strings.Contains(err.Error(), "writable by other users") {
+				t.Errorf("FIFO mode %04o: %v, want a refusal", c.mode, err)
+			}
+		}
+	}
+}

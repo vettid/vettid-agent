@@ -93,6 +93,12 @@ var (
 	// determined, so its key may remain. WipeAll with every known
 	// protector deletes it.
 	ErrProtectorUnknown = errors.New("the state file's protector is not known, so its key may remain; wipe with every known protector")
+	// ErrNotDurable: the new state file was renamed into place, but a
+	// flush after the rename failed, so it may not survive a crash. The
+	// Store treats the new state as written (a following Save works, and
+	// a Create is not retried); saving again is the way to make it
+	// durable.
+	ErrNotDurable = errors.New("state: the new state file is in place but may not be durable")
 	// ErrNothingToWipe: Wipe found no state file and nothing loaded.
 	ErrNothingToWipe = errors.New("no state file: nothing to wipe (not paired)")
 	// ErrNotLoaded: Save before Create or Load.
@@ -285,6 +291,10 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	// flushed (file and directory), so the old bytes are overwritten
 	// only once the new state is durable.
 	if err := s.create(p, state); err != nil {
+		// Also on ErrNotDurable: the old bytes are overwritten only once
+		// the new file is durable. The old file can no longer be opened
+		// (its protector's key is gone), and closing the handle releases
+		// it.
 		if old != nil {
 			old.Close()
 		}
@@ -322,13 +332,16 @@ func (s *Store) create(p Protector, state []byte) error {
 		return fmt.Errorf("state: protector %s could not wrap the key: %w", p.Name(), err)
 	}
 	h := &header{V: Version, Protector: p.Name(), WrappedKey: wrapped, CreatedAt: time.Now().Unix()}
-	if err := s.write(h, key, state); err != nil {
+	err = s.write(h, key, state)
+	if err != nil && !errors.Is(err, ErrNotDurable) {
 		clear(key)
 		return err
 	}
+	// Written (durably, or in place with ErrNotDurable): the file on disk
+	// is under this key, so the Store holds it as loaded either way.
 	s.forget()
 	s.prot, s.wrapped, s.dataKey, s.createdAt = p, wrapped, key, h.CreatedAt
-	return nil
+	return err
 }
 
 // Save writes state under the data key of the last Create or Load, with
@@ -607,7 +620,7 @@ func writeAtomic(dir, path string, raw []byte) error {
 		return fmt.Errorf("state: replace state file: %w", err)
 	}
 	if err := makeDurable(dir, path); err != nil {
-		return fmt.Errorf("state: the new state file is in place but may not be durable (flush failed): %w", err)
+		return fmt.Errorf("%w (flush failed): %w", ErrNotDurable, err)
 	}
 	return nil
 }

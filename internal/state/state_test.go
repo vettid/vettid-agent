@@ -824,21 +824,32 @@ func TestCreateReplaceProbeErrorChangesNothing(t *testing.T) {
 	}
 }
 
-// A flush failure after the rename says the new file is in place but
-// may not be durable.
-func TestFlushFailureMessage(t *testing.T) {
+// A flush failure after the rename is ErrNotDurable. The Store holds
+// the new key as loaded: a following Save works (not ErrNotLoaded), a
+// Create is refused as ErrExists (not pushed into CreateReplace), and
+// Load reads the new state.
+func TestNotDurable(t *testing.T) {
 	old := makeDurable
 	makeDurable = func(string, string) error { return errors.New("flush refused") }
 	defer func() { makeDurable = old }()
 	s := openTest(t)
 	p := newFixedProtector(seq(0x40, 32))
 	err := s.Create(p, []byte("a"))
-	if err == nil || !strings.Contains(err.Error(), "in place but may not be durable") || !strings.Contains(err.Error(), "flush refused") {
-		t.Fatalf("Create = %v", err)
+	if !errors.Is(err, ErrNotDurable) || !strings.Contains(err.Error(), "in place but may not be durable") || !strings.Contains(err.Error(), "flush refused") {
+		t.Fatalf("Create = %v, want ErrNotDurable", err)
+	}
+	if err := s.Save([]byte("b")); !errors.Is(err, ErrNotDurable) {
+		t.Fatalf("Save while flushes fail = %v, want ErrNotDurable", err)
 	}
 	makeDurable = old
-	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "a" {
-		t.Errorf("the new file should be in place: %q, %v", got, err)
+	if err := s.Save([]byte("c")); err != nil {
+		t.Fatalf("Save after the flush recovers: %v", err)
+	}
+	if err := s.Create(p, []byte("d")); !errors.Is(err, ErrExists) {
+		t.Errorf("Create after ErrNotDurable = %v, want ErrExists", err)
+	}
+	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "c" {
+		t.Errorf("Load = %q, %v", got, err)
 	}
 }
 

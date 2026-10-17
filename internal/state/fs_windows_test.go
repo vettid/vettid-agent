@@ -237,3 +237,32 @@ func TestProbeClassification(t *testing.T) {
 		t.Errorf("the probe left files: %v", names)
 	}
 }
+
+// "Not supported" counts only from the rename itself: the same code from
+// the probe's set-up is an error, so CreateReplace stops before wiping.
+func TestProbeSetupErrorsAreErrors(t *testing.T) {
+	s := openTest(t)
+	old := probeCreateTemp
+	defer func() { probeCreateTemp = old }()
+	for _, code := range []error{windows.ERROR_NOT_SUPPORTED, windows.ERROR_INVALID_PARAMETER, windows.ERROR_DISK_FULL} {
+		probeCreateTemp = func(string, string, string) (*os.File, string, error) { return nil, "", code }
+		ok, err := replaceOpenFileSupport(s.Dir())
+		if ok || err == nil {
+			t.Errorf("set-up failing with %v: ok %v err %v, want an error", code, ok, err)
+		}
+	}
+	probeCreateTemp = old
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	probeCreateTemp = func(string, string, string) (*os.File, string, error) {
+		return nil, "", windows.ERROR_NOT_SUPPORTED
+	}
+	if err := s.CreateReplace(p, []byte("b"), nil); err == nil || !strings.Contains(err.Error(), "nothing was replaced") {
+		t.Fatalf("CreateReplace with a failing probe set-up = %v", err)
+	}
+	if !p.hasKey || p.wiped != 0 {
+		t.Error("the old key was wiped")
+	}
+}

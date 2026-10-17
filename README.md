@@ -72,12 +72,16 @@ The connector takes the passphrase from one of:
 
 - a prompt on the terminal (no echo), when neither flag is given;
 - `--passphrase-file PATH`: a regular file holding the passphrase on one
-  line (one trailing line break is ignored). On Linux and macOS it must
-  be owned by you and readable by you only (`chmod 600`);
+  line (one trailing line break is ignored). It must be private to you:
+  on Linux and macOS owned by you and readable by you only (`chmod 600`);
+  on Windows owned by you with no access for anyone else (for example
+  `icacls <file> /inheritance:r /grant:r "%USERNAME%:F"`);
 - `--passphrase-fd N`: a pipe or regular file the parent process opened
   as descriptor `N`, read up to the first line break. A regular file
-  must be owner-only, as for `--passphrase-file` (Linux and macOS);
-  a pipe needs no check. Descriptors 0, 1 and 2 are refused, so
+  must be private to you, as for `--passphrase-file`. A pipe can be an
+  anonymous pipe (preferred) or a named FIFO on disk; a FIFO must not be
+  writable by other users (mode `0600` or `0640`), or the connector
+  refuses it. Descriptors 0, 1 and 2 are refused, so
   `echo … | vettid-agent … --passphrase-fd 0` is not supported; use
   another descriptor, for example a pipe from a secret store,
   `vettid-agent … --passphrase-fd 3 3< <(secret-tool lookup …)`, or a

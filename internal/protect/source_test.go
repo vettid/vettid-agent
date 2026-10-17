@@ -43,12 +43,7 @@ func TestReadLine(t *testing.T) {
 func writeFile(t *testing.T, content string, mode os.FileMode) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "passphrase")
-	if err := os.WriteFile(path, []byte(content), mode); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(path, mode); err != nil {
-		t.Fatal(err)
-	}
+	writePrivate(t, path, content, mode)
 	return path
 }
 

@@ -1,4 +1,4 @@
-//go:build !linux && !darwin
+//go:build !linux && !darwin && !windows
 
 package protect
 
@@ -7,10 +7,8 @@ import (
 	"os"
 )
 
-// checkPassphraseFile on systems without POSIX modes checks only that
-// the file is a regular file. On Windows the file's DACL is not checked
-// (AGENT-PLAN §6 A1.2 asks for the owner-only check on POSIX); keep the
-// file in a directory only the current user can read.
+// checkPassphraseFile on other systems (not supported by the connector,
+// AGENT-PLAN §2 AG4) checks only that the file is a regular file.
 func checkPassphraseFile(f *os.File) error {
 	fi, err := f.Stat()
 	if err != nil {
