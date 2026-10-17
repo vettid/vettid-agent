@@ -1,0 +1,9 @@
+# gitleaks: the default rules, plus an allowlist for the vault's public
+# test vectors (AGENT-PLAN §5). Their keys come from fixed, published test
+# seeds (VAULT-MESSAGING §16) and protect nothing.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "VAULT-MESSAGING §16 test vectors (public test seeds)"
+paths = ['''^testdata/vectors/[^/]+\.json$''']
