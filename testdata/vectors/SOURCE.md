@@ -28,3 +28,34 @@ case's status statement.
 
 `.gitattributes` keeps line endings unchanged on every platform, so the
 sha256 holds on Windows checkouts too.
+
+## The connector's own vectors
+
+Not copied from anywhere: generated in this repository from fixed,
+public test inputs (AGENT-PLAN §5). The same rule applies: a vector that
+stops matching is a stop-and-report item. A change to the state file
+format is a new header version with new vectors beside these, never an
+edit of these.
+
+| File | Source path | sha256sum | Checked by |
+|---|---|---|---|
+| `statefile.json` | (generated here) | `36fd3d093bc43e41e6dae56833cb42f5fe05a41969467582f1f5359ba640ef6f` | `internal/state` `TestStateFileVectors` |
+
+`statefile.json` holds the state file format of `docs/STATE-FILE.md`
+under a test-only protector with a fixed key (`test-fixed`), a fixed data
+key, nonce and `created_at`: one valid file, and files refused for a
+tampered header (each still canonical JSON, so that only the
+authentication catches it), a non-canonical header (white space, member
+case, a duplicate or unknown member, member order), an unknown version,
+an unknown protector, a wrapped key under another protector key, a header
+wrapping another data key, five truncations, a trailing byte and a
+tampered tag. Each case names its expected result (`ok`,
+`format: <check>`, `unknown_protector`, `unwrap` or `decrypt`).
+
+`TestStateFileVectors` regenerates the file and compares it byte for
+byte, checks this table's sha256, and decodes every case. To regenerate
+after a deliberate change (a new version, reviewed as such):
+
+```sh
+go test ./internal/state -run TestStateFileVectors -update
+```
