@@ -1,0 +1,46 @@
+# Pinned sources
+
+The connector builds on vettid-vault's reference client and wire packages
+instead of reimplementing the protocol (AGENT-PLAN §2 AG2, §3.2). They
+are pinned to one commit; a change to the pin is its own PR, with the
+vectors of `testdata/vectors/` re-copied from the new commit and their
+tests passing (AGENT-PLAN §5, §10 risk 2).
+
+| Module | Version in `go.mod` | Commit | Date (UTC) |
+|---|---|---|---|
+| `github.com/vettid/vettid-vault` | `v0.0.0-20261017190144-1ef2dd9ec686` | `1ef2dd9ec68627a80e18d665032fcd58e3a61a1d` (`main`, "Staging release 16 (S16): release number", #108) | 2026-10-17 19:01:44 |
+| `github.com/vettid/vettid-relay` (indirect, through vettid-vault) | `v0.0.0-20261015153542-cc3ce892f9dc` | `cc3ce892f9dcb990e9e9752f19c3e0e296dd12b9` (`main`, RELAY-PROTOCOL 0.9.4 byte budgets, #14) | 2026-10-15 15:35:42 |
+
+## Why these commits
+
+- **vettid-vault `1ef2dd9`** is the `main` head when A0.2 was written and
+  the commit AGENT-PLAN 0.1.2 was checked against (§1, §3.2): the agent
+  side of pairing, access sessions and LEASH in the enclave, and the
+  reference client's `client/leash.go`. The module has no tags, so the
+  dependency is a pseudo-version of a `main` commit.
+- **vettid-relay `cc3ce89`** is not chosen here: it is the version
+  vettid-vault `1ef2dd9` requires in its own `go.mod` (the relay client
+  and token packages its `client` imports), and Go's minimal version
+  selection keeps it. It is recorded so that a relay change reaching the
+  connector is visible in review.
+
+## What is used
+
+- `github.com/vettid/vettid-vault/client`: pairing, the vault session,
+  tokens and LEASH (AGENT-PLAN §3.2).
+- `github.com/vettid/vettid-vault/vms/leashwire`: the reference verifier
+  of delegations and status statements (VAULT-MESSAGING §10.11).
+
+Both are outside the vault module's `internal/`; their own imports of
+`internal/strictjson`, `internal/cbor` and `internal/der` are allowed
+because those packages are inside the vault module. Until AGENT-PLAN §7.1
+AV4 moves `client/wallet.go` out of `client`, importing `client` also
+compiles btcsuite/btcd and decred secp256k1.
+
+## Checks
+
+- `go mod verify` (CI, every platform).
+- `deps_test.go`: imports `client` and `vms/leashwire` and uses one
+  exported function of each.
+- `vectors_test.go`: the vault's `leash.json` vectors against
+  `leashwire.VerifyPresented`; see `testdata/vectors/SOURCE.md`.
