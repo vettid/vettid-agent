@@ -88,11 +88,12 @@ func (fakeTPM) Close() error                { return nil }
 func chooseEnv(t *testing.T, rm, raw bool, openErr error, srkErrs ...error) *int {
 	t.Helper()
 	dir := t.TempDir()
-	oRM, oRaw, oOpen, oSRK, oDelay := tpmRMDevice, tpmRawDevice, openTPMDevice, createSRKFn, tpmRetryDelay
+	oRM, oRaw, oSys, oOpen, oSRK, oDelay := tpmRMDevice, tpmRawDevice, tpmSysGlob, openTPMDevice, createSRKFn, tpmRetryDelay
 	t.Cleanup(func() {
-		tpmRMDevice, tpmRawDevice, openTPMDevice, createSRKFn, tpmRetryDelay = oRM, oRaw, oOpen, oSRK, oDelay
+		tpmRMDevice, tpmRawDevice, tpmSysGlob, openTPMDevice, createSRKFn, tpmRetryDelay = oRM, oRaw, oSys, oOpen, oSRK, oDelay
 	})
 	tpmRMDevice, tpmRawDevice = filepath.Join(dir, "tpmrm0"), filepath.Join(dir, "tpm0")
+	tpmSysGlob = filepath.Join(dir, "sys", "tpm*")
 	if rm {
 		os.WriteFile(tpmRMDevice, nil, 0o600)
 	}
@@ -126,6 +127,24 @@ func TestChooseNoTPM(t *testing.T) {
 	}
 	if c.Notice() != NotMachineBound {
 		t.Errorf("notice %q", c.Notice())
+	}
+}
+
+// The kernel lists a TPM but the device nodes are missing: an error,
+// not a silent fallback.
+func TestChooseSysfsOnly(t *testing.T) {
+	chooseEnv(t, false, false, nil)
+	sysDir := filepath.Dir(tpmSysGlob)
+	if err := os.MkdirAll(filepath.Join(sysDir, "tpm0"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	c, err := ChooseProtector(ChooseOptions{})
+	if err == nil || !strings.Contains(err.Error(), "the kernel lists a TPM") {
+		t.Fatalf("choice %+v, %v", c, err)
+	}
+	c, err = ChooseProtector(ChooseOptions{AllowPassphraseFallback: true})
+	if err != nil || c.Protector != PassphraseName || !strings.Contains(c.Reason, "the kernel lists a TPM") {
+		t.Fatalf("with fallback allowed: %+v, %v", c, err)
 	}
 }
 

@@ -75,8 +75,9 @@ updates do not lock the connector out.
 The sealed key lives only inside the state file. `forget` overwrites and
 deletes that file, but an old copy recovered from the disk afterwards (a
 backup, a file system snapshot, a block an SSD remapped) can still be
-opened on this computer until its TPM is cleared. Reaching such a copy
-already needs raw disk access on this computer and access to its TPM.
+opened on this computer until its TPM is cleared. Opening such a copy
+needs the copy (from a backup, a snapshot or the raw disk) and access to
+this computer's TPM.
 
 ## Passphrase (computers without a platform protector)
 

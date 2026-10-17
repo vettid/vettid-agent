@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path/filepath"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -19,14 +20,16 @@ import (
 var (
 	tpmRMDevice   = DefaultTPMDevice
 	tpmRawDevice  = "/dev/tpm0"
+	tpmSysGlob    = "/sys/class/tpm/tpm*"
 	openTPMDevice = func(path string) (transport.TPMCloser, error) { return linuxtpm.Open(path) }
 )
 
 // ChooseProtector picks the protector for a new state file (AGENT-PLAN
 // §2 AG3):
 //
-//   - no TPM device at all (neither /dev/tpmrm0 nor /dev/tpm0): the
-//     passphrase protector, with the reason, and no error;
+//   - no TPM at all (neither /dev/tpmrm0 nor /dev/tpm0, and no
+//     /sys/class/tpm/tpm* entry): the passphrase protector, with the
+//     reason, and no error;
 //   - a TPM that works (the resource manager opens and creates its
 //     storage root key, retrying transient answers): the TPM protector;
 //   - a TPM that is present but does not work (permission denied, no
@@ -40,10 +43,18 @@ func ChooseProtector(opts ChooseOptions) (Choice, error) {
 		return Choice{Protector: PassphraseName, Reason: reason + "; using a passphrase"}
 	}
 	rm, raw := exists(tpmRMDevice), exists(tpmRawDevice)
-	if !rm && !raw {
-		return passphrase(fmt.Sprintf("no TPM found (neither %s nor %s exists)", tpmRMDevice, tpmRawDevice)), nil
+	sys, _ := filepath.Glob(tpmSysGlob)
+	if !rm && !raw && len(sys) == 0 {
+		return passphrase(fmt.Sprintf("no TPM found (neither %s nor %s exists, and the kernel lists none)", tpmRMDevice, tpmRawDevice)), nil
 	}
-	err := tryTPM(rm)
+	var err error
+	if !rm && !raw {
+		// The kernel knows a TPM but its device nodes are missing (not
+		// created, or hidden from this process): not a silent fallback.
+		err = fmt.Errorf("the kernel lists a TPM (%s) but neither %s nor %s exists: check the device nodes and the container or sandbox settings", sys[0], tpmRMDevice, tpmRawDevice)
+	} else {
+		err = tryTPM(rm)
+	}
 	if err == nil {
 		return Choice{Protector: TPMName, Reason: "TPM 2.0 at " + tpmRMDevice, MachineBound: true}, nil
 	}

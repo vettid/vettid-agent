@@ -10,6 +10,7 @@ package protect
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -242,5 +243,49 @@ func TestTPMUnwrapRetriesTransient(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("%d attempts, want 2", n)
+	}
+}
+
+// swapSRKPublic changes the last byte of the public area in every
+// CreatePrimary response (the ECC point's y), leaving the Name as the
+// TPM sent it.
+type swapSRKPublic struct{ inner transport.TPMCloser }
+
+func (s swapSRKPublic) Send(cmd []byte) ([]byte, error) {
+	rsp, err := s.inner.Send(cmd)
+	if err != nil || len(cmd) < 10 || binary.BigEndian.Uint32(cmd[6:10]) != uint32(tpm2.TPMCCCreatePrimary) {
+		return rsp, err
+	}
+	// header (10) || object handle (4) || parameter size (4) || TPM2B_PUBLIC
+	if len(rsp) < 20 || binary.BigEndian.Uint32(rsp[6:10]) != 0 {
+		return rsp, err
+	}
+	n := int(binary.BigEndian.Uint16(rsp[18:20]))
+	out := append([]byte{}, rsp...)
+	out[20+n-1] ^= 0x01
+	return out, nil
+}
+func (s swapSRKPublic) Close() error { return s.inner.Close() }
+
+// A CreatePrimary answer whose public key does not match its Name is
+// refused before any session is salted to it.
+func TestTPMRefusesInconsistentSRK(t *testing.T) {
+	sim := simProtector(1)
+	p := &TPM{device: "simulator", open: func() (transport.TPMCloser, error) {
+		inner, err := sim.open()
+		if err != nil {
+			return nil, err
+		}
+		return swapSRKPublic{inner}, nil
+	}}
+	if _, err := p.Wrap(dataKey()); !errors.Is(err, ErrTPMInconsistent) {
+		t.Fatalf("Wrap with a swapped SRK public key = %v, want ErrTPMInconsistent", err)
+	}
+	blob, err := sim.Wrap(dataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Unwrap(blob); !errors.Is(err, ErrTPMInconsistent) {
+		t.Fatalf("Unwrap with a swapped SRK public key = %v, want ErrTPMInconsistent", err)
 	}
 }

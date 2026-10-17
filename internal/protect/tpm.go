@@ -57,8 +57,9 @@ package protect
 // so `forget` destroys it by overwriting and deleting the file. An old
 // copy of the state file recovered from the disk afterwards (a backup, a
 // file system snapshot, a block an SSD remapped) can still be opened on
-// this computer until its TPM is cleared. Reaching such a copy already
-// needs raw disk access on this machine plus access to its TPM.
+// this computer until its TPM is cleared. Opening such a copy needs the
+// copy (from a backup, a snapshot or the raw disk) and access to this
+// computer's TPM.
 
 import (
 	"bytes"
@@ -100,6 +101,10 @@ var (
 	// ErrTPMMismatch: the storage root key differs from the one the key
 	// was sealed under.
 	ErrTPMMismatch = errors.New("the TPM was cleared or replaced, or this file is from another computer")
+	// ErrTPMInconsistent: the TPM's answer to creating the storage root
+	// key does not hold together (its public area does not match its
+	// Name, or is not the template's kind of key).
+	ErrTPMInconsistent = errors.New("the TPM's storage root key answer is inconsistent (its public key does not match its Name); the TPM or the path to it may be faulty or tampered with")
 	// ErrTPMBusy: the TPM kept answering with a transient code (busy,
 	// self-testing, out of memory for objects or sessions).
 	ErrTPMBusy = errors.New("the TPM is busy or still starting; try again")
@@ -194,6 +199,16 @@ func createSRK(tpm transport.TPM) (*srk, error) {
 	if err != nil {
 		flush(tpm, rsp.ObjectHandle)
 		return nil, fmt.Errorf("TPM: storage root key: %w", err)
+	}
+	// The returned public area must be the template's kind of key, and
+	// its Name (computed here) must equal the Name the TPM returned,
+	// before any session is salted to that key or its Name is pinned.
+	name, err := tpm2.ObjectName(pub)
+	if err != nil || !bytes.Equal(name.Buffer, rsp.Name.Buffer) ||
+		pub.Type != tpm2.ECCSRKTemplate.Type || pub.NameAlg != tpm2.ECCSRKTemplate.NameAlg ||
+		pub.ObjectAttributes != tpm2.ECCSRKTemplate.ObjectAttributes {
+		flush(tpm, rsp.ObjectHandle)
+		return nil, ErrTPMInconsistent
 	}
 	return &srk{handle: rsp.ObjectHandle, name: rsp.Name, pub: *pub}, nil
 }
