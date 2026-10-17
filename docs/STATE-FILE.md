@@ -60,14 +60,21 @@ in it escapes the authentication through a quirk of a JSON parser.
   choice for its session AEAD).
 - **Atomic write**: a new temporary file in the state directory, created
   exclusively and owner-only, written, synced (`fsync`; `F_FULLFSYNC` on
-  macOS through Go's `File.Sync`; `FlushFileBuffers` on Windows), then
-  renamed over the state file (`rename`; on Windows a rename with POSIX
-  semantics, `FileRenameInfoEx` with `FILE_RENAME_REPLACE_IF_EXISTS |
-  FILE_RENAME_POSIX_SEMANTICS`, which works while the old file is held
-  open, falling back to `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING |
-  MOVEFILE_WRITE_THROUGH` where the file system lacks it), then the
-  directory synced (POSIX). A crash before the rename leaves the old file
-  in place and readable.
+  macOS through Go's `File.Sync`; `FlushFileBuffers` on Windows), renamed
+  over the state file, and the directory synced; `Create`, `Save` and
+  `CreateReplace` return only after all of that. A crash before the
+  rename leaves the old file in place and readable.
+  - POSIX: `rename`, then `fsync` of the directory.
+  - Windows: a rename with POSIX semantics (`FileRenameInfoEx` with
+    `FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS`), which
+    works while the old file is held open, falling back to `MoveFileEx`
+    with `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH` where the
+    file system lacks it; then `FlushFileBuffers` on the renamed file and
+    on the directory (opened with `FILE_FLAG_BACKUP_SEMANTICS`). Where a
+    file system refuses to flush a directory, what remains is its own
+    behaviour: NTFS journaling keeps the directory consistent after a
+    crash (the old entry or the new one), but that alone does not make
+    the new entry durable.
 - **Owner-only**: on Linux and macOS the directory is mode `0700` and the
   files `0600`, set explicitly after creation so the umask has no effect.
   On Windows the directory and every file are created owned by the
@@ -131,11 +138,28 @@ where the protector has one.
 ## Creating over an existing file
 
 `Create` refuses when a state file exists. Replacing one is explicit
-(`CreateReplace`): the old protector's key is wiped first (nothing
-changes if that fails or the protector is unknown), the old file is
-opened and held, the new state is written under a new data key and
-renamed over the path, and the old bytes are overwritten through the
-held descriptor before it is closed.
+(`CreateReplace`). Before anything changes it determines the old
+protector (or refuses, changing nothing) and whether the file system can
+rename over a file this process holds open (always on POSIX; on Windows
+a probe in the state directory). Then:
+
+1. the old protector's key is wiped (if that fails, nothing else
+   changes);
+2. where an open file can be renamed over: the old file is opened and
+   held, the new state is written, renamed into place and flushed, and
+   only then are the old bytes overwritten through the held descriptor
+   and the descriptor closed;
+3. where it cannot (the `MoveFileEx` fallback): the old bytes are
+   overwritten through a descriptor that is then closed, and the new
+   state is written, renamed into place and flushed. The old file can
+   no longer be opened once its key is gone, so nothing is lost by this
+   order.
+
+## Nothing to wipe
+
+With no state file, no temporary file and nothing opened, a wipe changes
+nothing and reports "nothing to wipe" (`ErrNothingToWipe`), which
+`forget` shows as not paired.
 
 In-memory keys are cleared when no longer needed, as far as Go allows;
 copies the runtime made cannot be reached.

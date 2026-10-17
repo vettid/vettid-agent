@@ -184,3 +184,18 @@ func TestCheckSecurity(t *testing.T) {
 		}
 	}
 }
+
+// The directory flush and the open-file rename work on the runner's
+// NTFS volume, and the probe leaves no files.
+func TestFlushDirAndProbe(t *testing.T) {
+	s := openTest(t)
+	if err := flushDir(s.Dir()); err != nil {
+		t.Errorf("flushing the state directory: %v", err)
+	}
+	if !canReplaceOpenFile(s.Dir()) {
+		t.Error("POSIX-semantics rename over an open file not available on NTFS")
+	}
+	if names := listDir(t, s.Dir()); len(names) != 1 {
+		t.Errorf("the probe left files: %v", names)
+	}
+}

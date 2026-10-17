@@ -245,30 +245,84 @@ func createTemp(dir, prefix, suffix string) (*os.File, string, error) {
 	return os.NewFile(uintptr(h), name), name, nil
 }
 
-// renameReplace renames from over to. It asks for POSIX semantics
-// first (SetFileInformationByHandle with FileRenameInfoEx and
-// FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS), which
-// replace the target even while a handle to it is open with delete
-// sharing: CreateReplace holds the old state file open across the
-// rename so that it can overwrite it afterwards. Where the file system
-// does not support that (FAT, some network shares) it falls back to
-// MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH). A target held open
+// renameReplace renames from over to and flushes the renamed file. It
+// asks for POSIX semantics first (SetFileInformationByHandle with
+// FileRenameInfoEx and FILE_RENAME_REPLACE_IF_EXISTS |
+// FILE_RENAME_POSIX_SEMANTICS), which replace the target even while a
+// handle to it is open with delete sharing. Where the file system does
+// not support that (FAT, some network shares) it falls back to
+// MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH), which cannot replace an
+// open file; CreateReplace checks canReplaceOpenFile first and does not
+// hold the old file open there. A target held open by another process
 // without delete sharing makes either fail; that is retried for about
-// 200 ms.
+// 200 ms. The caller then flushes the directory (syncDir).
 func renameReplace(from, to string) error {
 	var err error
 	for attempt := 0; ; attempt++ {
 		err = renamePOSIX(from, to)
-		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
-			errors.Is(err, windows.ERROR_INVALID_FUNCTION) {
+		if notSupported(err) {
 			err = moveFileEx(from, to)
 		}
 		if err == nil || attempt == 4 ||
 			!(errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)) {
-			return err
+			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	if err != nil {
+		return err
+	}
+	return flushPath(to, 0)
+}
+
+func notSupported(err error) bool {
+	return errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
+		errors.Is(err, windows.ERROR_INVALID_FUNCTION)
+}
+
+// flushPath opens path for writing (flags adds, for example,
+// FILE_FLAG_BACKUP_SEMANTICS for a directory) and calls
+// FlushFileBuffers on it.
+func flushPath(path string, flags uint32) error {
+	p, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	h, err := windows.CreateFile(p, windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|flags, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	return windows.FlushFileBuffers(h)
+}
+
+// canReplaceOpenFile probes, in dir, whether a POSIX-semantics rename
+// can replace a file that is held open: it creates two temporary files,
+// holds the second open with delete sharing, renames the first over it,
+// and removes what is left. The probe files carry the temporary-file
+// name, so a crash during the probe leaves only files that the next
+// Open deletes.
+func canReplaceOpenFile(dir string) bool {
+	a, an, err := createTemp(dir, tempPrefix, tempSuffix)
+	if err != nil {
+		return false
+	}
+	a.Close()
+	defer os.Remove(an)
+	b, bn, err := createTemp(dir, tempPrefix, tempSuffix)
+	if err != nil {
+		return false
+	}
+	b.Close()
+	defer os.Remove(bn)
+	held, err := openNoFollow(bn, windows.GENERIC_READ)
+	if err != nil {
+		return false
+	}
+	defer held.Close()
+	return renamePOSIX(an, bn) == nil
 }
 
 func moveFileEx(from, to string) error {
@@ -320,10 +374,25 @@ func renamePOSIX(from, to string) error {
 	return windows.SetFileInformationByHandle(h, windows.FileRenameInfoEx, &buf[0], uint32(len(buf)))
 }
 
-// syncDir is a no-op on Windows: a directory handle cannot be flushed.
-// The file's data is flushed before the rename; the rename itself is
-// journaled by NTFS (and written through on the MoveFileEx fallback).
-func syncDir(string) error { return nil }
+// syncDir flushes the directory: FlushFileBuffers on a handle opened with
+// FILE_FLAG_BACKUP_SEMANTICS and write access, which on NTFS writes the
+// directory's metadata (the renamed entry) to disk. Where the file
+// system refuses to flush a directory (ERROR_ACCESS_DENIED,
+// ERROR_INVALID_FUNCTION, ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER),
+// syncDir returns nil and what remains is the file system's own
+// behaviour: NTFS journaling keeps the directory consistent after a
+// crash (the old or the new entry, never a torn one), but does not by
+// itself make the new entry durable; the MoveFileEx fallback is written
+// through.
+func syncDir(dir string) error {
+	err := flushDir(dir)
+	if err != nil && (errors.Is(err, windows.ERROR_ACCESS_DENIED) || notSupported(err)) {
+		return nil
+	}
+	return err
+}
+
+func flushDir(dir string) error { return flushPath(dir, windows.FILE_FLAG_BACKUP_SEMANTICS) }
 
 type winLock struct{ h windows.Handle }
 

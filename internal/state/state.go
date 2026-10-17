@@ -92,6 +92,8 @@ var (
 	// determined, so its key may remain. WipeAll with every known
 	// protector deletes it.
 	ErrProtectorUnknown = errors.New("the state file's protector is not known, so its key may remain; wipe with every known protector")
+	// ErrNothingToWipe: Wipe found no state file and nothing loaded.
+	ErrNothingToWipe = errors.New("no state file: nothing to wipe (not paired)")
 	// ErrNotLoaded: Save before Create or Load.
 	ErrNotLoaded = errors.New("state: Save before Create or Load")
 	// ErrClosed: the store was closed.
@@ -239,6 +241,10 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	if oldP == nil {
 		return ErrProtectorUnknown
 	}
+	// Decided before anything is wiped: whether this file system can
+	// rename over a file this process holds open. If it cannot, the old
+	// file is overwritten and closed before the new one is written.
+	holdOld := canReplaceOpenFile(s.dir) && !testHookOverwriteFirst
 	if err := oldP.Wipe(); err != nil {
 		return fmt.Errorf("state: protector %s could not delete the old key; nothing was replaced: %w", oldP.Name(), err)
 	}
@@ -250,6 +256,19 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	case err != nil:
 		return fmt.Errorf("state: open the old state file: %w", err)
 	}
+	if old != nil && !holdOld {
+		// The old key is already gone, so the old file cannot be opened
+		// any more; overwrite it now and let the rename replace it.
+		err := overwriteFile(old)
+		old.Close()
+		old = nil
+		if err != nil {
+			return fmt.Errorf("state: overwrite the old state file: %w", err)
+		}
+	}
+	// create returns only after the new file is renamed into place and
+	// flushed (file and directory), so the old bytes are overwritten
+	// only once the new state is durable.
 	if err := s.create(p, state); err != nil {
 		if old != nil {
 			old.Close()
@@ -265,6 +284,10 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	}
 	return old.Close()
 }
+
+// testHookOverwriteFirst (tests only) makes CreateReplace take the order
+// used where an open file cannot be renamed over.
+var testHookOverwriteFirst bool
 
 func checkProtector(p Protector) error {
 	if p == nil || !protectorName.MatchString(p.Name()) {
@@ -370,11 +393,17 @@ func (s *Store) CreatedAt() time.Time {
 //     treated the same way; the directory is synced. A symbolic link
 //     (or other non-file) at a path is deleted itself, never followed.
 //
-// If no protector can be determined (the header is unreadable or
-// zeroed, or the file is already gone and nothing was loaded), Wipe
-// still deletes the files but returns ErrProtectorUnknown, because a
-// protector key may remain: WipeAll with every known protector is the
-// fallback. Wipe never returns nil while a protector key may remain.
+// If no protector can be determined because the header is unreadable
+// or zeroed, Wipe still deletes the files but returns
+// ErrProtectorUnknown, because a protector key may remain: WipeAll with
+// every known protector is the fallback. If there is no state file (and
+// no temporary file) and nothing was loaded, there is nothing to wipe:
+// Wipe changes nothing and returns ErrNothingToWipe, which callers such
+// as `forget` report as "not paired" (a key left by some earlier
+// pairing is not known here; WipeAll removes it). With a loaded
+// protector and no file (the file was already deleted), Wipe deletes the
+// protector's key and returns nil. Wipe never returns nil while a
+// protector key may remain.
 //
 // Overwriting is best effort against recovery from the disk: journaling
 // and copy-on-write file systems and SSD wear levelling can keep older
@@ -385,6 +414,15 @@ func (s *Store) Wipe(resolve Resolver) error {
 		return ErrClosed
 	}
 	p := s.oldProtector(resolve)
+	if p == nil {
+		exists, err := s.Exists()
+		if err != nil {
+			return err
+		}
+		if !exists && !s.hasTemps() {
+			return ErrNothingToWipe
+		}
+	}
 	if p != nil {
 		if err := p.Wipe(); err != nil {
 			return fmt.Errorf("state: protector %s could not delete its key; the state file is kept so that the wipe can be retried: %w", p.Name(), err)
@@ -400,8 +438,9 @@ func (s *Store) Wipe(resolve Resolver) error {
 
 // WipeAll is the fallback when the protector is not known: it asks every
 // protector in ps to delete its key (a protector without a key present
-// succeeds without doing anything), then removes the state and temporary
-// files as Wipe does, whatever the protectors answered. Every step is
+// succeeds without doing anything; nil entries are skipped), then
+// removes the state and temporary files as Wipe does, whatever the
+// protectors answered. Every step is
 // attempted; the errors are joined. It may be retried.
 func (s *Store) WipeAll(ps []Protector) error {
 	if s.lock == nil {
@@ -409,6 +448,9 @@ func (s *Store) WipeAll(ps []Protector) error {
 	}
 	var errs []error
 	for _, p := range ps {
+		if p == nil {
+			continue
+		}
 		if err := p.Wipe(); err != nil {
 			errs = append(errs, fmt.Errorf("state: protector %s could not delete its key: %w", p.Name(), err))
 		}
@@ -461,6 +503,20 @@ func (s *Store) removeFiles() []error {
 		errs = append(errs, fmt.Errorf("state: sync state directory: %w", err))
 	}
 	return errs
+}
+
+// hasTemps reports whether temporary state files are present.
+func (s *Store) hasTemps() bool {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return true // unknown: let removeFiles try
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), tempPrefix) && strings.HasSuffix(e.Name(), tempSuffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // removeTemps overwrites and deletes temporary state files.

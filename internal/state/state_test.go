@@ -346,20 +346,40 @@ func TestWipeWithoutLoad(t *testing.T) {
 	}
 }
 
-// Nothing loaded and no file: the protector cannot be determined, so a
-// key may remain and Wipe says so; WipeAll is the fallback.
-func TestWipeMissingFileReportsUnknownProtector(t *testing.T) {
+// Nothing loaded and no file: nothing to wipe, said as such; nothing
+// changes. WipeAll still deletes any key a protector holds, skipping nil
+// entries.
+func TestWipeNothingToWipe(t *testing.T) {
 	s := openTest(t)
-	if err := s.Wipe(resolverFor()); !errors.Is(err, ErrProtectorUnknown) {
-		t.Fatalf("Wipe with no state = %v, want ErrProtectorUnknown", err)
+	if err := s.Wipe(resolverFor()); !errors.Is(err, ErrNothingToWipe) {
+		t.Fatalf("Wipe with no state = %v, want ErrNothingToWipe", err)
 	}
 	p := newFixedProtector(seq(0x40, 32))
 	p.hasKey = true
-	if err := s.WipeAll([]Protector{p}); err != nil {
+	if err := s.WipeAll([]Protector{nil, p, nil}); err != nil {
 		t.Fatalf("WipeAll: %v", err)
 	}
 	if p.hasKey {
 		t.Error("WipeAll left the protector key")
+	}
+}
+
+// A loaded protector whose file is already gone: its key is deleted and
+// Wipe succeeds.
+func TestWipeLoadedProtectorFileGone(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Wipe(nil); err != nil {
+		t.Fatalf("Wipe: %v", err)
+	}
+	if p.hasKey {
+		t.Error("key remains")
 	}
 }
 
@@ -519,6 +539,43 @@ func TestCreateReplace(t *testing.T) {
 		t.Fatalf("Load = %q, %v", got, err)
 	}
 	for _, n := range listDir(t, dir) {
+		if strings.HasSuffix(n, tempSuffix) {
+			t.Errorf("temporary file %s left", n)
+		}
+	}
+}
+
+// The order used where an open file cannot be renamed over (decided
+// before the old key is wiped): the old bytes are overwritten and the
+// file closed first, then the new state is renamed into place.
+func TestCreateReplaceOverwriteFirst(t *testing.T) {
+	testHookOverwriteFirst = true
+	defer func() { testHookOverwriteFirst = false }()
+	s := openTest(t)
+	oldP := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(oldP, []byte("old state")); err != nil {
+		t.Fatal(err)
+	}
+	size := fileSize(t, s.Path())
+	link := filepath.Join(t.TempDir(), "old")
+	linked := os.Link(s.Path(), link) == nil
+	newP := newFixedProtector(seq(0x50, 32))
+	newP.name = "test-new"
+	if err := s.CreateReplace(newP, []byte("new state"), nil); err != nil {
+		t.Fatalf("CreateReplace: %v", err)
+	}
+	if oldP.hasKey {
+		t.Error("old protector key remains")
+	}
+	if linked {
+		if got, _ := os.ReadFile(link); int64(len(got)) != size || !bytes.Equal(got, make([]byte, size)) {
+			t.Error("the old file's bytes were not overwritten")
+		}
+	}
+	if got, err := s.Load(resolverFor(newP)); err != nil || string(got) != "new state" {
+		t.Fatalf("Load = %q, %v", got, err)
+	}
+	for _, n := range listDir(t, s.Dir()) {
 		if strings.HasSuffix(n, tempSuffix) {
 			t.Errorf("temporary file %s left", n)
 		}
