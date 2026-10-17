@@ -10,6 +10,8 @@ import (
 	"strconv"
 
 	"golang.org/x/term"
+
+	"github.com/vettid/vettid-agent/internal/state"
 )
 
 // PassphraseSource says where a passphrase comes from (AGENT-PLAN §2
@@ -20,6 +22,18 @@ import (
 // A passphrase never appears in an error or a log, and the prompt is
 // written to standard error, never standard output (which `vettid-agent
 // mcp` reserves for MCP messages).
+//
+// Order: read the passphrase before opening the state directory
+// (state.Open). Read refuses a file descriptor while any state.Store is
+// open in the process, so that a descriptor number can never name the
+// store's own lock or state file.
+//
+// --passphrase-fd N names a descriptor the parent process opened for
+// this one: a pipe or a regular file. Descriptors 0, 1 and 2 (standard
+// input, output and error) are refused and never closed; anything else
+// that is not a pipe or a regular file is refused. On Windows N is a
+// handle value inherited from the parent (the standard handles are
+// refused the same way).
 type PassphraseSource struct {
 	FD   int    // -1 when not set
 	File string // "" when not set
@@ -68,14 +82,24 @@ func (s PassphraseSource) Read(prompt string, confirm bool) ([]byte, error) {
 const lineLimit = MaxBytes + 2
 
 // readFD reads from file descriptor fd up to its first line break or
-// end of file, and closes it.
+// end of file, and closes it. See PassphraseSource for what it refuses.
 func readFD(fd int) ([]byte, error) {
+	label := fmt.Sprintf("--passphrase-fd %d", fd)
+	if fd <= 2 {
+		return nil, fmt.Errorf("%s: standard input, output and error cannot be used; pass another descriptor", label)
+	}
+	if state.OpenStores() != 0 {
+		return nil, fmt.Errorf("%s: the passphrase must be read before the state directory is opened", label)
+	}
+	if err := checkPassphraseFD(fd); err != nil {
+		return nil, fmt.Errorf("%s: %w", label, err)
+	}
 	f := os.NewFile(uintptr(fd), "passphrase-fd")
 	if f == nil {
-		return nil, fmt.Errorf("--passphrase-fd %d: not an open file descriptor", fd)
+		return nil, fmt.Errorf("%s: not an open file descriptor", label)
 	}
 	defer f.Close()
-	return readLine(f, fmt.Sprintf("--passphrase-fd %d", fd))
+	return readLine(f, label)
 }
 
 // readLine reads up to the first line break or end of file, one byte at
@@ -112,11 +136,13 @@ func readLine(r io.Reader, label string) ([]byte, error) {
 	return buf, nil
 }
 
-// readFile reads a passphrase file: it must be private to the current
-// user (POSIX, checkPassphraseFile), hold one line, and one trailing
-// line break ("\n" or "\r\n") is removed.
+// readFile reads a passphrase file: it must be a regular file (checked
+// before reading, so a FIFO cannot make it hang), private to the current
+// user (POSIX, checkPassphraseFile), and hold one line; one trailing
+// line break ("\n" or "\r\n") is removed. The buffer read is cleared;
+// the caller clears the returned copy.
 func readFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
+	f, err := openPassphraseFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("--passphrase-file: %w", err)
 	}
@@ -124,12 +150,19 @@ func readFile(path string) ([]byte, error) {
 	if err := checkPassphraseFile(f); err != nil {
 		return nil, fmt.Errorf("--passphrase-file: %w", err)
 	}
-	raw, err := io.ReadAll(io.LimitReader(f, lineLimit+1))
-	if err != nil {
-		return nil, errors.New("--passphrase-file: read failed")
+	raw := make([]byte, 0, lineLimit+1)
+	defer func() { clear(raw[:cap(raw)]) }()
+	for len(raw) < cap(raw) {
+		n, err := f.Read(raw[len(raw):cap(raw)])
+		raw = raw[:len(raw)+n]
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, errors.New("--passphrase-file: read failed")
+		}
 	}
 	if len(raw) > lineLimit {
-		clear(raw)
 		return nil, fmt.Errorf("--passphrase-file: passphrase longer than %d bytes", MaxBytes)
 	}
 	pass := raw
@@ -139,13 +172,12 @@ func readFile(path string) ([]byte, error) {
 		pass = pass[:len(pass)-1]
 	}
 	if bytes.ContainsAny(pass, "\r\n") {
-		clear(raw)
 		return nil, errors.New("--passphrase-file: the file must hold the passphrase on one line")
 	}
 	if len(pass) == 0 {
 		return nil, errors.New("--passphrase-file: empty passphrase")
 	}
-	return pass, nil
+	return append([]byte(nil), pass...), nil
 }
 
 func readPrompt(prompt string, confirm bool) ([]byte, error) {

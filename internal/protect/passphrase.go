@@ -55,11 +55,19 @@ var (
 	minParams     = Params{Time: 3, MemoryKiB: 64 * 1024, Threads: 1}
 )
 
-// maxParams bounds what Unwrap will compute, so that an altered file
-// cannot make the process allocate without limit before the
-// authentication fails. 1 GiB is the vault's highest Argon2id memory
-// (VAULT-MESSAGING §11.14.3, the recovery wrap).
-var maxParams = Params{Time: 32, MemoryKiB: 1024 * 1024, Threads: 16}
+// maxParams bounds what Unwrap will compute before the authentication
+// can fail (chosen; not in the spec). An altered or hostile file must
+// not make the connector allocate or spin beyond what a small host (a
+// container or a small VM with 512 MiB of memory) can afford: 256 MiB is
+// four times the default memory, 10 iterations a little over three
+// times the default time, and 4 lanes enough for a later raise. Raising
+// the parameters later stays possible within these bounds.
+var maxParams = Params{Time: 10, MemoryKiB: 256 * 1024, Threads: 4}
+
+// deriveKey is Argon2id; tests replace it to count or reuse derivations.
+var deriveKey = func(pass, salt []byte, p Params) []byte {
+	return argon2.IDKey(pass, salt, p.Time, p.MemoryKiB, p.Threads, chacha20poly1305.KeySize)
+}
 
 // DefaultParams returns the parameters new wraps use.
 func DefaultParams() Params { return defaultParams }
@@ -74,8 +82,9 @@ func MinParams() Params { return minParams }
 //	K    = Argon2id(passphrase, salt, t, m, p, 32)
 //	ct   = XChaCha20-Poly1305(K, nonce, aad = blobLabel || blob[0:26], data key)
 //
-// The passphrase is its UTF-8 bytes after normalization to NFC (as the
-// vault normalizes passwords, VAULT-MESSAGING §3.5.1). The parameters and
+// The passphrase is its UTF-8 bytes after normalization to NFC (chosen;
+// not in the spec), so that the same text typed or pasted in another
+// Unicode form opens the file. The parameters and
 // salt are in the blob, so they can be raised later; they are also
 // authenticated, although a changed salt or parameter already yields a
 // different K.
@@ -109,8 +118,8 @@ var (
 	ErrParamsAboveMaximum = errors.New("the passphrase key's Argon2id parameters are above the maximum")
 	// ErrBlobFormat: the wrapped key is not a passphrase protector blob.
 	ErrBlobFormat = errors.New("the wrapped key is not in the passphrase protector's format")
-	// ErrWiped: the protector's passphrase was wiped.
-	ErrWiped = errors.New("passphrase protector: passphrase was wiped")
+	// ErrForgotten: the protector's passphrase was cleared by Forget.
+	ErrForgotten = errors.New("passphrase protector: the passphrase was forgotten")
 )
 
 // Passphrase is the passphrase protector.
@@ -143,7 +152,7 @@ func (p *Passphrase) Name() string { return PassphraseName }
 // dataKey under it. It refuses a passphrase that fails CheckStrength.
 func (p *Passphrase) Wrap(dataKey []byte) ([]byte, error) {
 	if p.pass == nil {
-		return nil, ErrWiped
+		return nil, ErrForgotten
 	}
 	if len(dataKey) != state.DataKeyLen {
 		return nil, errors.New("passphrase protector: data key length")
@@ -155,19 +164,27 @@ func (p *Passphrase) Wrap(dataKey []byte) ([]byte, error) {
 }
 
 func (p *Passphrase) wrap(dataKey []byte, params Params) ([]byte, error) {
-	blob := make([]byte, blobHdrLen, blobLen)
-	blob[0] = blobVersion
-	binary.BigEndian.PutUint32(blob[1:], params.Time)
-	binary.BigEndian.PutUint32(blob[5:], params.MemoryKiB)
-	blob[9] = params.Threads
-	if _, err := rand.Read(blob[10:blobHdrLen]); err != nil {
+	salt := make([]byte, saltLen)
+	if _, err := rand.Read(salt); err != nil {
 		return nil, err
 	}
 	nonce := make([]byte, chacha20poly1305.NonceSizeX)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	k := argon2.IDKey(p.pass, blob[10:blobHdrLen], params.Time, params.MemoryKiB, params.Threads, chacha20poly1305.KeySize)
+	return p.wrapWith(dataKey, params, salt, nonce)
+}
+
+// wrapWith builds the blob from a given salt and nonce. Only wrap (fresh
+// random values) and the vector test (fixed values) call it.
+func (p *Passphrase) wrapWith(dataKey []byte, params Params, salt, nonce []byte) ([]byte, error) {
+	blob := make([]byte, blobHdrLen, blobLen)
+	blob[0] = blobVersion
+	binary.BigEndian.PutUint32(blob[1:], params.Time)
+	binary.BigEndian.PutUint32(blob[5:], params.MemoryKiB)
+	blob[9] = params.Threads
+	copy(blob[10:blobHdrLen], salt)
+	k := deriveKey(p.pass, salt, params)
 	defer clear(k)
 	aead, err := chacha20poly1305.NewX(k)
 	if err != nil {
@@ -185,7 +202,7 @@ func (p *Passphrase) wrap(dataKey []byte, params Params) ([]byte, error) {
 // refused before any derivation.
 func (p *Passphrase) Unwrap(blob []byte) ([]byte, error) {
 	if p.pass == nil {
-		return nil, ErrWiped
+		return nil, ErrForgotten
 	}
 	if len(blob) != blobLen || blob[0] != blobVersion {
 		return nil, ErrBlobFormat
@@ -204,7 +221,7 @@ func (p *Passphrase) Unwrap(blob []byte) ([]byte, error) {
 	salt := blob[10:blobHdrLen]
 	nonce := blob[blobHdrLen : blobHdrLen+chacha20poly1305.NonceSizeX]
 	ct := blob[blobHdrLen+chacha20poly1305.NonceSizeX:]
-	k := argon2.IDKey(p.pass, salt, params.Time, params.MemoryKiB, params.Threads, chacha20poly1305.KeySize)
+	k := deriveKey(p.pass, salt, params)
 	defer clear(k)
 	aead, err := chacha20poly1305.NewX(k)
 	if err != nil {
@@ -220,13 +237,18 @@ func (p *Passphrase) Unwrap(blob []byte) ([]byte, error) {
 	return dataKey, nil
 }
 
-// Wipe clears the passphrase from memory (best effort). The protector
-// keeps no key outside the state file, so there is nothing else to
-// delete. After Wipe, Wrap and Unwrap fail.
-func (p *Passphrase) Wipe() error {
+// Wipe is the state.Protector key deletion. This protector keeps no key
+// outside the state file, so there is nothing to delete and Wipe does
+// nothing: the protector stays usable, so that a Store.Wipe can be
+// followed by a Create with the same protector. Forget clears the
+// passphrase itself.
+func (p *Passphrase) Wipe() error { return nil }
+
+// Forget clears the passphrase from memory (best effort). After Forget,
+// Wrap and Unwrap fail with ErrForgotten.
+func (p *Passphrase) Forget() {
 	clear(p.pass)
 	p.pass = nil
-	return nil
 }
 
 // Equal reports, in constant time, whether two passphrases are the same

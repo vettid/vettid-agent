@@ -111,13 +111,20 @@ func TestWeakPassphrasesRefused(t *testing.T) {
 	weak := map[string]string{
 		"Short1!x":                     "characters",
 		"Abcdefghij1":                  "characters", // 11
-		"Café-Bar-1":                  "characters", // 11 after NFC
+		"Cafe\u0301-Bar-1":             "characters", // 11 after NFC
 		"alllowercaselettersonly":      "of these",
 		"ALLUPPERCASE12345":            "of these",
 		"lowercase and spaces":         "of these",
+		"correct horse battery 9":      "of these", // spaces count for no class
 		"123456789012!!":               "of these",
 		"Tab\tInside-12345":            "control",
 		"Line\nbreak-Inside-1":         "control",
+		"Zero\u200bWidth-Space-1":      "invisible",
+		"\ufeffByte-Order-Mark-1":      "invisible",
+		"Bidi-Mark-Inside-1\u200e":     "invisible",
+		"Private-Use-Inside-1\ue000":   "private-use",
+		"Unassigned-Inside-1\u0378":    "unassigned",
+		"Line\u2028Separator-Inside-1": "not visible",
 		strings.Repeat("Aa1!", 257):    "longer",
 		string([]byte{0xff, 'A', '1'}): "UTF-8",
 	}
@@ -136,10 +143,10 @@ func TestWeakPassphrasesRefused(t *testing.T) {
 	}
 	strong := []string{
 		testPass,
-		"correct horse battery 9", // lower, other, digit
-		"CORRECT horse battery",   // upper, lower, other
-		"ÄÖÜäöü123456",            // upper, lower, digit
-		"パスワードはとても長いですAa",         // other, upper, lower
+		"correct horse battery 9!", // lower, digit, punctuation
+		"CORRECT horse battery!",   // upper, lower, punctuation
+		"ÄÖÜäöü123456",             // upper, lower, digit
+		"パスワードはとても長いですAa",          // other, upper, lower
 	}
 	for _, pass := range strong {
 		if err := CheckStrength([]byte(pass)); err != nil {
@@ -214,9 +221,9 @@ func TestTamperedBlobRefused(t *testing.T) {
 		"time zero":      {mut(func(b []byte) []byte { binary.BigEndian.PutUint32(b[1:], 0); return b }), ErrParamsBelowMinimum},
 		"memory low":     {mut(func(b []byte) []byte { binary.BigEndian.PutUint32(b[5:], 255); return b }), ErrParamsBelowMinimum},
 		"threads zero":   {mut(func(b []byte) []byte { b[9] = 0; return b }), ErrParamsBelowMinimum},
-		"time huge":      {mut(func(b []byte) []byte { binary.BigEndian.PutUint32(b[1:], 33); return b }), ErrParamsAboveMaximum},
-		"memory huge":    {mut(func(b []byte) []byte { binary.BigEndian.PutUint32(b[5:], 1<<20+1); return b }), ErrParamsAboveMaximum},
-		"threads huge":   {mut(func(b []byte) []byte { b[9] = 17; return b }), ErrParamsAboveMaximum},
+		"time huge":      {mut(func(b []byte) []byte { binary.BigEndian.PutUint32(b[1:], 11); return b }), ErrParamsAboveMaximum},
+		"memory huge":    {mut(func(b []byte) []byte { binary.BigEndian.PutUint32(b[5:], 256*1024+1); return b }), ErrParamsAboveMaximum},
+		"threads huge":   {mut(func(b []byte) []byte { b[9] = 5; return b }), ErrParamsAboveMaximum},
 		"version":        {mut(func(b []byte) []byte { b[0] = 2; return b }), ErrBlobFormat},
 		"truncated":      {blob[:len(blob)-1], ErrBlobFormat},
 		"trailing":       {append(append([]byte{}, blob...), 0), ErrBlobFormat},
@@ -230,30 +237,23 @@ func TestTamperedBlobRefused(t *testing.T) {
 }
 
 // The production parameters are the vault's for passwords
-// (VAULT-MESSAGING §3.5.1), new wraps use them, and Unwrap refuses
-// anything below them.
+// (VAULT-MESSAGING §3.5.1), new wraps use them, Unwrap refuses anything
+// below them, and the maximum is what a small host can afford. The
+// derivation is replaced by a stub here; the real one at production
+// cost runs once, in TestPassphraseVectors.
 func TestProductionParams(t *testing.T) {
 	want := Params{Time: 3, MemoryKiB: 64 * 1024, Threads: 1}
 	if DefaultParams() != want || MinParams() != want {
 		t.Fatalf("DefaultParams %+v, MinParams %+v, want both %+v", DefaultParams(), MinParams(), want)
 	}
-	// Blobs below the production minimum, refused before any derivation
-	// (so this costs nothing).
-	for _, low := range []Params{testParams, {2, 64 * 1024, 1}, {3, 64*1024 - 1, 1}, {3, 64 * 1024, 0}} {
-		blob := make([]byte, blobLen)
-		blob[0] = blobVersion
-		binary.BigEndian.PutUint32(blob[1:], low.Time)
-		binary.BigEndian.PutUint32(blob[5:], low.MemoryKiB)
-		blob[9] = low.Threads
-		if _, err := newPass(t, testPass).Unwrap(blob); !errors.Is(err, ErrParamsBelowMinimum) {
-			t.Errorf("%+v: Unwrap = %v, want ErrParamsBelowMinimum", low, err)
-		}
+	if maxParams != (Params{Time: 10, MemoryKiB: 256 * 1024, Threads: 4}) {
+		t.Errorf("maxParams %+v", maxParams)
 	}
-	if raceEnabled {
-		t.Log("race detector on: skipping the 64 MiB derivation")
-		return
-	}
-	// One real wrap and unwrap at production cost (64 MiB).
+	var used []Params
+	old := deriveKey
+	deriveKey = func(_, _ []byte, p Params) []byte { used = append(used, p); return make([]byte, 32) }
+	defer func() { deriveKey = old }()
+
 	blob, err := newPass(t, testPass).Wrap(dataKey())
 	if err != nil {
 		t.Fatal(err)
@@ -261,12 +261,31 @@ func TestProductionParams(t *testing.T) {
 	if got := (Params{binary.BigEndian.Uint32(blob[1:]), binary.BigEndian.Uint32(blob[5:]), blob[9]}); got != want {
 		t.Errorf("blob parameters %+v, want %+v", got, want)
 	}
-	if k, err := newPass(t, testPass).Unwrap(blob); err != nil || !bytes.Equal(k, dataKey()) {
-		t.Errorf("Unwrap at production parameters: %v", err)
+	if _, err := newPass(t, testPass).Unwrap(blob); err != nil {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if len(used) != 2 || used[0] != want || used[1] != want {
+		t.Errorf("derivations used %+v, want two at %+v", used, want)
+	}
+	// Below the production minimum: refused before any derivation.
+	used = nil
+	for _, low := range []Params{testParams, {2, 64 * 1024, 1}, {3, 64*1024 - 1, 1}, {3, 64 * 1024, 0}} {
+		b := append([]byte{}, blob...)
+		binary.BigEndian.PutUint32(b[1:], low.Time)
+		binary.BigEndian.PutUint32(b[5:], low.MemoryKiB)
+		b[9] = low.Threads
+		if _, err := newPass(t, testPass).Unwrap(b); !errors.Is(err, ErrParamsBelowMinimum) {
+			t.Errorf("%+v: Unwrap = %v, want ErrParamsBelowMinimum", low, err)
+		}
+	}
+	if len(used) != 0 {
+		t.Errorf("%d derivations ran for refused parameters", len(used))
 	}
 }
 
-func TestWipe(t *testing.T) {
+// Wipe deletes no key material (there is none) and leaves the
+// protector usable; Forget clears the passphrase.
+func TestWipeAndForget(t *testing.T) {
 	useTestParams(t)
 	p := newPass(t, testPass)
 	blob, err := p.Wrap(dataKey())
@@ -276,11 +295,38 @@ func TestWipe(t *testing.T) {
 	if err := p.Wipe(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := p.Unwrap(blob); !errors.Is(err, ErrWiped) {
-		t.Errorf("Unwrap after Wipe = %v", err)
+	if _, err := p.Unwrap(blob); err != nil {
+		t.Errorf("Unwrap after Wipe: %v", err)
 	}
-	if _, err := p.Wrap(dataKey()); !errors.Is(err, ErrWiped) {
-		t.Errorf("Wrap after Wipe = %v", err)
+	p.Forget()
+	if _, err := p.Unwrap(blob); !errors.Is(err, ErrForgotten) {
+		t.Errorf("Unwrap after Forget = %v", err)
+	}
+	if _, err := p.Wrap(dataKey()); !errors.Is(err, ErrForgotten) {
+		t.Errorf("Wrap after Forget = %v", err)
+	}
+}
+
+// A Store.Wipe followed by Create with the same protector works.
+func TestStoreWipeThenCreate(t *testing.T) {
+	useTestParams(t)
+	s, err := state.Open(filepath.Join(t.TempDir(), "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	p := newPass(t, testPass)
+	if err := s.Create(p, []byte("first pairing")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Wipe(nil); err != nil {
+		t.Fatalf("Wipe: %v", err)
+	}
+	if err := s.Create(p, []byte("second pairing")); err != nil {
+		t.Fatalf("Create after Wipe: %v", err)
+	}
+	if got, err := s.Load(func(string) state.Protector { return p }); err != nil || string(got) != "second pairing" {
+		t.Fatalf("Load = %q, %v", got, err)
 	}
 }
 
@@ -365,7 +411,7 @@ func TestPassphraseNotLogged(t *testing.T) {
 	if len(errs) != 0 {
 		t.Fatalf("Create: %v", errs[0])
 	}
-	note(s.Create(newPass(t, weakPhrase), []byte("state")))
+	note(s.CreateReplace(newPass(t, weakPhrase), []byte("state"), nil))
 	s.Close()
 
 	s, err = state.Open(dir)

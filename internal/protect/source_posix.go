@@ -28,3 +28,24 @@ func checkPassphraseFile(f *os.File) error {
 	}
 	return nil
 }
+
+// openPassphraseFile opens with O_NONBLOCK, so that a FIFO at the path
+// opens at once (and checkPassphraseFile refuses it) instead of waiting
+// for a writer.
+func openPassphraseFile(path string) (*os.File, error) {
+	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+}
+
+// checkPassphraseFD accepts a pipe or a regular file.
+func checkPassphraseFD(fd int) error {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return errors.New("not an open file descriptor")
+	}
+	switch st.Mode & syscall.S_IFMT {
+	case syscall.S_IFIFO, syscall.S_IFREG:
+		return nil
+	default:
+		return errors.New("not a pipe or a regular file")
+	}
+}

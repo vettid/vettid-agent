@@ -21,3 +21,5 @@ func checkPassphraseFile(f *os.File) error {
 	}
 	return nil
 }
+
+func openPassphraseFile(path string) (*os.File, error) { return os.Open(path) }

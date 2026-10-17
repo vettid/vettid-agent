@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -134,6 +135,7 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{dir: dir, lock: lk}
+	openStores.Add(1)
 	// Temporary files left by a crash during a write hold an older
 	// state; overwrite and remove them now that this process owns the
 	// directory.
@@ -158,8 +160,18 @@ func (s *Store) Close() error {
 	}
 	err := s.lock.Close()
 	s.lock = nil
+	openStores.Add(-1)
 	return err
 }
+
+// openStores counts the Stores open in this process.
+var openStores atomic.Int32
+
+// OpenStores returns how many Stores this process has open. Secrets read
+// from inherited file descriptors (protect.PassphraseSource) are read
+// while it is 0, so that a descriptor number given on the command line
+// can never name a Store's lock or state file.
+func OpenStores() int { return int(openStores.Load()) }
 
 func (s *Store) forget() {
 	clear(s.dataKey)
