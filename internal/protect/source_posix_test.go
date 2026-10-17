@@ -185,12 +185,14 @@ func writePrivate(t *testing.T, path, content string, mode os.FileMode) {
 	}
 }
 
-// A named FIFO on disk passes only if no one else can write to it.
+// A named FIFO on disk passes only with no group or other permission
+// bits. (Every pipe must also belong to the current user; a pipe owned
+// by another user needs root to make, so that branch is not tested.)
 func TestReadFDRefusesWritableFIFO(t *testing.T) {
 	for _, c := range []struct {
 		mode os.FileMode
 		ok   bool
-	}{{0o600, true}, {0o620, false}, {0o602, false}, {0o640, true}} {
+	}{{0o600, true}, {0o620, false}, {0o602, false}, {0o640, false}, {0o604, false}} {
 		path := filepath.Join(t.TempDir(), "fifo")
 		if err := syscall.Mkfifo(path, 0o600); err != nil {
 			t.Skipf("mkfifo: %v", err)
@@ -216,7 +218,7 @@ func TestReadFDRefusesWritableFIFO(t *testing.T) {
 		}
 		if !c.ok {
 			syscall.Close(fd)
-			if err == nil || !strings.Contains(err.Error(), "writable by other users") {
+			if err == nil || !strings.Contains(err.Error(), "owner only") {
 				t.Errorf("FIFO mode %04o: %v, want a refusal", c.mode, err)
 			}
 		}

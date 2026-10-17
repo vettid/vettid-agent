@@ -97,7 +97,13 @@ var (
 	// flush after the rename failed, so it may not survive a crash. The
 	// Store treats the new state as written (a following Save works, and
 	// a Create is not retried); saving again is the way to make it
-	// durable.
+	// durable. From CreateReplace it means the flush also failed on
+	// retry, and the old state file's bytes were left in place (not
+	// overwritten; where the replace had to overwrite first, because the
+	// file system cannot rename over an open file, they were already
+	// overwritten). For protectors whose Wipe deletes nothing (the
+	// passphrase and TPM protectors) those old bytes can still be opened
+	// with the old secret.
 	ErrNotDurable = errors.New("state: the new state file is in place but may not be durable")
 	// ErrNothingToWipe: Wipe found no state file and nothing loaded.
 	ErrNothingToWipe = errors.New("no state file: nothing to wipe (not paired)")
@@ -291,14 +297,24 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	// flushed (file and directory), so the old bytes are overwritten
 	// only once the new state is durable.
 	if err := s.create(p, state); err != nil {
-		// Also on ErrNotDurable: the old bytes are overwritten only once
-		// the new file is durable. The old file can no longer be opened
-		// (its protector's key is gone), and closing the handle releases
-		// it.
-		if old != nil {
-			old.Close()
+		if old != nil && errors.Is(err, ErrNotDurable) {
+			// The new file is in place but not yet durable. The old
+			// bytes are overwritten only once a flush succeeds, so keep
+			// the handle and retry the flush a few times.
+			if err = s.retryDurable(); err != nil {
+				// Never flushed: the old file's bytes are left in place
+				// (closing the handle releases the file). Protectors
+				// whose Wipe deletes nothing (passphrase, TPM) can
+				// still open them with the old secret.
+				old.Close()
+				return err
+			}
+		} else {
+			if old != nil {
+				old.Close()
+			}
+			return err
 		}
-		return err
 	}
 	if old == nil {
 		return nil
@@ -313,6 +329,23 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 // probeReplaceOpen reports whether the file system can rename over a
 // file this process holds open; tests replace it.
 var probeReplaceOpen = replaceOpenFileSupport
+
+// retryDurable retries the flushes after a rename (makeDurable) up to
+// three more times, 20 ms apart; it returns ErrNotDurable if they all
+// fail.
+func (s *Store) retryDurable() error {
+	var err error
+	for i := 0; i < 3; i++ {
+		time.Sleep(durableRetryDelay)
+		if err = makeDurable(s.dir, s.Path()); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w (flush failed): %w", ErrNotDurable, err)
+}
+
+// durableRetryDelay is the pause between flush retries; tests shorten it.
+var durableRetryDelay = 20 * time.Millisecond
 
 func checkProtector(p Protector) error {
 	if p == nil || !protectorName.MatchString(p.Name()) {

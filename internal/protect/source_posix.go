@@ -36,9 +36,9 @@ func openPassphraseFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 }
 
-// checkPassphraseFD accepts a pipe that only its owner can write to, or
-// a regular file that passes the same owner-only check as
-// --passphrase-file.
+// checkPassphraseFD accepts a pipe that belongs to the current user (a
+// named FIFO also with mode 0600 or 0400), or a regular file that passes
+// the same owner-only check as --passphrase-file.
 func checkPassphraseFD(fd int) error {
 	var st syscall.Stat_t
 	if err := syscall.Fstat(fd, &st); err != nil {
@@ -46,11 +46,16 @@ func checkPassphraseFD(fd int) error {
 	}
 	switch st.Mode & syscall.S_IFMT {
 	case syscall.S_IFIFO:
-		// A named FIFO on disk has its file mode; one that others can
-		// write to could carry their passphrase instead of the
-		// operator's. Anonymous pipes have no name to reach them by.
-		if namedFIFO(&st) && os.FileMode(st.Mode).Perm()&0o022 != 0 {
-			return errors.New("the pipe is writable by other users (a named FIFO must be mode 0600 or 0640)")
+		// Every pipe must belong to the current user. A named FIFO on
+		// disk must also have no group or other permission bits (0600
+		// or 0400): one that others can open could carry their
+		// passphrase instead of the operator's. Anonymous pipes have no
+		// name to reach them by.
+		if st.Uid != uint32(os.Geteuid()) {
+			return errors.New("the pipe must belong to the current user")
+		}
+		if m := os.FileMode(st.Mode).Perm(); m&0o077 != 0 && namedFIFO(fd) {
+			return fmt.Errorf("the named FIFO must be readable and writable by its owner only (mode %04o; use mode 0600)", m)
 		}
 		return nil
 	case syscall.S_IFREG:

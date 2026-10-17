@@ -79,9 +79,9 @@ The connector takes the passphrase from one of:
 - `--passphrase-fd N`: a pipe or regular file the parent process opened
   as descriptor `N`, read up to the first line break. A regular file
   must be private to you, as for `--passphrase-file`. A pipe can be an
-  anonymous pipe (preferred) or a named FIFO on disk; a FIFO must not be
-  writable by other users (mode `0600` or `0640`), or the connector
-  refuses it. Descriptors 0, 1 and 2 are refused, so
+  anonymous pipe (preferred) or a named FIFO on disk. Every pipe must
+  belong to you, and a FIFO must be mode `0600` (readable and writable by
+  you only), or the connector refuses it. Descriptors 0, 1 and 2 are refused, so
   `echo … | vettid-agent … --passphrase-fd 0` is not supported; use
   another descriptor, for example a pipe from a secret store,
   `vettid-agent … --passphrase-fd 3 3< <(secret-tool lookup …)`, or a
