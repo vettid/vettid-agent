@@ -256,7 +256,10 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	// Decided before anything is wiped: whether this file system can
 	// rename over a file this process holds open. If it cannot, the old
 	// file is overwritten and closed before the new one is written.
-	holdOld := canReplaceOpenFile(s.dir) && !testHookOverwriteFirst
+	holdOld, err := probeReplaceOpen(s.dir)
+	if err != nil {
+		return fmt.Errorf("state: could not tell whether this file system can replace an open file; nothing was replaced: %w", err)
+	}
 	if err := oldP.Wipe(); err != nil {
 		return fmt.Errorf("state: protector %s could not delete the old key; nothing was replaced: %w", oldP.Name(), err)
 	}
@@ -297,9 +300,9 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	return old.Close()
 }
 
-// testHookOverwriteFirst (tests only) makes CreateReplace take the order
-// used where an open file cannot be renamed over.
-var testHookOverwriteFirst bool
+// probeReplaceOpen reports whether the file system can rename over a
+// file this process holds open; tests replace it.
+var probeReplaceOpen = replaceOpenFileSupport
 
 func checkProtector(p Protector) error {
 	if p == nil || !protectorName.MatchString(p.Name()) {
@@ -450,26 +453,42 @@ func (s *Store) Wipe(resolve Resolver) error {
 
 // WipeAll is the fallback when the protector is not known: it asks every
 // protector in ps to delete its key (a protector without a key present
-// succeeds without doing anything; nil entries are skipped), then
-// removes the state and temporary files as Wipe does, whatever the
-// protectors answered. Every step is
-// attempted; the errors are joined. It may be retried.
+// succeeds without doing anything), then removes the state and temporary
+// files as Wipe does, whatever the protectors answered. Nil entries are
+// skipped; a typed-nil entry whose Wipe panics is reported as an error
+// (safeWipe). Every step is attempted; the errors are joined. It may be
+// retried.
 func (s *Store) WipeAll(ps []Protector) error {
 	if s.lock == nil {
 		return ErrClosed
 	}
 	var errs []error
-	for _, p := range ps {
+	for i, p := range ps {
 		if p == nil {
 			continue
 		}
-		if err := p.Wipe(); err != nil {
-			errs = append(errs, fmt.Errorf("state: protector %s could not delete its key: %w", p.Name(), err))
+		if err := safeWipe(p); err != nil {
+			errs = append(errs, fmt.Errorf("state: protector %d could not delete its key: %w", i, err))
 		}
 	}
 	errs = append(errs, s.removeFiles()...)
 	s.forget()
 	return errors.Join(errs...)
+}
+
+// safeWipe calls p.Wipe and turns a panic into an error. A nil
+// interface is skipped by the caller; a typed nil pointer inside the
+// interface (an interface holding (*T)(nil)) cannot be told apart
+// without reflection, so it is called: if its Wipe tolerates a nil
+// receiver that is fine, and if it dereferences one the panic becomes
+// this error instead of crashing the wipe half-way.
+func safeWipe(p Protector) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = errors.New("the protector failed (a nil protector?)")
+		}
+	}()
+	return p.Wipe()
 }
 
 // oldProtector returns the protector of the last Create or Load or,
@@ -587,10 +606,19 @@ func writeAtomic(dir, path string, raw []byte) error {
 		os.Remove(tmp)
 		return fmt.Errorf("state: replace state file: %w", err)
 	}
-	if err := syncDir(dir); err != nil {
-		return fmt.Errorf("state: sync state directory: %w", err)
+	if err := makeDurable(dir, path); err != nil {
+		return fmt.Errorf("state: the new state file is in place but may not be durable (flush failed): %w", err)
 	}
 	return nil
+}
+
+// makeDurable flushes the renamed file (Windows) and the directory;
+// tests replace it.
+var makeDurable = func(dir, path string) error {
+	if err := flushRenamed(path); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 // errNotRegular: openForOverwrite found a symbolic link or another

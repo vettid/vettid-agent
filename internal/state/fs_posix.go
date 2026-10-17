@@ -167,8 +167,12 @@ func createTemp(dir, prefix, suffix string) (*os.File, string, error) {
 
 func renameReplace(from, to string) error { return os.Rename(from, to) }
 
-// canReplaceOpenFile: rename(2) replaces a name whose file is open.
-func canReplaceOpenFile(string) bool { return true }
+// replaceOpenFileSupport: rename(2) replaces a name whose file is open.
+func replaceOpenFileSupport(string) (bool, error) { return true, nil }
+
+// flushRenamed: the file was synced before the rename; syncDir makes
+// the new name durable.
+func flushRenamed(string) error { return nil }
 
 func syncDir(dir string) error {
 	d, err := os.Open(dir)

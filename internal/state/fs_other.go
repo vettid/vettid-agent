@@ -21,6 +21,7 @@ func openPrivate(string) (*os.File, error)                        { return nil, 
 func openForOverwrite(string) (*os.File, error)                   { return nil, errUnsupported }
 func createTemp(string, string, string) (*os.File, string, error) { return nil, "", errUnsupported }
 func renameReplace(string, string) error                          { return errUnsupported }
-func canReplaceOpenFile(string) bool                              { return false }
+func replaceOpenFileSupport(string) (bool, error)                 { return false, errUnsupported }
+func flushRenamed(string) error                                   { return errUnsupported }
 func syncDir(string) error                                        { return errUnsupported }
 func lockDir(string) (io.Closer, error)                           { return nil, errUnsupported }

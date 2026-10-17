@@ -63,8 +63,9 @@ and govulncheck on Linux, macOS and Windows runners.
 
 Where no TPM, Keychain or DPAPI protector is available, the keys are
 protected by a passphrase only: at least 12 characters, using at least 3
-of lower-case letters, upper-case letters, digits, and symbols or
-punctuation. It is not bound to the computer: the state file and the
+of lower-case letters, upper-case letters, digits, and symbols,
+punctuation or letters without case (such as Chinese or Japanese
+characters); spaces count for no class. It is not bound to the computer: the state file and the
 passphrase open it anywhere.
 
 The connector takes the passphrase from one of:
@@ -74,12 +75,15 @@ The connector takes the passphrase from one of:
   line (one trailing line break is ignored). On Linux and macOS it must
   be owned by you and readable by you only (`chmod 600`);
 - `--passphrase-fd N`: a pipe or regular file the parent process opened
-  as descriptor `N`, read up to the first line break. Descriptors 0, 1
-  and 2 are refused, so `echo … | vettid-agent … --passphrase-fd 0` is
-  not supported; use another descriptor, for example
-  `vettid-agent … --passphrase-fd 3 3< passphrase.txt`, or
-  `--passphrase-file`. On Windows `N` is an inherited handle value, not
-  a C runtime descriptor.
+  as descriptor `N`, read up to the first line break. A regular file
+  must be owner-only, as for `--passphrase-file` (Linux and macOS);
+  a pipe needs no check. Descriptors 0, 1 and 2 are refused, so
+  `echo … | vettid-agent … --passphrase-fd 0` is not supported; use
+  another descriptor, for example a pipe from a secret store,
+  `vettid-agent … --passphrase-fd 3 3< <(secret-tool lookup …)`, or a
+  file made with `chmod 600`, `vettid-agent … --passphrase-fd 3
+  3< passphrase.txt`, or `--passphrase-file`. On Windows `N` is an
+  inherited handle value, not a C runtime descriptor.
 
 The passphrase is read **before** the state directory is opened; a
 descriptor given while the connector already holds its state directory
