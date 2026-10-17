@@ -9,11 +9,16 @@ package protect
 
 import (
 	"bytes"
+	"crypto/rand"
 	"errors"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-tpm-tools/simulator"
+	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpmutil"
 
@@ -69,8 +74,9 @@ func TestTPMOtherTPMRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := simProtector(2).Unwrap(blob); !errors.Is(err, ErrTPMUnseal) {
-		t.Fatalf("Unwrap on another TPM = %v, want ErrTPMUnseal", err)
+	_, err = simProtector(2).Unwrap(blob)
+	if !errors.Is(err, ErrTPMMismatch) || !strings.Contains(err.Error(), "cleared or replaced") {
+		t.Fatalf("Unwrap on another TPM = %v, want ErrTPMMismatch", err)
 	}
 	if _, err := simProtector(1).Unwrap(blob); err != nil {
 		t.Fatalf("Unwrap on the same TPM after the other: %v", err)
@@ -85,10 +91,18 @@ func TestTPMTamperedRefused(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	pubLen := int(blob[1])<<8 | int(blob[2])
-	privStart := 1 + 2 + pubLen + 2
+	nameLen := int(blob[1])<<8 | int(blob[2])
+	pubAt := 1 + 2 + nameLen
+	pubLen := int(blob[pubAt])<<8 | int(blob[pubAt+1])
+	privStart := pubAt + 2 + pubLen + 2
+	// A changed SRK Name: refused as a mismatch before any load.
+	b := append([]byte{}, blob...)
+	b[1+2+nameLen-1] ^= 0x01
+	if _, err := p.Unwrap(b); !errors.Is(err, ErrTPMMismatch) {
+		t.Errorf("SRK Name changed: %v, want ErrTPMMismatch", err)
+	}
 	cases := map[string]int{
-		"public, last byte":  1 + 2 + pubLen - 1,
+		"public, last byte":  pubAt + 2 + pubLen - 1,
 		"private, first":     privStart + 2,
 		"private, middle":    privStart + (len(blob)-privStart)/2,
 		"private, last byte": len(blob) - 1,
@@ -97,7 +111,7 @@ func TestTPMTamperedRefused(t *testing.T) {
 		b := append([]byte{}, blob...)
 		b[i] ^= 0x01
 		_, err := p.Unwrap(b)
-		if !errors.Is(err, ErrTPMUnseal) && !errors.Is(err, ErrTPMBlobFormat) {
+		if !errors.Is(err, ErrTPMUnseal) && !errors.Is(err, ErrTPMBlobFormat) && !errors.Is(err, ErrTPMMismatch) {
 			t.Errorf("%s: Unwrap = %v, want a refusal", name, err)
 		}
 		if err == nil {
@@ -140,8 +154,93 @@ func TestTPMStateFile(t *testing.T) {
 
 // With a working TPM, the TPM protector is chosen.
 func TestChooseTPMWithSimulator(t *testing.T) {
-	c := chooseTPM("simulator", simProtector(1).open)
-	if c.Protector != TPMName || !c.MachineBound || c.Notice() != "" {
-		t.Fatalf("choice %+v", c)
+	dir := t.TempDir()
+	oRM, oRaw, oOpen := tpmRMDevice, tpmRawDevice, openTPMDevice
+	defer func() { tpmRMDevice, tpmRawDevice, openTPMDevice = oRM, oRaw, oOpen }()
+	tpmRMDevice, tpmRawDevice = filepath.Join(dir, "tpmrm0"), filepath.Join(dir, "tpm0")
+	if err := os.WriteFile(tpmRMDevice, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	open := simProtector(1).open
+	openTPMDevice = func(string) (transport.TPMCloser, error) { return open() }
+	c, err := ChooseProtector(ChooseOptions{})
+	if err != nil || c.Protector != TPMName || !c.MachineBound {
+		t.Fatalf("choice %+v, %v", c, err)
+	}
+}
+
+// recordingTPM keeps every command and response.
+type recordingTPM struct {
+	inner transport.TPMCloser
+	log   *[][]byte
+}
+
+func (r recordingTPM) Send(cmd []byte) ([]byte, error) {
+	*r.log = append(*r.log, append([]byte{}, cmd...))
+	rsp, err := r.inner.Send(cmd)
+	*r.log = append(*r.log, append([]byte{}, rsp...))
+	return rsp, err
+}
+func (r recordingTPM) Close() error { return r.inner.Close() }
+
+// The data key never crosses the wire in the clear: no command or
+// response of Wrap or Unwrap contains it.
+func TestTPMWireNeverCarriesKey(t *testing.T) {
+	var log [][]byte
+	sim := simProtector(1)
+	p := &TPM{device: "simulator", open: func() (transport.TPMCloser, error) {
+		inner, err := sim.open()
+		if err != nil {
+			return nil, err
+		}
+		return recordingTPM{inner: inner, log: &log}, nil
+	}}
+	key := make([]byte, state.DataKeyLen)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatal(err)
+	}
+	blob, err := p.Wrap(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.Unwrap(blob)
+	if err != nil || !bytes.Equal(got, key) {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if len(log) < 8 {
+		t.Fatalf("only %d messages recorded", len(log))
+	}
+	for i, m := range log {
+		for _, frag := range [][]byte{key, key[:16], key[16:]} {
+			if bytes.Contains(m, frag) {
+				t.Fatalf("message %d carries the data key (or half of it) in the clear", i)
+			}
+		}
+	}
+}
+
+// A transient answer during Unwrap is retried.
+func TestTPMUnwrapRetriesTransient(t *testing.T) {
+	p := simProtector(1)
+	blob, err := p.Wrap(dataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	oSRK, oDelay := createSRKFn, tpmRetryDelay
+	defer func() { createSRKFn, tpmRetryDelay = oSRK, oDelay }()
+	tpmRetryDelay = time.Millisecond
+	n := 0
+	createSRKFn = func(tpm transport.TPM) (*srk, error) {
+		n++
+		if n == 1 {
+			return nil, tpm2.TPMRCRetry
+		}
+		return oSRK(tpm)
+	}
+	if got, err := p.Unwrap(blob); err != nil || !bytes.Equal(got, dataKey()) {
+		t.Fatalf("Unwrap: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("%d attempts, want 2", n)
 	}
 }

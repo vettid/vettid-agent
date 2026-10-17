@@ -18,3 +18,11 @@ func (c Choice) Notice() string {
 	}
 	return NotMachineBound
 }
+
+// ChooseOptions are the operator's choices for ChooseProtector.
+type ChooseOptions struct {
+	// AllowPassphraseFallback chooses the passphrase protector when a
+	// platform protector is present but does not work, instead of
+	// returning the error (the operator asked for a passphrase).
+	AllowPassphraseFallback bool
+}

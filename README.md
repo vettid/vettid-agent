@@ -66,9 +66,17 @@ On Linux the connector seals its state file's key to the computer's TPM
 of the state file does not open on another computer. The user that runs
 the connector needs access to that device (on most distributions,
 membership of the `tss` group). Without a TPM, or without access to it,
-the connector uses a passphrase instead and says so. The sealed key is
-not bound to PCR measurements, so firmware and kernel updates do not
-lock the connector out.
+the connector says what is wrong and how to fix it (for example, add
+your user to the `tss` group), and uses a passphrase only if you ask for
+one; on a computer with no TPM at all it uses a passphrase and says so.
+The sealed key is not bound to PCR measurements, so firmware and kernel
+updates do not lock the connector out.
+
+The sealed key lives only inside the state file. `forget` overwrites and
+deletes that file, but an old copy recovered from the disk afterwards (a
+backup, a file system snapshot, a block an SSD remapped) can still be
+opened on this computer until its TPM is cleared. Reaching such a copy
+already needs raw disk access on this computer and access to its TPM.
 
 ## Passphrase (computers without a platform protector)
 

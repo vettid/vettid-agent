@@ -31,23 +31,42 @@ package protect
 //
 // The wrapped blob:
 //
-//	blob = version (1 byte, 0x01) || len(pub) (2, big-endian) || pub
-//	       || len(priv) (2, big-endian) || priv
+//	blob = version (1 byte, 0x02) || len(srk) (2, big-endian) || srk
+//	       || len(pub) (2, big-endian) || pub || len(priv) (2, big-endian) || priv
+//	srk  = the Name of the storage root key the object was sealed under
 //	pub  = the sealed object's TPM2B_PUBLIC, priv its TPM2B_PRIVATE,
 //	       as the TPM returned them (tpm2.Marshal)
 //
-// with nothing after; an unknown version is refused.
+// with nothing after; any other version is refused (0x01, which had no
+// SRK Name, was never released). Before loading, the recreated SRK's
+// Name is compared with the pinned one: a different Name means a
+// different storage seed (the TPM was cleared or replaced, or the file
+// is from another computer), reported as ErrTPMMismatch without asking
+// the TPM to load anything.
 //
-// Wipe deletes nothing: the sealed object lives only in the blob inside
-// the state file (no persistent handle, no NV index), so overwriting and
-// deleting the state file destroys it. A future version that keeps a
-// key in the TPM would delete it in Wipe.
+// Errors are of three kinds. Definite: ErrTPMMismatch (SRK Name) and
+// ErrTPMUnseal (the TPM refused the object's integrity or binding);
+// only these say "another computer, cleared TPM or altered file".
+// Transient: ErrTPMBusy, after retrying TPM_RC_RETRY, TPM_RC_YIELDED,
+// TPM_RC_TESTING and the other warning codes a few times. Anything else
+// (the device cannot be opened, the owner hierarchy has a password, the
+// TPM is in failure mode) is returned with its cause.
+//
+// Wipe deletes nothing: the sealed object lives only
+// in the blob inside the state file (no persistent handle, no NV index),
+// so `forget` destroys it by overwriting and deleting the file. An old
+// copy of the state file recovered from the disk afterwards (a backup, a
+// file system snapshot, a block an SSD remapped) can still be opened on
+// this computer until its TPM is cleared. Reaching such a copy already
+// needs raw disk access on this machine plus access to its TPM.
 
 import (
 	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
+	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
@@ -62,16 +81,28 @@ const (
 	// DefaultTPMDevice is the kernel's TPM resource manager.
 	DefaultTPMDevice = "/dev/tpmrm0"
 
-	tpmBlobVersion = 1
+	tpmBlobVersion = 2
 	maxTPMPart     = 2048
+)
+
+// Retry policy for transient TPM answers; tests shorten the delay.
+var (
+	tpmAttempts   = 5
+	tpmRetryDelay = 50 * time.Millisecond
 )
 
 var (
 	// ErrTPMBlobFormat: the wrapped key is not a TPM protector blob.
 	ErrTPMBlobFormat = errors.New("the wrapped key is not in the TPM protector's format")
-	// ErrTPMUnseal: this TPM could not load or unseal the blob (another
-	// computer's TPM, a cleared TPM, or an altered blob).
-	ErrTPMUnseal = errors.New("this computer's TPM cannot open the state file's key (another computer, a cleared TPM, or an altered file)")
+	// ErrTPMUnseal: the TPM refused the sealed object (integrity or
+	// binding): an altered file, or one sealed by another TPM.
+	ErrTPMUnseal = errors.New("this TPM refuses the state file's key: the file was altered, or it is from another computer or a cleared TPM")
+	// ErrTPMMismatch: the storage root key differs from the one the key
+	// was sealed under.
+	ErrTPMMismatch = errors.New("the TPM was cleared or replaced, or this file is from another computer")
+	// ErrTPMBusy: the TPM kept answering with a transient code (busy,
+	// self-testing, out of memory for objects or sessions).
+	ErrTPMBusy = errors.New("the TPM is busy or still starting; try again")
 )
 
 // TPM is the TPM protector. It opens the TPM for each operation and
@@ -92,8 +123,10 @@ func NewTPM(device string) *TPM {
 // Name returns "tpm".
 func (t *TPM) Name() string { return TPMName }
 
-// Wipe does nothing: the sealed key exists only in the state file (see
-// the package comment above).
+// Wipe does nothing: the sealed key exists only in the state file, and
+// an old copy of that file recovered from the disk still opens on this
+// computer until its TPM is cleared (see the comment at the top of this
+// file).
 func (t *TPM) Wipe() error { return nil }
 
 // sealTemplate is the sealed data object's public template.
@@ -116,6 +149,37 @@ type srk struct {
 	name   tpm2.TPM2BName
 	pub    tpm2.TPMTPublic
 }
+
+// isTransient reports a TPM warning code worth retrying.
+func isTransient(err error) bool {
+	for _, rc := range []tpm2.TPMRC{tpm2.TPMRCRetry, tpm2.TPMRCYielded, tpm2.TPMRCTesting, tpm2.TPMRCCanceled,
+		tpm2.TPMRCContextGap, tpm2.TPMRCObjectMemory, tpm2.TPMRCSessionMemory, tpm2.TPMRCMemory,
+		tpm2.TPMRCObjectHandles, tpm2.TPMRCReferenceH0, tpm2.TPMRCNVRate} {
+		if errors.Is(err, rc) {
+			return true
+		}
+	}
+	return false
+}
+
+// withRetry runs op, retrying transient TPM answers; after the last
+// attempt a transient answer becomes ErrTPMBusy.
+func withRetry(op func() error) error {
+	var err error
+	for i := 0; i < tpmAttempts; i++ {
+		if i > 0 {
+			time.Sleep(tpmRetryDelay << (i - 1))
+		}
+		if err = op(); err == nil || !isTransient(err) {
+			return err
+		}
+	}
+	return fmt.Errorf("%w (%v)", ErrTPMBusy, err)
+}
+
+// createSRKFn creates the storage root key; tests replace it to inject
+// TPM answers.
+var createSRKFn = createSRK
 
 // createSRK creates the storage root key from the fixed template.
 func createSRK(tpm transport.TPM) (*srk, error) {
@@ -148,12 +212,22 @@ func (t *TPM) Wrap(dataKey []byte) ([]byte, error) {
 	if len(dataKey) != state.DataKeyLen {
 		return nil, errors.New("TPM protector: data key length")
 	}
+	var blob []byte
+	err := withRetry(func() error {
+		var err error
+		blob, err = t.wrapOnce(dataKey)
+		return err
+	})
+	return blob, err
+}
+
+func (t *TPM) wrapOnce(dataKey []byte) ([]byte, error) {
 	tpm, err := t.open()
 	if err != nil {
-		return nil, fmt.Errorf("TPM: open %s: %w", t.device, err)
+		return nil, openError(t.device, err)
 	}
 	defer tpm.Close()
-	k, err := createSRK(tpm)
+	k, err := createSRKFn(tpm)
 	if err != nil {
 		return nil, err
 	}
@@ -174,33 +248,46 @@ func (t *TPM) Wrap(dataKey []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("TPM: seal the key: %w", err)
 	}
-	return encodeTPMBlob(tpm2.Marshal(rsp.OutPublic), tpm2.Marshal(rsp.OutPrivate)), nil
+	return encodeTPMBlob(k.name.Buffer, tpm2.Marshal(rsp.OutPublic), tpm2.Marshal(rsp.OutPrivate)), nil
 }
 
-// Unwrap loads the sealed object under this TPM's storage root key and
-// unseals the data key.
+// Unwrap recreates the storage root key, checks its Name against the
+// pinned one, loads the sealed object and unseals the data key.
 func (t *TPM) Unwrap(blob []byte) ([]byte, error) {
-	pub, priv, err := decodeTPMBlob(blob)
+	srkName, pub, priv, err := decodeTPMBlob(blob)
 	if err != nil {
 		return nil, err
 	}
+	var key []byte
+	err = withRetry(func() error {
+		var err error
+		key, err = t.unwrapOnce(srkName, pub, priv)
+		return err
+	})
+	return key, err
+}
+
+func (t *TPM) unwrapOnce(srkName []byte, pub *tpm2.TPM2BPublic, priv *tpm2.TPM2BPrivate) ([]byte, error) {
 	tpm, err := t.open()
 	if err != nil {
-		return nil, fmt.Errorf("TPM: open %s: %w", t.device, err)
+		return nil, openError(t.device, err)
 	}
 	defer tpm.Close()
-	k, err := createSRK(tpm)
+	k, err := createSRKFn(tpm)
 	if err != nil {
 		return nil, err
 	}
 	defer flush(tpm, k.handle)
+	if !bytes.Equal(k.name.Buffer, srkName) {
+		return nil, ErrTPMMismatch
+	}
 	loaded, err := tpm2.Load{
 		ParentHandle: tpm2.AuthHandle{Handle: k.handle, Name: k.name, Auth: tpm2.PasswordAuth(nil)},
 		InPublic:     *pub,
 		InPrivate:    *priv,
 	}.Execute(tpm)
 	if err != nil {
-		return nil, ErrTPMUnseal
+		return nil, classifyLoad("load the sealed key", err)
 	}
 	defer flush(tpm, loaded.ObjectHandle)
 	rsp, err := tpm2.Unseal{
@@ -211,7 +298,7 @@ func (t *TPM) Unwrap(blob []byte) ([]byte, error) {
 		},
 	}.Execute(tpm)
 	if err != nil {
-		return nil, ErrTPMUnseal
+		return nil, classifyLoad("unseal the key", err)
 	}
 	key := append([]byte(nil), rsp.OutData.Buffer...)
 	clear(rsp.OutData.Buffer)
@@ -222,20 +309,49 @@ func (t *TPM) Unwrap(blob []byte) ([]byte, error) {
 	return key, nil
 }
 
-func encodeTPMBlob(pub, priv []byte) []byte {
+// classifyLoad maps a Load or Unseal failure: transient codes pass
+// through for withRetry; integrity, binding, size and value refusals are
+// definite (ErrTPMUnseal); anything else keeps its cause.
+func classifyLoad(step string, err error) error {
+	if isTransient(err) {
+		return err
+	}
+	for _, rc := range []tpm2.TPMRC{tpm2.TPMRCIntegrity, tpm2.TPMRCBinding, tpm2.TPMRCSize, tpm2.TPMRCValue} {
+		if errors.Is(err, rc) {
+			return ErrTPMUnseal
+		}
+	}
+	return fmt.Errorf("TPM: %s: %w", step, err)
+}
+
+// openError names the cause of a failure to open the TPM device.
+func openError(device string, err error) error {
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return fmt.Errorf("TPM: %s cannot be opened by this user (permission denied): add your user to the tss group (for example `sudo usermod -aG tss $USER`, then log in again)", device)
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("TPM: %s does not exist", device)
+	default:
+		return fmt.Errorf("TPM: open %s: %w", device, err)
+	}
+}
+
+func encodeTPMBlob(srkName, pub, priv []byte) []byte {
 	out := []byte{tpmBlobVersion}
-	out = binary.BigEndian.AppendUint16(out, uint16(len(pub)))
-	out = append(out, pub...)
-	out = binary.BigEndian.AppendUint16(out, uint16(len(priv)))
-	return append(out, priv...)
+	for _, part := range [][]byte{srkName, pub, priv} {
+		out = binary.BigEndian.AppendUint16(out, uint16(len(part)))
+		out = append(out, part...)
+	}
+	return out
 }
 
 // decodeTPMBlob checks the framing and the sealed object's public part
 // (a keyed-hash object with this protector's attributes) and returns
-// both parts. Each part must re-marshal to exactly its bytes.
-func decodeTPMBlob(blob []byte) (*tpm2.TPM2BPublic, *tpm2.TPM2BPrivate, error) {
+// the pinned SRK Name and both parts. Each part must re-marshal to
+// exactly its bytes.
+func decodeTPMBlob(blob []byte) ([]byte, *tpm2.TPM2BPublic, *tpm2.TPM2BPrivate, error) {
 	if len(blob) < 1 || blob[0] != tpmBlobVersion {
-		return nil, nil, ErrTPMBlobFormat
+		return nil, nil, nil, ErrTPMBlobFormat
 	}
 	rest := blob[1:]
 	part := func() ([]byte, bool) {
@@ -250,23 +366,29 @@ func decodeTPMBlob(blob []byte) (*tpm2.TPM2BPublic, *tpm2.TPM2BPrivate, error) {
 		rest = rest[2+n:]
 		return p, true
 	}
+	srkName, ok0 := part()
 	pubB, ok1 := part()
 	privB, ok2 := part()
-	if !ok1 || !ok2 || len(rest) != 0 {
-		return nil, nil, ErrTPMBlobFormat
+	if !ok0 || !ok1 || !ok2 || len(rest) != 0 {
+		return nil, nil, nil, ErrTPMBlobFormat
+	}
+	// A Name is a 2-byte hash algorithm id and its digest; the SRK's
+	// name algorithm is SHA-256.
+	if len(srkName) != 2+32 || binary.BigEndian.Uint16(srkName) != uint16(tpm2.TPMAlgSHA256) {
+		return nil, nil, nil, ErrTPMBlobFormat
 	}
 	pub, err := tpm2.Unmarshal[tpm2.TPM2BPublic](pubB)
 	if err != nil || !bytes.Equal(tpm2.Marshal(pub), pubB) {
-		return nil, nil, ErrTPMBlobFormat
+		return nil, nil, nil, ErrTPMBlobFormat
 	}
 	priv, err := tpm2.Unmarshal[tpm2.TPM2BPrivate](privB)
 	if err != nil || !bytes.Equal(tpm2.Marshal(priv), privB) {
-		return nil, nil, ErrTPMBlobFormat
+		return nil, nil, nil, ErrTPMBlobFormat
 	}
 	contents, err := pub.Contents()
 	if err != nil || contents.Type != tpm2.TPMAlgKeyedHash || contents.NameAlg != tpm2.TPMAlgSHA256 ||
 		contents.ObjectAttributes != sealTemplate.ObjectAttributes {
-		return nil, nil, ErrTPMBlobFormat
+		return nil, nil, nil, ErrTPMBlobFormat
 	}
-	return pub, priv, nil
+	return srkName, pub, priv, nil
 }
