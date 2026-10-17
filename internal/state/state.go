@@ -47,7 +47,10 @@ type Protector interface {
 	Unwrap(wrapped []byte) (dataKey []byte, err error)
 	// Wipe destroys the protector's own key (a TPM object, a Keychain
 	// item), if it has one, so that wrapped values can no longer be
-	// unwrapped. A protector with no key of its own returns nil.
+	// unwrapped. A protector with no key of its own, or whose key is
+	// already gone, returns nil, so Wipe may be retried. After Wipe the
+	// protector can Wrap again (a new pairing), making a new key if it
+	// uses one.
 	Wipe() error
 }
 
@@ -82,6 +85,13 @@ var (
 	// ErrNotOwnerOnly: the state directory or file is accessible to
 	// someone other than the current user, or owned by someone else.
 	ErrNotOwnerOnly = errors.New("state is not private to the current user")
+	// ErrExists: Create found a state file; replacing one is
+	// CreateReplace.
+	ErrExists = errors.New("a state file already exists (this connector is paired); replacing it must be explicit")
+	// ErrProtectorUnknown: the protector of the state file cannot be
+	// determined, so its key may remain. WipeAll with every known
+	// protector deletes it.
+	ErrProtectorUnknown = errors.New("the state file's protector is not known, so its key may remain; wipe with every known protector")
 	// ErrNotLoaded: Save before Create or Load.
 	ErrNotLoaded = errors.New("state: Save before Create or Load")
 	// ErrClosed: the store was closed.
@@ -123,8 +133,9 @@ func Open(dir string) (*Store, error) {
 	}
 	s := &Store{dir: dir, lock: lk}
 	// Temporary files left by a crash during a write hold an older
-	// state; remove them now that this process owns the directory.
-	if err := s.removeTemps(false); err != nil {
+	// state; overwrite and remove them now that this process owns the
+	// directory.
+	if err := s.removeTemps(); err != nil {
 		s.Close()
 		return nil, err
 	}
@@ -172,16 +183,97 @@ func (s *Store) Exists() (bool, error) {
 	}
 }
 
-// Create writes state under a new random data key wrapped by p,
-// replacing any state file (AGENT-PLAN §4.2: a new data key at each
-// pairing). Later Saves keep this data key.
+// Create writes state under a new random data key wrapped by p
+// (AGENT-PLAN §4.2: a new data key at each pairing). Later Saves keep
+// this data key. If a state file (or anything else) is already at the
+// state file's path, Create returns ErrExists and changes nothing:
+// replacing a state file is CreateReplace.
 func (s *Store) Create(p Protector, state []byte) error {
 	if s.lock == nil {
 		return ErrClosed
 	}
+	if err := checkProtector(p); err != nil {
+		return err
+	}
+	exists, err := s.Exists()
+	if err != nil {
+		return err
+	}
+	if exists {
+		return ErrExists
+	}
+	return s.create(p, state)
+}
+
+// CreateReplace is Create that destroys an existing state file instead
+// of refusing it. In order:
+//
+//  1. The old protector's key is wiped (Protector.Wipe). The old
+//     protector is the one of the last Create or Load or, when the file
+//     was not opened, the one resolve returns for the old header's
+//     name. If neither gives one, CreateReplace returns
+//     ErrProtectorUnknown and changes nothing (WipeAll, then Create, is
+//     the way out). If the wipe fails, nothing else is changed.
+//  2. The old file is opened and held; the new state is written under a
+//     new data key and renamed over the path.
+//  3. The old file's bytes are overwritten with zeros through the held
+//     descriptor and synced; closing it deletes it.
+//
+// p may be the old protector itself: a protector can wrap again after
+// its Wipe.
+func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error {
+	if s.lock == nil {
+		return ErrClosed
+	}
+	if err := checkProtector(p); err != nil {
+		return err
+	}
+	exists, err := s.Exists()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return s.create(p, state)
+	}
+	oldP := s.oldProtector(resolve)
+	if oldP == nil {
+		return ErrProtectorUnknown
+	}
+	if err := oldP.Wipe(); err != nil {
+		return fmt.Errorf("state: protector %s could not delete the old key; nothing was replaced: %w", oldP.Name(), err)
+	}
+	s.forget()
+	old, err := openForOverwrite(s.Path())
+	switch {
+	case errors.Is(err, errNotRegular):
+		old = nil // a link or other non-file: the rename replaces the name itself
+	case err != nil:
+		return fmt.Errorf("state: open the old state file: %w", err)
+	}
+	if err := s.create(p, state); err != nil {
+		if old != nil {
+			old.Close()
+		}
+		return err
+	}
+	if old == nil {
+		return nil
+	}
+	if err := overwriteFile(old); err != nil {
+		old.Close()
+		return fmt.Errorf("state: the new state is written, but overwriting the old file failed: %w", err)
+	}
+	return old.Close()
+}
+
+func checkProtector(p Protector) error {
 	if p == nil || !protectorName.MatchString(p.Name()) {
 		return errors.New("state: invalid protector")
 	}
+	return nil
+}
+
+func (s *Store) create(p Protector, state []byte) error {
 	key := make([]byte, DataKeyLen)
 	if _, err := rand.Read(key); err != nil {
 		return err
@@ -265,13 +357,24 @@ func (s *Store) CreatedAt() time.Time {
 	return time.Unix(s.createdAt, 0)
 }
 
-// Wipe destroys the state (AGENT-PLAN §4.2 "Wipe"; AG12): it overwrites
-// the state file's bytes in place, syncs, deletes it, deletes temporary
-// files left by an interrupted write, and calls the protector's Wipe.
-// The protector is the one of the last Create or Load or, when the file
-// was not opened (a forgotten passphrase), the one resolve returns for
-// the header's name. Every step is attempted even when an earlier one
-// fails; the errors are joined. A missing state file is not an error.
+// Wipe destroys the state (AGENT-PLAN §4.2 "Wipe"; AG12). In order:
+//
+//  1. The protector's key is wiped first (Protector.Wipe). The
+//     protector is the one of the last Create or Load or, when the file
+//     was not opened (a forgotten passphrase), the one resolve returns
+//     for the header's name. If that wipe fails, Wipe returns the error
+//     and keeps the state file, so that a retry finds the protector
+//     again.
+//  2. The state file's bytes are overwritten with zeros in place,
+//     synced, and the file deleted; leftover temporary files are
+//     treated the same way; the directory is synced. A symbolic link
+//     (or other non-file) at a path is deleted itself, never followed.
+//
+// If no protector can be determined (the header is unreadable or
+// zeroed, or the file is already gone and nothing was loaded), Wipe
+// still deletes the files but returns ErrProtectorUnknown, because a
+// protector key may remain: WipeAll with every known protector is the
+// fallback. Wipe never returns nil while a protector key may remain.
 //
 // Overwriting is best effort against recovery from the disk: journaling
 // and copy-on-write file systems and SSD wear levelling can keep older
@@ -281,40 +384,87 @@ func (s *Store) Wipe(resolve Resolver) error {
 	if s.lock == nil {
 		return ErrClosed
 	}
-	p := s.prot
-	if p == nil && resolve != nil {
-		// The header only names the protector; the file is being
-		// destroyed, so its permissions are not checked here.
-		if raw, err := readNoFollow(s.Path(), maxFileLen, false); err == nil {
-			if hb, _, err := splitFile(raw); err == nil {
-				if h, err := parseHeader(hb); err == nil {
-					p = resolve(h.Protector)
-				}
-			}
+	p := s.oldProtector(resolve)
+	if p != nil {
+		if err := p.Wipe(); err != nil {
+			return fmt.Errorf("state: protector %s could not delete its key; the state file is kept so that the wipe can be retried: %w", p.Name(), err)
 		}
 	}
+	errs := s.removeFiles()
+	s.forget()
+	if p == nil {
+		errs = append([]error{ErrProtectorUnknown}, errs...)
+	}
+	return errors.Join(errs...)
+}
+
+// WipeAll is the fallback when the protector is not known: it asks every
+// protector in ps to delete its key (a protector without a key present
+// succeeds without doing anything), then removes the state and temporary
+// files as Wipe does, whatever the protectors answered. Every step is
+// attempted; the errors are joined. It may be retried.
+func (s *Store) WipeAll(ps []Protector) error {
+	if s.lock == nil {
+		return ErrClosed
+	}
+	var errs []error
+	for _, p := range ps {
+		if err := p.Wipe(); err != nil {
+			errs = append(errs, fmt.Errorf("state: protector %s could not delete its key: %w", p.Name(), err))
+		}
+	}
+	errs = append(errs, s.removeFiles()...)
+	s.forget()
+	return errors.Join(errs...)
+}
+
+// oldProtector returns the protector of the last Create or Load or,
+// failing that, the one resolve returns for the state file's header.
+// The header only names the protector, and the file is about to be
+// destroyed, so its permissions are not checked here.
+func (s *Store) oldProtector(resolve Resolver) Protector {
+	if s.prot != nil {
+		return s.prot
+	}
+	if resolve == nil {
+		return nil
+	}
+	raw, err := readNoFollow(s.Path(), maxFileLen, false)
+	if err != nil {
+		return nil
+	}
+	hb, _, err := splitFile(raw)
+	if err != nil {
+		return nil
+	}
+	h, err := parseHeader(hb)
+	if err != nil {
+		return nil
+	}
+	if p := resolve(h.Protector); p != nil && p.Name() == h.Protector {
+		return p
+	}
+	return nil
+}
+
+// removeFiles overwrites and deletes the state file and leftover
+// temporary files, and syncs the directory.
+func (s *Store) removeFiles() []error {
 	var errs []error
 	if err := overwriteAndRemove(s.Path()); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, fmt.Errorf("state: wipe state file: %w", err))
 	}
-	if err := s.removeTemps(true); err != nil {
+	if err := s.removeTemps(); err != nil {
 		errs = append(errs, err)
 	}
 	if err := syncDir(s.dir); err != nil {
 		errs = append(errs, fmt.Errorf("state: sync state directory: %w", err))
 	}
-	if p != nil {
-		if err := p.Wipe(); err != nil {
-			errs = append(errs, fmt.Errorf("state: protector %s could not delete its key: %w", p.Name(), err))
-		}
-	}
-	s.forget()
-	return errors.Join(errs...)
+	return errs
 }
 
-// removeTemps deletes temporary state files, overwriting them first when
-// overwrite is set.
-func (s *Store) removeTemps(overwrite bool) error {
+// removeTemps overwrites and deletes temporary state files.
+func (s *Store) removeTemps() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return err
@@ -325,13 +475,7 @@ func (s *Store) removeTemps(overwrite bool) error {
 		if !strings.HasPrefix(n, tempPrefix) || !strings.HasSuffix(n, tempSuffix) {
 			continue
 		}
-		path := filepath.Join(s.dir, n)
-		if overwrite {
-			err = overwriteAndRemove(path)
-		} else {
-			err = os.Remove(path)
-		}
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		if err := overwriteAndRemove(filepath.Join(s.dir, n)); err != nil && !errors.Is(err, os.ErrNotExist) {
 			errs = append(errs, fmt.Errorf("state: remove temporary file: %w", err))
 		}
 	}
@@ -381,16 +525,39 @@ func writeAtomic(dir, path string, raw []byte) error {
 	return nil
 }
 
+// errNotRegular: openForOverwrite found a symbolic link or another
+// non-file at the path.
+var errNotRegular = errors.New("not a regular file")
+
 // overwriteAndRemove overwrites a file's bytes with zeros in place,
-// syncs it and deletes it.
+// syncs it and deletes it. A symbolic link or other non-file at the
+// path is deleted itself, never followed or written.
 func overwriteAndRemove(path string) error {
 	f, err := openForOverwrite(path)
+	if errors.Is(err, errNotRegular) {
+		return os.Remove(path)
+	}
 	if err != nil {
 		return err
 	}
+	if err := overwriteFile(f); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Remove(path)
+}
+
+// overwriteFile writes zeros over the whole of f from its start and
+// syncs it.
+func overwriteFile(f *os.File) error {
 	fi, err := f.Stat()
 	if err != nil {
-		f.Close()
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	zeros := make([]byte, 64<<10)
@@ -400,19 +567,11 @@ func overwriteAndRemove(path string) error {
 			n = left
 		}
 		if _, err := f.Write(zeros[:n]); err != nil {
-			f.Close()
 			return err
 		}
 		left -= n
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Remove(path)
+	return f.Sync()
 }
 
 // readNoFollow opens path without following a symbolic link and reads at

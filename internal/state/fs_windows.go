@@ -182,6 +182,7 @@ func checkFile(f *os.File) error {
 
 // openNoFollow opens path with FILE_FLAG_OPEN_REPARSE_POINT, so that a
 // symbolic link or junction at the path is opened itself, not followed.
+// It returns errNotRegular for a reparse point or a directory.
 func openNoFollow(path string, access uint32) (*os.File, error) {
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
@@ -189,7 +190,7 @@ func openNoFollow(path string, access uint32) (*os.File, error) {
 	}
 	h, err := windows.CreateFile(p, access,
 		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
-		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
 			return nil, &os.PathError{Op: "open", Path: path, Err: os.ErrNotExist}
@@ -202,29 +203,23 @@ func openNoFollow(path string, access uint32) (*os.File, error) {
 		f.Close()
 		return nil, err
 	}
-	if info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+	if info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
 		f.Close()
-		return nil, notPrivate("state file", "is a link")
+		return nil, errNotRegular
 	}
 	return f, nil
 }
 
 func openPrivate(path string) (*os.File, error) {
-	return openNoFollow(path, windows.GENERIC_READ|windows.READ_CONTROL)
+	f, err := openNoFollow(path, windows.GENERIC_READ|windows.READ_CONTROL)
+	if errors.Is(err, errNotRegular) {
+		return nil, notPrivate("state file", "is a link or not a regular file")
+	}
+	return f, err
 }
 
 func openForOverwrite(path string) (*os.File, error) {
-	f, err := openNoFollow(path, windows.GENERIC_WRITE)
-	if err != nil {
-		return nil, err
-	}
-	var info windows.ByHandleFileInformation
-	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &info); err != nil ||
-		info.FileAttributes&windows.FILE_ATTRIBUTE_DIRECTORY != 0 {
-		f.Close()
-		return nil, notPrivate("state file", "is not a regular file")
-	}
-	return f, nil
+	return openNoFollow(path, windows.GENERIC_WRITE)
 }
 
 func createTemp(dir, prefix, suffix string) (*os.File, string, error) {

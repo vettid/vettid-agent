@@ -12,11 +12,16 @@ import (
 // fixedProtector is a test-only protector with a fixed key and a fixed
 // wrapping nonce, so that the vectors are reproducible. A fixed nonce is
 // acceptable only here: real protectors draw a fresh nonce per wrap.
+//
+// It models a protector with a key of its own: hasKey is set by Wrap
+// and cleared by Wipe; failWipes makes that many Wipes fail first.
 type fixedProtector struct {
-	name  string
-	key   []byte
-	nonce []byte
-	wiped int
+	name      string
+	key       []byte
+	nonce     []byte
+	wiped     int
+	hasKey    bool
+	failWipes int
 }
 
 const testProtectorName = "test-fixed"
@@ -36,6 +41,7 @@ func (p *fixedProtector) Wrap(dataKey []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	p.hasKey = true
 	out := append([]byte{}, p.nonce...)
 	return aead.Seal(out, p.nonce, dataKey, []byte(p.name)), nil
 }
@@ -56,7 +62,15 @@ func (p *fixedProtector) Unwrap(wrapped []byte) ([]byte, error) {
 	return k, nil
 }
 
-func (p *fixedProtector) Wipe() error { p.wiped++; return nil }
+func (p *fixedProtector) Wipe() error {
+	if p.failWipes > 0 {
+		p.failWipes--
+		return errors.New("key not deleted")
+	}
+	p.wiped++
+	p.hasKey = false
+	return nil
+}
 
 // seq returns n bytes start, start+1, ...
 func seq(start byte, n int) []byte {

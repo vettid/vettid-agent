@@ -12,7 +12,7 @@ session keyring) in one encrypted file per state directory (AGENT-PLAN
 |---|---|
 | `vettid-agent.state` | the state file below |
 | `vettid-agent.lock` | the lock file; empty, kept between runs |
-| `.vettid-agent.state.<32 hex>.tmp` | a write in progress; one left by a crash is removed by the next process that takes the lock |
+| `.vettid-agent.state.<32 hex>.tmp` | a write in progress; one left by a crash is overwritten and removed by the next process that takes the lock |
 
 ## Format, version 1
 
@@ -101,14 +101,38 @@ Errors name the check that failed, never the data.
 
 ## Wipe
 
-`forget` and `device.unlinked` (AGENT-PLAN AG12) overwrite the state
-file's bytes with zeros in place, sync it, delete it, delete leftover
-temporary files the same way, sync the directory, and call the
-protector's `Wipe` to destroy its own key (a TPM object, a Keychain
-item). The protector is found from the header's name when the file was
-not opened (a forgotten passphrase). Overwriting in place does not
-reach copies a journaling or copy-on-write file system or an SSD may
-keep; destroying the protector's key does, where the protector has one.
+`forget` and `device.unlinked` (AGENT-PLAN AG12) wipe in this order:
+
+1. The protector's key first (`Protector.Wipe`: a TPM object, a
+   Keychain item; nothing for the passphrase protector). The protector
+   is the one that created or opened the file or, when the file was not
+   opened (a forgotten passphrase), the one named in the header. If its
+   wipe fails, the state file is kept and the error returned, so that a
+   retry finds the protector again.
+2. The state file's bytes are overwritten with zeros in place, synced,
+   and the file deleted; leftover temporary files the same way; the
+   directory synced. A symbolic link at either path is deleted itself,
+   never followed.
+
+If the protector cannot be determined (an unreadable or zeroed header,
+or no file and nothing opened), the files are still deleted but the wipe
+reports that a protector key may remain; the fallback (`WipeAll`) asks
+every known protector to delete its key (a protector with no key present
+succeeds without doing anything). A wipe never reports success while a
+protector key may remain.
+
+Overwriting in place does not reach copies a journaling or copy-on-write
+file system or an SSD may keep; destroying the protector's key does,
+where the protector has one.
+
+## Creating over an existing file
+
+`Create` refuses when a state file exists. Replacing one is explicit
+(`CreateReplace`): the old protector's key is wiped first (nothing
+changes if that fails or the protector is unknown), the old file is
+opened and held, the new state is written under a new data key and
+renamed over the path, and the old bytes are overwritten through the
+held descriptor before it is closed.
 
 In-memory keys are cleared when no longer needed, as far as Go allows;
 copies the runtime made cannot be reached.

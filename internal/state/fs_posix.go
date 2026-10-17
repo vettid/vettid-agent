@@ -131,17 +131,18 @@ func openPrivate(path string) (*os.File, error) {
 
 func openForOverwrite(path string) (*os.File, error) {
 	f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
-	if errors.Is(err, syscall.ELOOP) {
-		// A link at the path: delete the link, never write through it.
-		return nil, notPrivate("state file", "is a symbolic link")
+	if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EISDIR) || errors.Is(err, syscall.ENXIO) {
+		// A symbolic link, a directory, or a FIFO without a reader.
+		return nil, errNotRegular
 	}
-	if err == nil {
-		if fi, serr := f.Stat(); serr != nil || !fi.Mode().IsRegular() {
-			f.Close()
-			return nil, notPrivate("state file", "is not a regular file")
-		}
+	if err != nil {
+		return nil, err
 	}
-	return f, err
+	if fi, serr := f.Stat(); serr != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, errNotRegular
+	}
+	return f, nil
 }
 
 func createTemp(dir, prefix, suffix string) (*os.File, string, error) {

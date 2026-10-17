@@ -96,7 +96,7 @@ func TestCreateMakesNewDataKey(t *testing.T) {
 	}
 	k1 := append([]byte{}, s.dataKey...)
 	w1 := readHeader(t, s.Path()).WrappedKey
-	if err := s.Create(p, []byte("b")); err != nil {
+	if err := s.CreateReplace(p, []byte("b"), nil); err != nil {
 		t.Fatal(err)
 	}
 	if bytes.Equal(k1, s.dataKey) {
@@ -288,8 +288,8 @@ func TestWipe(t *testing.T) {
 	if err := s.Wipe(nil); err != nil {
 		t.Fatalf("Wipe: %v", err)
 	}
-	if p.wiped != 1 {
-		t.Errorf("protector Wipe called %d times, want 1", p.wiped)
+	if p.wiped != 1 || p.hasKey {
+		t.Errorf("protector Wipe called %d times, key present %v", p.wiped, p.hasKey)
 	}
 	if _, err := os.Lstat(s.Path()); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("state file still there: %v", err)
@@ -346,31 +346,317 @@ func TestWipeWithoutLoad(t *testing.T) {
 	}
 }
 
-func TestWipeNothing(t *testing.T) {
+// Nothing loaded and no file: the protector cannot be determined, so a
+// key may remain and Wipe says so; WipeAll is the fallback.
+func TestWipeMissingFileReportsUnknownProtector(t *testing.T) {
 	s := openTest(t)
-	if err := s.Wipe(resolverFor()); err != nil {
-		t.Fatalf("Wipe with no state: %v", err)
+	if err := s.Wipe(resolverFor()); !errors.Is(err, ErrProtectorUnknown) {
+		t.Fatalf("Wipe with no state = %v, want ErrProtectorUnknown", err)
+	}
+	p := newFixedProtector(seq(0x40, 32))
+	p.hasKey = true
+	if err := s.WipeAll([]Protector{p}); err != nil {
+		t.Fatalf("WipeAll: %v", err)
+	}
+	if p.hasKey {
+		t.Error("WipeAll left the protector key")
 	}
 }
 
-type failingProtector struct{ *fixedProtector }
-
-func (failingProtector) Wipe() error { return errors.New("key not deleted") }
-
-// A protector that cannot delete its key does not stop the file's
-// deletion, and the error says so.
-func TestWipeProtectorFailure(t *testing.T) {
+// A zeroed header: Wipe deletes the file but reports that the key may
+// remain; WipeAll deletes the key.
+func TestWipeZeroedHeader(t *testing.T) {
 	s := openTest(t)
-	p := failingProtector{newFixedProtector(seq(0x40, 32))}
+	p := newFixedProtector(seq(0x40, 32))
 	if err := s.Create(p, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	err := s.Wipe(nil)
+	dir := s.Dir()
+	s.Close()
+	if err := os.WriteFile(filepath.Join(dir, StateFileName), make([]byte, 300), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if err := s2.Wipe(resolverFor(p)); !errors.Is(err, ErrProtectorUnknown) {
+		t.Fatalf("Wipe = %v, want ErrProtectorUnknown", err)
+	}
+	if ok, _ := s2.Exists(); ok {
+		t.Error("state file kept")
+	}
+	if !p.hasKey {
+		t.Fatal("precondition: the key should still be there")
+	}
+	if err := s2.WipeAll([]Protector{p}); err != nil {
+		t.Fatalf("WipeAll: %v", err)
+	}
+	if p.hasKey {
+		t.Error("protector key remains after WipeAll")
+	}
+}
+
+// A protector that cannot delete its key: Wipe reports it and keeps the
+// file; a retry finds the protector again and finishes.
+func TestWipeRetryAfterProtectorFailure(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	dir := s.Dir()
+	s.Close()
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	p.failWipes = 1
+	err = s2.Wipe(resolverFor(p))
 	if err == nil || !strings.Contains(err.Error(), "key not deleted") {
 		t.Fatalf("Wipe = %v, want the protector's error", err)
 	}
-	if ok, _ := s.Exists(); ok {
-		t.Error("state file kept after the protector failed")
+	if ok, _ := s2.Exists(); !ok {
+		t.Fatal("state file deleted although the key remains")
+	}
+	if !p.hasKey {
+		t.Fatal("precondition: key should remain after the failure")
+	}
+	if err := s2.Wipe(resolverFor(p)); err != nil {
+		t.Fatalf("retried Wipe: %v", err)
+	}
+	if p.hasKey {
+		t.Error("key remains after the retry")
+	}
+	if ok, _ := s2.Exists(); ok {
+		t.Error("state file remains after the retry")
+	}
+}
+
+// The protector's key goes before the file.
+func TestWipeOrderKeyFirst(t *testing.T) {
+	s := openTest(t)
+	p := &orderProtector{fixedProtector: newFixedProtector(seq(0x40, 32)), path: ""}
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	p.path = s.Path()
+	if err := s.Wipe(nil); err != nil {
+		t.Fatal(err)
+	}
+	if !p.fileExistedAtWipe {
+		t.Error("the state file was deleted before the protector's key")
+	}
+}
+
+type orderProtector struct {
+	*fixedProtector
+	path              string
+	fileExistedAtWipe bool
+}
+
+func (p *orderProtector) Wipe() error {
+	_, err := os.Lstat(p.path)
+	p.fileExistedAtWipe = err == nil
+	return p.fixedProtector.Wipe()
+}
+
+func TestCreateRefusesExisting(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Create(p, []byte("second")); !errors.Is(err, ErrExists) {
+		t.Fatalf("second Create = %v, want ErrExists", err)
+	}
+	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "first" {
+		t.Fatalf("Load = %q, %v; the first state should be untouched", got, err)
+	}
+}
+
+// An explicit replace wipes the old protector's key, overwrites the old
+// file's bytes and writes the new state under a new key.
+func TestCreateReplace(t *testing.T) {
+	s := openTest(t)
+	oldP := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(oldP, []byte("old state")); err != nil {
+		t.Fatal(err)
+	}
+	size := fileSize(t, s.Path())
+	link := filepath.Join(t.TempDir(), "old")
+	linked := os.Link(s.Path(), link) == nil
+	dir := s.Dir()
+	s.Close()
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+
+	newP := newFixedProtector(seq(0x50, 32))
+	newP.name = "test-new"
+	if err := s2.CreateReplace(newP, []byte("new state"), resolverFor(oldP)); err != nil {
+		t.Fatalf("CreateReplace: %v", err)
+	}
+	if oldP.hasKey || oldP.wiped != 1 {
+		t.Errorf("old protector key: hasKey %v, wiped %d", oldP.hasKey, oldP.wiped)
+	}
+	if linked {
+		got, err := os.ReadFile(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(got)) != size || !bytes.Equal(got, make([]byte, size)) {
+			t.Error("the old file's bytes were not overwritten")
+		}
+	} else {
+		t.Log("no hard links here; overwrite not observed")
+	}
+	if got, err := s2.Load(resolverFor(newP)); err != nil || string(got) != "new state" {
+		t.Fatalf("Load = %q, %v", got, err)
+	}
+	for _, n := range listDir(t, dir) {
+		if strings.HasSuffix(n, tempSuffix) {
+			t.Errorf("temporary file %s left", n)
+		}
+	}
+}
+
+// Replacing with the same protector after its Wipe works.
+func TestCreateReplaceSameProtector(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.CreateReplace(p, []byte("b"), nil); err != nil {
+		t.Fatalf("CreateReplace: %v", err)
+	}
+	if !p.hasKey || p.wiped != 1 {
+		t.Errorf("hasKey %v, wiped %d", p.hasKey, p.wiped)
+	}
+	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "b" {
+		t.Fatalf("Load = %q, %v", got, err)
+	}
+}
+
+func TestCreateReplaceRefusals(t *testing.T) {
+	t.Run("unknown protector", func(t *testing.T) {
+		s := openTest(t)
+		if err := s.Create(newFixedProtector(seq(0x40, 32)), []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(s.Path())
+		dir := s.Dir()
+		s.Close()
+		s2, err := Open(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s2.Close()
+		if err := s2.CreateReplace(newFixedProtector(seq(0x40, 32)), []byte("b"), resolverFor()); !errors.Is(err, ErrProtectorUnknown) {
+			t.Fatalf("CreateReplace = %v, want ErrProtectorUnknown", err)
+		}
+		if after, _ := os.ReadFile(s2.Path()); !bytes.Equal(before, after) {
+			t.Error("the state file changed")
+		}
+	})
+	t.Run("old key not deleted", func(t *testing.T) {
+		s := openTest(t)
+		p := newFixedProtector(seq(0x40, 32))
+		if err := s.Create(p, []byte("a")); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(s.Path())
+		p.failWipes = 1
+		if err := s.CreateReplace(p, []byte("b"), nil); err == nil {
+			t.Fatal("CreateReplace succeeded although the old key was not deleted")
+		}
+		if after, _ := os.ReadFile(s.Path()); !bytes.Equal(before, after) {
+			t.Error("the state file changed")
+		}
+	})
+	t.Run("no existing file", func(t *testing.T) {
+		s := openTest(t)
+		p := newFixedProtector(seq(0x40, 32))
+		if err := s.CreateReplace(p, []byte("a"), nil); err != nil {
+			t.Fatalf("CreateReplace without a file: %v", err)
+		}
+		if p.wiped != 0 {
+			t.Error("a protector was wiped although nothing was replaced")
+		}
+	})
+}
+
+// A symbolic link at the state file's path: Wipe deletes the link
+// itself, leaves its target alone, and succeeds.
+func TestWipeDeletesSymlinkItself(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "elsewhere")
+	if err := os.WriteFile(target, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(s.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, s.Path()); err != nil {
+		t.Skipf("cannot create a symbolic link here: %v", err)
+	}
+	tmpLink := filepath.Join(s.Dir(), tempPrefix+"01"+tempSuffix)
+	if err := os.Symlink(target, tmpLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Wipe(nil); err != nil {
+		t.Fatalf("Wipe: %v", err)
+	}
+	for _, path := range []string{s.Path(), tmpLink} {
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("link %s still there: %v", filepath.Base(path), err)
+		}
+	}
+	if got, _ := os.ReadFile(target); string(got) != "untouched" {
+		t.Errorf("the link's target was written: %q", got)
+	}
+	if p.hasKey {
+		t.Error("protector key remains")
+	}
+}
+
+// Open overwrites a leftover temporary file before deleting it.
+func TestOpenOverwritesLeftoverTemps(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	tmp := filepath.Join(dir, tempPrefix+"02"+tempSuffix)
+	content := []byte("an older encrypted state")
+	if err := os.WriteFile(tmp, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "tmp-link")
+	linked := os.Link(tmp, link) == nil
+	s, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := os.Lstat(tmp); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("temporary file still there: %v", err)
+	}
+	if !linked {
+		t.Skip("no hard links here; overwrite not observed")
+	}
+	if got, _ := os.ReadFile(link); !bytes.Equal(got, make([]byte, len(content))) {
+		t.Error("the temporary file was deleted without being overwritten")
 	}
 }
 
@@ -405,9 +691,13 @@ func TestLoadRefusesSymlink(t *testing.T) {
 	if _, err := s.Load(resolverFor()); !errors.Is(err, ErrNotOwnerOnly) {
 		t.Fatalf("Load through a symbolic link = %v, want ErrNotOwnerOnly", err)
 	}
-	// Wipe deletes the link and leaves its target alone.
-	if err := s.Wipe(nil); err == nil {
-		t.Log("Wipe returned nil")
+	// Nothing was loaded, so Wipe cannot tell the protector; it still
+	// deletes the link, not its target.
+	if err := s.Wipe(nil); !errors.Is(err, ErrProtectorUnknown) {
+		t.Errorf("Wipe = %v, want ErrProtectorUnknown", err)
+	}
+	if _, err := os.Lstat(s.Path()); !errors.Is(err, os.ErrNotExist) {
+		t.Error("link still there")
 	}
 	if got, _ := os.ReadFile(target); string(got) != "x" {
 		t.Error("Wipe wrote through the link")
