@@ -55,7 +55,9 @@ and govulncheck on Linux, macOS and Windows runners.
 - One connector, one vault: each MCP client gets its own state directory
   and its own pairing, which the member can remove separately.
 - Keys at rest are wrapped by a platform protector (TPM 2.0, macOS
-  Keychain, Windows DPAPI) or, where none exists, a passphrase.
+  Keychain, Windows DPAPI) or, where none exists, a passphrase. The
+  state file's format, owner-only rules and lock are in
+  [docs/STATE-FILE.md](docs/STATE-FILE.md).
 
 ## License
 

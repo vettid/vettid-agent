@@ -1,0 +1,182 @@
+//go:build windows
+
+package state
+
+import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+)
+
+const (
+	sidEveryone = "S-1-1-0"
+	sidUsers    = "S-1-5-32-545"
+	sidSystem   = "S-1-5-18"
+)
+
+func icacls(t *testing.T, args ...string) {
+	t.Helper()
+	out, err := exec.Command("icacls", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("icacls %v: %v: %s", args, err, out)
+	}
+}
+
+func userSID(t *testing.T) string {
+	t.Helper()
+	sid, err := currentUserSID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sid.String()
+}
+
+// assertOwnerOnly checks that path is owned by the current user and has
+// a protected DACL with one entry, for the current user.
+func assertOwnerOnly(t *testing.T, path string) {
+	t.Helper()
+	sd, err := windows.GetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	user := userSID(t)
+	owner, _, err := sd.Owner()
+	if err != nil || owner.String() != user {
+		t.Errorf("%s: owner %v, want %s", path, owner, user)
+	}
+	control, _, err := sd.Control()
+	if err != nil || control&windows.SE_DACL_PROTECTED == 0 {
+		t.Errorf("%s: DACL not protected (inherits from the parent)", path)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil || dacl == nil {
+		t.Fatalf("%s: no DACL", path)
+	}
+	if dacl.AceCount != 1 {
+		t.Errorf("%s: %d entries, want 1 (%s)", path, dacl.AceCount, sd.String())
+	}
+	var ace *windows.ACCESS_ALLOWED_ACE
+	if err := windows.GetAce(dacl, 0, &ace); err != nil {
+		t.Fatal(err)
+	}
+	sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart)).String()
+	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE || sid != user {
+		t.Errorf("%s: entry type %d for %s, want an allow entry for %s", path, ace.Header.AceType, sid, user)
+	}
+}
+
+func TestOwnerOnlyDACLOnCreate(t *testing.T) {
+	s := openTest(t)
+	if err := s.Create(newFixedProtector(seq(0x40, 32)), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Save([]byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	assertOwnerOnly(t, s.Dir())
+	assertOwnerOnly(t, s.Path())
+	assertOwnerOnly(t, filepath.Join(s.Dir(), LockFileName))
+}
+
+func TestLoadRefusesDACLGrantingOthers(t *testing.T) {
+	for _, sid := range []string{sidEveryone, sidUsers, sidSystem} {
+		t.Run(sid, func(t *testing.T) {
+			s := openTest(t)
+			p := newFixedProtector(seq(0x40, 32))
+			if err := s.Create(p, []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			icacls(t, s.Path(), "/grant", "*"+sid+":(R)")
+			_, err := s.Load(resolverFor(p))
+			if !errors.Is(err, ErrNotOwnerOnly) {
+				t.Fatalf("Load = %v, want ErrNotOwnerOnly", err)
+			}
+			if !strings.Contains(err.Error(), sid) {
+				t.Errorf("error %q does not name %s", err, sid)
+			}
+		})
+	}
+}
+
+func TestRefusesDirectoryDACLGrantingOthers(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	icacls(t, s.Dir(), "/grant", "*"+sidUsers+":(OI)(CI)(R)")
+	if _, err := s.Load(resolverFor(p)); !errors.Is(err, ErrNotOwnerOnly) {
+		t.Errorf("Load = %v, want ErrNotOwnerOnly", err)
+	}
+	s.Close()
+	if _, err := Open(s.Dir()); !errors.Is(err, ErrNotOwnerOnly) {
+		t.Errorf("Open = %v, want ErrNotOwnerOnly", err)
+	}
+}
+
+// A directory made another way inherits its parent's entries and is
+// refused, not repaired.
+func TestOpenRefusesExistingInheritedDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "plain")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	icacls(t, dir, "/grant", "*"+sidUsers+":(R)")
+	if _, err := Open(dir); !errors.Is(err, ErrNotOwnerOnly) {
+		t.Fatalf("Open = %v, want ErrNotOwnerOnly", err)
+	}
+}
+
+// A deny entry takes access away and is accepted.
+func TestLoadAcceptsDenyEntry(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	icacls(t, s.Path(), "/deny", "*"+sidUsers+":(W)")
+	if _, err := s.Load(resolverFor(p)); err != nil {
+		t.Fatalf("Load with a deny entry: %v", err)
+	}
+}
+
+// The owner-only rule: an owner other than the current user, a missing
+// DACL and an allow entry for anyone else are refused. Built from SDDL,
+// because changing a file's owner to another user needs a privilege.
+func TestCheckSecurity(t *testing.T) {
+	user := userSID(t)
+	cases := []struct {
+		sddl     string
+		accepted bool
+	}{
+		{"O:" + user + "D:P(A;;FA;;;" + user + ")", true},
+		{"O:" + user + "D:P(A;OICI;FA;;;" + user + ")(D;;FW;;;" + sidUsers + ")", true},
+		{"O:" + sidSystem + "D:P(A;;FA;;;" + user + ")", false},
+		{"O:BAD:P(A;;FA;;;" + user + ")", false},
+		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;;FR;;;" + sidEveryone + ")", false},
+		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;OICIIO;FR;;;" + sidUsers + ")", false},
+		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;;FA;;;" + sidSystem + ")", false},
+		{"O:" + user + "D:NO_ACCESS_CONTROL", false},
+		{"O:" + user + "D:P(OA;;FA;;;" + user + ")", false},
+	}
+	for _, c := range cases {
+		sd, err := windows.SecurityDescriptorFromString(c.sddl)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sddl, err)
+		}
+		err = checkSecurity("x", sd)
+		if (err == nil) != c.accepted {
+			t.Errorf("%s: err %v, accepted want %v", c.sddl, err, c.accepted)
+		}
+		if err != nil && !errors.Is(err, ErrNotOwnerOnly) {
+			t.Errorf("%s: error %v is not ErrNotOwnerOnly", c.sddl, err)
+		}
+	}
+}
