@@ -61,8 +61,11 @@ in it escapes the authentication through a quirk of a JSON parser.
 - **Atomic write**: a new temporary file in the state directory, created
   exclusively and owner-only, written, synced (`fsync`; `F_FULLFSYNC` on
   macOS through Go's `File.Sync`; `FlushFileBuffers` on Windows), then
-  renamed over the state file (`rename`; on Windows `MoveFileEx` with
-  `MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH`), then the
+  renamed over the state file (`rename`; on Windows a rename with POSIX
+  semantics, `FileRenameInfoEx` with `FILE_RENAME_REPLACE_IF_EXISTS |
+  FILE_RENAME_POSIX_SEMANTICS`, which works while the old file is held
+  open, falling back to `MoveFileEx` with `MOVEFILE_REPLACE_EXISTING |
+  MOVEFILE_WRITE_THROUGH` where the file system lacks it), then the
   directory synced (POSIX). A crash before the rename leaves the old file
   in place and readable.
 - **Owner-only**: on Linux and macOS the directory is mode `0700` and the

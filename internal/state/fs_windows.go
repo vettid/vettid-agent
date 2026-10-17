@@ -245,21 +245,24 @@ func createTemp(dir, prefix, suffix string) (*os.File, string, error) {
 	return os.NewFile(uintptr(h), name), name, nil
 }
 
-// renameReplace moves from over to with MoveFileEx(REPLACE_EXISTING |
-// WRITE_THROUGH): the rename replaces the target and is on disk when it
-// returns. A reader holding the target open without delete sharing
-// makes it fail; that is retried for about 200 ms.
+// renameReplace renames from over to. It asks for POSIX semantics
+// first (SetFileInformationByHandle with FileRenameInfoEx and
+// FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS), which
+// replace the target even while a handle to it is open with delete
+// sharing: CreateReplace holds the old state file open across the
+// rename so that it can overwrite it afterwards. Where the file system
+// does not support that (FAT, some network shares) it falls back to
+// MoveFileEx(REPLACE_EXISTING | WRITE_THROUGH). A target held open
+// without delete sharing makes either fail; that is retried for about
+// 200 ms.
 func renameReplace(from, to string) error {
-	f, err := windows.UTF16PtrFromString(from)
-	if err != nil {
-		return err
-	}
-	t, err := windows.UTF16PtrFromString(to)
-	if err != nil {
-		return err
-	}
+	var err error
 	for attempt := 0; ; attempt++ {
-		err = windows.MoveFileEx(f, t, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+		err = renamePOSIX(from, to)
+		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
+			errors.Is(err, windows.ERROR_INVALID_FUNCTION) {
+			err = moveFileEx(from, to)
+		}
 		if err == nil || attempt == 4 ||
 			!(errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED)) {
 			return err
@@ -268,8 +271,58 @@ func renameReplace(from, to string) error {
 	}
 }
 
-// syncDir is a no-op on Windows: MOVEFILE_WRITE_THROUGH makes the rename
-// durable, and a directory handle cannot be flushed.
+func moveFileEx(from, to string) error {
+	f, err := windows.UTF16PtrFromString(from)
+	if err != nil {
+		return err
+	}
+	t, err := windows.UTF16PtrFromString(to)
+	if err != nil {
+		return err
+	}
+	return windows.MoveFileEx(f, t, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+}
+
+// fileRenameInfoHeader is FILE_RENAME_INFO up to, not including, the
+// variable-length FileName that follows it.
+type fileRenameInfoHeader struct {
+	Flags          uint32
+	RootDirectory  windows.Handle
+	FileNameLength uint32 // in bytes, without the terminating NUL
+}
+
+func renamePOSIX(from, to string) error {
+	p, err := windows.UTF16PtrFromString(from)
+	if err != nil {
+		return err
+	}
+	h, err := windows.CreateFile(p, windows.DELETE|windows.SYNCHRONIZE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	abs, err := filepath.Abs(to)
+	if err != nil {
+		return err
+	}
+	name, err := windows.UTF16FromString(abs)
+	if err != nil {
+		return err
+	}
+	headerSize := int(unsafe.Offsetof(fileRenameInfoHeader{}.FileNameLength)) + 4
+	buf := make([]byte, headerSize+len(name)*2)
+	hdr := (*fileRenameInfoHeader)(unsafe.Pointer(&buf[0]))
+	hdr.Flags = windows.FILE_RENAME_REPLACE_IF_EXISTS | windows.FILE_RENAME_POSIX_SEMANTICS
+	hdr.FileNameLength = uint32((len(name) - 1) * 2)
+	copy(buf[headerSize:], unsafe.Slice((*byte)(unsafe.Pointer(&name[0])), len(name)*2))
+	return windows.SetFileInformationByHandle(h, windows.FileRenameInfoEx, &buf[0], uint32(len(buf)))
+}
+
+// syncDir is a no-op on Windows: a directory handle cannot be flushed.
+// The file's data is flushed before the rename; the rename itself is
+// journaled by NTFS (and written through on the MoveFileEx fallback).
 func syncDir(string) error { return nil }
 
 type winLock struct{ h windows.Handle }
