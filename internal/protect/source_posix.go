@@ -46,10 +46,10 @@ func checkPassphraseFD(fd int) error {
 	}
 	switch st.Mode & syscall.S_IFMT {
 	case syscall.S_IFIFO:
-		// An anonymous pipe is mode 0600; a named FIFO on disk has its
-		// file mode. One that others can write to could carry their
-		// passphrase instead of the operator's.
-		if os.FileMode(st.Mode).Perm()&0o022 != 0 {
+		// A named FIFO on disk has its file mode; one that others can
+		// write to could carry their passphrase instead of the
+		// operator's. Anonymous pipes have no name to reach them by.
+		if namedFIFO(&st) && os.FileMode(st.Mode).Perm()&0o022 != 0 {
 			return errors.New("the pipe is writable by other users (a named FIFO must be mode 0600 or 0640)")
 		}
 		return nil
