@@ -62,7 +62,9 @@ in it escapes the authentication through a quirk of a JSON parser.
   exclusively and owner-only, written, synced (`fsync`; `F_FULLFSYNC` on
   macOS through Go's `File.Sync`; `FlushFileBuffers` on Windows), renamed
   over the state file, and the directory synced; `Create`, `Save` and
-  `CreateReplace` return only after all of that. A crash before the
+  `CreateReplace` return only after all of that. If a flush after the
+  rename fails, the error says that the new file is in place but may not
+  be durable. A crash before the
   rename leaves the old file in place and readable.
   - POSIX: `rename`, then `fsync` of the directory.
   - Windows: a rename with POSIX semantics (`FileRenameInfoEx` with
@@ -141,7 +143,10 @@ where the protector has one.
 (`CreateReplace`). Before anything changes it determines the old
 protector (or refuses, changing nothing) and whether the file system can
 rename over a file this process holds open (always on POSIX; on Windows
-a probe in the state directory). Then:
+a probe in the state directory, retried briefly when a file is held by
+another process such as antivirus). Only a definite "not supported"
+answer selects the order of step 3; any other probe failure stops the
+replace before anything is wiped. Then:
 
 1. the old protector's key is wiped (if that fails, nothing else
    changes);

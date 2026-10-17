@@ -245,8 +245,7 @@ func createTemp(dir, prefix, suffix string) (*os.File, string, error) {
 	return os.NewFile(uintptr(h), name), name, nil
 }
 
-// renameReplace renames from over to and flushes the renamed file. It
-// asks for POSIX semantics first (SetFileInformationByHandle with
+// renameReplace renames from over to. It asks for POSIX semantics first (SetFileInformationByHandle with
 // FileRenameInfoEx and FILE_RENAME_REPLACE_IF_EXISTS |
 // FILE_RENAME_POSIX_SEMANTICS), which replace the target even while a
 // handle to it is open with delete sharing. Where the file system does
@@ -255,7 +254,8 @@ func createTemp(dir, prefix, suffix string) (*os.File, string, error) {
 // open file; CreateReplace checks canReplaceOpenFile first and does not
 // hold the old file open there. A target held open by another process
 // without delete sharing makes either fail; that is retried for about
-// 200 ms. The caller then flushes the directory (syncDir).
+// 200 ms. The caller then flushes the renamed file (flushRenamed) and
+// the directory (syncDir).
 func renameReplace(from, to string) error {
 	var err error
 	for attempt := 0; ; attempt++ {
@@ -269,11 +269,11 @@ func renameReplace(from, to string) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if err != nil {
-		return err
-	}
-	return flushPath(to, 0)
+	return err
 }
+
+// flushRenamed flushes the file now at path (FlushFileBuffers).
+func flushRenamed(path string) error { return flushPath(path, 0) }
 
 func notSupported(err error) bool {
 	return errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_NOT_SUPPORTED) ||
@@ -298,31 +298,66 @@ func flushPath(path string, flags uint32) error {
 	return windows.FlushFileBuffers(h)
 }
 
-// canReplaceOpenFile probes, in dir, whether a POSIX-semantics rename
+// renamePOSIXProbe is the rename the probe uses; tests replace it to
+// inject errors.
+var renamePOSIXProbe = renamePOSIX
+
+// replaceOpenFileSupport probes, in dir, whether a POSIX-semantics rename
 // can replace a file that is held open: it creates two temporary files,
 // holds the second open with delete sharing, renames the first over it,
 // and removes what is left. The probe files carry the temporary-file
 // name, so a crash during the probe leaves only files that the next
 // Open deletes.
-func canReplaceOpenFile(dir string) bool {
+//
+// A sharing violation or access denied (antivirus or an indexer holding
+// a probe file for a moment) is retried, five attempts in all with
+// backoff from 20 ms. Only a definite "not supported" answer from the
+// rename (ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER,
+// ERROR_INVALID_FUNCTION) reports false with no error; any other
+// failure is returned, and CreateReplace then stops before wiping
+// anything.
+func replaceOpenFileSupport(dir string) (bool, error) {
+	var err error
+	delay := 20 * time.Millisecond
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(delay)
+			delay *= 2
+		}
+		err = probeOnce(dir)
+		switch {
+		case err == nil:
+			return true, nil
+		case notSupported(err):
+			return false, nil
+		case errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED):
+			continue
+		default:
+			return false, err
+		}
+	}
+	return false, err
+}
+
+func probeOnce(dir string) error {
 	a, an, err := createTemp(dir, tempPrefix, tempSuffix)
 	if err != nil {
-		return false
+		return err
 	}
 	a.Close()
 	defer os.Remove(an)
 	b, bn, err := createTemp(dir, tempPrefix, tempSuffix)
 	if err != nil {
-		return false
+		return err
 	}
 	b.Close()
 	defer os.Remove(bn)
 	held, err := openNoFollow(bn, windows.GENERIC_READ)
 	if err != nil {
-		return false
+		return err
 	}
 	defer held.Close()
-	return renamePOSIX(an, bn) == nil
+	return renamePOSIXProbe(an, bn)
 }
 
 func moveFileEx(from, to string) error {

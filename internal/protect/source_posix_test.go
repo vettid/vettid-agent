@@ -158,3 +158,18 @@ func TestReadFileRefusesFIFO(t *testing.T) {
 		t.Fatal("Read of a FIFO hung")
 	}
 }
+
+// A regular file through --passphrase-fd gets the owner-only check; a
+// pipe does not need one.
+func TestReadFDRegularFileMustBeOwnerOnly(t *testing.T) {
+	f, err := os.Open(writeFile(t, "Pass-Phrase-1\n", 0o644))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	fd := dupOf(t, f)
+	defer syscall.Close(fd)
+	if _, err := (PassphraseSource{FD: fd}).Read("", false); err == nil || !strings.Contains(err.Error(), "owner only") {
+		t.Fatalf("Read of a 0644 file through a descriptor = %v", err)
+	}
+}

@@ -36,14 +36,23 @@ func openPassphraseFile(path string) (*os.File, error) {
 	return os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 }
 
-// checkPassphraseFD accepts a pipe or a regular file.
+// checkPassphraseFD accepts a pipe, or a regular file that passes the
+// same owner-only check as --passphrase-file.
 func checkPassphraseFD(fd int) error {
 	var st syscall.Stat_t
 	if err := syscall.Fstat(fd, &st); err != nil {
 		return errors.New("not an open file descriptor")
 	}
 	switch st.Mode & syscall.S_IFMT {
-	case syscall.S_IFIFO, syscall.S_IFREG:
+	case syscall.S_IFIFO:
+		return nil
+	case syscall.S_IFREG:
+		if st.Uid != uint32(os.Geteuid()) {
+			return errors.New("the file must be owned by the current user")
+		}
+		if m := os.FileMode(st.Mode).Perm(); m&0o077 != 0 {
+			return fmt.Errorf("the file must be readable by its owner only (mode %04o; use chmod 600)", m)
+		}
 		return nil
 	default:
 		return errors.New("not a pipe or a regular file")

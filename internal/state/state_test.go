@@ -549,8 +549,9 @@ func TestCreateReplace(t *testing.T) {
 // before the old key is wiped): the old bytes are overwritten and the
 // file closed first, then the new state is renamed into place.
 func TestCreateReplaceOverwriteFirst(t *testing.T) {
-	testHookOverwriteFirst = true
-	defer func() { testHookOverwriteFirst = false }()
+	old := probeReplaceOpen
+	probeReplaceOpen = func(string) (bool, error) { return false, nil }
+	defer func() { probeReplaceOpen = old }()
 	s := openTest(t)
 	oldP := newFixedProtector(seq(0x40, 32))
 	if err := s.Create(oldP, []byte("old state")); err != nil {
@@ -798,4 +799,65 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return fi.Size()
+}
+
+// If the file system's support cannot be determined, CreateReplace stops
+// before wiping anything.
+func TestCreateReplaceProbeErrorChangesNothing(t *testing.T) {
+	old := probeReplaceOpen
+	probeReplaceOpen = func(string) (bool, error) { return false, errors.New("probe failed") }
+	defer func() { probeReplaceOpen = old }()
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(s.Path())
+	if err := s.CreateReplace(p, []byte("b"), nil); err == nil || !strings.Contains(err.Error(), "nothing was replaced") {
+		t.Fatalf("CreateReplace = %v", err)
+	}
+	if !p.hasKey || p.wiped != 0 {
+		t.Error("the old key was wiped")
+	}
+	if after, _ := os.ReadFile(s.Path()); !bytes.Equal(before, after) {
+		t.Error("the state file changed")
+	}
+}
+
+// A flush failure after the rename says the new file is in place but
+// may not be durable.
+func TestFlushFailureMessage(t *testing.T) {
+	old := makeDurable
+	makeDurable = func(string, string) error { return errors.New("flush refused") }
+	defer func() { makeDurable = old }()
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	err := s.Create(p, []byte("a"))
+	if err == nil || !strings.Contains(err.Error(), "in place but may not be durable") || !strings.Contains(err.Error(), "flush refused") {
+		t.Fatalf("Create = %v", err)
+	}
+	makeDurable = old
+	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "a" {
+		t.Errorf("the new file should be in place: %q, %v", got, err)
+	}
+}
+
+// A typed nil pointer in WipeAll does not crash the wipe.
+func TestWipeAllTypedNil(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	var typedNil *fixedProtector
+	err := s.WipeAll([]Protector{typedNil, p})
+	if err == nil || !strings.Contains(err.Error(), "nil protector") {
+		t.Fatalf("WipeAll = %v, want an error naming the nil protector", err)
+	}
+	if p.hasKey {
+		t.Error("the other protector's key remains")
+	}
+	if ok, _ := s.Exists(); ok {
+		t.Error("state file remains")
+	}
 }

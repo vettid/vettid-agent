@@ -192,8 +192,46 @@ func TestFlushDirAndProbe(t *testing.T) {
 	if err := flushDir(s.Dir()); err != nil {
 		t.Errorf("flushing the state directory: %v", err)
 	}
-	if !canReplaceOpenFile(s.Dir()) {
-		t.Error("POSIX-semantics rename over an open file not available on NTFS")
+	if ok, err := replaceOpenFileSupport(s.Dir()); !ok || err != nil {
+		t.Errorf("POSIX-semantics rename over an open file not available on NTFS: %v", err)
+	}
+	if names := listDir(t, s.Dir()); len(names) != 1 {
+		t.Errorf("the probe left files: %v", names)
+	}
+}
+
+// The probe retries brief sharing violations, reports a definite "not
+// supported" as false, and returns any other error.
+func TestProbeClassification(t *testing.T) {
+	s := openTest(t)
+	old := renamePOSIXProbe
+	defer func() { renamePOSIXProbe = old }()
+
+	calls := 0
+	renamePOSIXProbe = func(a, b string) error {
+		calls++
+		if calls < 3 {
+			return windows.ERROR_SHARING_VIOLATION
+		}
+		return old(a, b)
+	}
+	if ok, err := replaceOpenFileSupport(s.Dir()); !ok || err != nil || calls != 3 {
+		t.Errorf("transient: ok %v err %v calls %d", ok, err, calls)
+	}
+
+	renamePOSIXProbe = func(string, string) error { return windows.ERROR_NOT_SUPPORTED }
+	if ok, err := replaceOpenFileSupport(s.Dir()); ok || err != nil {
+		t.Errorf("not supported: ok %v err %v", ok, err)
+	}
+
+	renamePOSIXProbe = func(string, string) error { return windows.ERROR_ACCESS_DENIED }
+	if ok, err := replaceOpenFileSupport(s.Dir()); ok || err == nil {
+		t.Errorf("persistent access denied: ok %v err %v", ok, err)
+	}
+
+	renamePOSIXProbe = func(string, string) error { return windows.ERROR_DISK_FULL }
+	if ok, err := replaceOpenFileSupport(s.Dir()); ok || err == nil {
+		t.Errorf("other error: ok %v err %v", ok, err)
 	}
 	if names := listDir(t, s.Dir()); len(names) != 1 {
 		t.Errorf("the probe left files: %v", names)
