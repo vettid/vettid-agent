@@ -8,6 +8,8 @@ require (
 	github.com/vettid/vettid-vault v0.0.0-20261017190144-1ef2dd9ec686
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
+	golang.org/x/term v0.46.0
+	golang.org/x/text v0.42.0
 )
 
 require (
@@ -21,5 +23,4 @@ require (
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/vettid/vettid-relay v0.0.0-20261015153542-cc3ce892f9dc // indirect
-	golang.org/x/text v0.42.0 // indirect
 )

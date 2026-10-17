@@ -1,0 +1,253 @@
+package protect
+
+import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"golang.org/x/crypto/chacha20poly1305"
+
+	"github.com/vettid/vettid-agent/internal/state"
+)
+
+// The passphrase protector's vectors at production parameters
+// (testdata/vectors/passphrase.json; AGENT-PLAN §5): a fixed passphrase,
+// salt and nonces, the wrapped data key, and a whole state file. The
+// test regenerates the file and compares it byte for byte; with -update
+// it writes it:
+//
+//	go test ./internal/protect -run TestPassphraseVectors -update
+//
+// The Argon2id derivation at t = 3, m = 64 MiB runs once per test run:
+// generation and both checks reuse its output. A vector that stops
+// matching is a stop-and-report item.
+
+var update = flag.Bool("update", false, "rewrite testdata/vectors/passphrase.json")
+
+var (
+	pvPath   = filepath.Join("..", "..", "testdata", "vectors", "passphrase.json")
+	pvSource = filepath.Join("..", "..", "testdata", "vectors", "SOURCE.md")
+)
+
+// Fixed, public test inputs. They protect nothing.
+var (
+	pvWords = "Vector-W\u00f6rds-For-Tests-2026" // NFC: U+00F6
+	// pvDecomposed is the same text with U+006F U+0308 for U+00F6: its
+	// bytes differ, its NFC form is pvWords.
+	pvDecomposed = "Vector-Wo\u0308rds-For-Tests-2026"
+	pvParams     = Params{Time: 3, MemoryKiB: 64 * 1024, Threads: 1}
+	pvSalt       = seqBytes(0x10, 16)
+	pvWrapNonce  = seqBytes(0x30, 24)
+	pvDataKey    = seqBytes(0x50, 32)
+	pvNonce      = seqBytes(0x70, 24)
+	pvCreatedAt  = int64(1792195200) // 2026-10-17T00:00:00Z
+	pvState      = []byte(`{"test":"passphrase vector; not a real device state"}`)
+)
+
+func seqBytes(start byte, n int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = start + byte(i)
+	}
+	return b
+}
+
+// nfcCase: the passphrase typed in decomposed form. Its bytes differ, it
+// normalizes to the passphrase's NFC bytes, and with the same salt and
+// nonce it wraps to the same blob (so it costs no second derivation).
+type nfcCase struct {
+	InputHex   string `json:"input_utf8_hex"`
+	NFCHex     string `json:"nfc_utf8_hex"`
+	WrappedB64 string `json:"wrapped_key_b64"`
+}
+
+type passphraseVectors struct {
+	Description  string  `json:"description"`
+	Blob         string  `json:"blob_format"`
+	Passphrase   string  `json:"passphrase"`
+	PassHex      string  `json:"passphrase_utf8_hex"`
+	NFC          nfcCase `json:"nfc_case"`
+	T            uint32  `json:"t"`
+	MKiB         uint32  `json:"m_kib"`
+	P            uint8   `json:"p"`
+	SaltHex      string  `json:"salt_hex"`
+	WrapNonceHex string  `json:"wrap_nonce_hex"`
+	KeyHex       string  `json:"argon2id_key_hex"`
+	DataKeyHex   string  `json:"data_key_hex"`
+	WrappedB64   string  `json:"wrapped_key_b64"`
+	NonceHex     string  `json:"state_nonce_hex"`
+	CreatedAt    int64   `json:"created_at"`
+	StateB64     string  `json:"state_b64"`
+	Header       string  `json:"header"`
+	FileB64      string  `json:"state_file_b64"`
+}
+
+// memoDerive replaces deriveKey for one test with a version that runs
+// each distinct derivation once, and counts the real ones.
+func memoDerive(t *testing.T) *int {
+	t.Helper()
+	real := deriveKey
+	cache := map[string][]byte{}
+	n := new(int)
+	deriveKey = func(pass, salt []byte, p Params) []byte {
+		k := fmt.Sprintf("%x|%x|%d|%d|%d", pass, salt, p.Time, p.MemoryKiB, p.Threads)
+		if v, ok := cache[k]; ok {
+			return append([]byte{}, v...)
+		}
+		*n++
+		v := real(pass, salt, p)
+		cache[k] = append([]byte{}, v...)
+		return v
+	}
+	t.Cleanup(func() { deriveKey = real })
+	return n
+}
+
+// buildStateFile writes the state file format of docs/STATE-FILE.md
+// independently of internal/state, so that this vector checks that
+// package too.
+func buildStateFile(t *testing.T, wrapped []byte) (header string, file []byte) {
+	t.Helper()
+	header = fmt.Sprintf(`{"v":1,"protector":"passphrase","wrapped_key":"%s","nonce":"%s","created_at":%d}`,
+		base64.StdEncoding.EncodeToString(wrapped), base64.StdEncoding.EncodeToString(pvNonce), pvCreatedAt)
+	aead, err := chacha20poly1305.NewX(pvDataKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file = binary.BigEndian.AppendUint16(nil, uint16(len(header)))
+	file = append(file, header...)
+	file = binary.BigEndian.AppendUint32(file, uint32(len(pvState)+aead.Overhead()))
+	file = aead.Seal(file, pvNonce, pvState, []byte(header))
+	return header, file
+}
+
+func TestPassphraseVectors(t *testing.T) {
+	derivations := memoDerive(t)
+	p := newPass(t, pvWords)
+	wrapped, err := p.wrapWith(pvDataKey, pvParams, pvSalt, pvWrapNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, file := buildStateFile(t, wrapped)
+	if pvDecomposed == pvWords {
+		t.Fatal("the NFC case must differ in bytes")
+	}
+	wrappedNFC, err := newPass(t, pvDecomposed).wrapWith(pvDataKey, pvParams, pvSalt, pvWrapNonce)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(wrappedNFC, wrapped) {
+		t.Error("the decomposed form wraps differently from its NFC form")
+	}
+	v := passphraseVectors{
+		Description: "VettID agent connector passphrase protector vectors at production Argon2id parameters " +
+			"(AGENT-PLAN §5). Generated by internal/protect TestPassphraseVectors; public test values that protect nothing.",
+		Blob: "blob = 0x01 || t (4, BE) || m_kib (4, BE) || p (1) || salt (16) || wrap_nonce (24) || " +
+			"XChaCha20-Poly1305(K, wrap_nonce, aad = \"vettid-agent/protect/passphrase/v1\\0\" || blob[0:26], data_key); " +
+			"K = Argon2id(NFC(passphrase), salt, t, m_kib, p, 32). The state file is docs/STATE-FILE.md version 1.",
+		Passphrase: pvWords,
+		PassHex:    hex.EncodeToString([]byte(pvWords)),
+		NFC: nfcCase{
+			InputHex:   hex.EncodeToString([]byte(pvDecomposed)),
+			NFCHex:     hex.EncodeToString(nfcCopy([]byte(pvDecomposed))),
+			WrappedB64: base64.StdEncoding.EncodeToString(wrappedNFC),
+		},
+		T:            pvParams.Time,
+		MKiB:         pvParams.MemoryKiB,
+		P:            pvParams.Threads,
+		SaltHex:      hex.EncodeToString(pvSalt),
+		WrapNonceHex: hex.EncodeToString(pvWrapNonce),
+		KeyHex:       hex.EncodeToString(deriveKey([]byte(pvWords), pvSalt, pvParams)),
+		DataKeyHex:   hex.EncodeToString(pvDataKey),
+		WrappedB64:   base64.StdEncoding.EncodeToString(wrapped),
+		NonceHex:     hex.EncodeToString(pvNonce),
+		CreatedAt:    pvCreatedAt,
+		StateB64:     base64.StdEncoding.EncodeToString(pvState),
+		Header:       header,
+		FileB64:      base64.StdEncoding.EncodeToString(file),
+	}
+	gen, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gen = append(gen, '\n')
+	if *update {
+		if err := os.WriteFile(pvPath, gen, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		t.Logf("wrote %s, sha256 %x; record it in testdata/vectors/SOURCE.md", pvPath, sha256.Sum256(gen))
+	}
+	raw, err := os.ReadFile(pvPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(raw, gen) {
+		t.Fatal("passphrase.json differs from what the generator produces: the format changed (stop and report)")
+	}
+	sum := sha256.Sum256(raw)
+	src, err := os.ReadFile(pvSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(src), "`passphrase.json` | (generated here) | `"+hex.EncodeToString(sum[:])+"`") {
+		t.Errorf("testdata/vectors/SOURCE.md does not record passphrase.json's sha256 %x", sum)
+	}
+
+	// The vector's blob unwraps under production minimums.
+	if MinParams() != pvParams {
+		t.Fatalf("MinParams %+v", MinParams())
+	}
+	k, err := newPass(t, pvWords).Unwrap(wrapped)
+	if err != nil || !bytes.Equal(k, pvDataKey) {
+		t.Fatalf("Unwrap of the vector blob: %v", err)
+	}
+	if v.NFC.NFCHex != v.PassHex {
+		t.Error("the NFC case does not normalize to the passphrase")
+	}
+	if k, err := newPass(t, pvDecomposed).Unwrap(wrapped); err != nil || !bytes.Equal(k, pvDataKey) {
+		t.Fatalf("Unwrap with the decomposed form: %v", err)
+	}
+	// The whole state file loads through internal/state. On Windows a
+	// file written with os.WriteFile may be owned by the Administrators
+	// group (an elevated runner), which the state store refuses; there
+	// the byte comparison above and internal/state's own vectors cover
+	// the format.
+	if runtime.GOOS == "windows" {
+		checkDerivations(t, *derivations)
+		return
+	}
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := os.WriteFile(s.Path(), file, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Load(func(string) state.Protector { return newPass(t, pvWords) })
+	if err != nil {
+		t.Fatalf("Load of the vector state file: %v", err)
+	}
+	if !bytes.Equal(got, pvState) {
+		t.Error("state differs")
+	}
+	checkDerivations(t, *derivations)
+}
+
+func checkDerivations(t *testing.T, n int) {
+	t.Helper()
+	if n != 1 {
+		t.Errorf("%d production derivations ran, want 1", n)
+	}
+}

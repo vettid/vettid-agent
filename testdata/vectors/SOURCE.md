@@ -40,6 +40,7 @@ edit of these.
 | File | Source path | sha256sum | Checked by |
 |---|---|---|---|
 | `statefile.json` | (generated here) | `36fd3d093bc43e41e6dae56833cb42f5fe05a41969467582f1f5359ba640ef6f` | `internal/state` `TestStateFileVectors` |
+| `passphrase.json` | (generated here) | `4e2d87c90e35bebd7f6f22ddc7a8c51acbca35d1fa1a69a225744bda355e5984` | `internal/protect` `TestPassphraseVectors` |
 
 `statefile.json` holds the state file format of `docs/STATE-FILE.md`
 under a test-only protector with a fixed key (`test-fixed`), a fixed data
@@ -58,4 +59,19 @@ after a deliberate change (a new version, reviewed as such):
 
 ```sh
 go test ./internal/state -run TestStateFileVectors -update
+```
+
+`passphrase.json` is the passphrase protector at its production
+Argon2id parameters (t = 3, m = 64 MiB, p = 1): a fixed passphrase, salt,
+wrapping nonce, data key and state nonce; the Argon2id output, the
+wrapped data key, and a whole state file built independently of
+`internal/state`. Its passphrase holds a non-ASCII letter; the NFC case
+gives the same text in decomposed form (different bytes), which must
+normalize to the passphrase and wrap to the same blob. `TestPassphraseVectors` regenerates it and compares it
+byte for byte, checks this table's sha256, unwraps the blob, and loads
+the state file through `internal/state` (not on Windows; see the test).
+The production derivation runs once per test run. To regenerate:
+
+```sh
+go test ./internal/protect -run TestPassphraseVectors -update
 ```
