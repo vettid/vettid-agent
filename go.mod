@@ -5,6 +5,8 @@ go 1.26.0
 toolchain go1.26.9
 
 require (
+	github.com/google/go-tpm v0.9.8
+	github.com/google/go-tpm-tools v0.4.11
 	github.com/vettid/vettid-vault v0.0.0-20261017190144-1ef2dd9ec686
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
