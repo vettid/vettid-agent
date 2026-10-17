@@ -28,12 +28,3 @@ go.work.sum
 # OS
 .DS_Store
 Thumbs.db
-
-# VettID agent runtime files (never commit these)
-connection.enc
-config.toml
-agent.log
-connector.lock
-pending.json
-*.enc
-*.sock

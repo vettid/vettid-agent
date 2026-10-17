@@ -1,0 +1,13 @@
+# False positives in the retired 2026-05 connector's history (tag legacy-v1-final):
+# algorithm names ("ChaCha20-Poly1305"), a field comparison in a test, and an
+# example token in an old design document. None is a secret.
+d7d98f13d917b9d8af6a8691b69edf442a7bf253:internal/credential/store.go:generic-api-key:6
+d7d98f13d917b9d8af6a8691b69edf442a7bf253:internal/crypto/keys.go:generic-api-key:3
+d7d98f13d917b9d8af6a8691b69edf442a7bf253:internal/crypto/keys_test.go:generic-api-key:53
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:internal/crypto/keys.go:generic-api-key:3
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:README.md:generic-api-key:19
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:internal/credential/store.go:generic-api-key:5
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:docs/vettid-agent-connector-design.md:generic-api-key:404
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:docs/vettid-agent-connector-design.md:generic-api-key:1176
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:docs/vettid-agent-connector-design.md:generic-api-key:1181
+0bcf0fcdb4acbedf03698bdae8cb7eb93a59dba1:docs/vettid-agent-connector-design.md:generic-api-key:1223
