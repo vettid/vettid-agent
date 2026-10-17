@@ -59,6 +59,17 @@ and govulncheck on Linux, macOS and Windows runners.
   state file's format, owner-only rules and lock are in
   [docs/STATE-FILE.md](docs/STATE-FILE.md).
 
+## Keys at rest on Linux: the TPM
+
+On Linux the connector seals its state file's key to the computer's TPM
+2.0 through the kernel's resource manager, `/dev/tpmrm0`, so that a copy
+of the state file does not open on another computer. The user that runs
+the connector needs access to that device (on most distributions,
+membership of the `tss` group). Without a TPM, or without access to it,
+the connector uses a passphrase instead and says so. The sealed key is
+not bound to PCR measurements, so firmware and kernel updates do not
+lock the connector out.
+
 ## Passphrase (computers without a platform protector)
 
 Where no TPM, Keychain or DPAPI protector is available, the keys are

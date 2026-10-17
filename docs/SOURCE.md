@@ -11,6 +11,14 @@ tests passing (AGENT-PLAN §5, §10 risk 2).
 | `github.com/vettid/vettid-vault` | `v0.0.0-20261017190144-1ef2dd9ec686` | `1ef2dd9ec68627a80e18d665032fcd58e3a61a1d` (`main`, "Staging release 16 (S16): release number", #108) | 2026-10-17 19:01:44 |
 | `github.com/vettid/vettid-relay` (indirect, through vettid-vault) | `v0.0.0-20261015153542-cc3ce892f9dc` | `cc3ce892f9dcb990e9e9752f19c3e0e296dd12b9` (`main`, RELAY-PROTOCOL 0.9.4 byte budgets, #14) | 2026-10-15 15:35:42 |
 
+Other direct dependencies are ordinary tagged releases chosen in the PR
+that adds them: `golang.org/x/crypto`, `x/sys`, `x/term`, `x/text`, and
+for the Linux TPM protector `github.com/google/go-tpm` v0.9.8 (Apache-2.0,
+compatible with AGPL-3.0; pure Go). `github.com/google/go-tpm-tools`
+v0.4.11 (Apache-2.0) is used only by tests, for its TPM 2.0 simulator
+(the Microsoft reference implementation, built with cgo on the Linux CI
+job); it is not linked into the binary.
+
 ## Why these commits
 
 - **vettid-vault `1ef2dd9`** is the `main` head when A0.2 was written and
