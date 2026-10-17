@@ -2,6 +2,8 @@ module github.com/vettid/vettid-agent
 
 go 1.26.0
 
+toolchain go1.26.9
+
 require (
 	github.com/vettid/vettid-vault v0.0.0-20261017190144-1ef2dd9ec686
 	golang.org/x/crypto v0.57.0

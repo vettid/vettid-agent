@@ -134,14 +134,16 @@ func TestOpenRefusesExistingInheritedDirectory(t *testing.T) {
 	}
 }
 
-// A deny entry takes access away and is accepted.
+// A deny entry takes access away and is accepted. (WD) denies writing
+// data only; the runner's user is in Users, and a broader right such
+// as (W) would include READ_CONTROL and SYNCHRONIZE and stop the read.
 func TestLoadAcceptsDenyEntry(t *testing.T) {
 	s := openTest(t)
 	p := newFixedProtector(seq(0x40, 32))
 	if err := s.Create(p, []byte("x")); err != nil {
 		t.Fatal(err)
 	}
-	icacls(t, s.Path(), "/deny", "*"+sidUsers+":(W)")
+	icacls(t, s.Path(), "/deny", "*"+sidUsers+":(WD)")
 	if _, err := s.Load(resolverFor(p)); err != nil {
 		t.Fatalf("Load with a deny entry: %v", err)
 	}
@@ -158,13 +160,15 @@ func TestCheckSecurity(t *testing.T) {
 	}{
 		{"O:" + user + "D:P(A;;FA;;;" + user + ")", true},
 		{"O:" + user + "D:P(A;OICI;FA;;;" + user + ")(D;;FW;;;" + sidUsers + ")", true},
+		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;;FA;;;" + user + ")", true},
 		{"O:" + sidSystem + "D:P(A;;FA;;;" + user + ")", false},
 		{"O:BAD:P(A;;FA;;;" + user + ")", false},
 		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;;FR;;;" + sidEveryone + ")", false},
 		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;OICIIO;FR;;;" + sidUsers + ")", false},
 		{"O:" + user + "D:P(A;;FA;;;" + user + ")(A;;FA;;;" + sidSystem + ")", false},
 		{"O:" + user + "D:NO_ACCESS_CONTROL", false},
-		{"O:" + user + "D:P(OA;;FA;;;" + user + ")", false},
+		// An object entry (with an object type, so that it stays one).
+		{"O:" + user + "D:P(OA;;FA;bf967aba-0de6-11d0-a285-00aa003049e2;;" + user + ")", false},
 	}
 	for _, c := range cases {
 		sd, err := windows.SecurityDescriptorFromString(c.sddl)
