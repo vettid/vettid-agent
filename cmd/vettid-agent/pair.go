@@ -45,7 +45,7 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	dir := fs.String("state-dir", "", "the state `DIR`ectory for this MCP client's pairing (required)")
 	name := fs.String("name", "", "the `NAME` your phone shows for this agent (default \"Agent on <host name>\")")
-	usePass := fs.Bool("passphrase", false, "protect the keys with a passphrase (not bound to this computer) instead of the computer's TPM or DPAPI")
+	usePass := fs.Bool("passphrase", false, "protect the keys with a passphrase (not bound to this computer) instead of the computer's TPM, Keychain or DPAPI")
 	restart := fs.Bool("restart", false, "discard what the state directory holds (an unfinished or completed pairing, or a file that does not open) and pair again")
 	prot := &pairing.Protectors{}
 	prot.Source.AddFlags(fs)
@@ -64,6 +64,7 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	prot.Passphrase = *usePass
+	prot.Dir = *dir
 	defer prot.Clear()
 	// A passphrase from a descriptor is read before the state directory
 	// is opened (protect.PassphraseSource).
@@ -107,7 +108,7 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 		Store:         store,
 		Resolve:       prot.Resolve,
 		ResolveErr:    prot.ResolveErr,
-		AllProtectors: protect.All(),
+		AllProtectors: protect.All(*dir),
 		Protector:     prot.New,
 		Code:          code,
 		CodeGiven:     fs.NArg() == 1,

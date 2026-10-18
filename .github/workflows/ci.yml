@@ -46,6 +46,12 @@ jobs:
         env:
           VETTID_AGENT_TEST_OTHER_USER: "1"
         run: go test -count=1 -v -run "TestDPAPI|TestChooseProtectorWindows|TestClassifyDPAPI" ./internal/protect
+      # The Keychain tests again, verbose, as the record of what macOS
+      # answers a binary without the keychain-access-groups entitlement
+      # (a test binary is one); the round trip needs the signed app (A5).
+      - name: Keychain tests, verbose
+        if: runner.os == 'macOS'
+        run: go test -count=1 -v -run "Keychain|TestChooseProtectorDarwin|TestCanonicalDir" ./internal/protect
       # The devstack build (vettid-vault's local dev stack; never a
       # release): vetted, and its unit tests run. The dev-stack tests
       # themselves need a running stack and skip with -short.
