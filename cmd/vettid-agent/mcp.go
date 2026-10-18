@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"syscall"
 
 	"github.com/vettid/vettid-agent/internal/access"
+	"github.com/vettid/vettid-agent/internal/leash"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/state"
 	"github.com/vettid/vettid-agent/internal/vaultconn"
@@ -32,7 +34,7 @@ Runs the connector for the MCP client that starts it, over standard
 input and output, with the pairing in DIR. It stays connected to your
 vault until the client closes standard input. Standard output carries
 only MCP messages; notices go to standard error. (The MCP tools are not
-available yet: this version keeps the vault connection only.)
+available yet: this version keeps the vault connection and the grants only.)
 
 Flags:
 `
@@ -108,14 +110,19 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	// The access policy (AG8) sees each event and vault.status; it is
 	// created once the connection exists (the callbacks run only in Run).
 	var mgr *access.Manager
+	grants := newGrants(rec, logger, func(code string) { mgr.OnAnswer(code) })
 	o := vaultconn.Options{
-		Store:    store,
-		Resolve:  resolve,
-		Record:   rec,
-		Out:      stderr,
-		Log:      logger,
-		OnEvent:  func(ev vaultconn.Event) { mgr.OnEvent(ev) },
-		OnStatus: func(oc string) { mgr.OnStatus(oc) },
+		Store:   store,
+		Resolve: resolve,
+		Record:  rec,
+		Out:     stderr,
+		Log:     logger,
+		OnEvent: func(ev vaultconn.Event) { mgr.OnEvent(ev) },
+		OnStatus: func(oc string) {
+			mgr.OnStatus(oc)
+			grants.OnStatus(oc)
+		},
+		Grants: grants,
 	}
 	if mcpOptions != nil {
 		mcpOptions(&o)
@@ -125,6 +132,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		return fail(err)
 	}
 	mgr = access.New(conn, *accessMinutes*60, nil)
+	grants.Bind(conn)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -147,6 +155,8 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 			logger.Warn("access session check at start failed", "err", err)
 		}
 	}()
+	// The grants' status statements are kept fresh (internal/leash Run).
+	go grants.Run(ctx)
 	err = conn.Run(ctx)
 	// The check ends with Run (its request fails once Run stops); wait
 	// for it, so that nothing writes to standard error after return.
@@ -161,4 +171,17 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	default:
 		return fail(err)
 	}
+}
+
+// newGrants returns the LEASH grants kept for the paired record
+// (internal/leash), with the saved ones loaded.
+func newGrants(rec *pairing.Record, logger *slog.Logger, onAnswer func(string)) *leash.Manager {
+	var dev struct {
+		Name     string `json:"name"`
+		VaultID  string `json:"vault_id"`
+		DeviceID string `json:"device_id"`
+	}
+	_ = json.Unmarshal(rec.Device, &dev)
+	return leash.New(leash.Options{Saved: rec.Leash, DeviceID: dev.DeviceID, VaultID: dev.VaultID, Name: dev.Name,
+		OnAnswer: onAnswer, Log: logger})
 }

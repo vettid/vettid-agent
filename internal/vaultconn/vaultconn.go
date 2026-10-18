@@ -17,6 +17,7 @@ package vaultconn
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,10 @@ type Options struct {
 	// StatusEvery is how often Run sends vault.status after the one at
 	// start; default 6 hours.
 	StatusEvery time.Duration
+	// Grants, if set, keeps the record's `leash` member (internal/leash):
+	// it sees each batch inside its save and gives the member saved with
+	// it. Without it the member loaded from Record is kept as it was.
+	Grants Part
 
 	// HTTP, Now and PollWait go to the client (nil and zero: its
 	// defaults; PollWait bounds how long a Request waits before it is
@@ -101,6 +106,32 @@ type Options struct {
 	HTTP     *http.Client
 	Now      func() time.Time
 	PollWait time.Duration
+}
+
+// Part is a member of the record kept by another package
+// (internal/leash's grants), saved with each batch like the access
+// session.
+type Part interface {
+	// Apply is called inside the save of a batch (in Run's goroutine,
+	// before the record is written and the batch acknowledged) with the
+	// batch's messages, responses included, in the order collected. It
+	// must not block or call Conn. Idempotent handling is required: a
+	// batch may be applied again by the next process after a crash
+	// between the save and the acknowledgement.
+	Apply(batch []Message)
+	// Snapshot returns the member's JSON for the record (nil: absent).
+	Snapshot() json.RawMessage
+}
+
+// Message is a collected vault message as Part.Apply sees it: an event
+// (Re empty) or a response.
+type Message struct {
+	ID        string
+	Type      string
+	Re        string
+	OK        bool
+	ErrorCode string
+	Body      json.RawMessage
 }
 
 // Event is a vault message that is not a response.
@@ -166,6 +197,11 @@ type Conn struct {
 	// goroutines.
 	accMu  sync.Mutex
 	access pairing.Access
+
+	ik ed25519.PublicKey
+	// lastContact: when a batch from the vault was last collected.
+	contactMu   sync.Mutex
+	lastContact time.Time
 }
 
 // New restores the device from the record, with Persist writing the
@@ -197,7 +233,20 @@ func New(o Options) (*Conn, error) {
 	}
 	c.dev = d
 	c.access = o.Record.Access
+	c.ik = d.IdentityKey()
 	return c, nil
+}
+
+// IdentityKey returns this agent's identity public key (its `ik`, the
+// `sub` of its LEASH delegations).
+func (c *Conn) IdentityKey() ed25519.PublicKey { return bytes.Clone(c.ik) }
+
+// LastContact returns when a message from the vault was last collected
+// in this process (zero: none yet).
+func (c *Conn) LastContact() time.Time {
+	c.contactMu.Lock()
+	defer c.contactMu.Unlock()
+	return c.lastContact
 }
 
 // Access returns the access session as last known: from the record at
@@ -284,6 +333,11 @@ func (c *Conn) persist(st []byte) error {
 	c.collected = true
 	evs := c.dev.Events()
 	c.events = append(c.events, evs...)
+	if len(evs) > 0 {
+		c.contactMu.Lock()
+		c.lastContact = c.o.Now()
+		c.contactMu.Unlock()
+	}
 	for _, ev := range evs {
 		if ev.Re == "" && ev.Type == "device.unlinked" {
 			c.unlinked = true
@@ -301,7 +355,20 @@ func (c *Conn) persist(st []byte) error {
 	// The batch's access events are applied before the save, so they are
 	// in the state file before the relay drops them.
 	c.applyAccess(evs)
-	rec := pairing.Record{Phase: pairing.PhasePaired, Device: bytes.Clone(st), Access: c.Access()}
+	leash := c.o.Record.Leash
+	if c.o.Grants != nil {
+		msgs := make([]Message, 0, len(evs))
+		for _, in := range evs {
+			m := Message{ID: in.ID, Type: in.Type, Re: in.Re, OK: in.Status == envelope.StatusOK, Body: in.Body}
+			if in.Error != nil {
+				m.ErrorCode = in.Error.Code
+			}
+			msgs = append(msgs, m)
+		}
+		c.o.Grants.Apply(msgs)
+		leash = c.o.Grants.Snapshot()
+	}
+	rec := pairing.Record{Phase: pairing.PhasePaired, Device: bytes.Clone(st), Access: c.Access(), Leash: leash}
 	b, err := rec.Encode()
 	clear(rec.Device)
 	if err != nil {

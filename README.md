@@ -165,7 +165,7 @@ known, checks the same way before asking for access for the first time.
 
 `vettid-agent status --state-dir DIR` shows what is saved: whether the
 connector is paired (its name, device and vault ids), the access session
-as last saved, and how the keys are protected. It does not contact the
+and the grants as last saved, and how the keys are protected. It does not contact the
 vault or the relay and does not take the state directory's lock, so it
 can run next to `vettid-agent mcp` and then shows that process's last
 saved state. It shows no keys or tokens.
@@ -198,6 +198,29 @@ asks you on your phone first.
   again.
 - Logs carry the kind of request, its id and the vault's error code,
   never an item's name or values.
+
+## Grants
+
+What the agent may do is set on your phone as **grants** (VAULT-MESSAGING
+§10.11): each names one permission (reading items you tagged for it, or
+one kind of request), whether your phone is asked each time, its limits
+an hour and a day, an optional end, and for some permissions the
+connections it is limited to. Your vault decides every request; the
+connector only keeps track of the grants so that it can show them and
+present them.
+
+The connector asks your vault for its grants each time an access
+session starts, and keeps the updates your vault sends during the
+session. It saves them, so `status` can show them, but it does not rely
+on what it saved: until the grants have been read again in the current
+access session it presents none. Each grant carries a delegation signed
+with your credential key and a short-lived status statement signed by
+your vault; the connector checks both, keeps the statement fresh (it
+asks for a new one when less than a quarter of its lifetime, and at
+least a minute, remains), and never presents a grant that your vault no
+longer lists, that has ended, or anything at all while your vault has
+paused the agent after repeated refused requests ("suspended"; you
+resume it on your phone).
 
 ## Keys at rest on Linux: the TPM
 
