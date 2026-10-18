@@ -107,6 +107,11 @@ type Vault struct {
 	// mailbox after pairing with this error (for example 403
 	// token_revoked).
 	DepositError *RelayError
+	// OnRequest, if set, is called (without the lock held) for every
+	// message the device sends in session other than leash.grant.list
+	// and vault.status, with its inner id, type and body; it may answer
+	// with SendResponse or SendEvent.
+	OnRequest func(id, typ string, body []byte)
 }
 
 // New starts a Vault; Close stops it.
@@ -282,6 +287,18 @@ func (v *Vault) SendEvent(typ string, body []byte) (string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.sealLocked(&envelope.Inner{Type: typ, Body: body})
+}
+
+// SendResponse sends the paired device a response to its request re:
+// ok with body, or the error code.
+func (v *Vault) SendResponse(re, typ string, body []byte, code string) (string, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	in := &envelope.Inner{Type: typ, Re: re, Status: envelope.StatusOK, Body: body}
+	if code != "" {
+		in.Status, in.Body, in.Error = envelope.StatusError, nil, &envelope.Error{Code: code}
+	}
+	return v.sealLocked(in)
 }
 
 func (v *Vault) sealLocked(in *envelope.Inner) (string, error) {
@@ -523,6 +540,7 @@ func (v *Vault) toVault(payload []byte) {
 	now := time.Now()
 	var decide func(string) Decision
 	var sas string
+	var hook func()
 	v.mu.Lock()
 	switch env.Mode() {
 	case envelope.ModeSealed:
@@ -573,6 +591,10 @@ func (v *Vault) toVault(payload []byte) {
 		if v.session != nil {
 			if in, _, err := v.session.Open(env, now); err == nil {
 				v.received = append(v.received, in.Type)
+				if f := v.OnRequest; f != nil && in.Type != "leash.grant.list" && in.Type != "vault.status" {
+					id, typ, body := in.ID, in.Type, append([]byte(nil), in.Body...)
+					hook = func() { f(id, typ, body) }
+				}
 				if in.Type == "leash.grant.list" && in.Re == "" {
 					resp := &envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK, Body: []byte(`{"grants":[],"suspended":false}`)}
 					if v.GrantListError != "" {
@@ -602,6 +624,9 @@ func (v *Vault) toVault(payload []byte) {
 		}
 	}
 	v.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if decide != nil {
 		_ = v.decide(decide(sas))
 	}
