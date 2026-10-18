@@ -27,7 +27,7 @@ func TestStatusPaired(t *testing.T) {
 		t.Fatalf("exit %d: %s", rc, errOut.String())
 	}
 	o := out.String()
-	for _, w := range []string{"Paired: yes", "Access session: none", `Paired: yes, as "Agent`, "Read without taking the state directory's lock"} {
+	for _, w := range []string{"Paired: yes", "Access session: not known yet", `Paired: yes, as "Agent`, "Read without taking the state directory's lock"} {
 		if !strings.Contains(o, w) {
 			t.Errorf("lacks %q:\n%s", w, o)
 		}

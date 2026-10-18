@@ -106,6 +106,15 @@ var (
 	// passphrase and TPM protectors) those old bytes can still be opened
 	// with the old secret.
 	ErrNotDurable = errors.New("state: the new state file is in place but may not be durable")
+	// ErrReplaceIncomplete: CreateReplace failed after it had wiped the
+	// old protector's key (and possibly overwritten the old bytes), and
+	// before the new file was in place: the old state may be gone, the
+	// new one is not there.
+	ErrReplaceIncomplete = errors.New("state: replacing the state file failed part of the way; the old state may be gone and the new one is not in place")
+	// ErrReplacedPartly: CreateReplace put the new file in place, but a
+	// later step (overwriting or closing the old file) failed. The Store
+	// holds the new file as created.
+	ErrReplacedPartly = errors.New("state: the new state file is in place, but replacing the old one did not finish")
 	// ErrNothingToWipe: Wipe found no state file and nothing loaded.
 	ErrNothingToWipe = errors.New("no state file: nothing to wipe (not paired)")
 	// ErrNotLoaded: Save before Create or Load.
@@ -248,6 +257,15 @@ func (s *Store) Create(p Protector, state []byte) error {
 //
 // p may be the old protector itself: a protector can wrap again after
 // its Wipe.
+//
+// What a failure left behind is in the error:
+//   - neither sentinel (an Exists error, ErrProtectorUnknown, the probe,
+//     the old protector's Wipe): nothing was changed;
+//   - ErrReplaceIncomplete: the old protector's key was wiped (and the
+//     old bytes possibly overwritten), so the old state may be gone; the
+//     new file is not in place;
+//   - ErrNotDurable (see there) or ErrReplacedPartly: the new file is in
+//     place and the Store holds it as created; the old state is gone.
 func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error {
 	if s.lock == nil {
 		return ErrClosed
@@ -276,13 +294,16 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	if err := oldP.Wipe(); err != nil {
 		return fmt.Errorf("state: protector %s could not delete the old key; nothing was replaced: %w", oldP.Name(), err)
 	}
+	// From here on the old protector's key is gone (for protectors that
+	// keep one), so a failure before the new file is in place may have
+	// destroyed the old state: such errors wrap ErrReplaceIncomplete.
 	s.forget()
 	old, err := openForOverwrite(s.Path())
 	switch {
 	case errors.Is(err, errNotRegular):
 		old = nil // a link or other non-file: the rename replaces the name itself
 	case err != nil:
-		return fmt.Errorf("state: open the old state file: %w", err)
+		return fmt.Errorf("%w: open the old state file: %w", ErrReplaceIncomplete, err)
 	}
 	if old != nil && !holdOld {
 		// The old key is already gone, so the old file cannot be opened
@@ -291,7 +312,7 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 		old.Close()
 		old = nil
 		if err != nil {
-			return fmt.Errorf("state: overwrite the old state file: %w", err)
+			return fmt.Errorf("%w: overwrite the old state file: %w", ErrReplaceIncomplete, err)
 		}
 	}
 	// create returns only after the new file is renamed into place and
@@ -315,7 +336,9 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 			if old != nil {
 				old.Close()
 			}
-			return err
+			// Not in place (a write before the rename failed, which
+			// leaves the path unchanged), but the old key is gone.
+			return fmt.Errorf("%w: %w", ErrReplaceIncomplete, err)
 		}
 	}
 	if old == nil {
@@ -323,9 +346,12 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	}
 	if err := overwriteFile(old); err != nil {
 		old.Close()
-		return fmt.Errorf("state: the new state is written, but overwriting the old file failed: %w", err)
+		return fmt.Errorf("%w: the new state is written, but overwriting the old file failed: %w", ErrReplacedPartly, err)
 	}
-	return old.Close()
+	if err := old.Close(); err != nil {
+		return fmt.Errorf("%w: the new state is written, but closing the old file failed: %w", ErrReplacedPartly, err)
+	}
+	return nil
 }
 
 // probeReplaceOpen reports whether the file system can rename over a

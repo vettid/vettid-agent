@@ -206,7 +206,10 @@ func (c *Conn) Access() pairing.Access {
 }
 
 // CompareAndSetAccess replaces the access session with a only if it is
-// still old, atomically, and reports whether it did. internal/access
+// still old, atomically, and reports whether it did. old must be a value
+// returned by Access (or access.Manager.Snapshot), taken before the
+// request whose answer a reflects; a value built otherwise compares
+// unequal to anything but an identical session. internal/access
 // uses it for what it learns from a probe or a session_required answer,
 // with old the session as it was when the request was sent: a batch
 // that changed the session in between (a grant or an end) is never

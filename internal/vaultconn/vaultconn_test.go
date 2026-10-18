@@ -786,8 +786,8 @@ func TestAccessSavedWithBatch(t *testing.T) {
 	}
 	sp := &accessSpy{v: e.v}
 	o := e.open(func(s Store) Store { sp.Store = s; return sp })
-	if a := o.conn.Access(); a.State != pairing.AccessNone {
-		t.Fatalf("after pairing without a first session: %+v", a)
+	if a := o.conn.Access(); a.State != pairing.AccessUnknown {
+		t.Fatalf("after pairing without a first session time: %+v", a)
 	}
 	stop := o.run()
 	nextEvent(t, o, "device.session.granted")
@@ -848,7 +848,7 @@ func TestAccessCrashBeforeSave(t *testing.T) {
 	stop := o.run()
 	eventually(t, "a failed save", func() bool { return fs.failures() >= 1 })
 	stop()
-	if rec, _ := e.saved(); rec.Access.State != pairing.AccessNone {
+	if rec, _ := e.saved(); rec.Access.State != pairing.AccessUnknown {
 		t.Fatal("the failed save reached the file")
 	}
 	sp := &accessSpy{v: e.v}
@@ -864,7 +864,7 @@ func TestCompareAndSetAccessSaved(t *testing.T) {
 	e := newPaired(t)
 	sp := &accessSpy{v: e.v}
 	o := e.open(func(s Store) Store { sp.Store = s; return sp })
-	cur := o.conn.Access() // none: paired without a first session
+	cur := o.conn.Access() // unknown: paired without a first session time
 	probed := pairing.Access{State: pairing.AccessActive}
 	if o.conn.CompareAndSetAccess(pairing.Access{State: pairing.AccessActive, SessionID: "x"}, probed) {
 		t.Fatal("set although the session was not the one compared")

@@ -98,3 +98,57 @@ func TestReadOnlyDuringWrites(t *testing.T) {
 		reads++
 	}
 }
+
+// TestCreateReplaceSentinels: a CreateReplace failure says what it left:
+// nothing changed (a failing probe, a failing old-key wipe: neither
+// sentinel, the old state still loads), or the old state may be gone
+// with the new one not in place (a write failing after the wipe:
+// ErrReplaceIncomplete).
+func TestCreateReplaceSentinels(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 32)
+	setup := func(t *testing.T) (*Store, *fixedProtector) {
+		s := openTest(t)
+		p := newFixedProtector(key)
+		if err := s.Create(p, []byte(`{"old":1}`)); err != nil {
+			t.Fatal(err)
+		}
+		return s, p
+	}
+	stillOld := func(t *testing.T, s *Store, p *fixedProtector) {
+		t.Helper()
+		pt, err := s.Load(func(string) Protector { return p })
+		if err != nil || string(pt) != `{"old":1}` {
+			t.Errorf("old state: %q %v", pt, err)
+		}
+	}
+	noSentinel := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil || errors.Is(err, ErrReplaceIncomplete) || errors.Is(err, ErrReplacedPartly) || errors.Is(err, ErrNotDurable) {
+			t.Errorf("got %v, want an error with no sentinel", err)
+		}
+	}
+
+	t.Run("probe", func(t *testing.T) {
+		s, p := setup(t)
+		old := probeReplaceOpen
+		probeReplaceOpen = func(string) (bool, error) { return false, errors.New("sharing violation") }
+		defer func() { probeReplaceOpen = old }()
+		noSentinel(t, s.CreateReplace(newFixedProtector(key), []byte(`{"new":1}`), nil))
+		stillOld(t, s, p)
+	})
+	t.Run("wipe", func(t *testing.T) {
+		s, p := setup(t)
+		p.failWipes = 1
+		noSentinel(t, s.CreateReplace(p, []byte(`{"new":1}`), nil))
+		stillOld(t, s, p)
+	})
+	t.Run("write after the wipe", func(t *testing.T) {
+		s, p := setup(t)
+		testHookBeforeRename = func(string) error { return errors.New("disk full") }
+		defer func() { testHookBeforeRename = nil }()
+		err := s.CreateReplace(p, []byte(`{"new":1}`), nil)
+		if !errors.Is(err, ErrReplaceIncomplete) || errors.Is(err, ErrReplacedPartly) {
+			t.Errorf("got %v", err)
+		}
+	})
+}

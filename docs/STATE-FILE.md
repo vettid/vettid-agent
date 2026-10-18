@@ -66,13 +66,16 @@ The plaintext under the data key is the connector's record
 | `phase` | `started`: fresh keys, mailbox registered, no SAS shown yet (discarded by the next `pair`); `waiting`: the handshake completed and the SAS was shown, the connector waits for the owner's decision (resumable until `deadline`); `paired`: `device.paired` arrived |
 | `deadline` | present exactly while `phase` is `started` or `waiting`: the end of the 10 minutes after `hs.init` (VAULT-MESSAGING §6.7), measured from just before the keys were created |
 | `device` | the vault client's `Save()` output: the `ik`, `kem` and relay-key seeds, the vault record with tokens, the session keyring |
-| `access` | optional, `paired` only: the access session (VAULT-MESSAGING §6.8) as of this save. `state` is `none` or `active`. An `active` one has `session_id` and `expires_at` (from `device.session.granted`), `expires_at` only (the first session, from `device.paired`'s `session_expires_at`, which comes with no session id), or neither (a session found by a check whose end is not known). Pairing writes `none` when the approval granted no session. Absent means not known: records paired by a build before the first session was recorded. `unknown` is never written |
+| `access` | optional, `paired` only: the access session (VAULT-MESSAGING §6.8) as of this save. `state` is `none` or `active`. An `active` one has `session_id` and `expires_at` (from `device.session.granted`), `expires_at` only (the first session, from `device.paired`'s `session_expires_at`, which comes with no session id), or neither (a session found by a check whose end is not known). Absent means not known: after a pairing whose `device.paired` gave no usable `session_expires_at`, and in records paired by a build before the first session was recorded. `unknown` is never written |
 
 It is parsed strictly (no unknown members, nothing after it). The
 pairing code and the SAS are never stored.
 
 `access` is first written by `internal/pairing` from `device.paired`
-(kept by the vault client, `Paired().SessionExpiresAt`), then by
+(kept by the vault client, `Paired().SessionExpiresAt`; without a usable
+time it stays absent, since the client keeps a missing and a malformed
+`session_expires_at` alike, and the first need checks it with the
+vault), then by
 `internal/vaultconn` in the same save as the batch that carried
 `device.session.granted` or `.ended`, before that batch is acknowledged
 at the relay, so a crash cannot lose a grant or
@@ -84,6 +87,16 @@ compare-and-set, so a grant or an end saved in between is never
 overwritten), and saved with the next batch. The version stays 1: the member is optional, and a record
 without it reads as before. A build older than this member refuses a
 record that has it (strict parsing); no such build was released.
+
+### Pairing's last batch
+
+`vettid-agent pair` saves and acknowledges the batch that carried
+`device.paired`, so any message that arrived after it in the same batch
+is acknowledged by `pair` and never reaches `internal/vaultconn`.
+Nothing is lost: the first access session comes from `device.paired`
+itself, grants are fetched with `leash.grant.list` at each session
+start (AGENT-PLAN §4.5), and the vault client applies its own messages
+(tokens, rekeys) while handling them, whichever command collects.
 
 ## Keys and writes
 
@@ -227,6 +240,14 @@ replace before anything is wiped. Then:
    state is written, renamed into place and flushed. The old file can
    no longer be opened once its key is gone, so nothing is lost by this
    order.
+
+A failure says what it left (the caller decides from that, never from
+which protector the store holds): no sentinel means nothing was changed
+(an `Exists` error, the protector or the probe, or the old key's wipe);
+`ErrReplaceIncomplete` means the old key was wiped (and possibly the old
+bytes overwritten) but the new file is not in place, so the old state
+may be gone; `ErrReplacedPartly` (or `ErrNotDurable`) means the new file
+is in place and the old one gone.
 
 ## Nothing to wipe
 

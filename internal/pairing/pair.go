@@ -171,7 +171,6 @@ type store interface {
 	Wipe(state.Resolver) error
 	WipeAll([]state.Protector) error
 	Dir() string
-	Protector() state.Protector
 }
 
 // wrapStore is the identity outside tests.
@@ -189,7 +188,7 @@ type run struct {
 	// "paired" or "unreadable"); replaced is set once it did.
 	replacing    string
 	replaced     bool
-	replaceTried bool
+	oldMaybeGone bool            // a failed replace may have destroyed the old state
 	prot         state.Protector // the new pairing's protector
 	created      bool            // the state file now holds this run's record
 	replace      bool            // a state file exists and is replaced at the first write
@@ -241,13 +240,13 @@ func Pair(ctx context.Context, o Options) error {
 	err = r.pairNew(ctx)
 	switch {
 	case err == nil || !r.replace || r.replaced:
-	case !r.replaceTried:
-		// The new pairing failed before its first write: whatever the
-		// state directory held is still there.
+	case !r.oldMaybeGone:
+		// Nothing was replaced (the pairing failed before its first
+		// write, or the replace failed before changing anything): what
+		// the state directory held is still there.
 		fmt.Fprintln(o.Out, textKept)
 	default:
-		// The replace was attempted and failed part of the way: the old
-		// state may already be gone.
+		// The replace failed part of the way: the old state may be gone.
 		fmt.Fprintln(o.Out, textMaybeReplaced)
 	}
 	return err
@@ -332,19 +331,28 @@ func (r *run) clientConfig(c client.Config) client.Config {
 // accessFromPaired is the first access session as device.paired gave it
 // (VAULT-MESSAGING §10.3 `session_expires_at`, kept by the client in
 // Paired): active until that time, with no session id (device.paired
-// carries none); none when the approval granted no session; unknown when
-// the client kept nothing.
+// carries none). Without a time it is unknown, not none: the client
+// keeps a missing and a malformed `session_expires_at` alike (zero), and
+// a malformed one must not hide a granted session; the first need checks
+// it with the vault (internal/access), which shows nothing on the phone.
 func accessFromPaired(p *client.Paired) Access {
 	switch {
-	case p == nil:
+	case p == nil, p.SessionExpiresAt.IsZero():
 		return Access{}
-	case p.SessionExpiresAt.IsZero():
-		return Access{State: AccessNone}
 	default:
 		return Access{State: AccessActive, ExpiresAt: p.SessionExpiresAt.UTC()}
 	}
 }
 
+// Messages that arrive after device.paired in the same collected batch
+// are acknowledged by `pair` when that batch is saved and are not seen
+// by internal/vaultconn later. Nothing is lost by that: the first access
+// session comes from device.paired itself (kept by the client in
+// Paired), and grants are fetched with leash.grant.list at each session
+// start (AGENT-PLAN §4.5), so a leash.grant.updated in that batch is
+// read again; the client applies its own messages (tokens, rekeys) while
+// handling them, whoever polls.
+//
 // persist is the client's Config.Persist while pairing: it saves the
 // device state with the current phase after each collected batch and
 // before the batch is acknowledged, so that device.paired (which the
@@ -527,21 +535,26 @@ func (r *run) write(b []byte) error {
 	}
 	var err error
 	if r.replace {
-		r.replaceTried = true
 		err = r.st.CreateReplace(r.prot, b, o.Resolve)
 		if errors.Is(err, state.ErrProtectorUnknown) && o.Restart {
+			// WipeAll removes the files whatever it answers.
+			r.oldMaybeGone = true
 			if err = r.st.WipeAll(o.AllProtectors); err == nil {
 				err = r.st.Create(r.prot, b)
 			}
 		}
+		// What a failure left is in its error (state.CreateReplace):
+		// never inferred from which protector the store holds.
+		switch {
+		case errors.Is(err, state.ErrReplacedPartly):
+			// The new file, under this run's key, is in place and the
+			// old one gone: the failure wipes this run's file.
+			r.oldMaybeGone, r.created = true, true
+		case errors.Is(err, state.ErrReplaceIncomplete):
+			r.oldMaybeGone = true
+		}
 	} else {
 		err = r.st.Create(r.prot, b)
-	}
-	if err != nil && !errors.Is(err, state.ErrNotDurable) && r.st.Protector() == r.prot {
-		// The store holds this run's protector: a file under this run's
-		// new key may be in place (the replace failed after writing
-		// it). Treat it as this run's, so that the failure wipes it.
-		r.created = true
 	}
 	if err == nil || errors.Is(err, state.ErrNotDurable) {
 		r.created = true
