@@ -404,7 +404,7 @@ again each time it opens the state file; otherwise it refuses.
 Only the **signed vettid-agent app** can use it. macOS gives access to
 this kind of Keychain item only to a program signed with an Apple
 Developer ID and a provisioning profile that allows it, so the connector
-is shipped (AGENT-PLAN A5, not yet released) as
+is shipped (from the first signed release; "Releases") as
 `vettid-agent.app`, run from
 `vettid-agent.app/Contents/MacOS/vettid-agent` like any command-line
 program. A binary built from source, or any copy without that
@@ -442,8 +442,9 @@ directory deletes it.
 
 The CI job (`macos-15`) cannot run the signed app, so it checks the
 format, the decisions and what macOS answers a binary without the
-entitlement; the following is checked by hand on a Mac once the signed
-app exists (A5). Use a test state directory and, for step 5, a second
+entitlement; the following is checked by hand on a Mac with the signed
+app (`scripts/build-macos-app` with the owner's identity, or a
+release's zip). Use a test state directory and, for step 5, a second
 Mac or a second user.
 
 1. Pair: `vettid-agent.app/Contents/MacOS/vettid-agent pair --state-dir
@@ -565,8 +566,10 @@ is refused.
 Release binaries are built reproducibly: anyone can rebuild a release
 from its tag and get byte-identical files. They are static
 (`CGO_ENABLED=0`) builds for **Linux amd64 and arm64** and **Windows
-amd64**. macOS binaries come later: the macOS Keychain needs cgo and a
-macOS build machine.
+amd64**, plus the signed and notarized **macOS app** (Apple silicon),
+which needs cgo for the Keychain and is built on the owner's Mac. The
+owner signs every release's `SHA256SUMS` with the release key
+("Verifying a release").
 
 ### Building
 
@@ -608,10 +611,46 @@ never a release; `vettid-agent version` says so on such a build.
 
 ### Verifying a release
 
+Every published release carries `SHA256SUMS` and `SHA256SUMS.sig`, the
+owner's signature over it. Check the signature first, then the files:
+
 ```sh
 git clone https://github.com/vettid/vettid-agent && cd vettid-agent
-# download SHA256SUMS from the release, then:
-scripts/verify-reproducible v0.1.0 /path/to/SHA256SUMS
+scripts/verify-release v0.2.0 vettid-agent-v0.2.0-linux-amd64
+```
+
+`scripts/verify-release` downloads `SHA256SUMS` and `SHA256SUMS.sig`
+into `./vettid-agent-v0.2.0`, checks the signature with `ssh-keygen -Y
+verify` against the release key in
+[release/allowed_signers](release/allowed_signers) (namespace
+`vettid-agent-release`), checks that the signed file names the release
+and its commit (and that commit is the tag's, if you have fetched the
+tag), and only then downloads the files you name (all of them if you
+name none) and checks their hashes. It exits non-zero, saying why, on
+any failure. `-l DIR` checks files you downloaded yourself. On a Mac it
+also checks the macOS app's Developer ID signature and notarization
+(`codesign`, `spctl`).
+
+The release key is also published on vettid.org: compare its
+fingerprint with the one `verify-release` prints. Without the script:
+
+```sh
+ssh-keygen -Y verify -f release/allowed_signers -I vettid-release \
+  -n vettid-agent-release -s SHA256SUMS.sig <SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS                          # Linux
+grep -v '^#' SHA256SUMS | shasum -a 256 -c --ignore-missing       # macOS
+```
+
+`SHA256SUMS` begins with one comment line,
+`# vettid-agent-release/<version>/<commit>` (the stamp that
+`vettid-agent version` prints), which binds the signature to the tag
+and its commit; `sha256sum -c` skips it.
+
+Then, to check that the binaries are what the source builds, rebuild
+them:
+
+```sh
+scripts/verify-reproducible v0.2.0 vettid-agent-v0.2.0/SHA256SUMS
 ```
 
 `scripts/verify-reproducible` clones the repository into a new temporary
@@ -625,46 +664,53 @@ itself, checks them with your checkout's
 `scripts/check-release-binaries`, on Linux amd64 and arm64 runs the
 binary for your machine and checks that `version` names the tag and its
 commit, and compares the hashes with the given `SHA256SUMS`: the same
-files and the same hashes, nothing more and nothing less. It exits
+files and the same hashes, nothing more and nothing less. Only the
+macOS app's line is left out (below), and it says so. It exits
 non-zero on any difference.
 
 The tag's build script runs as you, with your files within reach. Run
 the verification in a container or a throwaway VM rather than on a
 machine whose data matters.
 
-Then check the downloaded binary against the same file:
+### Signing and publishing
 
-```sh
-sha256sum -c SHA256SUMS --ignore-missing      # Linux
-shasum -a 256 -c SHA256SUMS --ignore-missing  # macOS
-```
-
-**Signatures come later.** The release workflow
+The release workflow
 ([.github/workflows/release.yml](.github/workflows/release.yml)) builds
 every version tag twice, on an amd64 and an arm64 runner, requires
-identical output and creates a **draft** GitHub release with the
-**unsigned** binaries and `SHA256SUMS`. Before signing, the owner
-rebuilds the tag on their own machine with `scripts/verify-reproducible
--m <tag> SHA256SUMS`, then signs `SHA256SUMS` offline with the release
-key and publishes the release; the signature format, the public key's
-place on vettid.org and how to check the signature come with that step
-(AGENT-PLAN A5.2). No CI system or other third party holds a VettID
-signing key, and the connector does not update itself. Until a release
-is signed, a rebuild that matches is the check. Pull requests run the
-same two builds and comparison as a dry run.
+identical output, requires the tag to be annotated and signed (GitHub
+verified), and creates a **draft** GitHub release with the **unsigned**
+binaries and `SHA256SUMS`. The owner then runs one command on their own
+Mac, `scripts/sign-release v0.2.0`: it checks the tag's signature against
+`release/allowed_signers`, checks that the draft came from the workflow's
+run for that tag, rebuilds the tag and requires byte-identical binaries,
+builds, signs and notarizes the macOS app, writes and signs
+`SHA256SUMS` with the release key, checks the result, uploads it and
+publishes after a confirmation. When the release is published, the
+workflow checks the signature once more. The steps, the one-time setup
+and the formats are in [docs/RELEASING.md](docs/RELEASING.md).
 
-### Signed binaries (planned, A5.3)
+No CI system or other third party holds a VettID signing key, an Apple
+certificate or notarization credentials: the release key stays with the
+owner (a security key or an offline file), and signing happens on the
+owner's machine. The connector does not update itself. Pull requests
+run the same two builds and comparison as a dry run.
 
-Authenticode signing changes a Windows binary's bytes, and the macOS
-binaries (cgo, built and notarized on a Mac) are not built by
-`scripts/build-release`. So that `SHA256SUMS` keeps meaning "exactly
-what anyone can rebuild", it will stay the list of the unsigned,
-reproducible binaries, and signed files will be listed in a separate
-file (for example `SHA256SUMS-signed`), also signed by the owner, which
-`scripts/verify-reproducible` does not compare. A signed Windows
-binary will be tied to its reproducible original by removing the
-signature and comparing with the unsigned hash; how, and how macOS
-binaries are checked, is part of A5.3.
+### macOS and Windows binaries
+
+The macOS app, `vettid-agent-<version>-darwin-arm64.zip`, holds
+`vettid-agent.app` (Apple silicon); run the connector as
+`vettid-agent.app/Contents/MacOS/vettid-agent`. Only this signed app can
+use the Keychain (see "Keys at rest on macOS"). It is built with cgo by
+`scripts/build-macos-app` on the owner's Mac and **is not
+reproducible**: the Mac's C toolchain and SDK reach the binary. It is
+checked by the owner's Developer ID signature, Apple's notarization and
+its line in the signed `SHA256SUMS` instead; `verify-reproducible` does
+not compare it.
+
+Windows binaries are not Authenticode-signed yet: the owner deferred
+Windows signing (2026-10-18) until the VettID business entity exists.
+The Windows binary is the reproducible one in `SHA256SUMS`; Smart App
+Control may refuse to run it.
 
 ## License
 

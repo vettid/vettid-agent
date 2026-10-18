@@ -5,7 +5,12 @@
 #   scripts/verify-reproducible [-m] [-k] REF SHA256SUMS
 #
 # REF is the release tag (for example v0.1.0) or a commit; SHA256SUMS is
-# the file published with the release (or written by another build).
+# the file published with the release (or written by another build). In a
+# signed SHA256SUMS (scripts/sign-release) the first line,
+# "# vettid-agent-release/<version>/<commit>", must name REF's version and
+# commit, and the macOS app's line (vettid-agent-<version>-darwin-arm64.zip,
+# built and notarized on the owner's Mac, not reproducible) is left out of
+# the comparison and said so; scripts/verify-release checks the signature.
 # The script clones this repository into a new temporary directory,
 # checks out REF there, and runs REF's own scripts/build-release in that
 # clone with a fresh build cache (REF is passed through, so a version
@@ -29,8 +34,8 @@
 #   -k  keep the temporary directory and say where it is
 #
 # Fetch the release tag first (git fetch --tags). Checking the owner's
-# signature over SHA256SUMS is a separate step (README, "Verifying a
-# release").
+# signature over SHA256SUMS is a separate step: scripts/verify-release
+# (README, "Verifying a release").
 set -euo pipefail
 
 usage() { echo "usage: scripts/verify-reproducible [-m] [-k] REF SHA256SUMS" >&2; exit 2; }
@@ -129,7 +134,20 @@ if ! cmp -s "$work/rehashed" "$work/out/SHA256SUMS"; then
   log "note: REF's build-release wrote a SHA256SUMS that differs from the hashes of its files; comparing the hashes computed here"
 fi
 
-if diff -u "$sums" "$work/rehashed"; then
+# The lines to compare: a signed SHA256SUMS without its "#" line and the
+# macOS app's line.
+given="$work/given"
+if [ "$(head -c1 "$sums")" = "#" ]; then
+  first="$(head -n1 "$sums")"
+  [ "$first" = "# vettid-agent-release/$version/$commit" ] || { log "FAIL $2 begins with \"$first\", not \"# vettid-agent-release/$version/$commit\""; exit 1; }
+  log "$2 is signed for $version at $commit"
+fi
+grep -v '^#' "$sums" | grep -vE "^[0-9a-f]{64}  vettid-agent-$version-darwin-arm64\.zip\$" >"$given" || true
+if grep -qE "^[0-9a-f]{64}  vettid-agent-$version-darwin-arm64\.zip\$" "$sums"; then
+  log "not compared: vettid-agent-$version-darwin-arm64.zip (the macOS app, built and notarized on the owner's Mac; not reproducible)"
+fi
+
+if diff -u "$given" "$work/rehashed"; then
   log "PASS $ref ($commit) rebuilds to the hashes in $2"
 else
   log "FAIL the rebuild of $ref ($commit) differs from $2 (- given, + rebuilt)"

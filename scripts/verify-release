@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# Check a vettid-agent release: the owner's signature over SHA256SUMS,
+# then the files against SHA256SUMS (AGENT-PLAN §2 AG4, §6 A5.2).
+#
+#   scripts/verify-release [-a ALLOWED_SIGNERS] [-c COMMIT] [-d DIR] TAG [FILE...]
+#   scripts/verify-release [-a ALLOWED_SIGNERS] [-c COMMIT] [-A] -l DIR [TAG]
+#
+# The first form downloads TAG's SHA256SUMS and SHA256SUMS.sig from the
+# GitHub release into DIR (default: ./vettid-agent-TAG, created if
+# missing), checks the signature, and only then downloads FILEs (default:
+# every file SHA256SUMS lists) and checks them. The second form checks
+# files already in DIR, without the network.
+#
+# The checks, in order; any failure stops with FAIL and a non-zero exit:
+#   1. ALLOWED_SIGNERS (default: release/allowed_signers in this checkout;
+#      the same key is published on vettid.org) holds a key; a file with
+#      only comments is refused.
+#   2. SHA256SUMS.sig is a valid signature over SHA256SUMS by a key in
+#      ALLOWED_SIGNERS, in the namespace vettid-agent-release
+#      (`ssh-keygen -Y find-principals`, then `ssh-keygen -Y verify`).
+#   3. SHA256SUMS is a signed release list: its first line is
+#      "# vettid-agent-release/<version>/<commit>" (the same stamp as in
+#      the binaries; `vettid-agent version` prints it), then only
+#      "<sha256>  vettid-agent-<version>-<platform>" lines. The version
+#      must be TAG when TAG is given, the commit COMMIT when -c is given,
+#      and the commit of the tag TAG in this checkout when it has that tag.
+#   4. Every file of DIR that SHA256SUMS lists has the listed hash; at
+#      least one does; no vettid-agent-<version>-* file in DIR is missing
+#      from the list. With -A every listed file must be in DIR.
+#   5. On a Mac, a listed vettid-agent-<version>-darwin-arm64.zip is
+#      unpacked into a temporary directory and vettid-agent.app is checked
+#      with codesign and Gatekeeper (spctl). Elsewhere it is checked by its
+#      hash only.
+#
+# Needs bash, OpenSSH 8.2 or later (ssh-keygen -Y), sha256sum or shasum,
+# and curl for the download form. VETTID_AGENT_REPO (default
+# vettid/vettid-agent) names the GitHub repository.
+set -euo pipefail
+
+usage() {
+  echo "usage: scripts/verify-release [-a ALLOWED_SIGNERS] [-c COMMIT] [-d DIR] TAG [FILE...]" >&2
+  echo "       scripts/verify-release [-a ALLOWED_SIGNERS] [-c COMMIT] [-A] -l DIR [TAG]" >&2
+  exit 2
+}
+log() { echo "verify-release: $*" >&2; }
+fail() { log "FAIL $*"; exit 1; }
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+allowed="$repo/release/allowed_signers"
+want_commit=""
+dir=""
+local_dir=""
+all=0
+while getopts "a:c:d:l:A" opt; do
+  case "$opt" in
+    a) allowed="$OPTARG" ;;
+    c) want_commit="$OPTARG" ;;
+    d) dir="$OPTARG" ;;
+    l) local_dir="$OPTARG" ;;
+    A) all=1 ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+namespace="vettid-agent-release"
+verre='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+namere='^vettid-agent-[0-9A-Za-z._-]+$'
+gh_repo="${VETTID_AGENT_REPO:-vettid/vettid-agent}"
+
+tag=""
+files=()
+if [ -n "$local_dir" ]; then
+  [ -z "$dir" ] || usage
+  [ "$#" -le 1 ] || usage
+  tag="${1:-}"
+else
+  [ "$#" -ge 1 ] || usage
+  [ "$all" = 0 ] || usage
+  tag="$1"
+  shift
+  files=("$@")
+fi
+if [ -n "$tag" ] && ! [[ "$tag" =~ $verre ]]; then
+  fail "\"$tag\" is not a release tag (v<major>.<minor>.<patch>[-pre])"
+fi
+if [ -n "$want_commit" ] && ! [[ "$want_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  fail "-c \"$want_commit\" is not a full commit hash"
+fi
+
+command -v ssh-keygen >/dev/null || fail "ssh-keygen not found (OpenSSH 8.2 or later)"
+if command -v sha256sum >/dev/null; then
+  sha256() { sha256sum "$1" | awk '{ print $1 }'; }
+elif command -v shasum >/dev/null; then
+  sha256() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+else
+  fail "neither sha256sum nor shasum found"
+fi
+
+# 1. The allowed signers file holds a key.
+[ -f "$allowed" ] || fail "$allowed is not a file"
+if ! grep -Evq '^[[:space:]]*(#|$)' "$allowed"; then
+  fail "$allowed holds no key yet (only comments): the owner adds the release key's line (docs/RELEASING.md); nothing can be verified until then"
+fi
+
+# 2. The signature. Prints the principal.
+check_signature() {
+  local d="$1" principals p out
+  [ -f "$d/SHA256SUMS" ] || fail "no SHA256SUMS in $d"
+  [ -f "$d/SHA256SUMS.sig" ] || fail "no SHA256SUMS.sig in $d: the release is not signed"
+  if ! principals="$(ssh-keygen -Y find-principals -s "$d/SHA256SUMS.sig" -f "$allowed" 2>&1)"; then
+    log "ssh-keygen: $principals"
+    fail "SHA256SUMS.sig is not a signature by a key in $allowed"
+  fi
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    if out="$(ssh-keygen -Y verify -f "$allowed" -I "$p" -n "$namespace" -s "$d/SHA256SUMS.sig" <"$d/SHA256SUMS" 2>&1)"; then
+      log "$out"
+      signer="$p"
+      return 0
+    fi
+  done <<<"$principals"
+  log "ssh-keygen: $out"
+  fail "SHA256SUMS.sig does not verify over SHA256SUMS in the namespace $namespace with $allowed (tampered, or signed for another purpose)"
+}
+
+# 3. The list. Sets version, commit and names.
+check_list() {
+  local d="$1" first line t
+  first="$(head -n1 "$d/SHA256SUMS")"
+  if ! [[ "$first" =~ ^\#\ vettid-agent-release/(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)/([0-9a-f]{40})$ ]]; then
+    fail "SHA256SUMS does not begin with \"# vettid-agent-release/<version>/<commit>\" (got \"$first\")"
+  fi
+  version="${BASH_REMATCH[1]}"
+  commit="${BASH_REMATCH[3]}"
+  names=()
+  while IFS= read -r line; do
+    if ! [[ "$line" =~ ^[0-9a-f]{64}\ \ (vettid-agent-[0-9A-Za-z._-]+)$ ]]; then
+      fail "SHA256SUMS has a line that is not \"<sha256>  vettid-agent-$version-<platform>\": \"$line\""
+    fi
+    case "${BASH_REMATCH[1]}" in
+      "vettid-agent-$version-"*) names+=("${BASH_REMATCH[1]}") ;;
+      *) fail "SHA256SUMS lists ${BASH_REMATCH[1]}, which is not named for $version" ;;
+    esac
+  done < <(tail -n +2 "$d/SHA256SUMS")
+  [ "${#names[@]}" -gt 0 ] || fail "SHA256SUMS lists no files"
+  if [ -n "$(printf '%s\n' "${names[@]}" | sort | uniq -d)" ]; then
+    fail "SHA256SUMS lists a file twice"
+  fi
+  if [ -n "$tag" ] && [ "$version" != "$tag" ]; then
+    fail "SHA256SUMS is signed for $version, not $tag"
+  fi
+  if [ -n "$want_commit" ] && [ "$commit" != "$want_commit" ]; then
+    fail "SHA256SUMS is signed for the commit $commit, not $want_commit"
+  fi
+  if git -C "$repo" rev-parse --verify --quiet --end-of-options "refs/tags/$version" >/dev/null 2>&1; then
+    t="$(git -C "$repo" rev-parse --verify --quiet --end-of-options "refs/tags/$version^{commit}" || true)"
+    [ "$t" = "$commit" ] || fail "SHA256SUMS is signed for the commit $commit, but the tag $version here is $t"
+    log "the tag $version in this checkout is $commit, as signed"
+  else
+    log "no tag $version in this checkout (git fetch --tags to compare it); signed for commit $commit"
+  fi
+}
+
+# 4. and 5. The files.
+check_files() {
+  local d="$1" n want got present=0 missing=0 f b
+  for n in "${names[@]}"; do
+    want="$(awk -v n="$n" 'NR > 1 && $2 == n { print $1 }' "$d/SHA256SUMS")"
+    if [ ! -f "$d/$n" ]; then
+      [ "$all" = 1 ] && fail "$n is listed but not in $d"
+      log "not here (not checked): $n"
+      missing=$((missing + 1))
+      continue
+    fi
+    got="$(sha256 "$d/$n")"
+    [ "$got" = "$want" ] || fail "$n: sha256 $got, SHA256SUMS says $want"
+    echo "$n: OK"
+    present=$((present + 1))
+  done
+  [ "$present" -gt 0 ] || fail "none of the files SHA256SUMS lists is in $d"
+  for f in "$d"/vettid-agent-"$version"-*; do
+    [ -e "$f" ] || continue
+    b="$(basename "$f")"
+    printf '%s\n' "${names[@]}" | grep -qxF "$b" || fail "$b is in $d but not in SHA256SUMS: do not use it"
+  done
+  macos_note=""
+  if [ -f "$d/vettid-agent-$version-darwin-arm64.zip" ]; then
+    if [ "$(uname -s)" = Darwin ]; then
+      check_macos_app "$d/vettid-agent-$version-darwin-arm64.zip"
+    else
+      macos_note=" (vettid-agent-$version-darwin-arm64.zip by its hash only; its Developer ID signature is checked on a Mac)"
+    fi
+  fi
+  checked="$present"
+  skipped=""
+  [ "$missing" = 0 ] || skipped=", $missing listed but not here"
+}
+
+check_macos_app() {
+  local zip="$1" tmp out team
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-app.XXXXXXXX")"
+  ditto -x -k "$zip" "$tmp" || { rm -rf "$tmp"; fail "$(basename "$zip") does not unpack"; }
+  [ -d "$tmp/vettid-agent.app" ] || { rm -rf "$tmp"; fail "$(basename "$zip") holds no vettid-agent.app"; }
+  if ! out="$(codesign --verify --strict --deep --verbose=2 "$tmp/vettid-agent.app" 2>&1)"; then
+    log "$out"; rm -rf "$tmp"; fail "vettid-agent.app: the code signature does not verify"
+  fi
+  if ! out="$(spctl --assess --type execute --verbose=2 "$tmp/vettid-agent.app" 2>&1)"; then
+    log "$out"; rm -rf "$tmp"; fail "vettid-agent.app: Gatekeeper does not accept it (not notarized?)"
+  fi
+  log "$out"
+  team="$(codesign -d --verbose=2 "$tmp/vettid-agent.app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+  log "vettid-agent.app: signed by the Developer ID of team $team, accepted by Gatekeeper"
+  rm -rf "$tmp"
+}
+
+download() {
+  local name="$1" to="$2"
+  curl -fsSL --proto '=https' --tlsv1.2 -o "$to/$name.part" \
+    "https://github.com/$gh_repo/releases/download/$tag/$name" || { rm -f "$to/$name.part"; fail "could not download $name of $tag"; }
+  mv "$to/$name.part" "$to/$name"
+}
+
+if [ -n "$local_dir" ]; then
+  [ -d "$local_dir" ] || fail "$local_dir is not a directory"
+  d="$local_dir"
+else
+  command -v curl >/dev/null || fail "curl not found"
+  d="${dir:-vettid-agent-$tag}"
+  mkdir -p "$d"
+  log "downloading SHA256SUMS and SHA256SUMS.sig of $tag from github.com/$gh_repo into $d"
+  rm -f "$d/SHA256SUMS" "$d/SHA256SUMS.sig"
+  download SHA256SUMS "$d"
+  download SHA256SUMS.sig "$d"
+fi
+
+signer=""
+check_signature "$d"
+check_list "$d"
+
+if [ -z "$local_dir" ]; then
+  if [ "${#files[@]}" -eq 0 ]; then files=("${names[@]}"); fi
+  for n in "${files[@]}"; do
+    [[ "$n" =~ $namere ]] || fail "\"$n\" is not a release file name"
+    printf '%s\n' "${names[@]}" | grep -qxF "$n" || fail "$n is not in $tag's SHA256SUMS"
+    log "downloading $n"
+    download "$n" "$d"
+  done
+fi
+
+check_files "$d"
+log "PASS vettid-agent $version (commit $commit): SHA256SUMS signed by $signer; $checked file(s) match$skipped$macos_note"

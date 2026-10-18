@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# Tests of the release signature scripts (scripts/sign-release --local,
+# scripts/verify-release -l, and the signed-file handling of
+# scripts/verify-reproducible): a sign and verify round trip, and the
+# refusals. `make release-sign-test`; CI runs it on Linux and macOS.
+#
+# The key is a throwaway Ed25519 key made in a new temporary directory
+# for this run and deleted with it: never a VettID key, never written to
+# the repository or to ~/.ssh. Nothing here uses the network or GitHub.
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+t="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-sigtest.XXXXXXXX")"
+trap 'rm -rf "$t"' EXIT
+
+tag="v0.0.0-sigtest.1"
+commit="0123456789abcdef0123456789abcdef01234567"
+other_commit="89abcdef0123456789abcdef0123456789abcdef"
+pass=0
+failed=0
+
+ok() { echo "ok   $*"; pass=$((pass + 1)); }
+bad() { echo "FAIL $*"; failed=$((failed + 1)); }
+
+# check DESC CMD...: CMD (a test) succeeds.
+check() {
+  local desc="$1"; shift
+  if "$@"; then ok "$desc"; else bad "$desc"; fi
+}
+# expect_pass DESC CMD...: CMD exits 0.
+expect_pass() {
+  local desc="$1"; shift
+  if out="$("$@" 2>&1)"; then ok "$desc"; else bad "$desc"; printf '%s\n' "$out" | sed 's/^/     /'; fi
+}
+# expect_fail DESC PATTERN CMD...: CMD exits non-zero and says PATTERN.
+expect_fail() {
+  local desc="$1" pat="$2"; shift 2
+  if out="$("$@" 2>&1)"; then
+    bad "$desc (exited 0)"; printf '%s\n' "$out" | sed 's/^/     /'
+  elif ! printf '%s\n' "$out" | grep -q -- "$pat"; then
+    bad "$desc (no \"$pat\" in the output)"; printf '%s\n' "$out" | sed 's/^/     /'
+  else
+    ok "$desc"
+  fi
+}
+
+# Fresh release files in $1.
+files() {
+  rm -rf "$1"; mkdir -p "$1"
+  printf 'linux amd64 binary\n' >"$1/vettid-agent-$tag-linux-amd64"
+  printf 'linux arm64 binary\n' >"$1/vettid-agent-$tag-linux-arm64"
+  printf 'windows binary\n' >"$1/vettid-agent-$tag-windows-amd64.exe"
+  # On a Mac, verify-release checks a listed macOS zip's app with codesign
+  # and Gatekeeper, which a stand-in cannot pass: there the list has no
+  # macOS line (CI's macOS job checks the app bundle on its own).
+  if [ "$(uname -s)" != Darwin ]; then
+    printf 'not a real zip\n' >"$1/vettid-agent-$tag-darwin-arm64.zip"
+  fi
+}
+nfiles=4
+[ "$(uname -s)" != Darwin ] || nfiles=3
+
+sign() { "$repo/scripts/sign-release" "$@"; }
+verify() { "$repo/scripts/verify-release" "$@"; }
+
+ssh-keygen -q -t ed25519 -N '' -C sigtest -f "$t/key"
+ssh-keygen -q -t ed25519 -N '' -C sigtest-other -f "$t/other"
+printf 'sigtest namespaces="git,vettid-agent-release" %s\n' "$(cut -d' ' -f1,2 "$t/key.pub")" >"$t/allowed"
+# The placeholder: the repository's file without any key line (as it is
+# shipped until the owner adds the release key).
+grep -E '^[[:space:]]*(#|$)' "$repo/release/allowed_signers" >"$t/placeholder"
+printf '\n   \n# another comment\n' >>"$t/placeholder"
+
+echo "== the placeholder allowed signers file"
+files "$t/a"
+expect_fail "sign-release refuses the placeholder" "holds no key yet" \
+  sign --local "$t/a" -c "$commit" -k "$t/key" -a "$t/placeholder" "$tag"
+check "nothing signed" test ! -e "$t/a/SHA256SUMS.sig"
+sign --local "$t/a" -c "$commit" -k "$t/key" -a "$t/allowed" "$tag" >/dev/null 2>&1
+expect_fail "verify-release refuses the placeholder" "holds no key yet" \
+  verify -a "$t/placeholder" -l "$t/a" "$tag"
+if grep -Evq '^[[:space:]]*(#|$)' "$repo/release/allowed_signers"; then
+  echo "note release/allowed_signers holds a key: the default refusal is not tested"
+else
+  expect_fail "verify-release refuses release/allowed_signers while it holds no key" "holds no key yet" \
+    verify -l "$t/a" "$tag"
+fi
+
+echo "== the round trip"
+files "$t/a"
+expect_pass "sign-release --local signs" sign --local "$t/a" -c "$commit" -k "$t/key" -a "$t/allowed" "$tag"
+check "SHA256SUMS.sig written" test -f "$t/a/SHA256SUMS.sig"
+check "the first line binds the tag and commit" test "$(head -n1 "$t/a/SHA256SUMS")" = "# vettid-agent-release/$tag/$commit"
+check "every file listed" test "$(grep -vc '^#' "$t/a/SHA256SUMS")" = "$nfiles"
+check "sorted by name" test "$(tail -n +2 "$t/a/SHA256SUMS" | awk '{ print $2 }')" = "$(tail -n +2 "$t/a/SHA256SUMS" | awk '{ print $2 }' | LC_ALL=C sort)"
+check "an SSH signature" grep -q 'BEGIN SSH SIGNATURE' "$t/a/SHA256SUMS.sig"
+expect_pass "verify-release -l accepts it" verify -a "$t/allowed" -l "$t/a" "$tag"
+expect_pass "verify-release -l -A -c accepts it" verify -a "$t/allowed" -A -c "$commit" -l "$t/a" "$tag"
+expect_pass "verify-release -l without a tag accepts it" verify -a "$t/allowed" -l "$t/a"
+# shellcheck disable=SC2016 # expanded by sh -c
+expect_pass "ssh-keygen -Y verify by hand (the documented command)" \
+  sh -c 'ssh-keygen -Y verify -f "$1" -I sigtest -n vettid-agent-release -s "$2/SHA256SUMS.sig" <"$2/SHA256SUMS"' sh "$t/allowed" "$t/a"
+if command -v sha256sum >/dev/null; then
+  # shellcheck disable=SC2016 # expanded by sh -c
+  expect_pass "sha256sum -c accepts the signed SHA256SUMS" sh -c 'cd "$1" && sha256sum -c SHA256SUMS' sh "$t/a"
+fi
+# shellcheck disable=SC2016 # expanded by sh -c
+expect_pass "the documented macOS form (grep -v '^#' | shasum -c)" \
+  sh -c 'cd "$1" && grep -v "^#" SHA256SUMS | if command -v shasum >/dev/null; then shasum -a 256 -c; else sha256sum -c; fi' sh "$t/a"
+expect_pass "signing again replaces the signature" sign --local "$t/a" -c "$commit" -k "$t/key" -a "$t/allowed" "$tag"
+expect_pass "and it still verifies" verify -a "$t/allowed" -A -l "$t/a" "$tag"
+
+echo "== what verify-release refuses"
+expect_fail "another tag" "signed for $tag, not v0.0.1" verify -a "$t/allowed" -l "$t/a" v0.0.1
+expect_fail "another commit" "not $other_commit" verify -a "$t/allowed" -c "$other_commit" -l "$t/a" "$tag"
+
+cp -R "$t/a" "$t/b"
+# The first hex digit of the first entry, changed.
+awk 'NR == 2 { $0 = (substr($0, 1, 1) == "0" ? "1" : "0") substr($0, 2) } { print }' "$t/a/SHA256SUMS" >"$t/b/SHA256SUMS"
+cmp -s "$t/a/SHA256SUMS" "$t/b/SHA256SUMS" && bad "the tamper changed nothing"
+expect_fail "a tampered hash in SHA256SUMS" "does not verify" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+sed -i.orig "1s/.*/# vettid-agent-release\/$tag\/$other_commit/" "$t/b/SHA256SUMS"; rm -f "$t/b/SHA256SUMS.orig"
+expect_fail "a tampered commit line" "does not verify" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+echo "extra" >>"$t/b/SHA256SUMS"
+expect_fail "a line added to SHA256SUMS" "does not verify" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+printf 'changed\n' >"$t/b/vettid-agent-$tag-linux-amd64"
+expect_fail "a tampered binary" "vettid-agent-$tag-linux-amd64: sha256" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+rm "$t/b/SHA256SUMS.sig"
+expect_fail "no signature" "not signed" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+rm "$t/b/SHA256SUMS.sig"
+ssh-keygen -q -Y sign -n file -f "$t/key" "$t/b/SHA256SUMS"
+expect_fail "the right key in the wrong namespace (file)" "namespace vettid-agent-release" verify -a "$t/allowed" -l "$t/b" "$tag"
+rm "$t/b/SHA256SUMS.sig"
+ssh-keygen -q -Y sign -n git -f "$t/key" "$t/b/SHA256SUMS"
+expect_fail "the right key in the git namespace (a tag signature)" "namespace vettid-agent-release" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+rm "$t/b/SHA256SUMS.sig"
+ssh-keygen -q -Y sign -n vettid-agent-release -f "$t/other" "$t/b/SHA256SUMS"
+expect_fail "a key not in allowed_signers" "not a signature by a key in" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+printf 'sneaked in\n' >"$t/b/vettid-agent-$tag-linux-riscv64"
+expect_fail "an unlisted file named for the release" "not in SHA256SUMS" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+rm -rf "$t/b"; cp -R "$t/a" "$t/b"
+rm "$t/b/vettid-agent-$tag-windows-amd64.exe"
+expect_pass "a listed file not downloaded is skipped" verify -a "$t/allowed" -l "$t/b" "$tag"
+expect_fail "but not with -A" "listed but not in" verify -a "$t/allowed" -A -l "$t/b" "$tag"
+rm "$t/b"/vettid-agent-*
+expect_fail "no listed file at all" "none of the files" verify -a "$t/allowed" -l "$t/b" "$tag"
+
+echo "== what sign-release refuses"
+files "$t/c"
+expect_fail "a key not in allowed_signers" "not in $t/allowed" \
+  sign --local "$t/c" -c "$commit" -k "$t/other" -a "$t/allowed" "$tag"
+cp "$t/key" "$t/nopub"
+expect_fail "a key without its .pub" "no $t/nopub.pub" \
+  sign --local "$t/c" -c "$commit" -k "$t/nopub" -a "$t/allowed" "$tag"
+expect_fail "no key" "no release key" \
+  env -u VETTID_RELEASE_KEY "$repo/scripts/sign-release" --local "$t/c" -c "$commit" -a "$t/allowed" "$tag"
+expect_fail "not a release tag" "not a release tag" \
+  sign --local "$t/c" -c "$commit" -k "$t/key" -a "$t/allowed" 0.1.0
+expect_fail "a short commit" "full commit hash" \
+  sign --local "$t/c" -c 0123456 -k "$t/key" -a "$t/allowed" "$tag"
+mkdir -p "$t/empty"
+expect_fail "no files for the tag" "no vettid-agent-$tag-\\* files" \
+  sign --local "$t/empty" -c "$commit" -k "$t/key" -a "$t/allowed" "$tag"
+if [ "$(uname -s)" != Darwin ]; then
+  expect_fail "a release without the macOS app needs --no-macos off a Mac" "pass --no-macos" \
+    sign -k "$t/key" -a "$t/allowed" "$tag"
+fi
+
+echo "== verify-reproducible reads a signed SHA256SUMS"
+# Against a clone whose build-release and check-release-binaries are stubs
+# (no Go build), running this checkout's verify-reproducible, committed
+# there.
+mkdir -p "$t/stub"
+git clone --quiet --no-local "$repo" "$t/stub/repo"
+cp "$repo/scripts/verify-reproducible" "$t/stub/repo/scripts/verify-reproducible"
+cat >"$t/stub/repo/scripts/build-release" <<'STUB'
+#!/usr/bin/env bash
+# Stub for scripts/test-release-signing: three small files, no Go build;
+# the Linux ones answer `version` as a release build does.
+set -euo pipefail
+out="$2"; mkdir -p "$out"
+c="$(git -C "$(dirname "$0")/.." rev-parse HEAD)"
+for n in linux-amd64 linux-arm64 windows-amd64.exe; do
+  printf '#!/bin/sh\necho "vettid-agent untagged"\necho "commit: %s"\n' "$c" >"$out/vettid-agent-untagged-$n"
+  chmod +x "$out/vettid-agent-untagged-$n"
+done
+STUB
+printf '#!/bin/sh\nexit 0\n' >"$t/stub/repo/scripts/check-release-binaries"
+chmod +x "$t/stub/repo/scripts/build-release" "$t/stub/repo/scripts/check-release-binaries"
+git -C "$t/stub/repo" -c user.name=t -c user.email=t@invalid -c commit.gpgsign=false commit --quiet -am "stubs"
+stub_commit="$(git -C "$t/stub/repo" rev-parse HEAD)"
+"$t/stub/repo/scripts/build-release" -o "$t/stub/out" >/dev/null
+{
+  (cd "$t/stub/out" && for f in vettid-agent-untagged-*; do
+    printf '%s  %s\n' "$({ sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"; } | awk '{ print $1 }')" "$f"
+  done)
+  printf '%064d  vettid-agent-untagged-darwin-arm64.zip\n' 0
+} | LC_ALL=C sort -k2 >"$t/entries"
+{ printf '# vettid-agent-release/untagged/%s\n' "$stub_commit"; cat "$t/entries"; } >"$t/signed-sums"
+expect_pass "a signed SHA256SUMS: the macOS line is left out, the rest compared" \
+  "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/signed-sums"
+grep -v darwin "$t/entries" >"$t/plain-sums"
+expect_pass "a plain SHA256SUMS still compares" \
+  "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/plain-sums"
+sed "1s/.*/# vettid-agent-release\/untagged\/$other_commit/" "$t/signed-sums" >"$t/wrong-sums"
+expect_fail "a first line naming another commit" "not \"# vettid-agent-release/untagged/$stub_commit\"" \
+  "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/wrong-sums"
+grep -v linux-arm64 "$t/signed-sums" >"$t/short-sums"
+expect_fail "a missing binary line" "differs" \
+  "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/short-sums"
+
+echo
+echo "$pass passed, $failed failed"
+[ "$failed" = 0 ]

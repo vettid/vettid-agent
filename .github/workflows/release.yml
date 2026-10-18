@@ -1,12 +1,17 @@
 name: release
 
-# Reproducible release builds (AGENT-PLAN §2 AG4, §6 A5.1; README,
-# "Releases").
+# Reproducible release builds and the owner's signature (AGENT-PLAN §2
+# AG4, §6 A5; README, "Releases"; docs/RELEASING.md).
 #
 # - A tag v<major>.<minor>.<patch>[-pre] builds that release and, if the
-#   builds match, creates a DRAFT GitHub release with the unsigned
-#   binaries and SHA256SUMS. The owner checks it, signs SHA256SUMS offline
-#   (A5.2), adds the signature and publishes the release by hand.
+#   builds match and the tag is annotated and signed (GitHub verified),
+#   creates a DRAFT GitHub release with the unsigned binaries and
+#   SHA256SUMS. The owner then runs scripts/sign-release on their own
+#   machine: it rebuilds and compares, adds the notarized macOS app, signs
+#   SHA256SUMS with the release key, uploads the signature and publishes.
+# - A published release is checked once more: SHA256SUMS.sig must verify
+#   against release/allowed_signers and every asset must match SHA256SUMS
+#   (the "signature" job), or the run fails.
 # - Pull requests and pushes to main run the same builds and comparison as
 #   a dry run, without a release.
 #
@@ -19,13 +24,20 @@ name: release
 # against the Go checksum database, into an empty module cache (the
 # module the go command itself fetches when it switches toolchains). The
 # two toolchains reach the runners by different paths. Nothing here
-# signs anything or holds a signing key; no secrets are used.
+# signs anything or holds a signing key, an Apple certificate or
+# notarization credentials; no secrets are used. Windows Authenticode
+# signing is deferred by the owner (2026-10-18) until the business entity
+# exists.
 
 on:
   push:
     branches: [main]
     tags: ['v*']
   pull_request:
+  # The owner publishes with their own token (scripts/sign-release), so
+  # publishing starts this workflow.
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -37,6 +49,7 @@ concurrency:
 jobs:
   build:
     name: build (${{ matrix.builder }}, ${{ matrix.runner }})
+    if: github.event_name != 'release'
     strategy:
       fail-fast: false
       matrix:
@@ -182,8 +195,8 @@ jobs:
           } >>"$GITHUB_STEP_SUMMARY"
 
   draft:
-    # Only for a version tag: a DRAFT release, published by the owner after
-    # adding the offline signature over SHA256SUMS.
+    # Only for a version tag: a DRAFT release, published by the owner with
+    # scripts/sign-release after adding the signature over SHA256SUMS.
     needs: compare
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
@@ -191,6 +204,23 @@ jobs:
     permissions:
       contents: write
     steps:
+      # The owner signs release tags with the release key (git's
+      # gpg.format=ssh; the key is also a signing key on the owner's GitHub
+      # account). scripts/sign-release checks the same signature against
+      # release/allowed_signers before signing the release.
+      - name: the release tag is signed (GitHub verified)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          obj="$(gh api "repos/$REPO/git/ref/tags/$TAG" --jq '.object.type + " " + .object.sha')"
+          read -r type sha <<<"$obj"
+          if [ "$type" != tag ]; then echo "::error::$TAG is a lightweight tag; release tags are annotated and signed"; exit 1; fi
+          verified="$(gh api "repos/$REPO/git/tags/$sha" --jq '.verification.verified')"
+          reason="$(gh api "repos/$REPO/git/tags/$sha" --jq '.verification.reason')"
+          if [ "$verified" != true ]; then echo "::error::$TAG's signature is not verified by GitHub ($reason)"; exit 1; fi
+          echo "$TAG: signed, verified ($reason)"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: build-a
@@ -214,7 +244,54 @@ jobs:
           cat >notes.md <<EOF
           vettid-agent $TAG, built from \`$GITHUB_SHA\` by [run $GITHUB_RUN_ID]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID).
 
-          Unsigned draft. Rebuild and compare with \`scripts/verify-reproducible $TAG SHA256SUMS\` (README, "Releases").
+          Unsigned draft. The owner signs and publishes it with \`scripts/sign-release $TAG\` (docs/RELEASING.md); rebuild and compare with \`scripts/verify-reproducible $TAG SHA256SUMS\` (README, "Releases").
           EOF
           gh release create "$TAG" --repo "$REPO" --draft --verify-tag --title "vettid-agent $TAG" --notes-file notes.md \
             release/vettid-agent-* release/SHA256SUMS
+
+  signature:
+    # A published release: the owner's signature over SHA256SUMS and every
+    # asset against it, with release/allowed_signers at the tag. Fails
+    # loudly if the signature is missing or does not verify; it cannot
+    # unpublish (no write permission), so the owner acts on the failure.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: SHA256SUMS.sig verifies, and every asset matches SHA256SUMS
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/release"
+          mkdir -p "$dir"
+          gh release download "$TAG" --repo "$REPO" -D "$dir"
+          ls -l "$dir"
+          if [ ! -f "$dir/SHA256SUMS.sig" ]; then
+            echo "::error::$TAG is published without SHA256SUMS.sig: make it a draft again (gh release edit $TAG --draft) and run scripts/sign-release $TAG"
+            exit 1
+          fi
+          # Every asset is listed: verify-release fails on an unlisted
+          # vettid-agent-$TAG-* file; anything else is refused here.
+          for f in "$dir"/*; do
+            case "$(basename "$f")" in
+              SHA256SUMS | SHA256SUMS.sig | "vettid-agent-$TAG-"*) ;;
+              *) echo "::error::$TAG has an asset that is not part of a release: $(basename "$f")"; exit 1 ;;
+            esac
+          done
+          if ! scripts/verify-release -a release/allowed_signers -c "$GITHUB_SHA" -A -l "$dir" "$TAG"; then
+            echo "::error::$TAG is published, but its signature or files do not verify (above): make it a draft again and run scripts/sign-release $TAG"
+            exit 1
+          fi
+          {
+            echo "### vettid-agent \`$TAG\`: signed"
+            echo
+            echo '```'
+            cat "$dir/SHA256SUMS"
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"

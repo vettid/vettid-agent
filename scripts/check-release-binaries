@@ -4,8 +4,9 @@
 #
 #   - built by exactly the expected toolchain (-t, default: go.mod's
 #     toolchain line in this checkout),
-#   - CGO_ENABLED=0, -trimpath=true, and the target's baseline level
-#     (GOAMD64=v1 on amd64, GOARM64=v8.0 on arm64),
+#   - CGO_ENABLED=0 (with -C: CGO_ENABLED=1 and GOOS=darwin, the macOS
+#     app's binary, scripts/build-macos-app), -trimpath=true, and the
+#     target's baseline level (GOAMD64=v1 on amd64, GOARM64=v8.0 on arm64),
 #   - no build tags, and in particular never the devstack tag (a devstack
 #     build accepts a plain-HTTP relay on a loopback address),
 #   - no -gcflags, -asmflags, GOEXPERIMENT or GOFIPS140, and no VCS stamp
@@ -13,18 +14,20 @@
 #   - exactly one release stamp, vettid-agent-release/<version>/<commit>,
 #     matching -v and -c when given.
 #
-#   scripts/check-release-binaries [-t TOOLCHAIN] [-v VERSION] [-c COMMIT] FILE...
+#   scripts/check-release-binaries [-C] [-t TOOLCHAIN] [-v VERSION] [-c COMMIT] FILE...
 #
 # Exits non-zero, naming the file and the reason, if any binary fails.
 set -euo pipefail
 
-usage() { echo "usage: scripts/check-release-binaries [-t TOOLCHAIN] [-v VERSION] [-c COMMIT] FILE..." >&2; exit 2; }
+usage() { echo "usage: scripts/check-release-binaries [-C] [-t TOOLCHAIN] [-v VERSION] [-c COMMIT] FILE..." >&2; exit 2; }
 
 toolchain=""
 want_version=""
 want_commit=""
-while getopts "t:v:c:" opt; do
+macos_cgo=0
+while getopts "Ct:v:c:" opt; do
   case "$opt" in
+    C) macos_cgo=1 ;;
     t) toolchain="$OPTARG" ;;
     v) want_version="$OPTARG" ;;
     c) want_commit="$OPTARG" ;;
@@ -71,7 +74,12 @@ for f in "${files[@]}"; do
     *,devstack,*) bad "built with the devstack tag (-tags=$tags): never a release" ;;
   esac
   [ -z "$tags" ] || bad "built with build tags (-tags=$tags); release builds use none"
-  has $'\tbuild\tCGO_ENABLED=0' || bad "not CGO_ENABLED=0"
+  if [ "$macos_cgo" = 1 ]; then
+    has $'\tbuild\tCGO_ENABLED=1' || bad "not CGO_ENABLED=1 (the macOS app is built with cgo)"
+    [ "$(setting GOOS)" = darwin ] || bad "GOOS=$(setting GOOS), the macOS app is darwin"
+  else
+    has $'\tbuild\tCGO_ENABLED=0' || bad "not CGO_ENABLED=0"
+  fi
   has $'\tbuild\t-trimpath=true' || bad "not -trimpath"
   case "$(setting GOARCH)" in
     amd64) [ "$(setting GOAMD64)" = v1 ] || bad "GOAMD64=$(setting GOAMD64), release builds use v1" ;;

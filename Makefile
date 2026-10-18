@@ -9,11 +9,17 @@
 
 GO ?= go
 
-.PHONY: test devstack-test devstack-hold-test
+.PHONY: test release-sign-test devstack-test devstack-hold-test
 
 test:
 	$(GO) vet ./...
 	$(GO) test -p 1 ./...
+
+# The release signature scripts (sign-release --local, verify-release,
+# verify-reproducible's reading of a signed SHA256SUMS), with a throwaway
+# key made for the run; no Go build, no network.
+release-sign-test:
+	scripts/test-release-signing
 
 # The exit tests of A2 and A3 (about 5 minutes on a running stack),
 # without the hold step.

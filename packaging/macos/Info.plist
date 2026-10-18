@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Template, used by AGENT-PLAN §6 A5 (macOS signing); nothing builds or
-  signs with it yet. The Info.plist of the app wrapper that lets the
+  Template, used by scripts/build-macos-app (AGENT-PLAN §6 A5.3). The
+  Info.plist of the app wrapper that lets the
   command-line connector carry a provisioning profile:
 
     vettid-agent.app/
       Contents/
-        Info.plist                    this file, VERSION set by A5
-        embedded.provisionprofile     the owner's Developer ID profile (A5)
+        Info.plist                    this file, VERSION set
+        embedded.provisionprofile     the owner's Developer ID profile
         MacOS/vettid-agent            the connector, run directly from here
 
   The connector stays a command-line program (an MCP client starts it,

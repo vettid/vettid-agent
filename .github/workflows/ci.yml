@@ -52,6 +52,35 @@ jobs:
       - name: Keychain tests, verbose
         if: runner.os == 'macOS'
         run: go test -count=1 -v -run "Keychain|TestChooseProtectorDarwin|TestCanonicalDir" ./internal/protect
+      # The macOS app bundle as scripts/sign-release builds it, signed ad
+      # hoc: no Developer ID, provisioning profile or notarization in CI
+      # (the owner signs and notarizes on their Mac, docs/RELEASING.md).
+      - name: macOS app bundle (ad hoc)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          scripts/build-macos-app -o "$RUNNER_TEMP/app" HEAD
+          app="$RUNNER_TEMP/app/vettid-agent.app"
+          find "$app" -print
+          plutil -p "$app/Contents/Info.plist"
+          codesign --verify --strict --verbose=2 "$app"
+          codesign -d --verbose=2 "$app" 2>&1 | grep -E 'Identifier=org.vettid.agent|flags=.*runtime'
+          "$app/Contents/MacOS/vettid-agent" version
+          # With a made-up team ID: the entitlements it would be signed with.
+          # Not run: without a provisioning profile macOS stops it at launch.
+          scripts/build-macos-app -o "$RUNNER_TEMP/app-team" -t ABCDE12345 HEAD
+          codesign -d --entitlements - --xml "$RUNNER_TEMP/app-team/vettid-agent.app" >"$RUNNER_TEMP/ent.xml"
+          plutil -p "$RUNNER_TEMP/ent.xml"
+          grep -q 'ABCDE12345.org.vettid.agent' "$RUNNER_TEMP/ent.xml"
+          if grep -q TEAMID "$RUNNER_TEMP/ent.xml"; then echo "::error::TEAMID left in the entitlements"; exit 1; fi
+          # A real identity needs the team ID and the profile.
+          if scripts/build-macos-app -o "$RUNNER_TEMP/app-x" -s "Developer ID Application" HEAD 2>"$RUNNER_TEMP/err"; then
+            echo "::error::build-macos-app signed with an identity but no team ID or profile"; exit 1
+          fi
+          grep -q 'needs the team ID' "$RUNNER_TEMP/err"
+      - name: release signature scripts
+        if: runner.os != 'Windows'
+        run: scripts/test-release-signing
       # The devstack build (vettid-vault's local dev stack; never a
       # release): vetted, and its unit tests run. The dev-stack tests
       # themselves need a running stack and skip with -short.
