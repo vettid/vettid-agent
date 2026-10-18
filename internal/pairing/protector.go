@@ -1,6 +1,7 @@
 package pairing
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/vettid/vettid-agent/internal/protect"
@@ -34,6 +35,11 @@ type Protectors struct {
 	// clears it.
 	Pass []byte
 
+	// NoPrompt: never ask on the terminal (`vettid-agent mcp`, whose
+	// standard input carries MCP messages); a passphrase must come from
+	// --passphrase-fd or --passphrase-file.
+	NoPrompt bool
+
 	choose   func(protect.ChooseOptions) (protect.Choice, error)
 	platform func(string) state.Protector
 
@@ -65,6 +71,9 @@ func (c *Protectors) sourceGiven() bool {
 func (c *Protectors) readPass(prompt string, confirm bool) ([]byte, error) {
 	if c.Pass != nil {
 		return append([]byte(nil), c.Pass...), nil
+	}
+	if c.NoPrompt && c.Source.FD < 0 && c.Source.File == "" {
+		return nil, errNoPrompt
 	}
 	return c.Source.Read(prompt, confirm)
 }
@@ -142,3 +151,6 @@ func (c *Protectors) Clear() {
 	}
 	c.cached = nil
 }
+
+// errNoPrompt: a passphrase is needed but asking for it is not allowed.
+var errNoPrompt = errors.New("the keys are protected by a passphrase, and this command cannot ask for it (its standard input carries MCP messages): give it with --passphrase-file or --passphrase-fd")

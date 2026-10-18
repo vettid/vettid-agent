@@ -24,7 +24,7 @@ type command struct {
 
 var commands = []command{
 	{name: "pair", summary: "pair with your vault", run: runPair},
-	{name: "mcp", summary: "run the MCP server over standard input and output (not yet available)"},
+	{name: "mcp", summary: "run for an MCP client over standard input and output (vault connection only; tools not yet available)", run: runMCP},
 	{name: "status", summary: "show the pairing and access state (not yet available)"},
 	{name: "forget", summary: "delete this connector's keys and state (not yet available)"},
 	{name: "version", summary: "print the version, commit and Go version", run: runVersion},

@@ -86,6 +86,21 @@ type Vault struct {
 	acks     int
 	requests []string // method and path of every request
 	notify   chan struct{}
+
+	// The paired session (after Approve).
+	session   *handshake.Keyring
+	devIK     ed25519.PublicKey
+	rekey     *handshake.Initiator
+	rekeyRsp  int       // hs.resp received for the vault's rekeys
+	doneRekey suite.Kid // the ephemeral kid of the last finished rekey
+	received  []string  // inner types received from the device in session
+	// FailAcks makes every ack fail (the message stays in the mailbox),
+	// as if the device stopped between saving and acknowledging.
+	FailAcks bool
+	// DepositError, if set, answers the device's deposits to the vault's
+	// mailbox after pairing with this error (for example 403
+	// token_revoked).
+	DepositError *RelayError
 }
 
 // New starts a Vault; Close stops it.
@@ -236,9 +251,123 @@ func (v *Vault) decide(d Decision) error {
 	if err != nil {
 		return err
 	}
+	if d == Approve {
+		v.session = &handshake.Keyring{}
+		v.session.Activate(v.epoch, now)
+	}
 	v.epoch = nil
 	v.enqueueLocked(raw)
 	return nil
+}
+
+func ulidNow() (string, time.Time, error) {
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	id, err := envelope.NewULID(now)
+	return id, now, err
+}
+
+// SendEvent sends the paired device an event in the current session
+// epoch and returns its inner id.
+func (v *Vault) SendEvent(typ string, body []byte) (string, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.sealLocked(&envelope.Inner{Type: typ, Body: body})
+}
+
+func (v *Vault) sealLocked(in *envelope.Inner) (string, error) {
+	if v.session == nil || v.session.Current() == nil {
+		return "", errors.New("pairtest: not paired")
+	}
+	id, now, err := ulidNow()
+	if err != nil {
+		return "", err
+	}
+	in.ID, in.TS = id, now
+	raw, err := v.session.Current().Seal(in)
+	if err != nil {
+		return "", err
+	}
+	v.enqueueLocked(raw)
+	return id, nil
+}
+
+// Rekey starts a vault-initiated rekey of the session (VAULT-MESSAGING
+// §6.5): hs.init in the current epoch; the device's hs.resp is answered
+// with hs.fin and the new epoch becomes current.
+func (v *Vault) Rekey() error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.session == nil || v.session.Current() == nil {
+		return errors.New("pairtest: not paired")
+	}
+	ini, err := handshake.NewInitiator(handshake.InitiatorConfig{
+		Purpose: handshake.PurposeRekey, Identity: v.ik, StaticKEM: v.kem.Public(),
+		Relay:       handshake.RelayAddr{URL: v.srv.URL, Mailbox: v.mailbox(), PK: v.relayPK()},
+		ResponderIK: v.devIK, ResponderRelayKey: v.devPK, Current: v.session.Current(),
+		PinnedSuite: 2, Policy: handshake.PolicyVaultToDevice, Now: time.Now(),
+	})
+	if err != nil {
+		return err
+	}
+	v.rekey = ini
+	v.enqueueLocked(ini.Envelope())
+	return nil
+}
+
+// Rotate rotates the vault's identity key and sends identity.rotate
+// (VAULT-MESSAGING §6.6). It returns the new ik.
+func (v *Vault) Rotate() (ed25519.PublicKey, error) {
+	_, nk, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	nkem, err := suite.GeneratePrivateKey()
+	if err != nil {
+		return nil, err
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	r, err := handshake.NewRotation(v.ik, nk, nkem.Public())
+	if err != nil {
+		return nil, err
+	}
+	body := append(append([]byte(`{"rotation":`), r.Marshal()...), '}')
+	if _, err := v.sealLocked(&envelope.Inner{Type: "identity.rotate", Body: body}); err != nil {
+		return nil, err
+	}
+	v.ik, v.kem = nk, nkem
+	return nk.Public().(ed25519.PublicKey), nil
+}
+
+// RekeyResps returns how many hs.resp the vault's rekeys received
+// (a repeated one is counted and ignored).
+func (v *Vault) RekeyResps() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.rekeyRsp
+}
+
+// RekeyDone reports whether the last rekey completed.
+func (v *Vault) RekeyDone() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.rekey == nil && v.rekeyRsp > 0
+}
+
+// Received returns the inner types the device sent in session, in
+// order.
+func (v *Vault) Received() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]string(nil), v.received...)
+}
+
+// Pending returns how many messages wait unacknowledged in the device's
+// mailbox.
+func (v *Vault) Pending() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return len(v.queue)
 }
 
 func (v *Vault) enqueueLocked(payload []byte) {
@@ -308,6 +437,16 @@ func (v *Vault) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if strings.TrimPrefix(p, "/v1/mailbox/") == v.mailbox() {
+			v.mu.Lock()
+			fail := v.DepositError
+			if v.session == nil {
+				fail = nil
+			}
+			v.mu.Unlock()
+			if fail != nil {
+				relayError(w, fail.Status, fail.Code)
+				return
+			}
 			v.toVault(in.Payload)
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"msg_id": "d" + strconv.FormatInt(time.Now().UnixNano(), 10)})
@@ -316,6 +455,11 @@ func (v *Vault) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/v1/mailbox/"):
 		id := strings.TrimPrefix(p, "/v1/mailbox/")
 		v.mu.Lock()
+		if v.FailAcks {
+			v.mu.Unlock()
+			relayError(w, http.StatusBadRequest, "test_ack_refused")
+			return
+		}
 		for i, m := range v.queue {
 			if m.MsgID == id {
 				v.queue = append(v.queue[:i:i], v.queue[i+1:]...)
@@ -365,6 +509,22 @@ func (v *Vault) toVault(payload []byte) {
 	v.mu.Lock()
 	switch env.Mode() {
 	case envelope.ModeSealed:
+		if v.rekey != nil && env.RecipientKid().Equal(v.rekey.EphKid()) {
+			v.rekeyRsp++
+			res, err := v.rekey.HandleResp(payload, v.devPK, now)
+			if err != nil {
+				break
+			}
+			v.session.Activate(res.Epoch, now)
+			v.doneRekey, v.rekey = v.rekey.EphKid(), nil
+			v.enqueueLocked(res.Fin)
+			break
+		}
+		if v.rekeyRsp > 0 && env.RecipientKid().Equal(v.doneRekey) {
+			// A repeated hs.resp of a finished rekey: counted, dropped.
+			v.rekeyRsp++
+			break
+		}
 		pi, err := handshake.OpenInit(payload, func(k suite.Kid) *suite.PrivateKey {
 			if k.Equal(v.kem.Public().Kid()) {
 				return v.kem
@@ -389,9 +549,20 @@ func (v *Vault) toVault(payload []byte) {
 			break
 		}
 		v.pending, v.devPK, v.devURL, v.name, v.epoch, v.sas = resp, in.From.Relay.PK, in.From.Relay.URL, prof.Name, nil, ""
+		v.devIK = in.From.IK
 		v.inits++
 		v.enqueueLocked(out)
 	case envelope.ModeSession:
+		if v.session != nil {
+			if in, _, err := v.session.Open(env, now); err == nil {
+				v.received = append(v.received, in.Type)
+				if in.Type == "vault.status" && in.Re == "" {
+					_, _ = v.sealLocked(&envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK,
+						Body: []byte(`{"vault_id":"` + VaultID + `","state_seq":1,"header_seq":1,"provisional":false,"devices":[],"connections":[],"owner_check":{"state":"ok"}}`)})
+				}
+				break
+			}
+		}
 		if v.pending == nil {
 			break
 		}

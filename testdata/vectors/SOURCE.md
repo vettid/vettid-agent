@@ -9,8 +9,10 @@ connector is built with (AGENT-PLAN §5).
 file here or skip a case.** Re-copy all of them from the new commit when
 the pin changes, and update this file in the same PR.
 
-Source commit: vettid-vault `1ef2dd9ec68627a80e18d665032fcd58e3a61a1d`
-(2026-10-17).
+Source commit: vettid-vault `271f3e23c0331d5fcd33c3bcb6fb2fc579a4911d`
+(2026-10-18). The files copied here are byte-identical at the earlier
+pin `1ef2dd9ec68627a80e18d665032fcd58e3a61a1d`; the sha256 values below
+are unchanged.
 
 | File | Source path | sha256sum | Checked by |
 |---|---|---|---|

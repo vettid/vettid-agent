@@ -8,21 +8,11 @@ require (
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.11
 	github.com/vettid/vettid-relay v0.0.0-20261015153542-cc3ce892f9dc
-	github.com/vettid/vettid-vault v0.0.0-20261017190144-1ef2dd9ec686
+	github.com/vettid/vettid-vault v0.0.0-20261018021545-271f3e23c033
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
 	golang.org/x/term v0.46.0
 	golang.org/x/text v0.42.0
 )
 
-require (
-	github.com/btcsuite/btcd v0.24.2 // indirect
-	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
-	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
-	github.com/btcsuite/btcd/btcutil/psbt v1.1.10 // indirect
-	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
-	github.com/btcsuite/btclog v0.0.0-20170628155309-84c8d2346e9f // indirect
-	github.com/coder/websocket v1.8.15 // indirect
-	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
-	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
-)
+require github.com/coder/websocket v1.8.15 // indirect

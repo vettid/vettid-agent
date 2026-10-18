@@ -23,8 +23,9 @@ vault.
 
 The rebuild follows the agent connector plan,
 [AGENT-PLAN](https://github.com/vettid/vettid.org/blob/master/docs/AGENT-PLAN.md),
-in small phases. Today the binary has `pair` and `version`; `mcp`,
-`status` and `forget` are listed as not yet available.
+in small phases. Today the binary has `pair`, `version` and `mcp`
+(which keeps the vault connection; its MCP tools come later); `status`
+and `forget` are listed as not yet available.
 
 **It needs a staging vault.** Only vaults whose release channel lists the
 optional `leash` feature answer agent pairing. Staging images list it;
@@ -111,6 +112,30 @@ the code commits to; a code whose relay was changed is refused before
 its six-digit code is shown. Builds with the `devstack` tag (for
 vettid-vault's local dev stack, never a release) also accept a
 plain-HTTP relay on a loopback address.
+
+## Running for an MCP client
+
+The MCP client starts the connector itself, for example with the command
+`vettid-agent mcp --state-dir ~/.config/vettid-agent/my-client` (and
+`--passphrase-file PATH` or `--passphrase-fd N` where the keys are
+protected by a passphrase: `mcp` never asks on the terminal, because its
+standard input carries MCP messages). It holds the state directory's
+lock while it runs (a second one on the same directory exits with "in
+use by another agent app"), stays connected to your vault, and exits
+when the client closes its standard input. Standard output carries only
+MCP messages; notices go to standard error (`--verbose` adds each
+message's type and id, never its contents).
+
+While it runs it collects what the vault sent and saves its state before
+telling the relay a message was received, so that a crash never loses a
+key change or a token: what was not saved is collected again. It asks
+the vault for its status when it starts, every 6 hours and after a
+failed save, rather than relying on having seen every notice.
+
+If you remove the agent on your phone, the vault tells the connector,
+which deletes its keys from this computer and exits saying so. If the
+relay refuses the agent but no such notice arrives, it exits saying so
+and keeps its keys; `vettid-agent forget` (to come) deletes them.
 
 ## Keys at rest on Linux: the TPM
 

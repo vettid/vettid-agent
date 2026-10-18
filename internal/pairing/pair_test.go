@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -756,8 +757,10 @@ func TestPairStartedNotDurable(t *testing.T) {
 // agent.
 func TestPairFinalSaveFails(t *testing.T) {
 	e := newEnv(t)
-	// Writes: 1 started (Create), 2 waiting (Save), 3 paired (Save).
-	withFailingStore(t, &failingStore{failAt: 3, failErr: errors.New("disk full")})
+	// Writes: 1 started (Create), 2 the hs.resp batch (Persist), 3
+	// waiting (Save), 4 the device.paired batch (Persist, fails: the
+	// batch stays unacknowledged), 5 paired (Save, fails).
+	withFailingStore(t, &failingStore{failAt: 4, failErr: errors.New("disk full")})
 	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
 	if err == nil || !strings.Contains(err.Error(), "Unlink the agent on your phone") || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("got %v", err)
@@ -768,5 +771,62 @@ func TestPairFinalSaveFails(t *testing.T) {
 	wrapStore = func(s store) store { return s }
 	if r, _ := e.record(); r != nil {
 		t.Errorf("state kept: %v", r.Phase)
+	}
+}
+
+// phaseSpy records the phase of every record written, and whether the
+// vault's mailbox still held unacknowledged messages at that moment.
+type phaseSpy struct {
+	store
+	v      *pairtest.Vault
+	mu     sync.Mutex
+	writes []string
+}
+
+func (p *phaseSpy) note(b []byte) {
+	r, err := DecodeRecord(b)
+	if err != nil {
+		return
+	}
+	p.mu.Lock()
+	p.writes = append(p.writes, string(r.Phase)+":"+strconv.Itoa(p.v.Pending()))
+	p.mu.Unlock()
+}
+
+func (p *phaseSpy) Create(pr state.Protector, b []byte) error {
+	p.note(b)
+	return p.store.Create(pr, b)
+}
+func (p *phaseSpy) Save(b []byte) error { p.note(b); return p.store.Save(b) }
+
+// TestPairPairedSavedBeforeAck: device.paired is saved (as paired)
+// while it is still unacknowledged at the relay, so a crash after the
+// relay dropped it cannot lose the pairing (the client's Config.Persist).
+func TestPairPairedSavedBeforeAck(t *testing.T) {
+	e := newEnv(t)
+	sp := &phaseSpy{v: e.v}
+	old := wrapStore
+	wrapStore = func(s store) store { sp.store = s; return sp }
+	t.Cleanup(func() { wrapStore = old })
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatal(err)
+	}
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	found := false
+	for _, w := range sp.writes {
+		if strings.HasPrefix(w, "paired:") {
+			found = true
+			if w == "paired:0" {
+				t.Errorf("paired saved after the acknowledgement: %v", sp.writes)
+			}
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no paired write: %v", sp.writes)
+	}
+	if n := strings.Count(strings.Join(sp.writes, " "), "paired:"); n != 1 {
+		t.Errorf("paired written %d times: %v", n, sp.writes)
 	}
 }
