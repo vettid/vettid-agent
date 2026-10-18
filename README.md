@@ -23,7 +23,7 @@ vault.
 
 The rebuild follows the agent connector plan,
 [AGENT-PLAN](https://github.com/vettid/vettid.org/blob/master/docs/AGENT-PLAN.md),
-in small phases. Today the binary has only `version`; `pair`, `mcp`,
+in small phases. Today the binary has `pair` and `version`; `mcp`,
 `status` and `forget` are listed as not yet available.
 
 **It needs a staging vault.** Only vaults whose release channel lists the
@@ -58,6 +58,59 @@ and govulncheck on Linux, macOS and Windows runners.
   Keychain, Windows DPAPI) or, where none exists, a passphrase. The
   state file's format, owner-only rules and lock are in
   [docs/STATE-FILE.md](docs/STATE-FILE.md).
+
+## Pairing
+
+On your phone, open Devices & agents and choose Pair an agent; then, on
+the computer where the agent runs:
+
+```sh
+vettid-agent pair --state-dir ~/.config/vettid-agent/my-client
+```
+
+and paste the code when asked (or give it as the last argument, or on
+standard input; a code on the command line can be seen by other users
+of the computer while the command runs). The code, its link form
+`https://…/connect#…` and `vettid://connect#…` are all accepted, also
+inside surrounding text. Each MCP client gets its own state directory,
+and so its own pairing, which your phone lists and removes separately.
+
+The connector shows a six-digit code: approve on your phone only if the
+phone shows the same one. It then waits up to 10 minutes for your
+decision. `--name` sets the name your phone shows (default "Agent on
+<host name>"). Everything is written to standard error; the pairing code
+is never written anywhere, and the six-digit code only to your terminal.
+
+The keys are protected as described below: the TPM on Linux, DPAPI on
+Windows, a passphrase where there is neither (macOS until its Keychain
+protector exists). A TPM or DPAPI that is present but does not work
+makes `pair` stop with the cause and the fix; `--passphrase` chooses
+the passphrase protector instead (not bound to this computer).
+
+If the wait is interrupted after the six-digit code was shown, the keys
+are kept: run `vettid-agent pair --state-dir …` again, without a code,
+before the 10 minutes end, and it keeps waiting with the same keys
+(approve only if your phone shows the code shown earlier). Run it with
+a new code instead, or interrupt it before the six-digit code is shown,
+and the unfinished pairing is discarded; a new pairing always uses new
+keys. A rejection on the phone, or the end of the 10 minutes, deletes
+the unfinished pairing. A state directory that holds a completed
+pairing is not paired again unless you add `--restart` (then remove the
+old pairing on your phone).
+
+The connector gives up at the end of its 10 minutes, measured from just
+before it creates its keys, so it stops no later than your vault. If
+you approve on the phone in the seconds after the connector gave up,
+the phone lists an agent whose keys no longer exist: unlink it in
+Devices & agents. The same applies if the connector reports that it
+could not save its keys after your approval.
+
+Codes are accepted only for relays reached over HTTPS, and the relay
+named in the code must be the vault's relay recorded in the invitation
+the code commits to; a code whose relay was changed is refused before
+its six-digit code is shown. Builds with the `devstack` tag (for
+vettid-vault's local dev stack, never a release) also accept a
+plain-HTTP relay on a loopback address.
 
 ## Keys at rest on Linux: the TPM
 

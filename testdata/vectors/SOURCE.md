@@ -15,6 +15,8 @@ Source commit: vettid-vault `1ef2dd9ec68627a80e18d665032fcd58e3a61a1d`
 | File | Source path | sha256sum | Checked by |
 |---|---|---|---|
 | `leash.json` | `testdata/vectors/leash.json` | `b1200366e5310cd5ac7bbded3bb035b6efa1408579a7c19bd4a73ca9fcba2beb` | `vectors_test.go` `TestLeashVectors` |
+| `invite.json` | `testdata/vectors/invite.json` | `6d7be9ba65f8426070ee54f0ea6ed84fed1e49c54eb31e09a1e177d3d5286d2f` | `internal/pairing` `TestInviteVector` |
+| `handshake.json` | `testdata/vectors/handshake.json` | `9b69503b507fd117ab3d6a66368cb60bb24e09286867921a6f473fb476fb0577` | `internal/pairing` `TestHandshakeVector` |
 
 `TestLeashVectors` checks the file's sha256 against this table, that each
 key matches its seed, and for each case (`a`, `b`) that
@@ -25,6 +27,27 @@ agent's or the vault's key instead of the member's, without a status
 statement, with any of the four parts altered by one bit (first, middle
 and last byte), with the two signatures swapped, and with the other
 case's status statement.
+
+`TestInviteVector` checks the file's sha256, that `link` decodes to
+`qr_json`, that the code forms of §6.4 (the bare payload, the URL form on
+the vector's relay and on another host, `vettid://connect#`, inside
+surrounding text, the same code twice) all find the payload with the
+payload's `r` as the relay, that this connection code (`t` = "c") is
+refused as not an agent code, that the same QR as an agent code passes
+until one second before `e` and is refused from `e` on, that the blob
+opens against `h` and round-trips to `bundle_json`, that the blob
+altered by one bit (first, middle and last byte) is refused by the hash
+check, and that an agent QR over this connection bundle is refused for
+its kind. Two different codes, truncated or altered payloads and text
+without a code are refused.
+
+`TestHandshakeVector` checks the file's sha256 and, from the
+initiator's side through the imported handshake package: `hs.resp`
+opens under the ephemeral key (seed 32 x 0x0c) and gives `K_e` and
+`n_R`; the transcript hashes `th1` and `th`; with the vector's `K_s`,
+the key schedule gives `prk`; `hs.fin` opens with `k_i2r` and reveals
+`n_I`, which opens `sas_commit`; and the SAS is the vector's `564218`,
+shown as `564 218`.
 
 `.gitattributes` keeps line endings unchanged on every platform, so the
 sha256 holds on Windows checkouts too.

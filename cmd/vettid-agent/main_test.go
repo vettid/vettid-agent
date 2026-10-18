@@ -74,7 +74,7 @@ func TestVersionFromWithoutBuildInfo(t *testing.T) {
 }
 
 func TestPlannedCommandsNotYetAvailable(t *testing.T) {
-	for _, name := range []string{"pair", "mcp", "status", "forget"} {
+	for _, name := range []string{"mcp", "status", "forget"} {
 		code, out, errOut := runArgs(name)
 		if code != 2 {
 			t.Errorf("%s: exit %d, want 2", name, code)
@@ -93,7 +93,7 @@ func TestUsageListsCommands(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("help: exit %d", code)
 	}
-	for _, name := range []string{"pair", "mcp", "status", "forget"} {
+	for _, name := range []string{"mcp", "status", "forget"} {
 		found := false
 		for _, line := range strings.Split(out, "\n") {
 			f := strings.Fields(line)

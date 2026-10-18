@@ -23,7 +23,7 @@ type command struct {
 }
 
 var commands = []command{
-	{name: "pair", summary: "pair with your vault (not yet available)"},
+	{name: "pair", summary: "pair with your vault", run: runPair},
 	{name: "mcp", summary: "run the MCP server over standard input and output (not yet available)"},
 	{name: "status", summary: "show the pairing and access state (not yet available)"},
 	{name: "forget", summary: "delete this connector's keys and state (not yet available)"},
@@ -65,7 +65,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 func usage(w io.Writer) {
 	fmt.Fprint(w, `Usage: vettid-agent <command> [flags]
 
-The VettID agent connector. It is being rebuilt; most commands are not
+The VettID agent connector. It is being rebuilt; some commands are not
 yet available.
 
 Commands:
