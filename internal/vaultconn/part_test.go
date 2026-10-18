@@ -164,3 +164,25 @@ func TestPartAbsentKeepsMember(t *testing.T) {
 		t.Errorf("saved %q", l)
 	}
 }
+
+// TestRequestWithIDEmpty: an empty id is accepted (the client chooses
+// one) and answered; a non-ULID id is refused before anything is sent.
+func TestRequestWithIDEmpty(t *testing.T) {
+	e := newPaired(t)
+	o := e.openWith(nil, &leashSpy{})
+	stop := o.run()
+	defer stop()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	r, err := o.conn.RequestWithID(ctx, "", "leash.grant.list", json.RawMessage(`{}`))
+	if err != nil || !r.OK {
+		t.Fatalf("empty id: %+v %v", r, err)
+	}
+	before := count(e.v.Received(), "leash.grant.list")
+	if _, err := o.conn.RequestWithID(ctx, "01jb2z6v9k3m4n5p6q7r8s9t41", "leash.grant.list", json.RawMessage(`{}`)); err == nil {
+		t.Error("a non-ULID id (lower case) was accepted")
+	}
+	if n := count(e.v.Received(), "leash.grant.list"); n != before {
+		t.Error("a refused id was sent")
+	}
+}
