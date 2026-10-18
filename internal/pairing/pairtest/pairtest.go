@@ -94,9 +94,7 @@ type Vault struct {
 	rekeyRsp  int       // hs.resp received for the vault's rekeys
 	doneRekey suite.Kid // the ephemeral kid of the last finished rekey
 	received  []string  // inner types received from the device in session
-	// FailAcks makes every ack fail (the message stays in the mailbox),
-	// as if the device stopped between saving and acknowledging.
-	FailAcks bool
+	failAcks  bool      // see SetFailAcks
 	// SessionSeconds, if positive, makes the approval grant a first
 	// access session of that length (device.paired session_expires_at).
 	SessionSeconds int
@@ -130,6 +128,16 @@ func New() (*Vault, error) {
 	v.srv = httptest.NewTLSServer(http.HandlerFunc(v.serve))
 	v.alt = httptest.NewTLSServer(http.HandlerFunc(v.serve))
 	return v, nil
+}
+
+// SetFailAcks makes every ack fail (the message stays in the mailbox),
+// as if the device stopped between saving and acknowledging, or stops
+// that. It takes the lock, so a test may call it while a device runs
+// or an earlier ack is still being served.
+func (v *Vault) SetFailAcks(fail bool) {
+	v.mu.Lock()
+	v.failAcks = fail
+	v.mu.Unlock()
 }
 
 // Close stops the servers.
@@ -489,7 +497,7 @@ func (v *Vault) serve(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodDelete && strings.HasPrefix(p, "/v1/mailbox/"):
 		id := strings.TrimPrefix(p, "/v1/mailbox/")
 		v.mu.Lock()
-		if v.FailAcks {
+		if v.failAcks {
 			v.mu.Unlock()
 			relayError(w, http.StatusBadRequest, "test_ack_refused")
 			return
