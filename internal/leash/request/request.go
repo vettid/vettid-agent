@@ -98,6 +98,8 @@ const (
 	TextStopped   = "The connection to your vault has stopped."
 	// TextSuperseded is chosen (not in the spec).
 	TextSuperseded = "Another copy of this request took its place, so its answer cannot be returned here. Make the request again if you still need it."
+	// TextApprovalPassed is chosen (not in the spec).
+	TextApprovalPassed = "The time to approve this request on your phone has passed; waiting for your vault's final answer. Check again with leash.check_status."
 )
 
 // Error is a request's outcome other than a result, with a stable code
@@ -475,7 +477,10 @@ func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
 // pending (Waiting when the vault holds it for approval), its result
 // (once), or its error. After Options.Unanswered without any sign from
 // the vault it answers ErrUnreachable with RequestID set (the request
-// stays in flight, AGENT-PLAN §4.4). An id that is not known, whose
+// stays in flight, AGENT-PLAN §4.4). Once a held request's approval
+// window (its exp) has passed it is still pending, but no longer
+// Waiting, with TextApprovalPassed: the vault may still run it and
+// answer under the same id. An id that is not known, whose
 // result was already returned or dropped, gives ErrExpired.
 func (c *Client) Status(ctx context.Context, requestID string) (*Outcome, error) {
 	c.mu.Lock()
@@ -517,7 +522,14 @@ func (c *Client) heldLocked() int {
 
 func pendingLocked(e *entry) *Outcome {
 	o := &Outcome{Pending: true, RequestID: e.id, Waiting: e.waiting, Text: TextInFlight}
-	if e.waiting {
+	switch {
+	case e.waiting && !time.Now().Before(e.exp):
+		// The approval's window has passed: the member can no longer
+		// answer it, so it no longer waits for the member; the vault's
+		// answer (normally approval_timeout, or an approval given just
+		// in time) is still collected under the same id.
+		o.Waiting, o.Text = false, TextApprovalPassed
+	case e.waiting:
 		o.Text = TextWaiting
 	}
 	return o
