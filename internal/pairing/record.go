@@ -14,7 +14,7 @@ import (
 // the vault client's saved state, and how far pairing got.
 //
 //	{"v":1,"phase":"started"|"waiting"|"paired","deadline":"<RFC 3339>","device":{…},
-//	 "access":{"state":"unknown"|"none"|"active","session_id":"…","expires_at":"<RFC 3339>"}}
+//	 "access":{"state":"none"|"active","session_id":"…","expires_at":"<RFC 3339>"}}
 //
 // deadline is present exactly while pairing is unfinished (started or
 // waiting): the end of the 10 minutes after hs.init (VAULT-MESSAGING
@@ -23,10 +23,16 @@ import (
 // (AGENT-PLAN §4.7).
 //
 // access (paired records only, optional) is the connector's access
-// session (VAULT-MESSAGING §6.8) as of the save: written by
-// internal/vaultconn from device.session.granted and .ended in the same
-// save as the batch that carried them. A record without it (written
-// before access was kept, or right after pairing) reads as unknown.
+// session (VAULT-MESSAGING §6.8) as of the save: none, or active with
+// session_id and expires_at (from device.session.granted), with
+// expires_at only (the first session, from device.paired, which carries
+// no session id), or with neither (a session found by a check whose end
+// is not known). It is first written by internal/pairing from
+// device.paired, then by internal/vaultconn from device.session.granted
+// and .ended in the same save as the batch that carried them, and from
+// what internal/access learns by a check. A record without it (paired by
+// a build before the first session was recorded) reads as unknown;
+// "unknown" is never written.
 type Record struct {
 	Phase    Phase
 	Deadline time.Time // zero once paired
@@ -45,9 +51,8 @@ type Access struct {
 type AccessState string
 
 const (
-	// AccessUnknown: not known (after pairing, whose first session the
-	// connector does not learn, or a record without the member). The
-	// zero value.
+	// AccessUnknown: not known (a record without the member, paired by
+	// a build that did not record the first session). The zero value.
 	AccessUnknown AccessState = ""
 	// AccessNone: no access session.
 	AccessNone AccessState = "none"
@@ -64,7 +69,7 @@ func (a Access) Valid() bool {
 	case AccessUnknown, AccessNone:
 		return a.SessionID == "" && a.ExpiresAt.IsZero()
 	case AccessActive:
-		return len(a.SessionID) <= maxSessionID && (a.SessionID != "" || a.ExpiresAt.IsZero())
+		return len(a.SessionID) <= maxSessionID
 	}
 	return false
 }

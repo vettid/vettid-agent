@@ -71,6 +71,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	writeStatus(stdout, *dir, v, rec, time.Now())
+	clear(rec.Device)
 	return 0
 }
 
@@ -86,7 +87,10 @@ func writeStatus(w io.Writer, dir string, v *state.View, rec *pairing.Record, no
 	fmt.Fprintf(w, "State directory: %s\n", dir)
 	switch rec.Phase {
 	case pairing.PhasePaired:
-		fmt.Fprintf(w, "Paired: yes, as %q (device %s of vault %s), on %s\n", dev.Name, dev.DeviceID, dev.VaultID, v.CreatedAt.Local().Format("2006-01-02 15:04"))
+		// Stored strings came from the vault or the operator: shown
+		// without control or format characters.
+		fmt.Fprintf(w, "Paired: yes, as \"%s\" (device %s of vault %s), on %s\n", pairing.Sanitize(dev.Name),
+			pairing.Sanitize(dev.DeviceID), pairing.Sanitize(dev.VaultID), v.CreatedAt.Local().Format("2006-01-02 15:04"))
 		fmt.Fprintf(w, "Access session: %s (as last saved; the vault is not contacted)\n", access.Describe(rec.Access, now))
 	case pairing.PhaseWaiting:
 		if now.Before(rec.Deadline) {
@@ -113,6 +117,6 @@ func protectorLabel(name string) string {
 	case "dpapi":
 		return "Windows DPAPI for this user"
 	default:
-		return fmt.Sprintf("%q", name)
+		return fmt.Sprintf("%q", pairing.Sanitize(name))
 	}
 }

@@ -158,7 +158,7 @@ type Conn struct {
 	ownerCheck    string
 
 	// The access session (VAULT-MESSAGING §6.8) as saved with each
-	// batch. accMu guards it: Access and SetAccess are called from other
+	// batch. accMu guards it: Access and CompareAndSetAccess are called from other
 	// goroutines.
 	accMu  sync.Mutex
 	access pairing.Access
@@ -198,23 +198,34 @@ func New(o Options) (*Conn, error) {
 
 // Access returns the access session as last known: from the record at
 // start, then from device.session.granted and .ended (applied in the
-// save of the batch that carried them), and SetAccess.
+// save of the batch that carried them), and CompareAndSetAccess.
 func (c *Conn) Access() pairing.Access {
 	c.accMu.Lock()
 	defer c.accMu.Unlock()
 	return c.access
 }
 
-// SetAccess replaces the access session (a result internal/access
-// learned from a probe or a session_required answer). It is saved with
-// the next batch.
-func (c *Conn) SetAccess(a pairing.Access) {
+// CompareAndSetAccess replaces the access session with a only if it is
+// still old, atomically, and reports whether it did. old must be a value
+// returned by Access (or access.Manager.Snapshot), taken before the
+// request whose answer a reflects; a value built otherwise compares
+// unequal to anything but an identical session. internal/access
+// uses it for what it learns from a probe or a session_required answer,
+// with old the session as it was when the request was sent: a batch
+// that changed the session in between (a grant or an end) is never
+// overwritten. The result is saved with the next batch. An invalid a is
+// refused.
+func (c *Conn) CompareAndSetAccess(old, a pairing.Access) bool {
 	if !a.Valid() {
-		return
+		return false
 	}
 	c.accMu.Lock()
 	defer c.accMu.Unlock()
+	if c.access != old {
+		return false
+	}
 	c.access = a
+	return true
 }
 
 // applyAccess applies a batch's device.session.granted and .ended to the

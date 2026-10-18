@@ -48,6 +48,16 @@ func (f *fakeConn) SetAccess(a pairing.Access) {
 	f.access = a
 }
 
+func (f *fakeConn) CompareAndSetAccess(old, a pairing.Access) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.access != old {
+		return false
+	}
+	f.access = a
+	return true
+}
+
 func (f *fakeConn) count(typ string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -300,7 +310,7 @@ func TestOwnerCheck(t *testing.T) {
 	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) {
 		t.Fatalf("after the hold: %v", err)
 	}
-	m.OnAnswer("owner_check_required")
+	m.OnAnswer("owner_check_required", m.Snapshot())
 	if err := ensure(t, m); !errors.Is(err, ErrOwnerCheck) {
 		t.Fatal("answer owner_check_required")
 	}
@@ -326,7 +336,7 @@ func TestUnknownProbed(t *testing.T) {
 		t.Error("requested")
 	}
 	// Until the vault answers session_required.
-	m.OnAnswer("session_required")
+	m.OnAnswer("session_required", m.Snapshot())
 	if f.Access().State != pairing.AccessNone {
 		t.Error("session_required did not end it")
 	}
@@ -415,5 +425,80 @@ func TestDenialWithoutOutstanding(t *testing.T) {
 	m2.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
 	if err := ensure(t, m2); !errors.Is(err, ErrAccessRequested) || f2.count("device.session.request") != 1 {
 		t.Fatalf("ended: %v", err)
+	}
+}
+
+// TestProbeDoesNotOverwriteBatch: a grant applied by a batch while the
+// probe is in flight is not overwritten by the probe's session_required
+// (an atomic compare-and-set against the session before the probe).
+func TestProbeDoesNotOverwriteBatch(t *testing.T) {
+	f, _, m := setup(pairing.Access{})
+	grant := pairing.Access{State: pairing.AccessActive, SessionID: "g", ExpiresAt: t0.Add(time.Hour)}
+	f.answer("leash.grant.list", func() (*vaultconn.Response, error) {
+		f.SetAccess(grant) // the batch lands while the answer is on its way
+		return &vaultconn.Response{ErrorCode: "session_required"}, nil
+	})
+	if err := ensure(t, m); err != nil {
+		t.Fatalf("got %v", err)
+	}
+	if f.Access() != grant || f.count("device.session.request") != 0 {
+		t.Errorf("the grant was overwritten: %+v", f.Access())
+	}
+	// Likewise an end applied in between is not revived by a probe
+	// that found a session.
+	f2, _, m2 := setup(pairing.Access{})
+	f2.answer("leash.grant.list", func() (*vaultconn.Response, error) {
+		f2.SetAccess(pairing.Access{State: pairing.AccessNone})
+		return &vaultconn.Response{OK: true, Body: json.RawMessage(`{}`)}, nil
+	})
+	_ = ensure(t, m2)
+	if f2.Access().State != pairing.AccessNone {
+		t.Errorf("an ended session was revived: %+v", f2.Access())
+	}
+	// OnAnswer with the session the request was sent with: a grant that
+	// came after it stays.
+	f3, _, m3 := setup(pairing.Access{State: pairing.AccessActive, SessionID: "old", ExpiresAt: t0.Add(time.Hour)})
+	sent := m3.Snapshot()
+	f3.SetAccess(grant)
+	m3.OnAnswer("session_required", sent)
+	if f3.Access() != grant {
+		t.Errorf("OnAnswer overwrote a later grant: %+v", f3.Access())
+	}
+	m3.OnAnswer("session_required", m3.Snapshot())
+	if f3.Access().State != pairing.AccessNone {
+		t.Error("OnAnswer did not end the current session")
+	}
+}
+
+// TestCallersDuringProbe: callers that arrive while the probe runs wait
+// for it and get its outcome; none is told a request was sent when none
+// was.
+func TestCallersDuringProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		answer func() (*vaultconn.Response, error)
+		want   error
+	}{
+		{"session found", ok(`{}`), nil},
+		{"unreachable", func() (*vaultconn.Response, error) { return nil, errors.New("down") }, ErrUnreachable},
+		{"held", fail("owner_check_required", `{}`), ErrOwnerCheck},
+	} {
+		f, _, m := setup(pairing.Access{})
+		release := make(chan struct{})
+		f.answer("leash.grant.list", func() (*vaultconn.Response, error) { <-release; return tc.answer() })
+		errs := make(chan error, 4)
+		for i := 0; i < 4; i++ {
+			go func() { errs <- m.Ensure(context.Background()) }()
+		}
+		time.Sleep(50 * time.Millisecond)
+		close(release)
+		for i := 0; i < 4; i++ {
+			if err := <-errs; !errors.Is(err, tc.want) || (tc.want == nil && err != nil) {
+				t.Errorf("%s: got %v, want %v", tc.name, err, tc.want)
+			}
+		}
+		if f.count("leash.grant.list") != 1 || f.count("device.session.request") != 0 {
+			t.Errorf("%s: %d probes, %d requests", tc.name, f.count("leash.grant.list"), f.count("device.session.request"))
+		}
 	}
 }

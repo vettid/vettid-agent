@@ -140,12 +140,18 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	}()
 	// A saved session that has not expired is checked once at start
 	// (internal/access Start), through Run's goroutine.
+	startDone := make(chan struct{})
 	go func() {
+		defer close(startDone)
 		if err := mgr.Start(ctx); err != nil && ctx.Err() == nil {
 			logger.Warn("access session check at start failed", "err", err)
 		}
 	}()
 	err = conn.Run(ctx)
+	// The check ends with Run (its request fails once Run stops); wait
+	// for it, so that nothing writes to standard error after return.
+	cancel()
+	<-startDone
 	switch {
 	case errors.Is(err, context.Canceled):
 		return 0

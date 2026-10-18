@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -53,4 +54,101 @@ func TestReadOnly(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(t.TempDir(), "absent")); !os.IsNotExist(err) {
 		t.Error("ReadOnly created a directory")
 	}
+}
+
+// TestReadOnlyDuringWrites: reads while the lock holder keeps saving
+// (each save a rename over the file) always see one whole state, never
+// a torn or missing one.
+func TestReadOnlyDuringWrites(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(bytes.Repeat([]byte{7}, 32))
+	if err := s.Create(p, []byte(`{"n":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		for i := 1; i <= 200; i++ {
+			if err := s.Save([]byte(fmt.Sprintf(`{"n":%d}`, i))); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	reads := 0
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("save: %v", err)
+			}
+			if reads == 0 {
+				t.Fatal("no read happened during the writes")
+			}
+			return
+		default:
+		}
+		v, err := ReadOnly(s.Dir(), func(string) Protector { return p })
+		if err != nil {
+			t.Fatalf("read %d during writes: %v", reads, err)
+		}
+		if !bytes.HasPrefix(v.State, []byte(`{"n":`)) {
+			t.Fatalf("read %d: %q", reads, v.State)
+		}
+		reads++
+	}
+}
+
+// TestCreateReplaceSentinels: a CreateReplace failure says what it left:
+// nothing changed (a failing probe, a failing old-key wipe: neither
+// sentinel, the old state still loads), or the old state may be gone
+// with the new one not in place (a write failing after the wipe:
+// ErrReplaceIncomplete).
+func TestCreateReplaceSentinels(t *testing.T) {
+	key := bytes.Repeat([]byte{3}, 32)
+	setup := func(t *testing.T) (*Store, *fixedProtector) {
+		s := openTest(t)
+		p := newFixedProtector(key)
+		if err := s.Create(p, []byte(`{"old":1}`)); err != nil {
+			t.Fatal(err)
+		}
+		return s, p
+	}
+	stillOld := func(t *testing.T, s *Store, p *fixedProtector) {
+		t.Helper()
+		pt, err := s.Load(func(string) Protector { return p })
+		if err != nil || string(pt) != `{"old":1}` {
+			t.Errorf("old state: %q %v", pt, err)
+		}
+	}
+	noSentinel := func(t *testing.T, err error) {
+		t.Helper()
+		if err == nil || errors.Is(err, ErrReplaceIncomplete) || errors.Is(err, ErrReplacedPartly) || errors.Is(err, ErrNotDurable) {
+			t.Errorf("got %v, want an error with no sentinel", err)
+		}
+	}
+
+	t.Run("probe", func(t *testing.T) {
+		s, p := setup(t)
+		old := probeReplaceOpen
+		probeReplaceOpen = func(string) (bool, error) { return false, errors.New("sharing violation") }
+		defer func() { probeReplaceOpen = old }()
+		noSentinel(t, s.CreateReplace(newFixedProtector(key), []byte(`{"new":1}`), nil))
+		stillOld(t, s, p)
+	})
+	t.Run("wipe", func(t *testing.T) {
+		s, p := setup(t)
+		p.failWipes = 1
+		noSentinel(t, s.CreateReplace(p, []byte(`{"new":1}`), nil))
+		stillOld(t, s, p)
+	})
+	t.Run("write after the wipe", func(t *testing.T) {
+		s, p := setup(t)
+		testHookBeforeRename = func(string) error { return errors.New("disk full") }
+		defer func() { testHookBeforeRename = nil }()
+		err := s.CreateReplace(p, []byte(`{"new":1}`), nil)
+		if !errors.Is(err, ErrReplaceIncomplete) || errors.Is(err, ErrReplacedPartly) {
+			t.Errorf("got %v", err)
+		}
+	})
 }

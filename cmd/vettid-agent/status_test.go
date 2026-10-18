@@ -82,3 +82,31 @@ func TestStatusNotPaired(t *testing.T) {
 		t.Errorf("no --state-dir: %d", rc)
 	}
 }
+
+// TestStatusSanitizes: stored strings (name, device id, vault id) are
+// shown without control or format characters.
+func TestStatusSanitizes(t *testing.T) {
+	withTestStatus(t)
+	dir := filepath.Join(t.TempDir(), "state")
+	s, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dev := `{"role":"agent","name":"evil\u001b[2J\nPaired: forged","device_id":"d\u202eevil","vault_id":"v\r\u200bx"}`
+	rec := `{"v":1,"phase":"paired","device":` + dev + `,"access":{"state":"none"}}`
+	if err := s.Create(cmdTestProtector{}, []byte(rec)); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	var out, errOut bytes.Buffer
+	if rc := run([]string{"status", "--state-dir", dir}, &out, &errOut); rc != 0 {
+		t.Fatalf("exit %d: %s", rc, errOut.String())
+	}
+	o := out.String()
+	if strings.ContainsAny(o, "\x1b\r\u202e\u200b") || strings.Count(o, "\nPaired:") != 1 {
+		t.Errorf("unsanitized output:\n%q", o)
+	}
+	if !strings.Contains(o, `"evil[2JPaired: forged"`) {
+		t.Errorf("name not shown cleaned:\n%s", o)
+	}
+}

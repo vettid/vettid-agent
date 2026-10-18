@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strconv"
@@ -25,10 +26,11 @@ import (
 
 // testProtector wraps under a fixed in-memory key (tests only).
 type testProtector struct {
-	name   string
-	key    [32]byte
-	broken bool // Unwrap always fails
-	wipes  int
+	name     string
+	key      [32]byte
+	broken   bool // Unwrap always fails
+	failWipe bool // Wipe fails
+	wipes    int
 }
 
 func (p *testProtector) Name() string { return p.name }
@@ -44,7 +46,13 @@ func (p *testProtector) Unwrap(w []byte) ([]byte, error) {
 	}
 	return a.Open(nil, w[:a.NonceSize()], w[a.NonceSize():], nil)
 }
-func (p *testProtector) Wipe() error { p.wipes++; return nil }
+func (p *testProtector) Wipe() error {
+	p.wipes++
+	if p.failWipe {
+		return errors.New("key store unavailable")
+	}
+	return nil
+}
 
 // syncBuffer is the operator's terminal; onLine runs for every line
 // written.
@@ -841,6 +849,7 @@ func TestRecordAccess(t *testing.T) {
 		{State: AccessNone},
 		{State: AccessActive},
 		{State: AccessActive, SessionID: "s1", ExpiresAt: exp},
+		{State: AccessActive, ExpiresAt: exp}, // the first session, from device.paired
 	} {
 		b, err := (&Record{Phase: PhasePaired, Device: json.RawMessage(`{}`), Access: a}).Encode()
 		if err != nil {
@@ -859,7 +868,6 @@ func TestRecordAccess(t *testing.T) {
 		`{"v":1,"phase":"paired","device":{},"access":{"state":""}}`,
 		`{"v":1,"phase":"paired","device":{},"access":{"state":"maybe"}}`,
 		`{"v":1,"phase":"paired","device":{},"access":{"state":"none","session_id":"x"}}`,
-		`{"v":1,"phase":"paired","device":{},"access":{"state":"active","expires_at":"2026-10-01T12:00:00Z"}}`,
 		`{"v":1,"phase":"paired","device":{},"access":{"state":"active","x":1}}`,
 		`{"v":1,"phase":"waiting","deadline":"2026-10-01T12:00:00Z","device":{},"access":{"state":"none"}}`,
 	} {
@@ -869,5 +877,104 @@ func TestRecordAccess(t *testing.T) {
 	}
 	if _, err := (&Record{Phase: PhaseWaiting, Deadline: exp, Device: json.RawMessage(`{}`), Access: Access{State: AccessNone}}).Encode(); err == nil {
 		t.Error("encoded access on an unfinished pairing")
+	}
+}
+
+// TestPairRecordsFirstSession: the first access session granted with
+// the approval (device.paired session_expires_at) is recorded as active
+// until that time; without a usable time (absent or malformed, which the
+// client keeps alike) it is unknown, to be checked.
+func TestPairRecordsFirstSession(t *testing.T) {
+	e := newEnv(t)
+	e.v.SessionSeconds = 600
+	before := time.Now()
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatal(err)
+	}
+	r, _ := e.record()
+	a := r.Access
+	if a.State != AccessActive || a.SessionID != "" || a.ExpiresAt.Before(before.Add(590*time.Second)) || a.ExpiresAt.After(time.Now().Add(601*time.Second)) {
+		t.Errorf("access %+v", a)
+	}
+	e2 := newEnv(t)
+	if err := e2.pair(context.Background(), e2.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := e2.record(); r.Access.State != AccessUnknown {
+		t.Errorf("without a session time: %+v", r.Access)
+	}
+}
+
+// replaceFailStore makes CreateReplace fail with err: before changing
+// anything (real=false), or after the real CreateReplace succeeded
+// (real=true, as when overwriting the old file fails late).
+type replaceFailStore struct {
+	store
+	real bool
+	err  error
+}
+
+func (f *replaceFailStore) CreateReplace(p state.Protector, b []byte, r state.Resolver) error {
+	if f.real {
+		if err := f.store.CreateReplace(p, b, r); err != nil {
+			return err
+		}
+	}
+	return f.err
+}
+
+// TestPairReplaceFailures: what a failed replace of a discarded pairing
+// does depends only on what the failure says it left (never on which
+// protector the store holds; here the old and the new protector are the
+// same instance, so they compare equal):
+//   - nothing replaced (a plain error, or the real CreateReplace failing
+//     at the old key's wipe): the old state is kept and said to be kept;
+//   - ErrReplaceIncomplete: the old state may be gone, said so;
+//   - ErrReplacedPartly after the new file is in place: this run's file
+//     is wiped, never "kept".
+func TestPairReplaceFailures(t *testing.T) {
+	cases := []struct {
+		name      string
+		wrap      func(store) store
+		failWipe  bool
+		wantKept  bool
+		wantOld   bool // the old record is still there
+		wantEmpty bool // no state file at all
+	}{
+		{name: "plain error", wrap: func(s store) store { return &replaceFailStore{store: s, err: errors.New("disk error")} },
+			wantKept: true, wantOld: true},
+		{name: "real early failure", failWipe: true, wantKept: true, wantOld: true},
+		{name: "incomplete", wrap: func(s store) store {
+			return &replaceFailStore{store: s, err: fmt.Errorf("%w: disk error", state.ErrReplaceIncomplete)}
+		}, wantOld: true},
+		{name: "late", wrap: func(s store) store {
+			return &replaceFailStore{store: s, real: true, err: fmt.Errorf("%w: disk error", state.ErrReplacedPartly)}
+		}, wantEmpty: true},
+	}
+	for _, tc := range cases {
+		e := newEnv(t)
+		e.writeRecord(PhaseStarted, time.Now().Add(time.Minute))
+		e.prot.failWipe = tc.failWipe
+		old := wrapStore
+		if tc.wrap != nil {
+			wrapStore = tc.wrap
+		}
+		err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
+		wrapStore = old
+		e.prot.failWipe = false
+		if err == nil {
+			t.Fatalf("%s: no error", tc.name)
+		}
+		out := e.out.String()
+		if tc.wantKept != strings.Contains(out, textKept) || tc.wantKept == strings.Contains(out, textMaybeReplaced) {
+			t.Errorf("%s: output:\n%s", tc.name, out)
+		}
+		r, _ := e.record()
+		switch {
+		case tc.wantOld && (r == nil || r.Phase != PhaseStarted):
+			t.Errorf("%s: the old state is not there", tc.name)
+		case tc.wantEmpty && r != nil:
+			t.Errorf("%s: this run's file was kept (%v)", tc.name, r.Phase)
+		}
 	}
 }

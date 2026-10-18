@@ -131,10 +131,11 @@ func deleteLocalUser(t *testing.T, name string) {
 	}
 }
 
-// restrictDir gives dir a protected DACL with full access for
-// Administrators and the given SIDs only (inherited by what is created
-// in it).
-func restrictDir(t *testing.T, dir string, sids ...string) {
+// createRestrictedDir creates a new directory under the system drive's
+// root whose protected DACL, set at creation (so there is no moment when
+// other users could add entries), gives full access to Administrators
+// and the given SIDs only, inherited by what is created in it.
+func createRestrictedDir(t *testing.T, sids ...string) string {
 	t.Helper()
 	sddl := "D:P(A;OICI;FA;;;BA)"
 	for _, s := range sids {
@@ -144,14 +145,24 @@ func restrictDir(t *testing.T, dir string, sids ...string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dacl, _, err := sd.DACL()
-	if err != nil {
-		t.Fatal(err)
+	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+	for i := 0; i < 10; i++ {
+		dir := os.Getenv("SystemDrive") + `\vettid-agent-dpapi-` + randHex(t, 8)
+		p, err := windows.UTF16PtrFromString(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = windows.CreateDirectory(p, sa)
+		if errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+			continue
+		}
+		if err != nil {
+			t.Fatalf("create the test directory: %v", err)
+		}
+		return dir
 	}
-	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
-		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
-		t.Fatalf("set the test directory's DACL: %v", err)
-	}
+	t.Fatal("could not create a test directory with a new name")
+	return ""
 }
 
 // TestDPAPIHelper is the helper mode: it runs only when the test binary
@@ -239,10 +250,7 @@ func TestDPAPIOtherUser(t *testing.T) {
 
 	// A directory only the test users and Administrators can use: the
 	// helper binary, the blobs and the results.
-	dir, err := os.MkdirTemp(os.Getenv("SystemDrive")+`\`, "vettid-agent-dpapi-")
-	if err != nil {
-		t.Fatal(err)
-	}
+	dir := createRestrictedDir(t, sid1, sid2)
 	t.Cleanup(func() {
 		var err error
 		for i := 0; i < 10; i++ {
@@ -253,7 +261,6 @@ func TestDPAPIOtherUser(t *testing.T) {
 		}
 		t.Errorf("the test directory %s was not removed: %v", dir, err)
 	})
-	restrictDir(t, dir, sid1, sid2)
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)

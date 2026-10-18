@@ -97,6 +97,9 @@ type Vault struct {
 	// FailAcks makes every ack fail (the message stays in the mailbox),
 	// as if the device stopped between saving and acknowledging.
 	FailAcks bool
+	// SessionSeconds, if positive, makes the approval grant a first
+	// access session of that length (device.paired session_expires_at).
+	SessionSeconds int
 	// GrantListError, if set, answers leash.grant.list with this error
 	// code (for example session_required) instead of an empty list.
 	GrantListError string
@@ -240,7 +243,11 @@ func (v *Vault) decide(d Decision) error {
 			return err
 		}
 		typ = "device.paired"
-		body, _ = json.Marshal(map[string]string{"device_id": DeviceID, "role": "agent", "vault_id": VaultID, "token": tok})
+		m := map[string]string{"device_id": DeviceID, "role": "agent", "vault_id": VaultID, "token": tok}
+		if v.SessionSeconds > 0 {
+			m["session_expires_at"] = envelope.FormatTS(now.Add(time.Duration(v.SessionSeconds) * time.Second))
+		}
+		body, _ = json.Marshal(m)
 	case Reject:
 		typ, body = "device.pair.rejected", []byte(`{}`)
 	default:

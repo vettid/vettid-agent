@@ -8,7 +8,8 @@
 // The session itself is kept by internal/vaultconn, which saves
 // device.session.granted and .ended with the batch that carried them;
 // this package reads it there (Conn.Access) and writes what it learns
-// from probes and answers back (Conn.SetAccess).
+// from probes and answers back (Conn.CompareAndSetAccess, against the
+// session as it was when the request was sent).
 package access
 
 import (
@@ -75,7 +76,7 @@ func quiet(base *Error, until time.Time, why string) *Error {
 type Conn interface {
 	Request(ctx context.Context, typ string, body json.RawMessage) (*vaultconn.Response, error)
 	Access() pairing.Access
-	SetAccess(pairing.Access)
+	CompareAndSetAccess(old, a pairing.Access) bool
 }
 
 // Manager applies AG8 for one connector. It is safe for concurrent use.
@@ -102,8 +103,10 @@ type Manager struct {
 	// held: the vault answered owner_check_required, or vault.status
 	// says held.
 	held bool
-	// probing: an unknown session is being checked.
-	probing bool
+	// probeDone is set while an unknown session is being checked, and
+	// closed when the check ends; probeErr is its outcome.
+	probeDone chan struct{}
+	probeErr  error
 }
 
 // New returns a Manager. seconds is the operator's default access
@@ -174,11 +177,10 @@ func (m *Manager) probe(ctx context.Context) error {
 }
 
 // setIfUnchanged sets a unless a device.session event changed the
-// session while the probe was in flight.
+// session while the probe was in flight (one atomic compare-and-set on
+// Conn).
 func (m *Manager) setIfUnchanged(before, a pairing.Access) {
-	if m.conn.Access() == before {
-		m.conn.SetAccess(a)
-	}
+	m.conn.CompareAndSetAccess(before, a)
 }
 
 // Ensure is called by a tool call that needs an access session. It
@@ -204,16 +206,32 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return nil
 	}
 	if a.State == pairing.AccessUnknown {
-		if m.probing {
+		if m.probeDone != nil {
+			// A probe is running: wait for it and take its outcome
+			// (nothing was sent to the phone for this caller).
+			done := m.probeDone
 			m.mu.Unlock()
-			return ErrAccessRequested
+			select {
+			case <-done:
+			case <-ctx.Done():
+				return ErrUnreachable
+			}
+			m.mu.Lock()
+			err := m.probeErr
+			m.mu.Unlock()
+			if err != nil {
+				return err
+			}
+			return m.Ensure(ctx)
 		}
-		m.probing = true
+		done := make(chan struct{})
+		m.probeDone = done
 		m.mu.Unlock()
 		err := m.probe(ctx)
 		m.mu.Lock()
-		m.probing = false
+		m.probeErr, m.probeDone = err, nil
 		m.mu.Unlock()
+		close(done)
 		if err != nil {
 			return err
 		}
@@ -354,16 +372,20 @@ func (m *Manager) OnStatus(ownerCheck string) {
 	m.held = ownerCheck == "held"
 }
 
-// OnAnswer takes the error code of any other request's answer:
-// session_required means the session has ended (expired or ended while
-// the connector did not see it); owner_check_required means the vault
-// is held.
-func (m *Manager) OnAnswer(code string) {
+// Snapshot returns the access session; a caller takes it before
+// sending a request and gives it to OnAnswer with the answer.
+func (m *Manager) Snapshot() pairing.Access { return m.conn.Access() }
+
+// OnAnswer takes the error code of any other request's answer, with the
+// session as it was when that request was sent (Snapshot):
+// session_required means that session has ended (expired or ended while
+// the connector did not see it) and sets none, unless a grant or an end
+// changed the session since; owner_check_required means the vault is
+// held.
+func (m *Manager) OnAnswer(code string, sentWith pairing.Access) {
 	switch code {
 	case "session_required":
-		if m.conn.Access().State != pairing.AccessNone {
-			m.conn.SetAccess(pairing.Access{State: pairing.AccessNone})
-		}
+		m.conn.CompareAndSetAccess(sentWith, pairing.Access{State: pairing.AccessNone})
 	case "owner_check_required":
 		m.mu.Lock()
 		m.held = true
