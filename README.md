@@ -480,7 +480,8 @@ another toolchain, cgo, a missing `-trimpath`, a target level other than
 `GOAMD64=v1` or `GOARM64=v8.0`, `-gcflags`, `-asmflags`, a
 `GOEXPERIMENT`, `GOFIPS140`, a VCS stamp, any build tag, or a missing or
 wrong release stamp. A build with the `devstack` tag (which accepts a
-plain-HTTP relay on loopback, for vettid-vault's local dev stack) is
+plain-HTTP relay on loopback and maps the dev stack's relay origin when
+`VETTID_AGENT_DEVSTACK` is set, for vettid-vault's local dev stack) is
 never a release; `vettid-agent version` says so on such a build.
 
 ### Verifying a release

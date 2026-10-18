@@ -76,7 +76,7 @@ func TestVersionFromDevstackBuild(t *testing.T) {
 		if !v.Devstack {
 			t.Errorf("-tags=%s: not reported as a devstack build", tags)
 		}
-		if !strings.HasSuffix(v.String(), "build: devstack (accepts a plain-HTTP relay on loopback; not a release build)\n") {
+		if !strings.HasSuffix(v.String(), "build: devstack (accepts a plain-HTTP relay on loopback, and VETTID_AGENT_DEVSTACK; not a release build)\n") {
 			t.Errorf("-tags=%s: output %q", tags, v.String())
 		}
 	}
