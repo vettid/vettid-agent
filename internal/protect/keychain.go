@@ -61,21 +61,36 @@ package protect
 // ErrKeychainUnavailable (this build cannot use the data protection
 // keychain). Anything else keeps the Keychain's status code and message.
 //
-// Wipe deletes the items: every item whose service is this state
-// directory's (found without the blob, so a Wipe from the header alone
-// works), and then every item this protector instance wrapped or
-// unwrapped (so a state directory that was moved or renamed after
-// pairing is still wiped when its file was opened). An item that is
-// already gone counts as deleted, so Wipe is idempotent. The deletion
-// of the key opened in this process comes last, so a failed Wipe leaves
-// it intact. Without the entitlement Wipe cannot look, and says so.
+// Unwrap re-tags an item it opens whose service names another state
+// directory (the directory was moved or renamed after pairing, or the
+// file was copied) with the current directory's service
+// (SecItemUpdate), so that a new pairing made at the old path, and a
+// later Wipe there, cannot reach it. A failed re-tag does not fail
+// Unwrap; it is logged at debug level.
+//
+// Wipe deletes the items, one by one by name: every item listed under
+// this state directory's service (found without the blob, so a Wipe from
+// the header alone works) and every item this protector instance wrapped
+// or unwrapped. The key in use is deleted last, as Wipe's last action:
+// it is the newest item this instance wrapped or unwrapped or, for an
+// instance that has opened nothing (a Wipe from the header alone), the
+// newest listed item (kSecAttrCreationDate). Every step that can fail
+// (the entitlement, the directory, the listing, the other deletions)
+// comes before it, and nothing that can fail comes after it, so a Wipe
+// that returns an error has not deleted the key in use. An item already
+// gone counts as deleted, so Wipe is idempotent. Without the entitlement
+// Wipe cannot look, and says so.
 //
 // Not covered: an item made for a state directory that was later moved,
-// when the file at the new path is wiped without being opened (its
-// header only), stays in the Keychain; it opens nothing without an old
-// copy of the state file. An item is also left when the process stops
-// between Wrap and the state file being written; the next Wipe of the
-// same state directory deletes it.
+// and wiped at the new path without its file ever having been opened
+// there (its header only), stays in the Keychain; it opens nothing
+// without an old copy of the state file. For a Wipe from the header
+// alone, "the key in use is the newest item" can be wrong only when such
+// a never-opened moved item is newer than the directory's own; then a
+// failure of the last deletion can follow the deletion of the key in
+// use. An item is also left when the process stops between Wrap and the
+// state file being written; the next Wipe of the same state directory
+// deletes it.
 
 import (
 	"crypto/rand"
@@ -84,6 +99,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -105,11 +121,16 @@ const (
 	keychainDirLabel  = "vettid-agent/protect/keychain/v1 dir\x00"
 	keychainService   = "vettid-agent/"
 	keychainLabel     = "vettid-agent data key"
-	keychainProbeName = keychainService + "probe"
+	keychainProbeName = keychainService + "probe/"
+)
 
-	// maxKeychainDeletes bounds Wipe's repeated deletion of a state
-	// directory's items.
-	maxKeychainDeletes = 64
+// What keychainOps.entitlement reports.
+const (
+	entitlementAbsent  = 0
+	entitlementPresent = 1
+	// entitlementUnknown: the entitlement could not be read (the
+	// Security framework failed, or the value has an unexpected form).
+	entitlementUnknown = -1
 )
 
 // Keychain status codes (Security/SecBase.h) the protector tells apart.
@@ -140,6 +161,10 @@ var (
 	// ErrKeychainLocked: the Keychain is locked or not reachable in this
 	// session (environmental).
 	ErrKeychainLocked = errors.New("the macOS Keychain is locked or not reachable in this session")
+	// ErrKeychainEntitlementUnknown: vettid-agent could not read its own
+	// entitlements, so it cannot tell whether it may use the Keychain
+	// (present but failing, not absent).
+	ErrKeychainEntitlementUnknown = errors.New("vettid-agent could not read its own entitlements, so it cannot tell whether it may use the macOS Keychain")
 )
 
 // Fixes added to the errors above.
@@ -147,7 +172,14 @@ const (
 	keychainUnavailableFix = "use the signed vettid-agent app (vettid-agent.app/Contents/MacOS/vettid-agent), or pair with --passphrase (not bound to this computer)"
 	keychainLockedFix      = "run the connector as the logged-in user while the Mac is unlocked (not over SSH or from a launch daemon with no one logged in at the Mac)"
 	keychainGoneFix        = "if the item was deleted or the file was copied from elsewhere, pair again (`vettid-agent pair --restart`)"
+	keychainEntitlementFix = "reinstall the signed vettid-agent app, or pair with --passphrase (not bound to this computer)"
 )
+
+// keychainListed is an item a listing returns.
+type keychainListed struct {
+	account string
+	created float64 // kSecAttrCreationDate, seconds since 2001-01-01 UTC
+}
 
 // keychainItem is what a Keychain lookup returns.
 type keychainItem struct {
@@ -160,18 +192,24 @@ type keychainItem struct {
 // keychainOps are the Keychain calls; keychain_darwin.go has the real
 // ones, tests a fake. Status codes are OSStatus values.
 type keychainOps interface {
-	// entitled reports whether this process has the
-	// keychain-access-groups entitlement.
-	entitled() bool
+	// entitlement reports whether this process has the
+	// keychain-access-groups entitlement: entitlementPresent,
+	// entitlementAbsent or entitlementUnknown.
+	entitlement() int
 	// add stores key as a generic password in the data protection
 	// keychain, ThisDeviceOnly and not synchronizable.
 	add(service, account string, key []byte) int32
 	// get looks an item up by its account, in the data protection
 	// keychain, without any user interface.
 	get(account string) (keychainItem, int32)
-	// remove deletes every item with this service (account "") or this
-	// account (service "").
-	remove(service, account string) int32
+	// list returns the items with this service (never "").
+	list(service string) ([]keychainListed, int32)
+	// retag sets the service of the item with this account (neither
+	// may be "").
+	retag(account, service string) int32
+	// remove deletes the item with this account (never "": an empty
+	// account must not become a query that matches every item).
+	remove(account string) int32
 	// message is the Keychain's text for a status code, or "".
 	message(status int32) string
 }
@@ -204,6 +242,19 @@ func keychainDirTag(canonical string) string {
 	return hex.EncodeToString(sum[:16])
 }
 
+// usable returns nil if this process may use the data protection
+// keychain, else why not; context ends the "not available" message.
+func usable(ops keychainOps, context string) error {
+	switch ops.entitlement() {
+	case entitlementPresent:
+		return nil
+	case entitlementAbsent:
+		return fmt.Errorf("%w%s", ErrKeychainUnavailable, context)
+	default:
+		return fmt.Errorf("%w; %s", ErrKeychainEntitlementUnknown, keychainEntitlementFix)
+	}
+}
+
 // Name returns "keychain".
 func (*Keychain) Name() string { return KeychainName }
 
@@ -221,8 +272,8 @@ func (k *Keychain) Wrap(dataKey []byte) ([]byte, error) {
 	if len(dataKey) != state.DataKeyLen {
 		return nil, errors.New("Keychain protector: data key length")
 	}
-	if !k.ops.entitled() {
-		return nil, fmt.Errorf("%w; %s", ErrKeychainUnavailable, keychainUnavailableFix)
+	if err := usable(k.ops, "; "+keychainUnavailableFix); err != nil {
+		return nil, err
 	}
 	if k.dirErr != nil {
 		// An item made now could not be found by a Wipe from the header.
@@ -245,12 +296,12 @@ func (k *Keychain) Wrap(dataKey []byte) ([]byte, error) {
 	// asked for, or the item is deleted and nothing is returned.
 	item, st := k.ops.get(name)
 	if st != errSecSuccess {
-		k.ops.remove("", name)
+		k.ops.remove(name)
 		return nil, k.statusError("read back the new key", st, false)
 	}
 	defer clear(item.data)
 	if subtle.ConstantTimeCompare(item.data, kek) != 1 || !item.thisDeviceOnly || item.synchronizable || item.service != k.service {
-		k.ops.remove("", name)
+		k.ops.remove(name)
 		return nil, errors.New("Keychain protector: macOS did not store the key as asked (this Mac only, not synchronized), so it is not used")
 	}
 	blob := make([]byte, 0, keychainBlobLen)
@@ -259,7 +310,7 @@ func (k *Keychain) Wrap(dataKey []byte) ([]byte, error) {
 	blob = append(blob, nonce...)
 	aead, err := chacha20poly1305.NewX(kek)
 	if err != nil {
-		k.ops.remove("", name)
+		k.ops.remove(name)
 		return nil, err
 	}
 	blob = aead.Seal(blob, nonce, dataKey, keychainAD(blob[:1+keychainNameLen]))
@@ -274,8 +325,8 @@ func (k *Keychain) Unwrap(blob []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !k.ops.entitled() {
-		return nil, fmt.Errorf("%w, and the state file's key is in the Keychain; use the signed vettid-agent app", ErrKeychainUnavailable)
+	if err := usable(k.ops, ", and the state file's key is in the Keychain; use the signed vettid-agent app"); err != nil {
+		return nil, err
 	}
 	name := hex.EncodeToString(id)
 	item, st := k.ops.get(name)
@@ -294,40 +345,72 @@ func (k *Keychain) Unwrap(blob []byte) ([]byte, error) {
 	if err != nil {
 		return nil, ErrKeychainRefused
 	}
+	if k.dirErr == nil && item.service != k.service {
+		// Opened from another directory than the one the item is
+		// tagged with: follow the file (see the top of this file).
+		if st := k.ops.retag(name, k.service); st != errSecSuccess {
+			slog.Debug("keychain protector: could not re-tag the item for this state directory", "status", st)
+		}
+	}
 	k.remember(name)
 	return key, nil
 }
 
-// Wipe deletes this state directory's items, then the items this
-// instance wrapped or unwrapped (see the comment at the top of this
-// file). Items already gone count as deleted.
+// Wipe deletes this state directory's items and the items this
+// instance wrapped or unwrapped, the key in use last (see the top of
+// this file). Items already gone count as deleted.
 func (k *Keychain) Wipe() error {
-	if !k.ops.entitled() {
-		return fmt.Errorf("%w, so it cannot check for or delete the state file's Keychain item; use the signed vettid-agent app to wipe", ErrKeychainUnavailable)
+	if err := usable(k.ops, ", so it cannot check for or delete the state file's Keychain item; use the signed vettid-agent app to wipe"); err != nil {
+		return err
 	}
 	if k.dirErr != nil {
 		return fmt.Errorf("Keychain protector: the state directory could not be resolved, so its Keychain items cannot be found: %w", k.dirErr)
 	}
-	// SecItemDelete deletes every match in the data protection keychain;
-	// repeat until none is left in case a release deletes one at a time.
-	for i := 0; ; i++ {
-		st := k.ops.remove(k.service, "")
-		if st == errSecItemNotFound {
-			break
-		}
-		if st != errSecSuccess {
-			return k.statusError("delete the key", st, false)
-		}
-		if i == maxKeychainDeletes {
-			return errors.New("Keychain protector: the state directory's items are still there after deleting them")
+	listed, st := k.ops.list(k.service)
+	switch st {
+	case errSecSuccess:
+	case errSecItemNotFound:
+		listed = nil
+	default:
+		return k.statusError("list the keys", st, false)
+	}
+	inUse := ""
+	if n := len(k.names); n > 0 {
+		inUse = k.names[n-1]
+	} else {
+		var newest float64
+		for _, it := range listed {
+			if inUse == "" || it.created > newest {
+				inUse, newest = it.account, it.created
+			}
 		}
 	}
-	for len(k.names) > 0 {
-		if st := k.ops.remove("", k.names[0]); st != errSecSuccess && st != errSecItemNotFound {
+	var others []string
+	seen := map[string]bool{inUse: true, "": true}
+	for _, it := range listed {
+		if !seen[it.account] {
+			seen[it.account] = true
+			others = append(others, it.account)
+		}
+	}
+	for _, n := range k.names {
+		if !seen[n] {
+			seen[n] = true
+			others = append(others, n)
+		}
+	}
+	for _, a := range others {
+		if st := k.ops.remove(a); st != errSecSuccess && st != errSecItemNotFound {
+			return k.statusError("delete an old key", st, false)
+		}
+	}
+	// The last action that can fail: the key in use.
+	if inUse != "" {
+		if st := k.ops.remove(inUse); st != errSecSuccess && st != errSecItemNotFound {
 			return k.statusError("delete the key", st, false)
 		}
-		k.names = k.names[1:]
 	}
+	k.names = nil
 	return nil
 }
 
@@ -378,8 +461,9 @@ func (k *Keychain) statusError(step string, st int32, opening bool) error {
 //   - the Keychain works (a probe item is stored ThisDeviceOnly and not
 //     synchronizable, read back, opens a probe key and is deleted): the
 //     Keychain protector;
-//   - the binary has the entitlement but the Keychain fails (locked, no
-//     login session, macOS stored the probe otherwise): an error naming
+//   - the entitlement cannot be read, or the binary has it but the
+//     Keychain fails (locked, no login session, macOS stored the probe
+//     otherwise): an error naming
 //     the cause and the fix, unless opts.AllowPassphraseFallback is set
 //     (the operator asked for a passphrase), in which case the passphrase
 //     protector with that cause as the reason.
@@ -387,10 +471,13 @@ func chooseKeychain(ops keychainOps, opts ChooseOptions) (Choice, error) {
 	passphrase := func(reason string) Choice {
 		return Choice{Protector: PassphraseName, Reason: reason + "; using a passphrase"}
 	}
-	if !ops.entitled() {
+	if ops.entitlement() == entitlementAbsent {
 		return passphrase("this vettid-agent build cannot use the macOS Keychain (only the signed vettid-agent app can: run it from vettid-agent.app/Contents/MacOS/vettid-agent to bind keys to this Mac)"), nil
 	}
-	err := tryKeychain(ops)
+	err := usable(ops, "")
+	if err == nil {
+		err = tryKeychain(ops)
+	}
 	if err == nil {
 		return Choice{Protector: KeychainName, Reason: "macOS Keychain, this Mac only", MachineBound: true}, nil
 	}
@@ -400,15 +487,20 @@ func chooseKeychain(ops keychainOps, opts ChooseOptions) (Choice, error) {
 	return Choice{}, fmt.Errorf("%w; or choose a passphrase instead (not bound to this computer)", err)
 }
 
-// tryKeychain wraps, unwraps and wipes a random probe key under the
-// probe service (never a state directory's).
+// tryKeychain wraps, unwraps and wipes a random probe key under a probe
+// service of its own (never a state directory's, and never another
+// probe's: concurrent `pair` runs cannot delete each other's probe).
 func tryKeychain(ops keychainOps) error {
 	key := make([]byte, state.DataKeyLen)
 	defer clear(key)
 	if _, err := rand.Read(key); err != nil {
 		return err
 	}
-	p := newKeychain(ops, keychainProbeName, nil)
+	suffix := make([]byte, 16)
+	if _, err := rand.Read(suffix); err != nil {
+		return err
+	}
+	p := newKeychain(ops, keychainProbeName+hex.EncodeToString(suffix), nil)
 	blob, err := p.Wrap(key)
 	if err != nil {
 		return fmt.Errorf("the macOS Keychain does not work for this user: %w", err)
@@ -427,4 +519,21 @@ func tryKeychain(ops keychainOps) error {
 		return fmt.Errorf("the macOS Keychain does not delete what it stored: %w", err)
 	}
 	return nil
+}
+
+// keychainProtectors is All for macOS: the Keychain protector unless
+// this build certainly lacks the entitlement, and the passphrase
+// protector. Without the entitlement the Keychain protector's Wipe could
+// only fail: it cannot see or delete any item, and this build cannot
+// have made one. WipeAll removes the state files whatever its protectors
+// answer, so that failure would protect nothing and would only make the
+// first `pair --restart` over an unreadable header fail (the second, with
+// no file left, would work). An item the signed app made for this
+// directory stays; it opens nothing without an old copy of the state
+// file, and the signed app's next wipe of the directory deletes it.
+func keychainProtectors(ops keychainOps, k *Keychain) []state.Protector {
+	if ops.entitlement() == entitlementAbsent {
+		return []state.Protector{&Passphrase{}}
+	}
+	return []state.Protector{k, &Passphrase{}}
 }

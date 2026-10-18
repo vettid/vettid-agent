@@ -10,25 +10,42 @@ import (
 )
 
 // fakeKeychain is a keychainOps over a map, for the protector's logic on
-// every platform. It records the order of deletions and can fail calls.
+// every platform. It records deletions in order and can fail calls.
 type fakeKeychain struct {
 	noEntitlement bool
+	entUnknown    bool
 	items         map[string]keychainItem // by account
-	removed       []string                // "service" or "account" queries, in order
+	created       map[string]float64      // by account
+	clock         float64
+	removed       []string // accounts, in order
+	listed        []string // services listed
+	retagged      []string // "account service"
+	emptyQueries  int      // remove, list or retag calls with an empty argument
 
 	addStatus    int32
 	getStatus    int32
-	removeStatus map[string]int32 // by service or account query
+	listStatus   int32
+	retagStatus  int32
+	removeAny    int32            // status for every remove
+	removeStatus map[string]int32 // by account
 	// stored overrides what add stores (macOS storing an item otherwise
 	// than asked).
 	stored func(*keychainItem)
 }
 
 func newFakeKeychain() *fakeKeychain {
-	return &fakeKeychain{items: map[string]keychainItem{}, removeStatus: map[string]int32{}}
+	return &fakeKeychain{items: map[string]keychainItem{}, created: map[string]float64{}, removeStatus: map[string]int32{}}
 }
 
-func (f *fakeKeychain) entitled() bool { return !f.noEntitlement }
+func (f *fakeKeychain) entitlement() int {
+	switch {
+	case f.entUnknown:
+		return entitlementUnknown
+	case f.noEntitlement:
+		return entitlementAbsent
+	}
+	return entitlementPresent
+}
 
 func (f *fakeKeychain) add(service, account string, key []byte) int32 {
 	if f.addStatus != 0 {
@@ -42,6 +59,8 @@ func (f *fakeKeychain) add(service, account string, key []byte) int32 {
 		f.stored(&it)
 	}
 	f.items[account] = it
+	f.clock++
+	f.created[account] = f.clock
 	return 0
 }
 
@@ -57,22 +76,61 @@ func (f *fakeKeychain) get(account string) (keychainItem, int32) {
 	return it, 0
 }
 
-func (f *fakeKeychain) remove(service, account string) int32 {
-	q := service + account
-	f.removed = append(f.removed, q)
-	if st := f.removeStatus[q]; st != 0 {
-		return st
+func (f *fakeKeychain) list(service string) ([]keychainListed, int32) {
+	if service == "" {
+		f.emptyQueries++
+		return nil, -50
 	}
-	n := 0
+	f.listed = append(f.listed, service)
+	if f.listStatus != 0 {
+		return nil, f.listStatus
+	}
+	var out []keychainListed
 	for a, it := range f.items {
-		if (service != "" && it.service == service) || (account != "" && a == account) {
-			delete(f.items, a)
-			n++
+		if it.service == service {
+			out = append(out, keychainListed{account: a, created: f.created[a]})
 		}
 	}
-	if n == 0 {
+	if len(out) == 0 {
+		return nil, errSecItemNotFound
+	}
+	return out, 0
+}
+
+func (f *fakeKeychain) retag(account, service string) int32 {
+	if account == "" || service == "" {
+		f.emptyQueries++
+		return -50
+	}
+	f.retagged = append(f.retagged, account+" "+service)
+	if f.retagStatus != 0 {
+		return f.retagStatus
+	}
+	it, ok := f.items[account]
+	if !ok {
 		return errSecItemNotFound
 	}
+	it.service = service
+	f.items[account] = it
+	return 0
+}
+
+func (f *fakeKeychain) remove(account string) int32 {
+	if account == "" {
+		f.emptyQueries++
+		return -50
+	}
+	f.removed = append(f.removed, account)
+	if f.removeAny != 0 {
+		return f.removeAny
+	}
+	if st := f.removeStatus[account]; st != 0 {
+		return st
+	}
+	if _, ok := f.items[account]; !ok {
+		return errSecItemNotFound
+	}
+	delete(f.items, account)
 	return 0
 }
 
@@ -366,10 +424,10 @@ func TestKeychainWipeMoved(t *testing.T) {
 	if len(f.items) != 0 {
 		t.Fatal("the moved directory's item remains")
 	}
-	// remove(service) found nothing, then the remembered name.
+	// Unwrap re-tagged it for /new; one deletion, by name.
 	name := hexOf(blob[1:17])
-	if len(f.removed) != 2 || f.removed[0] != keychainDirService("/new") || f.removed[1] != name {
-		t.Fatalf("deletion order %v", f.removed)
+	if len(f.removed) != 1 || f.removed[0] != name {
+		t.Fatalf("deletions %v", f.removed)
 	}
 }
 
@@ -383,7 +441,7 @@ func TestKeychainWipeAllOrNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.removeStatus[svc] = errSecInteractionNotAllowed
+	f.listStatus = errSecInteractionNotAllowed
 	if err := k.Wipe(); !errors.Is(err, ErrKeychainLocked) {
 		t.Fatalf("Wipe: %v", err)
 	}
@@ -391,7 +449,7 @@ func TestKeychainWipeAllOrNothing(t *testing.T) {
 		t.Fatalf("after a failed Wipe: %v", err)
 	}
 	// Moved directory: the last step (the remembered item) fails.
-	f.removeStatus = map[string]int32{}
+	f.listStatus = 0
 	k2 := newKeychain(f, keychainDirService("/moved"), nil)
 	if _, err := k2.Unwrap(blob); err != nil {
 		t.Fatal(err)
@@ -417,34 +475,6 @@ func TestKeychainWipeAllOrNothing(t *testing.T) {
 	if _, err := k3.Wrap(testDataKey()); err == nil || len(f.items) != n {
 		t.Fatalf("Wrap without a state directory: %v", err)
 	}
-}
-
-// TestKeychainWipeOneAtATime: Wipe repeats the deletion until no item
-// of the state directory is left.
-func TestKeychainWipeOneAtATime(t *testing.T) {
-	f := &oneAtATime{newFakeKeychain()}
-	svc := keychainDirService("/d")
-	k := newKeychain(f, svc, nil)
-	for i := 0; i < 3; i++ {
-		if _, err := k.Wrap(testDataKey()); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := newKeychain(f, svc, nil).Wipe(); err != nil || len(f.items) != 0 {
-		t.Fatalf("Wipe: %v, %d items left", err, len(f.items))
-	}
-}
-
-type oneAtATime struct{ *fakeKeychain }
-
-func (f *oneAtATime) remove(service, account string) int32 {
-	for a, it := range f.items {
-		if (service != "" && it.service == service) || (account != "" && a == account) {
-			delete(f.items, a)
-			return 0
-		}
-	}
-	return errSecItemNotFound
 }
 
 // TestKeychainDirTag: the service names the directory by a hash, not
@@ -478,15 +508,16 @@ func TestChooseKeychain(t *testing.T) {
 	if err != nil || c.Protector != KeychainName || !c.MachineBound || c.Notice() != "" {
 		t.Fatalf("works: %+v %v", c, err)
 	}
-	if len(f.items) != 0 || len(f.removed) == 0 || f.removed[0] != keychainProbeName {
-		t.Fatalf("probe left %d items, removed %v", len(f.items), f.removed)
+	if len(f.items) != 0 || len(f.listed) != 1 || !strings.HasPrefix(f.listed[0], keychainProbeName) {
+		t.Fatalf("probe left %d items, listed %v", len(f.items), f.listed)
 	}
 	// Present but failing: an error with cause and fix, unless the
 	// operator asked for a passphrase.
 	for name, setup := range map[string]func(*fakeKeychain){
-		"locked":         func(f *fakeKeychain) { f.addStatus = errSecInteractionNotAllowed },
-		"stored as sync": func(f *fakeKeychain) { f.stored = func(it *keychainItem) { it.synchronizable = true } },
-		"not deleted":    func(f *fakeKeychain) { f.removeStatus[keychainProbeName] = -61 },
+		"locked":                 func(f *fakeKeychain) { f.addStatus = errSecInteractionNotAllowed },
+		"stored as sync":         func(f *fakeKeychain) { f.stored = func(it *keychainItem) { it.synchronizable = true } },
+		"not deleted":            func(f *fakeKeychain) { f.removeAny = -61 },
+		"entitlement unreadable": func(f *fakeKeychain) { f.entUnknown = true },
 	} {
 		f := newFakeKeychain()
 		setup(f)
@@ -498,5 +529,219 @@ func TestChooseKeychain(t *testing.T) {
 		if err != nil || c.Protector != PassphraseName || c.MachineBound || !strings.Contains(c.Reason, "Keychain") {
 			t.Errorf("%s, fallback: %+v %v", name, c, err)
 		}
+	}
+}
+
+// TestKeychainRetag: an item opened from another state directory than
+// the one it is tagged with follows the file, so that a new pairing at
+// the old path and its Wipe leave it alone. Rename A to B, open B, pair
+// again in a new A, wipe A from the header: B still opens.
+func TestKeychainRetag(t *testing.T) {
+	f := newFakeKeychain()
+	svcA, svcB := keychainDirService("/A"), keychainDirService("/B")
+	blobB, err := newKeychain(f, svcA, nil).Wrap(testDataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A renamed to B, opened there (status, mcp).
+	if _, err := newKeychain(f, svcB, nil).Unwrap(blobB); err != nil {
+		t.Fatal(err)
+	}
+	if it := f.items[hexOf(blobB[1:17])]; it.service != svcB {
+		t.Fatalf("not re-tagged: %q", it.service)
+	}
+	// A new pairing in a new A, then a Wipe of A from its header.
+	if _, err := newKeychain(f, svcA, nil).Wrap(testDataKey()); err != nil {
+		t.Fatal(err)
+	}
+	if err := newKeychain(f, svcA, nil).Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newKeychain(f, svcB, nil).Unwrap(blobB); err != nil {
+		t.Fatalf("B no longer opens after wiping A: %v", err)
+	}
+	if len(f.items) != 1 {
+		t.Fatalf("%d items", len(f.items))
+	}
+	// Opened where it is tagged: no re-tag.
+	n := len(f.retagged)
+	if _, err := newKeychain(f, svcB, nil).Unwrap(blobB); err != nil || len(f.retagged) != n {
+		t.Fatalf("re-tagged in place: %v %v", err, f.retagged)
+	}
+	// A failed re-tag does not fail Unwrap; the tag stays.
+	f.retagStatus = errSecInteractionNotAllowed
+	if _, err := newKeychain(f, keychainDirService("/C"), nil).Unwrap(blobB); err != nil {
+		t.Fatalf("Unwrap with a failed re-tag: %v", err)
+	}
+	if it := f.items[hexOf(blobB[1:17])]; it.service != svcB {
+		t.Fatalf("service changed: %q", it.service)
+	}
+	// An unresolved directory opens without re-tagging.
+	f.retagStatus = 0
+	n = len(f.retagged)
+	if _, err := newKeychain(f, "", errors.New("no state directory")).Unwrap(blobB); err != nil || len(f.retagged) != n {
+		t.Fatalf("unresolved directory: %v %v", err, f.retagged)
+	}
+}
+
+// TestKeychainWipeInUseLast: the key in use is deleted last, and every
+// failure comes before it, so an error means it is intact.
+func TestKeychainWipeInUseLast(t *testing.T) {
+	// Header only: three items of the directory; the newest is the key
+	// in use and is deleted last.
+	f := newFakeKeychain()
+	svc := keychainDirService("/d")
+	var names []string
+	for i := 0; i < 3; i++ {
+		b, err := newKeychain(f, svc, nil).Wrap(testDataKey())
+		if err != nil {
+			t.Fatal(err)
+		}
+		names = append(names, hexOf(b[1:17]))
+	}
+	if err := newKeychain(f, svc, nil).Wipe(); err != nil || len(f.items) != 0 {
+		t.Fatalf("Wipe: %v, %d left", err, len(f.items))
+	}
+	if len(f.removed) != 3 || f.removed[2] != names[2] {
+		t.Fatalf("deletions %v, newest %s", f.removed, names[2])
+	}
+
+	// Loaded: the key this instance opened is last, even if it is not
+	// the newest; a failure on another item leaves it intact.
+	f = newFakeKeychain()
+	inUse, err := newKeychain(f, svc, nil).Wrap(testDataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphan, err := newKeychain(f, svc, nil).Wrap(testDataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := newKeychain(f, svc, nil)
+	if _, err := k.Unwrap(inUse); err != nil {
+		t.Fatal(err)
+	}
+	f.removeStatus[hexOf(orphan[1:17])] = errSecInteractionNotAllowed
+	if err := k.Wipe(); err == nil {
+		t.Fatal("Wipe succeeded")
+	}
+	if _, err := k.Unwrap(inUse); err != nil {
+		t.Fatalf("the key in use was deleted by a failed Wipe: %v", err)
+	}
+	delete(f.removeStatus, hexOf(orphan[1:17]))
+	f.removed = nil
+	if err := k.Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.removed) != 2 || f.removed[1] != hexOf(inUse[1:17]) {
+		t.Fatalf("deletions %v", f.removed)
+	}
+	if _, err := k.Unwrap(inUse); !errors.Is(err, ErrKeychainItemGone) {
+		t.Fatalf("after Wipe: %v", err)
+	}
+}
+
+// TestKeychainNoEmptyQueries: no call ever reaches the Keychain with an
+// empty service or account (which would widen it to every item).
+func TestKeychainNoEmptyQueries(t *testing.T) {
+	f := newFakeKeychain()
+	k := newKeychain(f, keychainDirService("/d"), nil)
+	if err := k.Wipe(); err != nil { // nothing listed, nothing opened
+		t.Fatal(err)
+	}
+	blob, err := k.Wrap(testDataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := newKeychain(f, keychainDirService("/e"), nil).Unwrap(blob); err != nil {
+		t.Fatal(err)
+	}
+	if err := k.Wipe(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chooseKeychain(f, ChooseOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if f.emptyQueries != 0 {
+		t.Fatalf("%d calls with an empty service or account", f.emptyQueries)
+	}
+}
+
+// TestKeychainEntitlementUnknown: an entitlement that cannot be read is
+// "present but failing": every call refuses with the cause and the fix,
+// and the selection needs --passphrase.
+func TestKeychainEntitlementUnknown(t *testing.T) {
+	f := newFakeKeychain()
+	k := newKeychain(f, keychainDirService("/d"), nil)
+	blob, err := k.Wrap(testDataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.entUnknown = true
+	_, werr := k.Wrap(testDataKey())
+	_, uerr := k.Unwrap(blob)
+	for what, err := range map[string]error{"Wrap": werr, "Unwrap": uerr, "Wipe": k.Wipe()} {
+		if !errors.Is(err, ErrKeychainEntitlementUnknown) || errors.Is(err, ErrKeychainUnavailable) || !strings.Contains(err.Error(), "--passphrase") {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	if len(f.items) != 1 {
+		t.Error("an item was deleted")
+	}
+	if _, err := chooseKeychain(f, ChooseOptions{}); !errors.Is(err, ErrKeychainEntitlementUnknown) {
+		t.Errorf("choose: %v", err)
+	}
+	if c, err := chooseKeychain(f, ChooseOptions{AllowPassphraseFallback: true}); err != nil || c.Protector != PassphraseName {
+		t.Errorf("choose with --passphrase: %+v %v", c, err)
+	}
+}
+
+// TestKeychainProbeOwnService: each probe uses a service of its own and
+// never deletes another probe's item (concurrent `pair` runs).
+func TestKeychainProbeOwnService(t *testing.T) {
+	f := newFakeKeychain()
+	// Another run's probe, still in progress.
+	other := newKeychain(f, keychainProbeName+"0123456789abcdef0123456789abcdef", nil)
+	blob, err := other.Wrap(testDataKey())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := tryKeychain(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(f.listed) != 2 || f.listed[0] == f.listed[1] || !strings.HasPrefix(f.listed[0], keychainProbeName) {
+		t.Fatalf("probe services %v", f.listed)
+	}
+	if _, err := other.Unwrap(blob); err != nil {
+		t.Fatalf("another probe's item was deleted: %v", err)
+	}
+}
+
+// TestKeychainProtectorsForWipeAll: a build that certainly lacks the
+// entitlement leaves the Keychain protector out of WipeAll's list (its
+// Wipe could only fail, after WipeAll had removed the files anyway); a
+// build that has it, or cannot tell, keeps it.
+func TestKeychainProtectorsForWipeAll(t *testing.T) {
+	f := newFakeKeychain()
+	k := newKeychain(f, keychainDirService("/d"), nil)
+	names := func() []string {
+		var out []string
+		for _, p := range keychainProtectors(f, k) {
+			out = append(out, p.Name())
+		}
+		return out
+	}
+	if got := strings.Join(names(), ","); got != "keychain,passphrase" {
+		t.Errorf("entitled: %s", got)
+	}
+	f.entUnknown = true
+	if got := strings.Join(names(), ","); got != "keychain,passphrase" {
+		t.Errorf("unknown: %s", got)
+	}
+	f.entUnknown, f.noEntitlement = false, true
+	if got := strings.Join(names(), ","); got != "passphrase" {
+		t.Errorf("absent: %s", got)
 	}
 }

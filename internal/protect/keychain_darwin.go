@@ -24,7 +24,10 @@ package protect
 // vk_nomem is returned when a CoreFoundation object cannot be made
 // (memFullErr); vk_badresult when the Keychain answers in a form not
 // asked for (errSecInternalComponent).
-enum { vk_nomem = -108, vk_badresult = -2070 };
+// vk_badparam (errSecParam) when an argument would widen a query (an
+// empty service or account); vk_toomany (errSecBufferTooSmall) when a
+// listing has more items than the caller has room for.
+enum { vk_nomem = -108, vk_badresult = -2070, vk_badparam = -50, vk_toomany = -25301 };
 
 static CFMutableDictionaryRef vk_query(void) {
 	CFMutableDictionaryRef q = CFDictionaryCreateMutable(NULL, 0,
@@ -43,15 +46,25 @@ static int vk_set_str(CFMutableDictionaryRef q, CFStringRef key, const char *v) 
 	return 1;
 }
 
-static int vk_entitled(void) {
+// vk_entitlement: 1 present, 0 absent, -1 could not be read (no task
+// object, an error from the framework, or a value of another form).
+static int vk_entitlement(void) {
 	SecTaskRef t = SecTaskCreateFromSelf(NULL);
-	if (t == NULL) return 0;
-	CFTypeRef v = SecTaskCopyValueForEntitlement(t, CFSTR("keychain-access-groups"), NULL);
+	if (t == NULL) return -1;
+	CFErrorRef err = NULL;
+	CFTypeRef v = SecTaskCopyValueForEntitlement(t, CFSTR("keychain-access-groups"), &err);
 	CFRelease(t);
-	if (v == NULL) return 0;
+	if (v == NULL) {
+		if (err != NULL) {
+			CFRelease(err);
+			return -1;
+		}
+		return 0;
+	}
+	if (err != NULL) CFRelease(err);
 	int ok = CFGetTypeID(v) == CFArrayGetTypeID() && CFArrayGetCount((CFArrayRef)v) > 0;
 	CFRelease(v);
-	return ok;
+	return ok ? 1 : -1;
 }
 
 static OSStatus vk_add(const char *service, const char *account, const char *label,
@@ -133,16 +146,100 @@ static OSStatus vk_get(const char *account, unsigned char *out, int outcap, int 
 	return errSecSuccess;
 }
 
-static OSStatus vk_remove(const char *service, const char *account) {
+// vk_list writes the accounts (slots of slotlen bytes) and creation
+// times of the items with this service, at most cap of them.
+static OSStatus vk_list(const char *service, char *accounts, int slotlen, double *created, int cap, int *n) {
+	*n = 0;
+	if (service == NULL || service[0] == 0) return vk_badparam;
 	CFMutableDictionaryRef q = vk_query();
 	if (q == NULL) return vk_nomem;
-	if ((service[0] != 0 && !vk_set_str(q, kSecAttrService, service)) ||
-			(account[0] != 0 && !vk_set_str(q, kSecAttrAccount, account))) {
+	if (!vk_set_str(q, kSecAttrService, service)) {
 		CFRelease(q);
 		return vk_nomem;
 	}
 	CFDictionarySetValue(q, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
-	OSStatus st = SecItemDelete(q);
+	CFDictionarySetValue(q, kSecReturnAttributes, kCFBooleanTrue);
+	CFDictionarySetValue(q, kSecMatchLimit, kSecMatchLimitAll);
+	CFTypeRef r = NULL;
+	OSStatus st = SecItemCopyMatching(q, &r);
+	CFRelease(q);
+	if (st != errSecSuccess) {
+		if (r != NULL) CFRelease(r);
+		return st;
+	}
+	if (r == NULL || CFGetTypeID(r) != CFArrayGetTypeID()) {
+		if (r != NULL) CFRelease(r);
+		return vk_badresult;
+	}
+	CFArrayRef a = (CFArrayRef)r;
+	CFIndex count = CFArrayGetCount(a);
+	if (count > cap) {
+		CFRelease(r);
+		return vk_toomany;
+	}
+	for (CFIndex i = 0; i < count; i++) {
+		CFTypeRef m = CFArrayGetValueAtIndex(a, i);
+		char *slot = accounts + i * slotlen;
+		slot[0] = 0;
+		created[i] = 0;
+		if (m == NULL || CFGetTypeID(m) != CFDictionaryGetTypeID()) {
+			CFRelease(r);
+			return vk_badresult;
+		}
+		CFTypeRef ac = CFDictionaryGetValue((CFDictionaryRef)m, kSecAttrAccount);
+		if (ac == NULL || CFGetTypeID(ac) != CFStringGetTypeID() ||
+				!CFStringGetCString((CFStringRef)ac, slot, slotlen, kCFStringEncodingUTF8) || slot[0] == 0) {
+			CFRelease(r);
+			return vk_badresult;
+		}
+		CFTypeRef cd = CFDictionaryGetValue((CFDictionaryRef)m, kSecAttrCreationDate);
+		if (cd != NULL && CFGetTypeID(cd) == CFDateGetTypeID()) created[i] = CFDateGetAbsoluteTime((CFDateRef)cd);
+	}
+	*n = (int)count;
+	CFRelease(r);
+	return errSecSuccess;
+}
+
+// vk_account_query is a query for the one item with this account
+// (never empty: a query without it would match every item).
+static CFMutableDictionaryRef vk_account_query(const char *account, OSStatus *st) {
+	if (account == NULL || account[0] == 0) {
+		*st = vk_badparam;
+		return NULL;
+	}
+	CFMutableDictionaryRef q = vk_query();
+	if (q == NULL || !vk_set_str(q, kSecAttrAccount, account)) {
+		if (q != NULL) CFRelease(q);
+		*st = vk_nomem;
+		return NULL;
+	}
+	CFDictionarySetValue(q, kSecAttrSynchronizable, kSecAttrSynchronizableAny);
+	return q;
+}
+
+static OSStatus vk_retag(const char *account, const char *service) {
+	if (service == NULL || service[0] == 0) return vk_badparam;
+	OSStatus st = errSecSuccess;
+	CFMutableDictionaryRef q = vk_account_query(account, &st);
+	if (q == NULL) return st;
+	CFMutableDictionaryRef u = CFDictionaryCreateMutable(NULL, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	if (u == NULL || !vk_set_str(u, kSecAttrService, service)) {
+		if (u != NULL) CFRelease(u);
+		CFRelease(q);
+		return vk_nomem;
+	}
+	st = SecItemUpdate(q, u);
+	CFRelease(u);
+	CFRelease(q);
+	return st;
+}
+
+static OSStatus vk_remove(const char *account) {
+	OSStatus st = errSecSuccess;
+	CFMutableDictionaryRef q = vk_account_query(account, &st);
+	if (q == NULL) return st;
+	st = SecItemDelete(q);
 	CFRelease(q);
 	return st;
 }
@@ -161,7 +258,6 @@ import "C"
 import (
 	"errors"
 	"fmt"
-	"path/filepath"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -172,7 +268,7 @@ import (
 // darwinKeychain is the real keychainOps.
 type darwinKeychain struct{}
 
-func (darwinKeychain) entitled() bool { return C.vk_entitled() == 1 }
+func (darwinKeychain) entitlement() int { return int(C.vk_entitlement()) }
 
 func (darwinKeychain) add(service, account string, key []byte) int32 {
 	if len(key) == 0 {
@@ -205,11 +301,71 @@ func (darwinKeychain) get(account string) (keychainItem, int32) {
 	}, st
 }
 
-func (darwinKeychain) remove(service, account string) int32 {
-	cs, ca := C.CString(service), C.CString(account)
+// keychainListMax bounds a listing; a state directory has one item in
+// normal use.
+const (
+	keychainListMax = 256
+	keychainSlotLen = 128
+)
+
+func (darwinKeychain) list(service string) ([]keychainListed, int32) {
+	if service == "" {
+		return nil, int32(C.vk_badparam)
+	}
+	cs := C.CString(service)
 	defer C.free(unsafe.Pointer(cs))
+	accounts := make([]byte, keychainListMax*keychainSlotLen)
+	created := make([]C.double, keychainListMax)
+	var n C.int
+	st := int32(C.vk_list(cs, (*C.char)(unsafe.Pointer(&accounts[0])), keychainSlotLen,
+		&created[0], keychainListMax, &n))
+	if st != errSecSuccess {
+		return nil, st
+	}
+	out := make([]keychainListed, 0, int(n))
+	for i := 0; i < int(n); i++ {
+		slot := accounts[i*keychainSlotLen : (i+1)*keychainSlotLen]
+		out = append(out, keychainListed{
+			account: C.GoString((*C.char)(unsafe.Pointer(&slot[0]))),
+			created: float64(created[i]),
+		})
+	}
+	return out, st
+}
+
+func (darwinKeychain) retag(account, service string) int32 {
+	if account == "" || service == "" {
+		return int32(C.vk_badparam)
+	}
+	ca, cs := C.CString(account), C.CString(service)
 	defer C.free(unsafe.Pointer(ca))
-	return int32(C.vk_remove(cs, ca))
+	defer C.free(unsafe.Pointer(cs))
+	return int32(C.vk_retag(ca, cs))
+}
+
+func (darwinKeychain) remove(account string) int32 {
+	if account == "" {
+		return int32(C.vk_badparam)
+	}
+	ca := C.CString(account)
+	defer C.free(unsafe.Pointer(ca))
+	return int32(C.vk_remove(ca))
+}
+
+// cEmptyQueryStatuses calls the C functions directly with an empty
+// account or service, past the Go guards, so that a test shows the C
+// guards refuse them (errSecParam) without asking the Keychain.
+func cEmptyQueryStatuses() (remove, list, retag int32) {
+	empty, svc := C.CString(""), C.CString(keychainProbeName+"guard")
+	defer C.free(unsafe.Pointer(empty))
+	defer C.free(unsafe.Pointer(svc))
+	var acc [keychainSlotLen]byte
+	var created C.double
+	var n C.int
+	remove = int32(C.vk_remove(empty))
+	list = int32(C.vk_list(empty, (*C.char)(unsafe.Pointer(&acc[0])), keychainSlotLen, &created, 1, &n))
+	retag = int32(C.vk_retag(empty, svc))
+	return remove, list, retag
 }
 
 func (darwinKeychain) message(st int32) string {
@@ -227,7 +383,9 @@ var keychainOS keychainOps = darwinKeychain{}
 // NewKeychain returns the Keychain protector for the state directory
 // dir. The directory's items are named by its canonical path (symbolic
 // links resolved, and the letter case the file system stores), so the
-// same directory gives the same name however it is spelled.
+// same directory gives the same name however it is spelled. If dir
+// cannot be resolved, Wrap and Wipe refuse; Unwrap still opens by the
+// item's name (without re-tagging).
 func NewKeychain(dir string) *Keychain {
 	canonical, err := canonicalDir(dir)
 	if err != nil {
@@ -237,38 +395,32 @@ func NewKeychain(dir string) *Keychain {
 }
 
 // canonicalDir returns the path macOS reports for the open directory
-// (fcntl F_GETPATH), or, when the directory cannot be opened, its
-// absolute path with symbolic links resolved.
+// (fcntl F_GETPATH). A directory that cannot be opened, or whose path
+// macOS does not report, is an error, never a guess: a path that is not
+// canonical would name other Keychain items than the directory's.
 func canonicalDir(dir string) (string, error) {
 	if dir == "" {
 		return "", errors.New("no state directory")
 	}
 	fd, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err == nil {
-		defer unix.Close(fd)
-		getpathMu.Lock()
-		defer getpathMu.Unlock()
-		_, err = unix.FcntlInt(uintptr(fd), unix.F_GETPATH, int(uintptr(unsafe.Pointer(&getpathBuf[0]))))
-		if err == nil {
-			n := 0
-			for n < len(getpathBuf) && getpathBuf[n] != 0 {
-				n++
-			}
-			p := string(getpathBuf[:n])
-			clear(getpathBuf[:])
-			if p != "" {
-				return p, nil
-			}
-		}
-	}
-	abs, err := filepath.Abs(dir)
 	if err != nil {
-		return "", fmt.Errorf("the state directory's absolute path: %w", err)
+		return "", fmt.Errorf("open the state directory: %w", err)
 	}
-	if r, err := filepath.EvalSymlinks(abs); err == nil {
-		return r, nil
+	defer unix.Close(fd)
+	getpathMu.Lock()
+	defer getpathMu.Unlock()
+	defer clear(getpathBuf[:])
+	if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETPATH, int(uintptr(unsafe.Pointer(&getpathBuf[0])))); err != nil {
+		return "", fmt.Errorf("the state directory's path (F_GETPATH): %w", err)
 	}
-	return filepath.Clean(abs), nil
+	n := 0
+	for n < len(getpathBuf) && getpathBuf[n] != 0 {
+		n++
+	}
+	if n == 0 || getpathBuf[0] != '/' {
+		return "", errors.New("the state directory's path (F_GETPATH) is not absolute")
+	}
+	return string(getpathBuf[:n]), nil
 }
 
 // ChooseProtector picks the protector for a new state file (AGENT-PLAN
@@ -291,10 +443,10 @@ func Platform(name, dir string) state.Protector {
 
 // All returns one instance of every protector this build knows, for
 // state.Store.WipeAll on the state directory dir when a state file's
-// protector cannot be determined. The passphrase instance holds no
-// passphrase: it can only Wipe (which deletes nothing). The Keychain
-// instance's Wipe deletes dir's items; in a build without the Keychain
-// entitlement it cannot look, and says so.
+// protector cannot be determined: the Keychain protector, which deletes
+// dir's items, unless this build certainly lacks the entitlement
+// (keychainProtectors says why), and the passphrase protector, which
+// holds no passphrase and can only Wipe (deleting nothing).
 func All(dir string) []state.Protector {
-	return []state.Protector{NewKeychain(dir), &Passphrase{}}
+	return keychainProtectors(keychainOS, NewKeychain(dir))
 }

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/vettid/vettid-agent/internal/state"
 )
 
 // The macOS Keychain against the real Security framework. A test binary
@@ -18,8 +20,11 @@ import (
 // on macOS: the Keychain", manual check).
 
 func TestKeychainDarwinNotEntitled(t *testing.T) {
-	if keychainOS.entitled() {
+	switch keychainOS.entitlement() {
+	case entitlementPresent:
 		t.Skip("this test binary has the keychain-access-groups entitlement")
+	case entitlementUnknown:
+		t.Fatal("the entitlement of a bare test binary could not be read (expected: absent)")
 	}
 	// What macOS answers a binary without the entitlement, asked
 	// directly: errSecMissingEntitlement for add and delete, and "not
@@ -37,7 +42,7 @@ func TestKeychainDarwinNotEntitled(t *testing.T) {
 	if st != errSecItemNotFound && st != errSecMissingEntitlement {
 		t.Fatalf("get: OSStatus %d", st)
 	}
-	st = keychainOS.remove(keychainProbeName, "")
+	st = keychainOS.remove(name)
 	t.Logf("remove: OSStatus %d (%s)", st, keychainOS.message(st))
 	if st != errSecMissingEntitlement && st != errSecItemNotFound {
 		t.Fatalf("remove: OSStatus %d", st)
@@ -84,21 +89,41 @@ func TestKeychainDarwinNotEntitled(t *testing.T) {
 	if Platform("tpm", dir) != nil || Platform(DPAPIName, dir) != nil {
 		t.Error("other platform protectors in a macOS build")
 	}
+	// Without the entitlement WipeAll's list leaves the Keychain out
+	// (keychainProtectors), so `pair --restart` over an unreadable
+	// header works the first time.
 	all := All(dir)
-	if len(all) != 2 || all[0].Name() != KeychainName || all[1].Name() != PassphraseName {
+	if len(all) != 1 || all[0].Name() != PassphraseName {
 		t.Errorf("All: %v", all)
+	}
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := os.WriteFile(filepath.Join(dir, state.StateFileName), []byte("not a state file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.WipeAll(All(dir)); err != nil {
+		t.Errorf("WipeAll over an unreadable header: %v", err)
+	}
+	if ok, err := store.Exists(); err != nil || ok {
+		t.Errorf("state file left: %v %v", ok, err)
 	}
 }
 
 type bypassEntitlement struct{ keychainOps }
 
-func (bypassEntitlement) entitled() bool { return true }
+func (bypassEntitlement) entitlement() int { return entitlementPresent }
 
 // TestChooseProtectorDarwin: a binary without the entitlement chooses
 // the passphrase, without an error, and says why and what to do.
 func TestChooseProtectorDarwin(t *testing.T) {
-	if keychainOS.entitled() {
+	switch keychainOS.entitlement() {
+	case entitlementPresent:
 		t.Skip("this test binary has the keychain-access-groups entitlement")
+	case entitlementUnknown:
+		t.Fatal("the entitlement of a bare test binary could not be read (expected: absent)")
 	}
 	for _, fallback := range []bool{false, true} {
 		c, err := ChooseProtector(ChooseOptions{AllowPassphraseFallback: fallback})
@@ -144,8 +169,47 @@ func TestCanonicalDir(t *testing.T) {
 	if _, err := canonicalDir(""); err == nil {
 		t.Error("empty path accepted")
 	}
-	k := NewKeychain("")
-	if k.dirErr == nil {
-		t.Error("NewKeychain(\"\") has no error")
+	// A directory that cannot be opened is refused, never guessed.
+	file := filepath.Join(base, "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", filepath.Join(base, "missing"), file} {
+		if p, err := canonicalDir(bad); err == nil {
+			t.Errorf("%q accepted as %q", bad, p)
+		}
+		if NewKeychain(bad).dirErr == nil {
+			t.Errorf("NewKeychain(%q) has no error", bad)
+		}
+	}
+	// Wrap and Wipe refuse it (past the entitlement check).
+	k := NewKeychain(filepath.Join(base, "missing"))
+	k.ops = bypassEntitlement{keychainOS}
+	if _, err := k.Wrap(make([]byte, 32)); err == nil || !strings.Contains(err.Error(), "could not be resolved") {
+		t.Errorf("Wrap: %v", err)
+	}
+	if err := k.Wipe(); err == nil || !strings.Contains(err.Error(), "could not be resolved") {
+		t.Errorf("Wipe: %v", err)
+	}
+}
+
+// TestKeychainDarwinNoEmptyQueries: an empty account or service is
+// refused by the Go layer and by the C layer, before the Keychain.
+func TestKeychainDarwinNoEmptyQueries(t *testing.T) {
+	if st := keychainOS.remove(""); st != -50 {
+		t.Errorf("Go remove: %d", st)
+	}
+	if _, st := keychainOS.list(""); st != -50 {
+		t.Errorf("Go list: %d", st)
+	}
+	if st := keychainOS.retag("", "x"); st != -50 {
+		t.Errorf("Go retag: %d", st)
+	}
+	if st := keychainOS.retag("x", ""); st != -50 {
+		t.Errorf("Go retag, empty service: %d", st)
+	}
+	r, l, g := cEmptyQueryStatuses()
+	if r != -50 || l != -50 || g != -50 {
+		t.Errorf("C guards: remove %d, list %d, retag %d", r, l, g)
 	}
 }
