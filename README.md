@@ -79,6 +79,46 @@ opened on this computer until its TPM is cleared. Opening such a copy
 needs the copy (from a backup, a snapshot or the raw disk) and access to
 this computer's TPM.
 
+## Keys at rest on Windows: DPAPI
+
+On Windows the connector encrypts its state file's key with DPAPI in
+user scope (`CryptProtectData`), so it opens only for the Windows user
+who paired the connector, on this computer. Another user of the
+computer cannot open it from the file alone; an administrator controls
+the computer, though, and while you are logged on can obtain your DPAPI
+keys from Windows' memory. Any program running as you can open it, as it
+can read the state file: DPAPI protects you from other users and from a
+copy of the file taken elsewhere, not from programs you run.
+
+Exceptions that come with Windows itself:
+
+- with a roaming profile (some company networks), the key also opens on
+  the other computers of the network where your profile is loaded;
+- in an Active Directory domain, the domain's DPAPI backup key, held by
+  the domain controllers, can recover a domain user's keys;
+- if an administrator resets your Windows password (rather than you
+  changing it), Windows can no longer open keys made before, and the
+  connector says so; set the old password back if you can, or pair
+  again.
+
+When Windows cannot use the key it needs, the connector first asks you
+to check that you are signed in as the user who paired it, with your
+profile loaded and, for a domain account, the domain reachable (a
+domain controller out of reach or a roaming profile not yet synced can
+cause this for a while); pair again only if it persists.
+
+If DPAPI does not work in the logon the connector runs in (for example
+a service or scheduled task without your loaded profile or stored
+password), the connector says what is wrong and how to fix it, and uses
+a passphrase only if you ask for one.
+
+The encrypted key lives only inside the state file. `forget` overwrites
+and deletes that file, but an old copy recovered from the disk
+afterwards (a backup, a file system snapshot, a block an SSD remapped)
+can still be opened by your Windows user on this computer for as long as
+your DPAPI keys exist. Opening such a copy needs the copy (from a
+backup, a snapshot or the raw disk) and your Windows logon.
+
 ## Passphrase (computers without a platform protector)
 
 Where no TPM, Keychain or DPAPI protector is available, the keys are

@@ -37,6 +37,15 @@ jobs:
         run: go vet ./...
       - name: go test
         run: go test ${{ matrix.race }} -count=1 ./...
+      # The DPAPI tests again, verbose, as the record of what Windows
+      # answered. Only this step creates local test users and runs a helper
+      # as them (internal/protect/dpapi_otheruser_windows_test.go), so that
+      # happens once per run.
+      - name: DPAPI tests, verbose, with test users
+        if: runner.os == 'Windows'
+        env:
+          VETTID_AGENT_TEST_OTHER_USER: "1"
+        run: go test -count=1 -v -run "TestDPAPI|TestChooseProtectorWindows|TestClassifyDPAPI" ./internal/protect
       - name: build and run
         shell: bash
         run: |

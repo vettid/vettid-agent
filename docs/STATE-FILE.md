@@ -38,7 +38,7 @@ members, in this order, without white space:
 | Member | Value |
 |---|---|
 | `v` | `1` |
-| `protector` | the protector's name: `[a-z][a-z0-9-]{0,31}` (`passphrase`, and later `tpm`, `keychain`, `dpapi`) |
+| `protector` | the protector's name: `[a-z][a-z0-9-]{0,31}` (`passphrase`, `tpm`, `dpapi`, and later `keychain`) |
 | `wrapped_key` | the data key as the protector wrapped it, standard base64 with padding, 1 to 4096 bytes before encoding; its inner format is the protector's |
 | `nonce` | the AEAD nonce for `ct`, standard base64 with padding, 24 bytes before encoding |
 | `created_at` | when the data key was made (the pairing), Unix seconds, positive |
@@ -111,12 +111,45 @@ A reader refuses, in this order:
 
 Errors name the check that failed, never the data.
 
+## The `dpapi` wrapped key (Windows)
+
+The DPAPI protector's `wrapped_key` (internal/protect/dpapi_blob.go):
+
+```
+wrapped_key = version (1 byte, 0x01) || dpapi
+dpapi       = CryptProtectData(plaintext,
+                               description = "vettid-agent data key",
+                               entropy     = "vettid-agent/protect/dpapi/v1\x00",
+                               flags       = CRYPTPROTECT_UI_FORBIDDEN)
+              in user scope (never CRYPTPROTECT_LOCAL_MACHINE), unchanged
+plaintext   = data key (32 bytes)
+              || SHA-256("vettid-agent/protect/dpapi/v1 check\x00" || data key)[:16]
+```
+
+Nothing follows `dpapi`. Before calling Windows, a reader refuses any
+other version byte and checks the DPAPI blob's layout (all little
+endian): blob version 1, the DPAPI provider GUID
+`{df9d8cd0-1501-11d1-8c7a-00c04fc297eb}`, master key version 1, the
+flags exactly 0 (what Windows writes for a user-scope blob made with
+`CRYPTPROTECT_UI_FORBIDDEN`; so a machine-scope blob, flag
+`CRYPTPROTECT_LOCAL_MACHINE`, is refused), the description above
+(UTF-16 with its terminating NUL), AES-128, -192 or -256 with SHA-256,
+-384 or -512, each length-prefixed field non-empty (the HMAC key may be
+empty) and at most 1024 bytes, and nothing left over. Microsoft does not
+document this layout; `Wrap` checks its own output against the same
+rules. After Windows decrypts, the description it returns and the check
+value must match, else the key is refused (Microsoft documents that
+CryptUnprotectData may succeed with corrupted output). The entropy is a
+public constant: it keeps these blobs apart from other programs' DPAPI
+blobs, and any process running as the same user can open them.
+
 ## Wipe
 
 `forget` and `device.unlinked` (AGENT-PLAN AG12) wipe in this order:
 
-1. The protector's key first (`Protector.Wipe`: a TPM object, a
-   Keychain item; nothing for the passphrase protector). The protector
+1. The protector's key first (`Protector.Wipe`: a Keychain item;
+   nothing for the passphrase, TPM and DPAPI protectors, whose wrapped
+   key lives only in the file). The protector
    is the one that created or opened the file or, when the file was not
    opened (a forgotten passphrase), the one named in the header. If its
    wipe fails, the state file is kept and the error returned, so that a
