@@ -52,6 +52,16 @@ type Protector interface {
 	// already gone, returns nil, so Wipe may be retried. After Wipe the
 	// protector can Wrap again (a new pairing), making a new key if it
 	// uses one.
+	//
+	// Wipe is all or nothing: when it returns an error, the key is
+	// intact and still unwraps what it wrapped. CreateReplace relies on
+	// this: it reports a failed Wipe of the old key as "nothing was
+	// replaced" and leaves the old state file as it was, which is only
+	// true if that file can still be opened. A protector whose key has
+	// several parts outside the state file must make the deletion that
+	// destroys the key its last step (or otherwise make a partial wipe
+	// impossible); if it cannot, it must not return an error once the
+	// key can no longer unwrap.
 	Wipe() error
 }
 
@@ -319,26 +329,32 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	// flushed (file and directory), so the old bytes are overwritten
 	// only once the new state is durable.
 	if err := s.create(p, state); err != nil {
-		if old != nil && errors.Is(err, ErrNotDurable) {
-			// The new file is in place but not yet durable. The old
-			// bytes are overwritten only once a flush succeeds, so keep
-			// the handle and retry the flush where that is sound
-			// (Windows; never on POSIX, see retryDurable).
-			if err = s.retryDurable(); err != nil {
-				// Never flushed: the old file's bytes are left in place
-				// (closing the handle releases the file). Protectors
-				// whose Wipe deletes nothing (passphrase, TPM) can
-				// still open them with the old secret.
-				old.Close()
-				return err
-			}
-		} else {
+		if !errors.Is(err, ErrNotDurable) {
 			if old != nil {
 				old.Close()
 			}
 			// Not in place (a write before the rename failed, which
 			// leaves the path unchanged), but the old key is gone.
 			return fmt.Errorf("%w: %w", ErrReplaceIncomplete, err)
+		}
+		// The new file is in place but not yet durable.
+		if old == nil {
+			// No old file is held (it was overwritten and closed
+			// first, or the path was not a regular file): there is
+			// nothing left to overwrite, and the Store holds the new
+			// file, so this is ErrNotDurable as from Create.
+			return err
+		}
+		// The old bytes are overwritten only once a flush succeeds, so
+		// keep the handle and retry the flush where that is sound
+		// (Windows; never on POSIX, see retryDurable).
+		if err = s.retryDurable(); err != nil {
+			// Never flushed: the old file's bytes are left in place
+			// (closing the handle releases the file). Protectors whose
+			// Wipe deletes nothing (passphrase, TPM) can still open
+			// them with the old secret.
+			old.Close()
+			return err
 		}
 	}
 	if old == nil {
