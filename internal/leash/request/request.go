@@ -83,22 +83,20 @@ const (
 
 // Texts (AGENT-PLAN §11 where it drafts one; the others are chosen).
 const (
-	TextWaiting   = "Waiting for your approval on your phone. Check again with leash.check_status."
-	TextInFlight  = "Your vault has not answered yet. Check again with leash.check_status."
-	TextDenied    = "Declined on your phone."
-	TextForbidden = "Your vault does not allow this agent to do that. You can change its permissions on your phone."
-	TextSuspended = "Your vault paused this agent after repeated refused requests. You can resume it on your phone."
-	TextTimeout   = "Your phone did not answer in time, and the request was dropped. Make it again if you still need it."
-	TextExpired   = "No result is kept for this request: a result is returned once and kept at most 10 minutes, and none survives a restart of the connector. Make the request again."
-	TextSession   = "Your access session ended before your vault ran this request. Try again."
-	TextNotFound  = "That item has no such field, or the field cannot be used this way."
-	TextLimit     = "Too many requests are waiting for approval on your phone. Try again after you answer them."
-	TextTooMany   = "Too many requests are waiting for your vault. Check their status, or try again later."
-	TextProtocol  = "Your vault's answer could not be read."
-	TextStopped   = "The connection to your vault has stopped."
-	// TextSuperseded is chosen (not in the spec).
-	TextSuperseded = "Another copy of this request took its place, so its answer cannot be returned here. Make the request again if you still need it."
-	// TextApprovalPassed is chosen (not in the spec).
+	TextWaiting        = "Waiting for your approval on your phone. Check again with leash.check_status."
+	TextInFlight       = "Your vault has not answered yet. Check again with leash.check_status."
+	TextDenied         = "Declined on your phone."
+	TextForbidden      = "Your vault does not allow this agent to do that. You can change its permissions on your phone."
+	TextSuspended      = "Your vault paused this agent after repeated refused requests. You can resume it on your phone."
+	TextTimeout        = "Your phone did not answer in time, and the request was dropped. Make it again if you still need it."
+	TextExpired        = "No result is kept for this request: a result is returned once and kept at most 10 minutes, and none survives a restart of the connector. Make the request again."
+	TextSession        = "Your access session ended before your vault ran this request. Try again."
+	TextNotFound       = "That item has no such field, or the field cannot be used this way."
+	TextLimit          = "Too many requests are waiting for approval on your phone. Try again after you answer them."
+	TextTooMany        = "Too many requests are waiting for your vault. Check their status, or try again later."
+	TextProtocol       = "Your vault's answer could not be read."
+	TextStopped        = "The connection to your vault has stopped."
+	TextSuperseded     = "Another copy of this request took its place, so its answer cannot be returned here. Make the request again if you still need it."
 	TextApprovalPassed = "The time to approve this request on your phone has passed; waiting for your vault's final answer. Check again with leash.check_status."
 )
 
