@@ -27,7 +27,8 @@ import (
 // AG8's bounds, and the request's default length.
 const (
 	// QuietAfterRefusal: no automatic request for 10 minutes after a
-	// denial or a request that expired unanswered.
+	// denial, a request that expired unanswered, or a session the
+	// member ended in the app.
 	QuietAfterRefusal = 10 * time.Minute
 	// MaxPerHour automatic requests in any hour.
 	MaxPerHour = 6
@@ -72,6 +73,14 @@ func quiet(base *Error, until time.Time, why string) *Error {
 		Text: fmt.Sprintf("%s No new request is sent before %s (%s).", base.Text, until.Local().Format("15:04"), why)}
 }
 
+// endedQuiet is the answer during the quiet period after the member
+// ended the session in the app (chosen; AGENT-PLAN §11 drafts none):
+// access_denied, as the member chose to stop the agent's access.
+func endedQuiet(until time.Time) *Error {
+	return &Error{Code: ErrAccessDenied.Code, Until: until,
+		Text: fmt.Sprintf("Access was ended on your phone. No new request is sent before %s.", until.Local().Format("15:04"))}
+}
+
 // Conn is what this package uses of vaultconn.Conn.
 type Conn interface {
 	Request(ctx context.Context, typ string, body json.RawMessage) (*vaultconn.Response, error)
@@ -92,10 +101,11 @@ type Manager struct {
 	outID       string
 	outExp      time.Time
 	sending     bool
-	// quietUntil: after a denial or an unanswered request; denied says
-	// which.
+	// quietUntil: after a denial, an unanswered request or a session
+	// ended in the app; denied or ended says which (neither: unanswered).
 	quietUntil time.Time
 	denied     bool
+	ended      bool
 	// allowedAfter: the vault's too_soon.
 	allowedAfter time.Time
 	// sent: times of automatic requests in the last hour.
@@ -278,7 +288,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		// Expired unanswered (VAULT-MESSAGING §6.8: dropped after 10
 		// minutes).
 		m.outstanding = false
-		m.quietUntil, m.denied = m.outExp.Add(QuietAfterRefusal), false
+		m.quietUntil, m.denied, m.ended = m.outExp.Add(QuietAfterRefusal), false, false
 	}
 	switch {
 	case m.outstanding || m.sending:
@@ -286,6 +296,10 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return ErrAccessRequested
 	case now.Before(m.quietUntil) && m.denied:
 		e := quiet(ErrAccessDenied, m.quietUntil, "the last request was declined")
+		m.mu.Unlock()
+		return e
+	case now.Before(m.quietUntil) && m.ended:
+		e := endedQuiet(m.quietUntil)
 		m.mu.Unlock()
 		return e
 	case now.Before(m.quietUntil):
@@ -399,7 +413,15 @@ func (m *Manager) OnEvent(ev vaultconn.Event) {
 			// again after a crash, it restarts the quiet period: the
 			// cautious direction.
 			m.outstanding = false
-			m.quietUntil, m.denied = m.now().Add(QuietAfterRefusal), true
+			m.quietUntil, m.denied, m.ended = m.now().Add(QuietAfterRefusal), true, false
+		} else if b.Reason == "ended" {
+			// The member ended the session in the app (owner decision,
+			// 2026-10-18): a quiet period as after a denial, so that the
+			// connector does not ask again at once. The vault dropped any
+			// pending request (VAULT-MESSAGING §6.8). A session that
+			// expires sends no event and starts none.
+			m.outstanding = false
+			m.quietUntil, m.denied, m.ended = m.now().Add(QuietAfterRefusal), false, true
 		}
 	}
 	// No event ends a hold, neither leash.grant.updated nor

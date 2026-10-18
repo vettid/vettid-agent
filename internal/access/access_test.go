@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -431,12 +432,53 @@ func TestDenialWithoutOutstanding(t *testing.T) {
 	if err := ensure(t, m); !errors.Is(err, ErrAccessDenied) || f.count("device.session.request") != 0 {
 		t.Fatalf("got %v", err)
 	}
-	// An app ending the session starts no quiet period (AG8 names only
-	// denials and unanswered requests).
-	f2, _, m2 := setup(none)
-	m2.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
-	if err := ensure(t, m2); !errors.Is(err, ErrAccessRequested) || f2.count("device.session.request") != 1 {
-		t.Fatalf("ended: %v", err)
+}
+
+// TestQuietAfterEnded: a session the member ended in the app starts the
+// quiet period, as a denial does (owner decision, 2026-10-18), also
+// without a request outstanding; it answers access_denied with its own
+// text. A session that simply expired starts none.
+func TestQuietAfterEnded(t *testing.T) {
+	f, c, m := setup(pairing.Access{State: pairing.AccessActive, ExpiresAt: t0.Add(time.Hour)})
+	if err := ensure(t, m); err != nil {
+		t.Fatal(err)
+	}
+	c.add(5 * time.Minute)
+	f.SetAccess(none) // vaultconn applied the event in the batch's save
+	m.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
+	endedAt := c.now()
+	for _, d := range []time.Duration{0, 5 * time.Minute, 10*time.Minute - time.Second} {
+		c.t = endedAt.Add(d)
+		err := ensure(t, m)
+		var e *Error
+		if !errors.As(err, &e) || !errors.Is(err, ErrAccessDenied) || !e.Until.Equal(endedAt.Add(10*time.Minute)) ||
+			!strings.HasPrefix(e.Text, "Access was ended on your phone. No new request is sent before ") {
+			t.Fatalf("at +%v: %v", d, err)
+		}
+	}
+	if n := f.count("device.session.request"); n != 0 {
+		t.Fatalf("%d requests during the quiet period", n)
+	}
+	c.t = endedAt.Add(10 * time.Minute)
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) || f.count("device.session.request") != 1 {
+		t.Fatalf("after the quiet period: %v", err)
+	}
+
+	// Ended while a request was outstanding: the vault dropped it, and
+	// the quiet period applies.
+	f, c, m = setup(none)
+	_ = ensure(t, m)
+	c.add(time.Minute)
+	m.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
+	if err := ensure(t, m); !errors.Is(err, ErrAccessDenied) || f.count("device.session.request") != 1 {
+		t.Fatalf("ended with one outstanding: %v", err)
+	}
+
+	// Expired: no event, no quiet period; the next call asks.
+	f, c, m = setup(pairing.Access{State: pairing.AccessActive, ExpiresAt: t0.Add(time.Hour)})
+	c.t = t0.Add(time.Hour)
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) || f.count("device.session.request") != 1 {
+		t.Fatalf("expired: %v", err)
 	}
 }
 

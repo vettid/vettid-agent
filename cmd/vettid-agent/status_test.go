@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vettid/vettid-agent/internal/pairing"
+	"github.com/vettid/vettid-agent/internal/protect"
 	"github.com/vettid/vettid-agent/internal/state"
 )
 
@@ -108,5 +110,29 @@ func TestStatusSanitizes(t *testing.T) {
 	}
 	if !strings.Contains(o, `"evil[2JPaired: forged"`) {
 		t.Errorf("name not shown cleaned:\n%s", o)
+	}
+}
+
+// TestStatusDPAPINotices: for keys protected by DPAPI, status shows how
+// far the account's DPAPI keys reach (owner decision, 2026-10-18); for
+// another protector it does not ask.
+func TestStatusDPAPINotices(t *testing.T) {
+	asked := 0
+	statusDPAPINotices = func() []string { asked++; return []string{protect.TextDPAPIDomain, protect.TextDPAPIRoaming} }
+	t.Cleanup(func() { statusDPAPINotices = protect.DPAPINotices })
+	rec := &pairing.Record{Phase: pairing.PhasePaired, Device: []byte(`{"name":"a","device_id":"d","vault_id":"v"}`)}
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+
+	var out bytes.Buffer
+	writeStatus(&out, "dir", &state.View{Protector: protect.DPAPIName, CreatedAt: now}, rec, now)
+	want := "Keys: protected by Windows DPAPI for this user, bound to this computer\n  " + protect.TextDPAPIDomain + "\n  " + protect.TextDPAPIRoaming + "\n"
+	if !strings.Contains(out.String(), want) || asked != 1 {
+		t.Errorf("dpapi:\n%s", out.String())
+	}
+
+	out.Reset()
+	writeStatus(&out, "dir", &state.View{Protector: "tpm", CreatedAt: now}, rec, now)
+	if strings.Contains(out.String(), protect.TextDPAPIDomain) || asked != 1 {
+		t.Errorf("tpm:\n%s", out.String())
 	}
 }
