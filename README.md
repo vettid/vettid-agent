@@ -50,6 +50,32 @@ CI runs `go vet`, `go test` (with `-race` on Linux and macOS), gitleaks
 and govulncheck on Linux, macOS and Windows runners. Release binaries are
 built differently, reproducibly: see [Releases](#releases).
 
+### Dev-stack tests
+
+`make devstack-test` runs the connector against vettid-vault's local dev
+stack (its README, "Local dev stack" and "A member for an agent"): the
+binary built with the `devstack` tag pairs, runs as an MCP server for
+the MCP Go SDK's client, and is checked against a test vault whose app
+is the stack's `vaultctl` (`internal/devstack`). They do not run in CI.
+
+| Variable | |
+|---|---|
+| `VETTID_DEVSTACK_DATA` | the stack's data directory (default: the user cache directory's `vettid-devstack`, as the stack's `-data`); a stack that runs for it is used and left running |
+| `VETTID_DEVSTACK_SRC` | a vettid-vault checkout: when no stack answers, the tests build `cmd/devstack` from it, start it (only with 8 GB of memory available) and stop it at the end |
+| `VETTID_AGENT_BIN` | a connector already built with `-tags devstack` (default: built by the tests) |
+
+One stack at a time and `go test -p 1`. The hold step of A3's exit test
+(`owner_check_required`) waits for a real one-hour owner-check deadline,
+because the dev stack has no clock to move for it; it runs only with
+`make devstack-hold-test` (over an hour).
+
+A `devstack` build reaches a dev stack when `VETTID_AGENT_DEVSTACK` names
+the stack's control port (`ctl` in its `ready.json`): relay requests for
+the stack's relay origin (`https://relay.vettid.test`) are dialled at its
+TLS front on the loopback interface, trusting only the TEST TLS root its
+`GET /dev/trust` serves, and any other host is refused. The tag is never
+in a release build.
+
 ## Design rules
 
 - Item values pass through to the agent and are never written to disk or
@@ -454,7 +480,8 @@ another toolchain, cgo, a missing `-trimpath`, a target level other than
 `GOAMD64=v1` or `GOARM64=v8.0`, `-gcflags`, `-asmflags`, a
 `GOEXPERIMENT`, `GOFIPS140`, a VCS stamp, any build tag, or a missing or
 wrong release stamp. A build with the `devstack` tag (which accepts a
-plain-HTTP relay on loopback, for vettid-vault's local dev stack) is
+plain-HTTP relay on loopback and maps the dev stack's relay origin when
+`VETTID_AGENT_DEVSTACK` is set, for vettid-vault's local dev stack) is
 never a release; `vettid-agent version` says so on such a build.
 
 ### Verifying a release

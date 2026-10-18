@@ -46,6 +46,14 @@ jobs:
         env:
           VETTID_AGENT_TEST_OTHER_USER: "1"
         run: go test -count=1 -v -run "TestDPAPI|TestChooseProtectorWindows|TestClassifyDPAPI" ./internal/protect
+      # The devstack build (vettid-vault's local dev stack; never a
+      # release): vetted, and its unit tests run. The dev-stack tests
+      # themselves need a running stack and skip with -short.
+      - name: devstack build, vet and unit tests
+        if: runner.os == 'Linux'
+        run: |
+          go vet -tags devstack ./...
+          go test -tags devstack -short -count=1 ./internal/devstack ./internal/pairing ./cmd/vettid-agent
       - name: build and run
         shell: bash
         run: |

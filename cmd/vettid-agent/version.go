@@ -87,7 +87,7 @@ func (v versionInfo) String() string {
 	}
 	s := fmt.Sprintf("vettid-agent %s\ncommit: %s\ngo: %s\n", v.Version, commit, v.GoVersion)
 	if v.Devstack {
-		s += "build: devstack (accepts a plain-HTTP relay on loopback; not a release build)\n"
+		s += "build: devstack (accepts a plain-HTTP relay on loopback, and VETTID_AGENT_DEVSTACK; not a release build)\n"
 	}
 	return s
 }

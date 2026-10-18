@@ -58,3 +58,37 @@ func TestBinaryDoesNotLinkMCPSDK(t *testing.T) {
 		t.Error("the binary does not import internal/mcp")
 	}
 }
+
+// TestDevstackOnlyWithTag: the dev-stack relay mapping (internal/devstack)
+// is linked only into a build with the devstack tag, never into a
+// default build (which release builds are); a devstack build links it,
+// and still not the MCP Go SDK, which only the dev-stack tests use.
+func TestDevstackOnlyWithTag(t *testing.T) {
+	gobin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("no go command")
+	}
+	const devstack = "github.com/vettid/vettid-agent/internal/devstack"
+	deps := func(args ...string) []string {
+		out, err := exec.Command(gobin, append([]string{"list", "-deps"}, append(args, "./cmd/vettid-agent")...)...).Output()
+		if err != nil {
+			t.Fatalf("go list %v: %v", args, err)
+		}
+		return strings.Fields(string(out))
+	}
+	for _, p := range deps() {
+		if p == devstack {
+			t.Error("a build without the devstack tag imports internal/devstack")
+		}
+	}
+	found := false
+	for _, p := range deps("-tags", "devstack") {
+		found = found || p == devstack
+		if strings.HasPrefix(p, "github.com/modelcontextprotocol/") {
+			t.Errorf("the devstack build imports %s", p)
+		}
+	}
+	if !found {
+		t.Error("the devstack build does not import internal/devstack")
+	}
+}
