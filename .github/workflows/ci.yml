@@ -36,6 +36,10 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: go test
+        # On Windows the DPAPI test creates a local user and runs a helper
+        # as that user (internal/protect/dpapi_otheruser_windows_test.go).
+        env:
+          VETTID_AGENT_TEST_OTHER_USER: ${{ runner.os == 'Windows' && '1' || '' }}
         run: go test ${{ matrix.race }} -count=1 ./...
       - name: build and run
         shell: bash

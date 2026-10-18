@@ -5,7 +5,7 @@ package protect
 // the passphrase protector). `status` shows Reason, and Notice when the
 // choice is not bound to the computer.
 type Choice struct {
-	Protector    string // TPMName or PassphraseName
+	Protector    string // TPMName, DPAPIName or PassphraseName
 	Reason       string // plain text for the operator
 	MachineBound bool
 }
