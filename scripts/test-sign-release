@@ -131,7 +131,7 @@ case "$cmd" in
         for f in "$S"/assets/*; do
           b="$(basename "$f")"; want=0
           if [ "${#pats[@]}" -eq 0 ]; then want=1; fi
-          for p in "${pats[@]}"; do
+          for p in ${pats[@]+"${pats[@]}"}; do
             # shellcheck disable=SC2053 # a glob, as gh's -p
             if [[ "$b" == $p ]]; then want=1; fi
           done
