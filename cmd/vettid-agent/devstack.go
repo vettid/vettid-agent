@@ -11,35 +11,48 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
-	"os"
 
 	"github.com/vettid/vettid-agent/internal/devstack"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/vaultconn"
 )
 
+// devstackClient is the dev stack's relay client for the running
+// command, nil when VETTID_AGENT_DEVSTACK is not set.
+var devstackClient *http.Client
+
 func init() {
+	for i, c := range commands {
+		if c.name == "pair" || c.name == "mcp" {
+			commands[i].run = withDevstack(c.name, c.run)
+		}
+	}
 	pairOptions = func(o *pairing.Options) {
-		if hc := devstackHTTP(); hc != nil {
-			o.HTTP = hc
+		if devstackClient != nil {
+			o.HTTP = devstackClient
 		}
 	}
 	mcpOptions = func(o *vaultconn.Options) {
-		if hc := devstackHTTP(); hc != nil {
-			o.HTTP = hc
+		if devstackClient != nil {
+			o.HTTP = devstackClient
 		}
 	}
 }
 
-// devstackHTTP returns the dev stack's relay client, nil when
-// VETTID_AGENT_DEVSTACK is not set; a stack that cannot be reached ends
-// the command (before anything is sent, so before anything is saved).
-func devstackHTTP() *http.Client {
-	hc, err := devstack.FromEnv(context.Background())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "vettid-agent (devstack build): %v\n", err)
-		os.Exit(1)
+// withDevstack resolves the dev stack's relay client before the command
+// runs, so before the state directory is opened or a passphrase read: a
+// stack that cannot be reached ends the command with exit code 1 before
+// anything is opened, sent or saved.
+func withDevstack(name string, run func(args []string, stdout, stderr io.Writer) int) func(args []string, stdout, stderr io.Writer) int {
+	return func(args []string, stdout, stderr io.Writer) int {
+		hc, err := devstack.FromEnv(context.Background())
+		if err != nil {
+			fmt.Fprintf(stderr, "vettid-agent %s (devstack build): %v\n", name, err)
+			return 1
+		}
+		devstackClient = hc
+		return run(args, stdout, stderr)
 	}
-	return hc
 }
