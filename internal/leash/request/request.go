@@ -380,12 +380,37 @@ func (c *Client) Use(ctx context.Context, itemID, fieldID string, data []byte) (
 	return c.do(ctx, &entry{op: OpUse, itemID: itemID, fieldID: fieldID, body: body})
 }
 
-// do sends e's request and waits up to Options.Wait for its outcome.
+// isClosed reports whether Close was called.
+func (c *Client) isClosed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closed
+}
+
+// do sends e's request and waits for its outcome up to Options.Wait in
+// all (AG9's budget), access check included: internal/access may wait
+// for the vault (a probe, a device.session.request), and is stopped at
+// the budget's end with ErrUnreachable while its request goes on. A
+// call whose ctx has ended, or after Close, sends nothing and asks the
+// phone for nothing.
 func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.isClosed() {
+		return nil, ErrStopped
+	}
 	if c.o.Suspended != nil && c.o.Suspended() {
 		return nil, ErrSuspended
 	}
-	if err := c.acc.Ensure(ctx); err != nil {
+	budgetEnd := time.Now().Add(c.o.Wait)
+	bctx, cancel := context.WithDeadline(ctx, budgetEnd)
+	err := c.acc.Ensure(bctx)
+	cancel()
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
+	}
+	if err != nil {
 		return nil, fromAccess(err)
 	}
 	id, err := c.conn.NewID()
@@ -400,6 +425,10 @@ func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
 		c.mu.Unlock()
 		return nil, ErrStopped
 	}
+	if ctx.Err() != nil {
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	}
 	if c.heldLocked() >= c.o.MaxPending {
 		c.mu.Unlock()
 		return nil, ErrTooMany
@@ -410,7 +439,7 @@ func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
 	c.log.Info("agent.request", "op", e.op, "id", id)
 	go c.run(e)
 
-	t := time.NewTimer(c.o.Wait)
+	t := time.NewTimer(max(time.Until(budgetEnd), 0))
 	defer t.Stop()
 	select {
 	case <-e.finished:
@@ -421,7 +450,7 @@ func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
 	if e.done {
 		res, rerr := c.takeLocked(e)
 		c.mu.Unlock()
-		return c.report(ctx, res, rerr)
+		return c.report(ctx, res, rerr, budgetEnd)
 	}
 	if ctx.Err() != nil {
 		// The tool call ended before it got the id: nobody can collect
@@ -461,11 +490,11 @@ func (c *Client) Status(ctx context.Context, requestID string) (*Outcome, error)
 	if e.res != nil {
 		res, _ := c.takeLocked(e)
 		c.mu.Unlock()
-		return c.report(ctx, res, nil)
+		return c.report(ctx, res, nil, time.Now().Add(c.o.Wait))
 	}
 	rerr := e.err // errors are kept until evicted: they hold no secret
 	c.mu.Unlock()
-	return c.report(ctx, nil, rerr)
+	return c.report(ctx, nil, rerr, time.Now().Add(c.o.Wait))
 }
 
 // heldLocked counts the requests in flight and the results kept (kept
@@ -510,13 +539,16 @@ func (c *Client) dropLocked(id string, e *entry) {
 }
 
 // report turns a final outcome into the tool's answer. A
-// session_required answer asks for access now, in this tool call (AG8):
-// the access manager's answer is returned, or ErrSession if a session
-// exists again.
-func (c *Client) report(ctx context.Context, res *Result, err *Error) (*Outcome, error) {
+// session_required answer asks for access now, in this tool call (AG8),
+// until the call's budget ends at deadline: the access manager's answer
+// is returned, or ErrSession if a session exists again.
+func (c *Client) report(ctx context.Context, res *Result, err *Error, deadline time.Time) (*Outcome, error) {
 	if err != nil {
-		if err.Code == ErrSession.Code {
-			if aerr := c.acc.Ensure(ctx); aerr != nil {
+		if err.Code == ErrSession.Code && ctx.Err() == nil && !c.isClosed() {
+			bctx, cancel := context.WithDeadline(ctx, deadline)
+			aerr := c.acc.Ensure(bctx)
+			cancel()
+			if aerr != nil {
 				return nil, fromAccess(aerr)
 			}
 		}

@@ -435,8 +435,9 @@ func TestStatementChecks(t *testing.T) {
 	}
 }
 
-// TestHeld: owner_check_required stops refreshing until vault.status or
-// a grant update shows the hold ended; internal/access is told.
+// TestHeld: owner_check_required stops refreshing until vault.status
+// shows the hold ended (a grant update does not end it); internal/access
+// is told; the background loop is woken when the hold ends.
 func TestHeld(t *testing.T) {
 	e := newEnv(t)
 	var answered []string
@@ -457,11 +458,39 @@ func TestHeld(t *testing.T) {
 	if strings.Join(answered, ",") != "owner_check_required" {
 		t.Errorf("answers passed on: %v", answered)
 	}
+	if !e.m.Held() {
+		t.Error("Held false while held")
+	}
+	// A grant update does not end the hold.
+	e.update(t, false, g1)
+	e.c.Add(10 * time.Minute)
+	e.m.step(ctx)
+	if !e.m.Held() || e.f.count("leash.status.get") != n || e.f.count("leash.grant.list") != 1 {
+		t.Errorf("a grant update ended the hold: held %v, %d refreshes, %d lists", e.m.Held(), e.f.count("leash.status.get"), e.f.count("leash.grant.list"))
+	}
+	// Drain a wake-up left by the update.
+	select {
+	case <-e.m.wake:
+	default:
+	}
+	e.m.OnStatus("held")
+	if !e.m.Held() {
+		t.Error("vault.status held ended the hold")
+	}
 	e.m.OnStatus("ok")
+	select {
+	case <-e.m.wake:
+	default:
+		t.Error("the background loop was not woken when the hold ended")
+	}
+	if e.m.Held() {
+		t.Error("Held true after the hold ended")
+	}
+	e.listing(t, false, g1)
 	e.f.statusGet = statusAnswer(t, e.c, map[string]json.RawMessage{gid(1): g1})
 	e.m.step(ctx)
-	if e.f.count("leash.status.get") != n+1 {
-		t.Error("not refreshed after the hold")
+	if e.f.count("leash.grant.list") != 2 {
+		t.Errorf("not listed after the hold: %d lists", e.f.count("leash.grant.list"))
 	}
 	mustPresent(t, e, gid(1))
 }

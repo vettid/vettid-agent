@@ -1,0 +1,142 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "tools": [
+      {
+        "name": "leash.list_available",
+        "title": "List the items this agent may use",
+        "description": "Lists the items in the member's VettID vault that this agent may use: each item's item_id, name, category and field labels (field_id, label, kind), never values. The member decides on their phone which items are listed. Use an item_id and field_id from here with leash.execute_action (preferred: the value never leaves the vault) or leash.request_secret. Result: {\"status\":\"ok\",\"items\":[...]}, or {\"status\":\"pending\",\"request_id\"} if the vault has not answered within about 20 seconds (then use leash.check_status).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "annotations": {
+          "title": "List the items this agent may use",
+          "readOnlyHint": true,
+          "openWorldHint": false,
+          "idempotentHint": false
+        }
+      },
+      {
+        "name": "leash.request_secret",
+        "title": "Read an item's values",
+        "description": "Reads an item's values from the member's VettID vault: all its fields, or only those named in fields. The values come from the member's vault and are the member's secrets: use them only for the task at hand and do not repeat them in your answers. Prefer leash.execute_action wherever an HMAC of a value suffices. The vault may ask the member on their phone first; then the result is {\"status\":\"pending\",\"request_id\"} and leash.check_status gives the outcome later (the member has up to 5 minutes to answer). Result: {\"status\":\"ok\",\"item\":{\"item_id\",\"name\",\"category\",\"fields\":[{\"field_id\",\"label\",\"kind\",\"value\"}],\"notes\"}}.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "item_id": {
+              "type": "string",
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "minItems": 1,
+              "maxItems": 64,
+              "uniqueItems": true,
+              "description": "Only these fields (field ids from leash.list_available); all fields if absent."
+            }
+          },
+          "required": [
+            "item_id"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "title": "Read an item's values",
+          "readOnlyHint": true,
+          "openWorldHint": false,
+          "idempotentHint": false
+        }
+      },
+      {
+        "name": "leash.execute_action",
+        "title": "Use a field without revealing it",
+        "description": "Computes HMAC-SHA-256 over data, keyed with one field's value, inside the member's VettID vault, and returns the HMAC in base64. The value never leaves the vault and never enters this conversation: prefer this to leash.request_secret wherever it suffices. data is text (its UTF-8 bytes), or base64 with data_encoding \"base64\"; 1 to 16384 bytes. Result: {\"status\":\"ok\",\"item_id\",\"field_id\",\"action\":\"hmac-sha256\",\"result\"}, or {\"status\":\"pending\",\"request_id\"} as for leash.request_secret.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "item_id": {
+              "type": "string",
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "field_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{1,32}$"
+            },
+            "data": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The data to authenticate: text, or base64 with data_encoding \"base64\"; 1 to 16384 bytes."
+            },
+            "data_encoding": {
+              "type": "string",
+              "enum": [
+                "text",
+                "base64"
+              ],
+              "default": "text"
+            }
+          },
+          "required": [
+            "item_id",
+            "field_id",
+            "data"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "title": "Use a field without revealing it",
+          "readOnlyHint": true,
+          "openWorldHint": false,
+          "idempotentHint": false
+        }
+      },
+      {
+        "name": "leash.check_status",
+        "title": "Check a pending request",
+        "description": "Returns the outcome of a request that answered {\"status\":\"pending\",\"request_id\"}: still pending (waiting_for_approval says the member is being asked), its result (returned once, in the shape of the tool that made it), or an error with a code such as denied (declined on the phone), approval_timeout, or expired (no result is kept: results are kept 10 minutes, returned once, and lost when the connector restarts).",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string",
+              "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+            }
+          },
+          "required": [
+            "request_id"
+          ],
+          "additionalProperties": false
+        },
+        "annotations": {
+          "title": "Check a pending request",
+          "readOnlyHint": true,
+          "openWorldHint": false,
+          "idempotentHint": false
+        }
+      },
+      {
+        "name": "leash.connection_info",
+        "title": "Show this agent's connection",
+        "description": "Shows this agent's connection to the member's VettID vault, as the connector last learned it (it asks the vault for nothing): the vault and device ids, the last contact, the access session and its end, the grants the member gave this agent (scope, approval, limits, expiry, connections), whether the vault paused the agent after repeated refused requests (suspended), and whether the vault waits for the member's daily check.",
+        "inputSchema": {
+          "type": "object",
+          "properties": {},
+          "additionalProperties": false
+        },
+        "annotations": {
+          "title": "Show this agent's connection",
+          "readOnlyHint": true,
+          "openWorldHint": false,
+          "idempotentHint": true
+        }
+      }
+    ]
+  }
+}

@@ -502,3 +502,154 @@ func TestCallersDuringProbe(t *testing.T) {
 		}
 	}
 }
+
+// TestEnsureBounded: Ensure returns when its context ends although the
+// vault has not answered (a tool call's 20 s budget); the request goes
+// on, later callers are told access was requested, nothing more is sent,
+// and the answer is recorded when it comes. A context that has already
+// ended sends nothing.
+func TestEnsureBounded(t *testing.T) {
+	f, _, m := setup(none)
+	release := make(chan struct{})
+	f.mu.Lock()
+	f.block = release
+	f.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if err := m.Ensure(ctx); !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("got %v", err)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Fatal("Ensure did not return at its deadline")
+	}
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) {
+		t.Fatalf("while the request is on its way: %v", err)
+	}
+	close(release)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		m.mu.Lock()
+		out := m.outstanding
+		m.mu.Unlock()
+		if out {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the answer was not recorded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) || f.count("device.session.request") != 1 {
+		t.Fatalf("after the answer: %v, %d requests", err, f.count("device.session.request"))
+	}
+
+	// The probe of an unknown session is bounded the same way.
+	f2, _, m2 := setup(pairing.Access{})
+	release2 := make(chan struct{})
+	f2.mu.Lock()
+	f2.block = release2
+	f2.mu.Unlock()
+	f2.answer("leash.grant.list", ok(`{}`))
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel2()
+	if err := m2.Ensure(ctx2); !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("probe: %v", err)
+	}
+	close(release2)
+	deadline = time.Now().Add(5 * time.Second)
+	for f2.Access().State != pairing.AccessActive {
+		if time.Now().After(deadline) {
+			t.Fatal("the probe's answer was not recorded")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Already ended: nothing is sent.
+	f3, _, m3 := setup(none)
+	done, cancel3 := context.WithCancel(context.Background())
+	cancel3()
+	if err := m3.Ensure(done); err == nil || f3.count("device.session.request") != 0 {
+		t.Fatalf("ended context: %v, %d requests", err, f3.count("device.session.request"))
+	}
+}
+
+// TestCheckHold: while held, CheckHold sends vault.status at most once
+// per HoldRecheck; an answer that is not held ends the hold and reaches
+// the hook.
+func TestCheckHold(t *testing.T) {
+	f, c, m := setup(none)
+	var mu sync.Mutex
+	var hooked []string
+	m.SetStatusHook(func(s string) { mu.Lock(); hooked = append(hooked, s); mu.Unlock() })
+	f.answer("vault.status", ok(`{"owner_check":{"state":"held"}}`))
+	m.OnStatus("held")
+	if !m.Held() {
+		t.Fatal("not held")
+	}
+	waitSent := func(n int) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			m.mu.Lock()
+			busy := m.checking
+			m.mu.Unlock()
+			if f.count("vault.status") == n && !busy {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("%d vault.status, want %d", f.count("vault.status"), n)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	m.CheckHold()
+	waitSent(1)
+	m.CheckHold()
+	c.add(30 * time.Second)
+	m.CheckHold()
+	waitSent(1)
+	if !m.Held() {
+		t.Error("held answer ended the hold")
+	}
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"}}`))
+	c.add(31 * time.Second)
+	m.CheckHold()
+	waitSent(2)
+	if m.Held() {
+		t.Error("ok answer did not end the hold")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(hooked) != 2 || hooked[0] != "held" || hooked[1] != "ok" {
+		t.Errorf("hook got %v", hooked)
+	}
+}
+
+// TestWait: Wait returns once the requests running in the background
+// (an Ensure whose caller stopped waiting, CheckHold) have ended.
+func TestWait(t *testing.T) {
+	f, _, m := setup(none)
+	release := make(chan struct{})
+	f.mu.Lock()
+	f.block = release
+	f.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_ = m.Ensure(ctx)
+	m.OnStatus("held")
+	m.CheckHold()
+	waited := make(chan struct{})
+	go func() { m.Wait(); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("Wait returned while requests were running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return")
+	}
+}

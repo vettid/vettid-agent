@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"error\",\"code\":\"denied\",\"message\":\"Declined on your phone.\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "error",
+      "code": "denied",
+      "message": "Declined on your phone."
+    },
+    "isError": true
+  }
+}

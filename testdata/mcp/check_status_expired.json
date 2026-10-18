@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"error\",\"code\":\"expired\",\"message\":\"No result is kept for this request: a result is returned once and kept at most 10 minutes, and none survives a restart of the connector. Make the request again.\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "error",
+      "code": "expired",
+      "message": "No result is kept for this request: a result is returned once and kept at most 10 minutes, and none survives a restart of the connector. Make the request again."
+    },
+    "isError": true
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"error\",\"code\":\"bad_request\",\"message\":\"The request is not valid: data is not standard base64.\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "error",
+      "code": "bad_request",
+      "message": "The request is not valid: data is not standard base64."
+    },
+    "isError": true
+  }
+}

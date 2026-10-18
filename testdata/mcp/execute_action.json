@@ -1,0 +1,20 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"ok\",\"item_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9XYZ\",\"field_id\":\"password\",\"action\":\"hmac-sha256\",\"result\":\"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "ok",
+      "item_id": "01JB2Z6V9K3M4N5P6Q7R8S9XYZ",
+      "field_id": "password",
+      "action": "hmac-sha256",
+      "result": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+    },
+    "isError": false
+  }
+}

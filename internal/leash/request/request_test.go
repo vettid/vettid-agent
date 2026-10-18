@@ -3,8 +3,10 @@ package request
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -808,5 +810,100 @@ func TestOtherCodes(t *testing.T) {
 		if !errors.Is(err, want) || strings.ContainsAny(err.Error(), "\n<>") {
 			t.Errorf("%q: %v", c, err)
 		}
+	}
+}
+
+// TestRedacted: a result, item, field or use printed with any verb, or
+// logged, shows no value, note or HMAC.
+func TestRedacted(t *testing.T) {
+	e := newEnv(t, func(int, string) (*vaultconn.Response, error) { return ok(itemBody), nil }, nil)
+	out, err := e.c.Get(context.Background(), itemID, nil)
+	if err != nil || out.Result == nil {
+		t.Fatalf("Get: %+v, %v", out, err)
+	}
+	defer out.Result.Wipe()
+	res := out.Result
+	mac := []byte("0123456789abcdef0123456789abcdef")
+	use := &Use{ItemID: itemID, FieldID: "pw", Action: "hmac-sha256", Result: mac}
+	var logged syncBuf
+	l := slog.New(slog.NewTextHandler(&logged, nil))
+	l.Info("r", "result", res, "item", res.Item, "field", res.Item.Fields[0], "use", use)
+	l.Info("r", "result", *res, "item", *res.Item, "use", *use)
+	slog.New(slog.NewJSONHandler(&logged, nil)).Info("r", "result", res, "use", use)
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%x", "%q", "%d"} {
+		for _, v := range []any{res, *res, res.Item, *res.Item, res.Item.Fields, res.Item.Fields[0], use, *use, out} {
+			s := fmt.Sprintf(verb, v)
+			noSecretIn(t, verb, s)
+			if strings.Contains(s, string(mac)) || strings.Contains(s, fmt.Sprintf("%x", mac)) {
+				t.Errorf("%s shows the HMAC: %s", verb, s)
+			}
+		}
+	}
+	for _, v := range []any{res, *res, res.Item, *res.Item, res.Item.Fields, res.Item.Fields[0], use, *use, out} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		noSecretIn(t, "json.Marshal", string(b))
+		if strings.Contains(string(b), base64.StdEncoding.EncodeToString(mac)) {
+			t.Errorf("json.Marshal shows the HMAC: %s", b)
+		}
+	}
+	noSecretIn(t, "log", logged.String())
+	if strings.Contains(logged.String(), string(mac)) {
+		t.Error("the log shows the HMAC")
+	}
+	if !strings.Contains(fmt.Sprint(res), "redacted") {
+		t.Errorf("summary: %v", res)
+	}
+}
+
+// TestNothingSentWhenEnded: a call whose context has ended, or one after
+// Close, neither asks for access nor sends anything.
+func TestNothingSentWhenEnded(t *testing.T) {
+	e := newEnv(t, func(int, string) (*vaultconn.Response, error) { return ok(itemBody), nil }, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := e.c.Get(ctx, itemID, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled: %v", err)
+	}
+	e.c.Close()
+	if _, err := e.c.Catalog(context.Background()); !errors.Is(err, ErrStopped) {
+		t.Fatalf("closed: %v", err)
+	}
+	e.acc.mu.Lock()
+	n := e.acc.ensures
+	e.acc.mu.Unlock()
+	if n != 0 || len(e.conn.copies()) != 0 {
+		t.Errorf("%d access checks, %d copies", n, len(e.conn.copies()))
+	}
+}
+
+// slowAccess blocks Ensure until its context ends, as internal/access
+// does while its request waits for the vault.
+type slowAccess struct{ *fakeAccess }
+
+func (s slowAccess) Ensure(ctx context.Context) error {
+	<-ctx.Done()
+	return access.ErrUnreachable
+}
+
+// TestAccessWithinBudget: the access check is bounded by the tool
+// call's wait (AG9): the call returns vault_unreachable at the end of
+// the budget, not after the access manager's own 90 s.
+func TestAccessWithinBudget(t *testing.T) {
+	conn := &fakeConn{answer: func(int, string) (*vaultconn.Response, error) { return ok(itemBody), nil }}
+	c := New(conn, slowAccess{&fakeAccess{snap: session}}, Options{Wait: 100 * time.Millisecond})
+	defer c.Close()
+	start := time.Now()
+	_, err := c.Get(context.Background(), itemID, nil)
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("Get: %v", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Errorf("returned after %v", d)
+	}
+	if len(conn.copies()) != 0 {
+		t.Error("sent without access")
 	}
 }

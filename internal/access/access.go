@@ -103,10 +103,44 @@ type Manager struct {
 	// held: the vault answered owner_check_required, or vault.status
 	// says held.
 	held bool
-	// probeDone is set while an unknown session is being checked, and
-	// closed when the check ends; probeErr is its outcome.
-	probeDone chan struct{}
-	probeErr  error
+	// probing is set while an unknown session is being checked.
+	probing *flight
+	// statusAt: when CheckHold last sent vault.status; checking: one is
+	// in flight; statusHook also receives its answer.
+	statusAt   time.Time
+	checking   bool
+	statusHook func(ownerCheck string)
+	// bg counts the requests running in goroutines of their own (Wait).
+	bg sync.WaitGroup
+}
+
+// Wait waits for the requests this Manager runs in the background (an
+// Ensure whose caller stopped waiting, CheckHold). Each ends with its
+// answer, with RequestTimeout, or at once when the connection's Run has
+// ended (vaultconn answers ErrStopped); the caller calls Wait after Run
+// returns, so that nothing of the Manager runs after it.
+func (m *Manager) Wait() { m.bg.Wait() }
+
+// flight is a request to the vault that runs in a goroutine of its own,
+// so that a caller can stop waiting for it (its context ended) without
+// cancelling it: done is closed when it ends, and err is then its
+// outcome.
+type flight struct {
+	done chan struct{}
+	err  error
+}
+
+func newFlight() *flight { return &flight{done: make(chan struct{})} }
+
+// wait returns f's outcome, or ErrUnreachable if ctx ends first (the
+// request goes on; what it learns is recorded when it ends).
+func (f *flight) wait(ctx context.Context) error {
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return ErrUnreachable
+	}
 }
 
 // New returns a Manager. seconds is the operator's default access
@@ -193,7 +227,18 @@ func (m *Manager) setIfUnchanged(before, a pairing.Access) {
 // QuietAfterRefusal after a denial or a request that expired
 // unanswered; at most MaxPerHour an hour; never before the vault's
 // too_soon allowed_after.
+//
+// Ensure returns when ctx ends even if a request to the vault is still
+// on its way (a tool call's budget, AGENT-PLAN §2 AG9): it then answers
+// ErrUnreachable, and the request goes on in the background, bounded by
+// RequestTimeout, with what it learns recorded when it ends (while a
+// device.session.request is on its way, Ensure answers
+// ErrAccessRequested and sends no other). A ctx that has already ended
+// sends nothing.
 func (m *Manager) Ensure(ctx context.Context) error {
+	if ctx.Err() != nil {
+		return ErrUnreachable
+	}
 	now := m.now()
 	m.mu.Lock()
 	if m.held {
@@ -206,33 +251,25 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return nil
 	}
 	if a.State == pairing.AccessUnknown {
-		if m.probeDone != nil {
-			// A probe is running: wait for it and take its outcome
-			// (nothing was sent to the phone for this caller).
-			done := m.probeDone
-			m.mu.Unlock()
-			select {
-			case <-done:
-			case <-ctx.Done():
-				return ErrUnreachable
-			}
-			m.mu.Lock()
-			err := m.probeErr
-			m.mu.Unlock()
-			if err != nil {
-				return err
-			}
-			return m.Ensure(ctx)
+		// Check the session first (one probe at a time; callers that
+		// arrive meanwhile wait for it and take its outcome: nothing was
+		// sent to the phone for them).
+		f := m.probing
+		if f == nil {
+			f = newFlight()
+			m.probing = f
+			m.bg.Add(1)
+			go func() {
+				defer m.bg.Done()
+				err := m.probe(context.WithoutCancel(ctx))
+				m.mu.Lock()
+				f.err, m.probing = err, nil
+				m.mu.Unlock()
+				close(f.done)
+			}()
 		}
-		done := make(chan struct{})
-		m.probeDone = done
 		m.mu.Unlock()
-		err := m.probe(ctx)
-		m.mu.Lock()
-		m.probeErr, m.probeDone = err, nil
-		m.mu.Unlock()
-		close(done)
-		if err != nil {
+		if err := f.wait(ctx); err != nil {
 			return err
 		}
 		return m.Ensure(ctx)
@@ -269,7 +306,14 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	m.sending = true
 	m.sent = append(m.sent, now)
 	m.mu.Unlock()
-	return m.request(ctx)
+	f := newFlight()
+	m.bg.Add(1)
+	go func() {
+		defer m.bg.Done()
+		f.err = m.request(context.WithoutCancel(ctx))
+		close(f.done)
+	}()
+	return f.wait(ctx)
 }
 
 func (m *Manager) pruneSent(now time.Time) {
@@ -370,6 +414,72 @@ func (m *Manager) OnStatus(ownerCheck string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.held = ownerCheck == "held"
+}
+
+// HoldRecheck is how often, at most, CheckHold asks the vault whether
+// it is still held (chosen; not in the spec).
+const HoldRecheck = time.Minute
+
+// Held reports whether the vault was last seen held (AGENT-PLAN §4.4).
+func (m *Manager) Held() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.held
+}
+
+// SetStatusHook makes f receive the owner check state of each
+// vault.status that CheckHold sends, after OnStatus (for internal/leash,
+// which keeps its own hold). Call it before CheckHold is first used.
+func (m *Manager) SetStatusHook(f func(ownerCheck string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.statusHook = f
+}
+
+// CheckHold sends vault.status in the background, at most once per
+// HoldRecheck and one at a time, so that a hold ends promptly once the
+// member has done the daily check (AGENT-PLAN §4.4: vault.status passes
+// while the vault is held, and a successful one shows the hold ended).
+// A tool call calls it while the vault is held; the vault's own
+// vault.status at start and every 6 hours (internal/vaultconn) is not
+// enough for that. The answer goes to OnStatus and the status hook.
+func (m *Manager) CheckHold() {
+	now := m.now()
+	m.mu.Lock()
+	if m.checking || (!m.statusAt.IsZero() && now.Before(m.statusAt.Add(HoldRecheck))) {
+		m.mu.Unlock()
+		return
+	}
+	m.checking, m.statusAt = true, now
+	hook := m.statusHook
+	m.bg.Add(1)
+	m.mu.Unlock()
+	go func() {
+		defer m.bg.Done()
+		defer func() {
+			m.mu.Lock()
+			m.checking = false
+			m.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(context.Background(), RequestTimeout)
+		defer cancel()
+		r, err := m.conn.Request(ctx, "vault.status", json.RawMessage(`{}`))
+		if err != nil || !r.OK {
+			return
+		}
+		var s struct {
+			OwnerCheck struct {
+				State string `json:"state"`
+			} `json:"owner_check"`
+		}
+		if json.Unmarshal(r.Body, &s) != nil || s.OwnerCheck.State == "" {
+			return
+		}
+		m.OnStatus(s.OwnerCheck.State)
+		if hook != nil {
+			hook(s.OwnerCheck.State)
+		}
+	}()
 }
 
 // Snapshot returns the access session; a caller takes it before

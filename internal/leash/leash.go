@@ -171,8 +171,14 @@ type Manager struct {
 	// listFails and nextList pace the background loop's lists.
 	listFails int
 	nextList  time.Time
-	// held: the vault answered owner_check_required; nothing is refreshed
-	// until leash.grant.updated or vault.status shows the hold ended.
+	// held: the vault answered owner_check_required; the background loop
+	// lists and refreshes nothing until a vault.status (OnStatus) or a
+	// list applied in full shows the hold ended, and then resumes at
+	// once (OnStatus wakes it). A leash.grant.updated does not end it:
+	// it is applied only as a narrowing, and nothing in it says the hold
+	// ended. While held, a tool call has internal/access send vault.status
+	// at most once a minute (access.CheckHold), whose answer reaches
+	// OnStatus.
 	held bool
 	// Statements by grant id (memory only), and per grant: when one was
 	// last asked for, last refreshed successfully, last wanted by
@@ -437,6 +443,22 @@ func (m *Manager) OnStatus(ownerCheck string) {
 		m.held = false
 		m.signal()
 	}
+}
+
+// Held reports whether the vault answered owner_check_required and no
+// vault.status or list has shown the hold ended since.
+func (m *Manager) Held() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.held
+}
+
+// Suspended reports whether the vault suspended this agent (§10.11), as
+// last learned.
+func (m *Manager) Suspended() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.suspended
 }
 
 // activeAt reports whether a is a session usable at now.

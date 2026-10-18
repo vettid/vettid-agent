@@ -14,6 +14,8 @@ import (
 
 	"github.com/vettid/vettid-agent/internal/access"
 	"github.com/vettid/vettid-agent/internal/leash"
+	"github.com/vettid/vettid-agent/internal/leash/request"
+	"github.com/vettid/vettid-agent/internal/mcp"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/state"
 	"github.com/vettid/vettid-agent/internal/vaultconn"
@@ -24,17 +26,20 @@ import (
 var (
 	mcpIn      io.Reader = os.Stdin
 	mcpOptions func(*vaultconn.Options)
+	// mcpRequestOptions adjusts the requests' options (tests' timings).
+	mcpRequestOptions func(*request.Options)
 	// mcpResolve replaces the protector resolver (tests' protector).
 	mcpResolve state.Resolver
 )
 
 const mcpUsage = `Usage: vettid-agent mcp --state-dir DIR [--passphrase-fd N | --passphrase-file PATH]
 
-Runs the connector for the MCP client that starts it, over standard
-input and output, with the pairing in DIR. It stays connected to your
-vault until the client closes standard input. Standard output carries
-only MCP messages; notices go to standard error. (The MCP tools are not
-available yet: this version keeps the vault connection and the grants only.)
+Runs the connector as an MCP server for the MCP client that starts it,
+over standard input and output, with the pairing in DIR. It offers the
+LEASH tools (leash.list_available, leash.request_secret,
+leash.execute_action, leash.check_status, leash.connection_info) and
+stays connected to your vault until the client closes standard input.
+Standard output carries only MCP messages; notices go to standard error.
 
 Flags:
 `
@@ -107,9 +112,11 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		level = slog.LevelInfo
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
-	// The access policy (AG8) sees each event and vault.status; it is
-	// created once the connection exists (the callbacks run only in Run).
+	// The access policy (AG8) and the agent's requests see each event,
+	// and the access policy each vault.status; they are created once the
+	// connection exists (the callbacks run only in Run).
 	var mgr *access.Manager
+	var reqs *request.Client
 	grants := newGrants(rec, logger, func(code string, sentWith pairing.Access) { mgr.OnAnswer(code, sentWith) })
 	o := vaultconn.Options{
 		Store:   store,
@@ -117,7 +124,10 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		Record:  rec,
 		Out:     stderr,
 		Log:     logger,
-		OnEvent: func(ev vaultconn.Event) { mgr.OnEvent(ev) },
+		OnEvent: func(ev vaultconn.Event) {
+			mgr.OnEvent(ev)
+			reqs.OnEvent(ev)
+		},
 		OnStatus: func(oc string) {
 			mgr.OnStatus(oc)
 			grants.OnStatus(oc)
@@ -132,22 +142,49 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		return fail(err)
 	}
 	mgr = access.New(conn, *accessMinutes*60, nil)
+	// A vault.status sent while the vault is held (CheckHold) also ends
+	// the grants' hold.
+	mgr.SetStatusHook(grants.OnStatus)
 	// Every grant must name this device (the client's device id); without
 	// one nothing could be checked, so the connector does not run.
 	if err := grants.Bind(conn); err != nil {
 		return fail(err)
 	}
+	ro := request.Options{Log: logger, Suspended: grants.Suspended}
+	if mcpRequestOptions != nil {
+		mcpRequestOptions(&ro)
+	}
+	reqs = request.New(conn, mgr, ro)
+	// Closed last: it zeroes every result still kept.
+	defer reqs.Close()
+	held := func() bool { return mgr.Held() || grants.Held() }
+	srv := mcp.New(mcp.Options{
+		Requests: reqs,
+		Info:     grants.ConnectionInfo,
+		Held:     held,
+		// While the vault is held, a tool call asks it again whether it
+		// still is, at most once a minute (AGENT-PLAN §4.4).
+		BeforeCall: func() {
+			if held() {
+				mgr.CheckHold()
+			}
+		},
+		Version: readVersion().Version,
+		Log:     logger,
+	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	// The MCP client ends the session by closing standard input. The MCP
-	// messages themselves are handled from A3.3 on; until then they are
-	// read and dropped, and nothing is written to standard output.
-	in := mcpIn
+	// The MCP session: standard input and output carry its messages and
+	// nothing else. The MCP client ends it by closing standard input.
+	serveDone := make(chan struct{})
 	go func() {
-		_, _ = io.Copy(io.Discard, in)
+		defer close(serveDone)
+		if err := srv.Serve(ctx, mcpIn, stdout); err != nil && ctx.Err() == nil {
+			logger.Warn("MCP input failed", "err", "read error")
+		}
 		cancel()
 	}()
 	// A saved session that has not expired is checked once at start
@@ -160,12 +197,22 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 	// The grants' status statements are kept fresh (internal/leash Run).
-	go grants.Run(ctx)
+	grantsDone := make(chan struct{})
+	go func() {
+		defer close(grantsDone)
+		grants.Run(ctx)
+	}()
 	err = conn.Run(ctx)
 	// The check ends with Run (its request fails once Run stops); wait
-	// for it, so that nothing writes to standard error after return.
+	// for it, and for the MCP session (whose tool calls end with ctx),
+	// so that nothing writes to standard output or error after return.
 	cancel()
 	<-startDone
+	<-serveDone
+	<-grantsDone
+	// Requests the access manager still runs in the background end at
+	// once now that Run has (vaultconn answers ErrStopped).
+	mgr.Wait()
 	switch {
 	case errors.Is(err, context.Canceled):
 		return 0

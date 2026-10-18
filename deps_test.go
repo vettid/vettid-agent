@@ -6,6 +6,8 @@ package vettidagent_test
 // compile if either package moves or its exported API changes shape.
 
 import (
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,5 +34,27 @@ func TestVaultPackagesCompile(t *testing.T) {
 	// vms/leashwire: the reference verifier refuses an empty presentation.
 	if _, err := leashwire.VerifyPresented(nil, &leashwire.Presented{}, time.Now()); err == nil {
 		t.Fatal("leashwire.VerifyPresented accepted an empty presentation")
+	}
+}
+
+// TestBinaryDoesNotLinkMCPSDK: the MCP Go SDK is used only by tests (its
+// client drives the server); the binary's MCP server is internal/mcp
+// and links none of it (docs/SOURCE.md).
+func TestBinaryDoesNotLinkMCPSDK(t *testing.T) {
+	gobin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("no go command")
+	}
+	out, err := exec.Command(gobin, "list", "-deps", "./cmd/vettid-agent").Output()
+	if err != nil {
+		t.Fatalf("go list: %v", err)
+	}
+	for _, p := range strings.Fields(string(out)) {
+		if strings.HasPrefix(p, "github.com/modelcontextprotocol/") {
+			t.Errorf("the binary imports %s", p)
+		}
+	}
+	if !strings.Contains(string(out), "github.com/vettid/vettid-agent/internal/mcp") {
+		t.Error("the binary does not import internal/mcp")
 	}
 }
