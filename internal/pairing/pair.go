@@ -171,6 +171,7 @@ type store interface {
 	Wipe(state.Resolver) error
 	WipeAll([]state.Protector) error
 	Dir() string
+	Protector() state.Protector
 }
 
 // wrapStore is the identity outside tests.
@@ -186,11 +187,12 @@ type run struct {
 	persistedPaired bool
 	// replacing says what the first write replaces ("unfinished",
 	// "paired" or "unreadable"); replaced is set once it did.
-	replacing string
-	replaced  bool
-	prot      state.Protector // the new pairing's protector
-	created   bool            // the state file now holds this run's record
-	replace   bool            // a state file exists and is replaced at the first write
+	replacing    string
+	replaced     bool
+	replaceTried bool
+	prot         state.Protector // the new pairing's protector
+	created      bool            // the state file now holds this run's record
+	replace      bool            // a state file exists and is replaced at the first write
 }
 
 // Pair runs `vettid-agent pair` (AGENT-PLAN §4.3):
@@ -237,10 +239,16 @@ func Pair(ctx context.Context, o Options) error {
 		}
 	}
 	err = r.pairNew(ctx)
-	if err != nil && r.replace && !r.replaced {
+	switch {
+	case err == nil || !r.replace || r.replaced:
+	case !r.replaceTried:
 		// The new pairing failed before its first write: whatever the
 		// state directory held is still there.
 		fmt.Fprintln(o.Out, textKept)
+	default:
+		// The replace was attempted and failed part of the way: the old
+		// state may already be gone.
+		fmt.Fprintln(o.Out, textMaybeReplaced)
 	}
 	return err
 }
@@ -321,6 +329,22 @@ func (r *run) clientConfig(c client.Config) client.Config {
 	return c
 }
 
+// accessFromPaired is the first access session as device.paired gave it
+// (VAULT-MESSAGING §10.3 `session_expires_at`, kept by the client in
+// Paired): active until that time, with no session id (device.paired
+// carries none); none when the approval granted no session; unknown when
+// the client kept nothing.
+func accessFromPaired(p *client.Paired) Access {
+	switch {
+	case p == nil:
+		return Access{}
+	case p.SessionExpiresAt.IsZero():
+		return Access{State: AccessNone}
+	default:
+		return Access{State: AccessActive, ExpiresAt: p.SessionExpiresAt.UTC()}
+	}
+}
+
 // persist is the client's Config.Persist while pairing: it saves the
 // device state with the current phase after each collected batch and
 // before the batch is acknowledged, so that device.paired (which the
@@ -336,6 +360,7 @@ func (r *run) persist(st []byte) error {
 	var cs struct {
 		DeviceID string          `json:"device_id"`
 		Vault    json.RawMessage `json:"vault"`
+		Paired   *client.Paired  `json:"paired"`
 	}
 	if err := json.Unmarshal(st, &cs); err != nil {
 		return errors.New("the device state could not be read for saving")
@@ -344,6 +369,7 @@ func (r *run) persist(st []byte) error {
 	switch {
 	case cs.DeviceID != "":
 		rec.Phase, rec.Deadline = PhasePaired, time.Time{}
+		rec.Access = accessFromPaired(cs.Paired)
 	case len(cs.Vault) == 0 || string(cs.Vault) == "null":
 		return nil
 	}
@@ -442,6 +468,9 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 		return nil
 	case err == nil:
 		rec.Phase, rec.Deadline = PhasePaired, time.Time{}
+		if p, ok := d.Paired(); ok {
+			rec.Access = accessFromPaired(&p)
+		}
 		if err := r.save(d, rec); err != nil {
 			if errors.Is(err, state.ErrNotDurable) {
 				fmt.Fprintln(o.Out, TextPaired)
@@ -498,6 +527,7 @@ func (r *run) write(b []byte) error {
 	}
 	var err error
 	if r.replace {
+		r.replaceTried = true
 		err = r.st.CreateReplace(r.prot, b, o.Resolve)
 		if errors.Is(err, state.ErrProtectorUnknown) && o.Restart {
 			if err = r.st.WipeAll(o.AllProtectors); err == nil {
@@ -506,6 +536,12 @@ func (r *run) write(b []byte) error {
 		}
 	} else {
 		err = r.st.Create(r.prot, b)
+	}
+	if err != nil && !errors.Is(err, state.ErrNotDurable) && r.st.Protector() == r.prot {
+		// The store holds this run's protector: a file under this run's
+		// new key may be in place (the replace failed after writing
+		// it). Treat it as this run's, so that the failure wipes it.
+		r.created = true
 	}
 	if err == nil || errors.Is(err, state.ErrNotDurable) {
 		r.created = true
@@ -567,6 +603,10 @@ func (r *run) pairError(ctx, wctx context.Context, code *Code, err error) error 
 
 // maxShownError is the most of a foreign error text shown, in bytes.
 const maxShownError = 200
+
+// Sanitize is sanitize, for other packages that show stored or foreign
+// text (`vettid-agent status`).
+func Sanitize(s string) string { return sanitize(s) }
 
 // sanitize makes text from outside (a relay) safe to show on one
 // terminal line: control characters (escape sequences, line breaks),

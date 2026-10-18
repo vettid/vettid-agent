@@ -156,11 +156,12 @@ the last request was too recent. While your vault waits for your daily
 check, it asks for nothing.
 
 The connector saves the session your phone grants together with the
-message that brought it. Your vault has no message that tells an agent
-its current session, so at start the connector checks a saved,
-unexpired session with one request that needs a session (it shows
-nothing on your phone), and after pairing it checks the same way before
-asking for access for the first time.
+message that brought it, including a first session granted with the
+pairing. Your vault has no message that tells an agent its current
+session, so at start the connector checks a saved, unexpired session
+with one request that needs a session (it shows nothing on your phone).
+A connector paired by an earlier version, whose first session is not
+known, checks the same way before asking for access for the first time.
 
 `vettid-agent status --state-dir DIR` shows what is saved: whether the
 connector is paired (its name, device and vault ids), the access session

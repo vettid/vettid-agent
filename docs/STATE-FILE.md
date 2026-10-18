@@ -66,18 +66,22 @@ The plaintext under the data key is the connector's record
 | `phase` | `started`: fresh keys, mailbox registered, no SAS shown yet (discarded by the next `pair`); `waiting`: the handshake completed and the SAS was shown, the connector waits for the owner's decision (resumable until `deadline`); `paired`: `device.paired` arrived |
 | `deadline` | present exactly while `phase` is `started` or `waiting`: the end of the 10 minutes after `hs.init` (VAULT-MESSAGING §6.7), measured from just before the keys were created |
 | `device` | the vault client's `Save()` output: the `ik`, `kem` and relay-key seeds, the vault record with tokens, the session keyring |
-| `access` | optional, `paired` only: the access session (VAULT-MESSAGING §6.8) as of this save. `state` is `none` or `active`; an `active` one has `session_id` and `expires_at` (from `device.session.granted`) or neither (a session found by a check whose end is not known). Absent means not known: right after pairing (the connector does not learn the first session granted at pairing) and in records written before the member existed |
+| `access` | optional, `paired` only: the access session (VAULT-MESSAGING §6.8) as of this save. `state` is `none` or `active`. An `active` one has `session_id` and `expires_at` (from `device.session.granted`), `expires_at` only (the first session, from `device.paired`'s `session_expires_at`, which comes with no session id), or neither (a session found by a check whose end is not known). Pairing writes `none` when the approval granted no session. Absent means not known: records paired by a build before the first session was recorded. `unknown` is never written |
 
 It is parsed strictly (no unknown members, nothing after it). The
 pairing code and the SAS are never stored.
 
-`access` is written by `internal/vaultconn` in the same save as the
-batch that carried `device.session.granted` or `.ended`, before that
-batch is acknowledged at the relay, so a crash cannot lose a grant or
+`access` is first written by `internal/pairing` from `device.paired`
+(kept by the vault client, `Paired().SessionExpiresAt`), then by
+`internal/vaultconn` in the same save as the batch that carried
+`device.session.granted` or `.ended`, before that batch is acknowledged
+at the relay, so a crash cannot lose a grant or
 an end that the relay has dropped; applying the same events again gives
 the same result. What `internal/access` learns from a check
-(`leash.grant.list` answered or `session_required`) is saved with the
-next batch. The version stays 1: the member is optional, and a record
+(`leash.grant.list` answered or `session_required`) is set only if the
+session is still the one the check started from (an atomic
+compare-and-set, so a grant or an end saved in between is never
+overwritten), and saved with the next batch. The version stays 1: the member is optional, and a record
 without it reads as before. A build older than this member refuses a
 record that has it (strict parsing); no such build was released.
 

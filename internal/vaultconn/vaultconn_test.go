@@ -786,8 +786,8 @@ func TestAccessSavedWithBatch(t *testing.T) {
 	}
 	sp := &accessSpy{v: e.v}
 	o := e.open(func(s Store) Store { sp.Store = s; return sp })
-	if a := o.conn.Access(); a.State != pairing.AccessUnknown {
-		t.Fatalf("after pairing: %+v", a)
+	if a := o.conn.Access(); a.State != pairing.AccessNone {
+		t.Fatalf("after pairing without a first session: %+v", a)
 	}
 	stop := o.run()
 	nextEvent(t, o, "device.session.granted")
@@ -848,7 +848,7 @@ func TestAccessCrashBeforeSave(t *testing.T) {
 	stop := o.run()
 	eventually(t, "a failed save", func() bool { return fs.failures() >= 1 })
 	stop()
-	if rec, _ := e.saved(); rec.Access.State != pairing.AccessUnknown {
+	if rec, _ := e.saved(); rec.Access.State != pairing.AccessNone {
 		t.Fatal("the failed save reached the file")
 	}
 	sp := &accessSpy{v: e.v}
@@ -858,17 +858,26 @@ func TestAccessCrashBeforeSave(t *testing.T) {
 	eventually(t, "the grant saved on the second run", func() bool { return sp.has("active/sess-3/") })
 }
 
-// TestSetAccessSavedWithNextBatch: what internal/access learns from a
+// TestCompareAndSetAccessSaved: what internal/access learns from a
 // probe is saved with the next batch.
-func TestSetAccessSavedWithNextBatch(t *testing.T) {
+func TestCompareAndSetAccessSaved(t *testing.T) {
 	e := newPaired(t)
 	sp := &accessSpy{v: e.v}
 	o := e.open(func(s Store) Store { sp.Store = s; return sp })
-	o.conn.SetAccess(pairing.Access{State: pairing.AccessNone})
-	o.conn.SetAccess(pairing.Access{State: "bogus"}) // ignored
+	cur := o.conn.Access() // none: paired without a first session
+	probed := pairing.Access{State: pairing.AccessActive}
+	if o.conn.CompareAndSetAccess(pairing.Access{State: pairing.AccessActive, SessionID: "x"}, probed) {
+		t.Fatal("set although the session was not the one compared")
+	}
+	if o.conn.CompareAndSetAccess(cur, pairing.Access{State: "bogus"}) {
+		t.Fatal("set an invalid value")
+	}
+	if !o.conn.CompareAndSetAccess(cur, probed) {
+		t.Fatal("not set")
+	}
 	stop := o.run()
 	defer stop()
-	eventually(t, "saved", func() bool { return sp.has("none//") })
+	eventually(t, "saved", func() bool { return sp.has("active//") })
 }
 
 func TestParseGranted(t *testing.T) {
@@ -910,5 +919,29 @@ func TestOnStatus(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("no OnStatus")
+	}
+}
+
+// TestGrantedThenEndedOneBatch: a grant and the end of that session in
+// one batch save none, and the grant is never saved on its own.
+func TestGrantedThenEndedOneBatch(t *testing.T) {
+	e := newPaired(t)
+	if _, err := e.v.SendEvent("device.session.granted", granted("sess-4", time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.v.SendEvent("device.session.ended", []byte(`{"reason":"ended"}`)); err != nil {
+		t.Fatal(err)
+	}
+	sp := &accessSpy{v: e.v}
+	o := e.open(func(s Store) Store { sp.Store = s; return sp })
+	stop := o.run()
+	nextEvent(t, o, "device.session.ended")
+	eventually(t, "the batch acknowledged", func() bool { return e.v.Pending() == 0 })
+	stop()
+	if sp.has("active/sess-4/") {
+		t.Errorf("the grant was saved on its own: %v", sp.saves)
+	}
+	if rec, _ := e.saved(); rec.Access.State != pairing.AccessNone {
+		t.Errorf("saved %+v", rec.Access)
 	}
 }

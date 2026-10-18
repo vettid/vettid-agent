@@ -8,7 +8,7 @@ tests passing (AGENT-PLAN §5, §10 risk 2).
 
 | Module | Version in `go.mod` | Commit | Date (UTC) |
 |---|---|---|---|
-| `github.com/vettid/vettid-vault` | `v0.0.0-20261018021545-271f3e23c033` | `271f3e23c0331d5fcd33c3bcb6fb2fc579a4911d` (`main`, "client: Config.Persist, save before acknowledging a collected batch", #111) | 2026-10-18 02:15:45 |
+| `github.com/vettid/vettid-vault` | `v0.0.0-20261018030705-f75ea0b945b7` | `f75ea0b945b7a665a1edf676c1b70e67ac42ff75` (`main`, "client: Paired, device.paired's fields kept in the state", #113) | 2026-10-18 03:07:05 |
 | `github.com/vettid/vettid-relay` (the version vettid-vault requires; imported directly since A2.1) | `v0.0.0-20261015153542-cc3ce892f9dc` | `cc3ce892f9dcb990e9e9752f19c3e0e296dd12b9` (`main`, RELAY-PROTOCOL 0.9.4 byte budgets, #14) | 2026-10-15 15:35:42 |
 
 Other direct dependencies are ordinary tagged releases chosen in the PR
@@ -30,8 +30,12 @@ job); it is not linked into the binary.
   access-session prompts (AV6). The vault's vectors used here are
   unchanged between the two commits (same sha256). The module has no
   tags, so the dependency is a pseudo-version of a `main` commit.
+- **vettid-vault `f75ea0b`** (A2 follow-ups) adds `(*Device).Paired()`:
+  `device.paired`'s fields kept in the client state, among them the end
+  of the first access session (`SessionExpiresAt`), which pairing now
+  records. The vectors used here are unchanged (same sha256).
 - **vettid-relay `cc3ce89`** is not chosen here: it is the version
-  vettid-vault `271f3e2` requires in its own `go.mod` (the relay client
+  vettid-vault `f75ea0b` requires in its own `go.mod` (the relay client
   and token packages its `client` imports), and Go's minimal version
   selection keeps it. It is recorded so that a relay change reaching the
   connector is visible in review.

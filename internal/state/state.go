@@ -753,6 +753,10 @@ func notPrivate(what, check string) error {
 	return fmt.Errorf("%w: %s %s", ErrNotOwnerOnly, what, check)
 }
 
+// readOnlyAttempts bounds ReadOnly's reads of a file replaced while it
+// was opened.
+const readOnlyAttempts = 5
+
 // View is a read-only look at a state directory (ReadOnly).
 type View struct {
 	// State is the decrypted state; the caller clears it when done.
@@ -782,7 +786,18 @@ func ReadOnly(dir string, resolve Resolver) (*View, error) {
 	if err := checkDir(dir); err != nil {
 		return nil, err
 	}
-	raw, err := readNoFollow(filepath.Join(dir, StateFileName), maxFileLen, true)
+	// A save by the lock holder can rename a new file over the one just
+	// opened, which then has no link left and fails the one-link check;
+	// read again. A file that keeps failing (another link) is refused.
+	var raw []byte
+	var err error
+	for attempt := 0; ; attempt++ {
+		raw, err = readNoFollow(filepath.Join(dir, StateFileName), maxFileLen, true)
+		if err == nil || !errors.Is(err, ErrNotOwnerOnly) || attempt == readOnlyAttempts-1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err != nil {
 		return nil, err
 	}

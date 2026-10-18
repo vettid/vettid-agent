@@ -33,6 +33,9 @@ const (
 	textResumeStdin = "Standard input is not read: an unfinished pairing is resumed instead. To start a new pairing, give the code as an argument or add --restart."
 	// textResumePassphrase is shown on a resume with --passphrase.
 	textResumePassphrase = "--passphrase is ignored: the resumed pairing keeps the protection it started with."
+	// textMaybeReplaced is shown when replacing what the state directory
+	// held failed part of the way.
+	textMaybeReplaced = "Replacing the earlier state in this state directory failed part of the way; it may be gone. Check with `vettid-agent status`."
 	// textKept is shown when a new pairing failed before replacing what
 	// the state directory held.
 	textKept = "The earlier state in this state directory was kept."

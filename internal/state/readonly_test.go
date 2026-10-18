@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -52,5 +53,48 @@ func TestReadOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(t.TempDir(), "absent")); !os.IsNotExist(err) {
 		t.Error("ReadOnly created a directory")
+	}
+}
+
+// TestReadOnlyDuringWrites: reads while the lock holder keeps saving
+// (each save a rename over the file) always see one whole state, never
+// a torn or missing one.
+func TestReadOnlyDuringWrites(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(bytes.Repeat([]byte{7}, 32))
+	if err := s.Create(p, []byte(`{"n":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		for i := 1; i <= 200; i++ {
+			if err := s.Save([]byte(fmt.Sprintf(`{"n":%d}`, i))); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	reads := 0
+	for {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("save: %v", err)
+			}
+			if reads == 0 {
+				t.Fatal("no read happened during the writes")
+			}
+			return
+		default:
+		}
+		v, err := ReadOnly(s.Dir(), func(string) Protector { return p })
+		if err != nil {
+			t.Fatalf("read %d during writes: %v", reads, err)
+		}
+		if !bytes.HasPrefix(v.State, []byte(`{"n":`)) {
+			t.Fatalf("read %d: %q", reads, v.State)
+		}
+		reads++
 	}
 }
