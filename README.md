@@ -98,6 +98,20 @@ the unfinished pairing. A state directory that holds a completed
 pairing is not paired again unless you add `--restart` (then remove the
 old pairing on your phone).
 
+The connector gives up at the end of its 10 minutes, measured from just
+before it creates its keys, so it stops no later than your vault. If
+you approve on the phone in the seconds after the connector gave up,
+the phone lists an agent whose keys no longer exist: unlink it in
+Devices & agents. The same applies if the connector reports that it
+could not save its keys after your approval.
+
+Codes are accepted only for relays reached over HTTPS, and the relay
+named in the code must be the vault's relay recorded in the invitation
+the code commits to; a code whose relay was changed is refused before
+its six-digit code is shown. Builds with the `devstack` tag (for
+vettid-vault's local dev stack, never a release) also accept a
+plain-HTTP relay on a loopback address.
+
 ## Keys at rest on Linux: the TPM
 
 On Linux the connector seals its state file's key to the computer's TPM

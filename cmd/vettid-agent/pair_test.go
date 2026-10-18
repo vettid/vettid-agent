@@ -38,9 +38,10 @@ func (cmdTestProtector) Wipe() error { return nil }
 
 // withTestPairing replaces the protector (the platform's is tested in
 // internal/protect) and standard input for one test.
-func withTestPairing(t *testing.T, stdin string) {
+func withTestPairing(t *testing.T, v *pairtest.Vault, stdin string) {
 	t.Helper()
 	pairOptions = func(o *pairing.Options) {
+		o.HTTP = v.HTTPClient()
 		o.Protector = func() (state.Protector, string, error) { return cmdTestProtector{}, "", nil }
 		o.Resolve = func(string) state.Protector { return cmdTestProtector{} }
 		o.PollWait = 10 * time.Millisecond
@@ -78,7 +79,7 @@ func TestPairCommand(t *testing.T) {
 		} else {
 			args = append(args, code)
 		}
-		withTestPairing(t, stdin)
+		withTestPairing(t, v, stdin)
 		var out, errOut bytes.Buffer
 		if rc := run(args, &out, &errOut); rc != 0 {
 			t.Fatalf("stdin %v: exit %d\n%s", viaStdin, rc, errOut.String())
@@ -104,7 +105,7 @@ func TestPairCommand(t *testing.T) {
 		}
 		// Again: already paired.
 		var errOut2 bytes.Buffer
-		withTestPairing(t, "")
+		withTestPairing(t, v, "")
 		if rc := run([]string{"pair", "--state-dir", dir, code}, &bytes.Buffer{}, &errOut2); rc != 1 || !strings.Contains(errOut2.String(), "already paired") {
 			t.Errorf("second pair: exit %d: %s", rc, errOut2.String())
 		}

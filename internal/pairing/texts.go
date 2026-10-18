@@ -27,7 +27,15 @@ const (
 	textContacting = "Contacting your vault…"
 	// textResume is shown when an interrupted wait is resumed; %s is the
 	// time the wait ends.
-	textResume = "Resuming the pairing started earlier on this computer; the wait ends at %s. Approve on your phone only if it shows the code this computer showed when the pairing started."
+	textResume = "Resuming the pairing started earlier on this computer; the wait ends at %s. Approve on your phone only if it shows the code this computer showed when the pairing started. If you are not sure a code was shown here, reject the pairing on your phone and start again."
+	// textResumeStdin is shown on a resume when standard input may hold
+	// a code.
+	textResumeStdin = "Standard input is not read: an unfinished pairing is resumed instead. To start a new pairing, give the code as an argument or add --restart."
+	// textResumePassphrase is shown on a resume with --passphrase.
+	textResumePassphrase = "--passphrase is ignored: the resumed pairing keeps the protection it started with."
+	// textKept is shown when a new pairing failed before replacing what
+	// the state directory held.
+	textKept = "The earlier state in this state directory was kept."
 	// textInterrupted is shown when the operator interrupts the wait
 	// after the SAS was shown; %s is the time the wait ends.
 	textInterrupted = "Pairing interrupted. To keep waiting, run `vettid-agent pair` again (without a code) before %s; to start over, get a new code from your phone."
@@ -36,6 +44,9 @@ const (
 	textInterruptedEarly = "Pairing interrupted before a code to compare was shown; nothing was kept. Start again from your phone."
 	// textDiscarded is shown when an unfinished pairing is discarded.
 	textDiscarded = "An unfinished pairing on this computer was discarded; its keys are deleted."
-	// textReplaced is shown when --restart replaces a completed pairing.
-	textReplaced = "This replaces the existing pairing; the old one stays listed on your phone until you remove it there."
+	// textDiscardedUnreadable is shown when --restart discarded a state
+	// file that did not open.
+	textDiscardedUnreadable = "The state file that could not be opened was discarded."
+	// textReplaced is shown when --restart replaced a completed pairing.
+	textReplaced = "The existing pairing on this computer was replaced; the old one stays listed on your phone until you remove it there."
 )

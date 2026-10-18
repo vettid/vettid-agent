@@ -55,6 +55,12 @@ type Options struct {
 	// CodeGiven: the operator gave a code on the command line, so an
 	// interrupted pairing is discarded instead of resumed.
 	CodeGiven bool
+	// CodeOnStdin: standard input is not a terminal, so it may hold a
+	// code; a resume says that it is not read.
+	CodeOnStdin bool
+	// PassphraseChosen: the operator gave --passphrase; a resume says
+	// that it does not change the saved pairing's protector.
+	PassphraseChosen bool
 	// Restart discards whatever the state directory holds, including a
 	// completed pairing or a state file that does not open.
 	Restart bool
@@ -79,6 +85,9 @@ var (
 	// ErrInterrupted: the operator interrupted Pair. The error's text
 	// says whether the pairing can be resumed.
 	ErrInterrupted = errors.New("pairing interrupted")
+	// ErrRelayMismatch: the code's relay is not the vault's relay in the
+	// bundle the code commits to.
+	ErrRelayMismatch = errors.New("the relay named in the pairing code is not your vault's relay (the code was altered); nothing was kept. Start again from your phone, and copy the code directly")
 	// ErrAlreadyPaired: the state directory holds a completed pairing.
 	ErrAlreadyPaired = errors.New("this connector is already paired with a vault (this state directory holds its keys); to pair this state directory again, run `vettid-agent pair --restart`, and remove the old pairing on your phone")
 )
@@ -102,7 +111,8 @@ func DefaultName() string {
 
 // CheckName checks an operator's name for the connector (chosen; not in
 // the spec): 1 to MaxNameBytes bytes of UTF-8, no control characters,
-// no leading or trailing space.
+// no format characters (Unicode category Cf: direction overrides,
+// zero-width characters), no leading or trailing space.
 func CheckName(name string) error {
 	switch {
 	case name == "":
@@ -115,8 +125,11 @@ func CheckName(name string) error {
 		return errors.New("the name starts or ends with white space")
 	}
 	for _, r := range name {
-		if unicode.IsControl(r) || r == ' ' || r == ' ' {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' {
 			return errors.New("the name contains a control character")
+		}
+		if unicode.Is(unicode.Cf, r) {
+			return errors.New("the name contains an invisible formatting character (such as a direction override)")
 		}
 	}
 	return nil
@@ -146,12 +159,33 @@ func FormatSAS(sas string) (string, error) {
 	return sas[:3] + " " + sas[3:], nil
 }
 
+// store is what Pair uses of *state.Store; tests wrap it to inject
+// failures.
+type store interface {
+	Exists() (bool, error)
+	Load(state.Resolver) ([]byte, error)
+	Create(state.Protector, []byte) error
+	CreateReplace(state.Protector, []byte, state.Resolver) error
+	Save([]byte) error
+	Wipe(state.Resolver) error
+	WipeAll([]state.Protector) error
+	Dir() string
+}
+
+// wrapStore is the identity outside tests.
+var wrapStore = func(s store) store { return s }
+
 // run is one Pair call.
 type run struct {
-	o       Options
-	prot    state.Protector // the new pairing's protector
-	created bool            // the state file now holds this run's record
-	replace bool            // a state file exists and is replaced at the first write
+	o  Options
+	st store
+	// replacing says what the first write replaces ("unfinished",
+	// "paired" or "unreadable"); replaced is set once it did.
+	replacing string
+	replaced  bool
+	prot      state.Protector // the new pairing's protector
+	created   bool            // the state file now holds this run's record
+	replace   bool            // a state file exists and is replaced at the first write
 }
 
 // Pair runs `vettid-agent pair` (AGENT-PLAN §4.3):
@@ -183,8 +217,8 @@ func Pair(ctx context.Context, o Options) error {
 	if err := CheckName(o.Name); err != nil {
 		return err
 	}
-	r := &run{o: o}
-	exists, err := o.Store.Exists()
+	r := &run{o: o, st: wrapStore(o.Store)}
+	exists, err := r.st.Exists()
 	if err != nil {
 		return err
 	}
@@ -197,14 +231,20 @@ func Pair(ctx context.Context, o Options) error {
 			return r.resume(ctx, rec)
 		}
 	}
-	return r.pairNew(ctx)
+	err = r.pairNew(ctx)
+	if err != nil && r.replace && !r.replaced {
+		// The new pairing failed before its first write: whatever the
+		// state directory held is still there.
+		fmt.Fprintln(o.Out, textKept)
+	}
+	return err
 }
 
 // loadExisting looks at an existing state file. It returns a record to
 // resume, nil to start a new pairing over it, or an error.
 func (r *run) loadExisting() (*Record, error) {
 	o := r.o
-	raw, err := o.Store.Load(o.Resolve)
+	raw, err := r.st.Load(o.Resolve)
 	var rec *Record
 	if err == nil {
 		rec, err = DecodeRecord(raw)
@@ -217,9 +257,9 @@ func (r *run) loadExisting() (*Record, error) {
 	}
 	if err != nil {
 		if !o.Restart {
-			return nil, fmt.Errorf("the state directory %s holds a state file that cannot be opened (%w); to discard it and pair again, run `vettid-agent pair --restart`", o.Store.Dir(), err)
+			return nil, fmt.Errorf("the state directory %s holds a state file that cannot be opened (%w); to discard it and pair again, run `vettid-agent pair --restart`", r.st.Dir(), err)
 		}
-		r.replace = true
+		r.replace, r.replacing = true, "unreadable"
 		return nil, nil
 	}
 	r.replace = true
@@ -227,19 +267,19 @@ func (r *run) loadExisting() (*Record, error) {
 	case rec.Phase == PhasePaired && !o.Restart:
 		return nil, ErrAlreadyPaired
 	case rec.Phase == PhasePaired:
-		fmt.Fprintln(o.Out, textReplaced)
+		r.replacing = "paired"
 		return nil, nil
 	case rec.Phase == PhaseWaiting && !o.Restart && !o.CodeGiven:
 		if o.Now().Before(rec.Deadline) {
 			return rec, nil
 		}
 		// The wait ended while nothing ran.
-		if err := o.Store.Wipe(o.Resolve); err != nil {
+		if err := r.st.Wipe(o.Resolve); err != nil {
 			return nil, fmt.Errorf("%s The unfinished pairing could not be deleted (%w); it is discarded at the next pairing.", TextExpired, err)
 		}
 		return nil, ErrExpired
 	default:
-		fmt.Fprintln(o.Out, textDiscarded)
+		r.replacing = "unfinished"
 		return nil, nil
 	}
 }
@@ -259,6 +299,12 @@ func (r *run) resume(ctx context.Context, rec *Record) error {
 	}
 	r.created = true
 	fmt.Fprintf(o.Out, textResume+"\n", rec.Deadline.Local().Format("15:04"))
+	if o.CodeOnStdin {
+		fmt.Fprintln(o.Out, textResumeStdin)
+	}
+	if o.PassphraseChosen {
+		fmt.Fprintln(o.Out, textResumePassphrase)
+	}
 	fmt.Fprintln(o.Out, TextWaiting)
 	return r.wait(ctx, d, rec)
 }
@@ -300,11 +346,22 @@ func (r *run) pairNew(ctx context.Context) error {
 		return r.pairError(ctx, wctx, code, err)
 	}
 	if err := r.save(d, rec); err != nil {
-		return err
+		// Also a write that is in place but not durable: nothing of
+		// this pairing is kept.
+		return r.failWipe(err)
 	}
 	sas, err := d.Pair(wctx, code.Link)
 	if err != nil {
 		return r.failWipe(r.pairError(ctx, wctx, code, err))
+	}
+	// The device's own mailbox is on the code's `r`; the vault's relay
+	// is the one in the bundle the code's hash commits to. The vault
+	// writes the same URL into both, so a difference means `r` was
+	// altered (the handshake and the SAS would still be genuine), and the
+	// connector would keep its mailbox on another relay (AGENT-PLAN
+	// §4.7). Checked before anything is saved as waiting or shown.
+	if vurl, _ := d.VaultMailbox(); vurl == "" || strings.TrimRight(vurl, "/") != strings.TrimRight(code.Relay, "/") {
+		return r.failWipe(ErrRelayMismatch)
 	}
 	shown, err := FormatSAS(sas)
 	if err != nil {
@@ -336,7 +393,9 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 				fmt.Fprintf(o.Out, "Warning: the state file is in place but could not be flushed to disk (%v); it may not survive a power loss.\n", err)
 				return nil
 			}
-			return fmt.Errorf("your phone approved this agent, but its keys could not be saved (%w); remove the agent on your phone and pair again", err)
+			// A `waiting` file left behind would be resumed for an
+			// approval that already came: delete it.
+			return r.failWipe(fmt.Errorf("your phone approved this agent, but its keys could not be saved (%w), so this computer cannot use the pairing; its unfinished state is deleted. Unlink the agent on your phone (Devices & agents) and pair again", err))
 		}
 		fmt.Fprintln(o.Out, TextPaired)
 		return nil
@@ -369,7 +428,7 @@ func (r *run) save(d *client.Device, rec *Record) error {
 	defer clear(b)
 	err = r.write(b)
 	if errors.Is(err, state.ErrNotDurable) {
-		err = r.o.Store.Save(b)
+		err = r.st.Save(b)
 	}
 	if err != nil && !errors.Is(err, state.ErrNotDurable) {
 		return fmt.Errorf("the pairing state could not be saved: %w", err)
@@ -380,21 +439,33 @@ func (r *run) save(d *client.Device, rec *Record) error {
 func (r *run) write(b []byte) error {
 	o := r.o
 	if r.created {
-		return o.Store.Save(b)
+		return r.st.Save(b)
 	}
 	var err error
 	if r.replace {
-		err = o.Store.CreateReplace(r.prot, b, o.Resolve)
+		err = r.st.CreateReplace(r.prot, b, o.Resolve)
 		if errors.Is(err, state.ErrProtectorUnknown) && o.Restart {
-			if err = o.Store.WipeAll(o.AllProtectors); err == nil {
-				err = o.Store.Create(r.prot, b)
+			if err = r.st.WipeAll(o.AllProtectors); err == nil {
+				err = r.st.Create(r.prot, b)
 			}
 		}
 	} else {
-		err = o.Store.Create(r.prot, b)
+		err = r.st.Create(r.prot, b)
 	}
 	if err == nil || errors.Is(err, state.ErrNotDurable) {
 		r.created = true
+		if r.replace && !r.replaced {
+			// Said only now that the old state is gone.
+			r.replaced = true
+			switch r.replacing {
+			case "paired":
+				fmt.Fprintln(o.Out, textReplaced)
+			case "unreadable":
+				fmt.Fprintln(o.Out, textDiscardedUnreadable)
+			default:
+				fmt.Fprintln(o.Out, textDiscarded)
+			}
+		}
 	}
 	return err
 }
@@ -406,7 +477,7 @@ func (r *run) failWipe(err error) error {
 	if !r.created {
 		return err
 	}
-	if werr := r.o.Store.Wipe(r.o.Resolve); werr != nil && !errors.Is(werr, state.ErrNothingToWipe) {
+	if werr := r.st.Wipe(r.o.Resolve); werr != nil && !errors.Is(werr, state.ErrNothingToWipe) {
 		return fmt.Errorf("%w\nThe unfinished pairing's state could not be deleted (%v); it is discarded at the next pairing.", err, werr)
 	}
 	r.created = false
@@ -428,11 +499,41 @@ func (r *run) pairError(ctx, wctx context.Context, code *Code, err error) error 
 		return errors.New("the invitation behind this pairing code could not be opened (the code was mistyped or altered); start again from your phone")
 	case errors.As(err, &re) && re.Status == http.StatusNotFound:
 		return errors.New("the pairing code was already used or has expired; start again from your phone")
+	case errors.As(err, &re):
+		// Only the status and a cleaned error code: the relay's own text
+		// is not shown, so a relay cannot write lines to the terminal.
+		return fmt.Errorf("your vault's relay refused the request (HTTP %d, %s); start again from your phone", re.Status, sanitize(redact(re.Code, code.secrets()...)))
 	case errors.Is(err, client.ErrProtocol):
 		return errors.New("the handshake with your vault failed; start again from your phone")
 	default:
-		return fmt.Errorf("could not pair through your vault's relay: %s", redact(err.Error(), code.secrets()...))
+		return fmt.Errorf("could not pair through your vault's relay: %s", sanitize(redact(err.Error(), code.secrets()...)))
 	}
+}
+
+// maxShownError is the most of a foreign error text shown, in bytes.
+const maxShownError = 200
+
+// sanitize makes text from outside (a relay) safe to show on one
+// terminal line: control characters (escape sequences, line breaks),
+// Unicode format characters (bidirectional overrides) and line or
+// paragraph separators are dropped, invalid UTF-8 is replaced, and the
+// result is cut to maxShownError bytes. An empty result is "-".
+func sanitize(s string) string {
+	var b strings.Builder
+	for _, c := range strings.ToValidUTF8(s, "?") {
+		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == '\u2028' || c == '\u2029' {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(c) > maxShownError {
+			b.WriteString("…")
+			break
+		}
+		b.WriteRune(c)
+	}
+	if b.Len() == 0 {
+		return "-"
+	}
+	return b.String()
 }
 
 // deadlineCtx returns a context that ends at deadline, measured on the

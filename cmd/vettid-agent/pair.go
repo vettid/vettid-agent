@@ -111,9 +111,13 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 		Protector:     prot.New,
 		Code:          code,
 		CodeGiven:     fs.NArg() == 1,
-		Restart:       *restart,
-		Name:          *name,
-		Out:           stderr,
+		// A resume does not read standard input; say so when it may
+		// hold a code.
+		CodeOnStdin:      fs.NArg() == 0 && !codeInTerminal(),
+		PassphraseChosen: *usePass,
+		Restart:          *restart,
+		Name:             *name,
+		Out:              stderr,
 	}
 	if pairOptions != nil {
 		pairOptions(&o)

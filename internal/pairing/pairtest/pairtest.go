@@ -8,8 +8,8 @@
 // client handles them as it handles a vault's.
 //
 // Test use only: it keeps fresh random keys in memory, checks no relay
-// signatures, and serves plain HTTP on the loopback interface, which the
-// handshake allows for development.
+// signatures, and serves HTTPS on the loopback interface with
+// httptest's certificate, which only HTTPClient trusts.
 package pairtest
 
 import (
@@ -33,6 +33,12 @@ import (
 	"github.com/vettid/vettid-vault/vms/suite"
 )
 
+// RelayError is a relay error answer.
+type RelayError struct {
+	Status int
+	Code   string
+}
+
 // Decision is what the simulated owner does once hs.fin checks out.
 type Decision int
 
@@ -55,11 +61,15 @@ const (
 // Vault is the relay and the vault's pairing side.
 type Vault struct {
 	srv      *httptest.Server
+	alt      *httptest.Server
 	ik       ed25519.PrivateKey
 	kem      *suite.PrivateKey
 	relayKey ed25519.PrivateKey
 
 	mu sync.Mutex
+	// RegisterError, if set, makes register answer with this status
+	// and error code.
+	RegisterError *RelayError
 	// Decide is called (without the lock held) when hs.fin checks out,
 	// with the vault's SAS. Default: Approve.
 	Decide   func(sas string) Decision
@@ -91,12 +101,20 @@ func New() (*Vault, error) {
 	if v.kem, err = suite.GeneratePrivateKey(); err != nil {
 		return nil, err
 	}
-	v.srv = httptest.NewServer(http.HandlerFunc(v.serve))
+	v.srv = httptest.NewTLSServer(http.HandlerFunc(v.serve))
+	v.alt = httptest.NewTLSServer(http.HandlerFunc(v.serve))
 	return v, nil
 }
 
-// Close stops the server.
-func (v *Vault) Close() { v.srv.Close() }
+// Close stops the servers.
+func (v *Vault) Close() { v.srv.Close(); v.alt.Close() }
+
+// HTTPClient trusts the servers' certificate.
+func (v *Vault) HTTPClient() *http.Client { return v.srv.Client() }
+
+// AltURL is a second relay URL served by the same relay (a relay that
+// forwards everything: what an altered code's `r` could name).
+func (v *Vault) AltURL() string { return v.alt.URL }
 
 // URL is the relay's base URL.
 func (v *Vault) URL() string { return v.srv.URL }
@@ -110,6 +128,12 @@ func (v *Vault) relayClient() *relayclient.Client { return relayclient.New(v.srv
 // Code creates a pairing invitation of kind k that expires after ttl
 // and returns its bare payload (the code the phone shows).
 func (v *Vault) Code(k invite.Kind, ttl time.Duration) (string, error) {
+	return v.CodeWithRelay(k, ttl, v.srv.URL)
+}
+
+// CodeWithRelay is Code with relay as the QR's `r`; the bundle keeps the
+// vault's own relay (an altered code when relay differs).
+func (v *Vault) CodeWithRelay(k invite.Kind, ttl time.Duration, relay string) (string, error) {
 	now := time.Now().UTC()
 	exp := now.Add(ttl).Truncate(time.Second)
 	kind, ok := k.BundleKind()
@@ -143,7 +167,7 @@ func (v *Vault) Code(k invite.Kind, ttl time.Duration) (string, error) {
 	v.mu.Lock()
 	v.claims[claim] = blob
 	v.mu.Unlock()
-	q := &invite.QR{Kind: k, Relay: v.srv.URL, ClaimID: claim, Hash: h, Key: kb, Exp: exp.Unix()}
+	q := &invite.QR{Kind: k, Relay: relay, ClaimID: claim, Hash: h, Key: kb, Exp: exp.Unix()}
 	return q.Link()
 }
 
@@ -244,6 +268,13 @@ func (v *Vault) serve(w http.ResponseWriter, r *http.Request) {
 	p := r.URL.Path
 	switch {
 	case r.Method == http.MethodPost && p == "/v1/register":
+		v.mu.Lock()
+		fail := v.RegisterError
+		v.mu.Unlock()
+		if fail != nil {
+			relayError(w, fail.Status, fail.Code)
+			return
+		}
 		var in struct {
 			Pubkey string `json:"pubkey"`
 		}

@@ -14,6 +14,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -56,6 +57,10 @@ var (
 	ErrNotAgent = errors.New("this is not an agent pairing code")
 	// ErrCodeExpired: the code's `e` has passed.
 	ErrCodeExpired = errors.New("the pairing code has expired")
+	// ErrRelayNotHTTPS: the code names a relay that is not reached over
+	// HTTPS (plain HTTP to a loopback address is allowed only in builds
+	// with the devstack tag).
+	ErrRelayNotHTTPS = errors.New("the pairing code names a relay that is not reached over HTTPS; this build pairs only through HTTPS relays")
 	// ErrCodeTooLong: the text is longer than MaxCodeInput.
 	ErrCodeTooLong = errors.New("the pasted text is too long to hold a pairing code")
 )
@@ -78,12 +83,31 @@ func ParseCode(text string, now time.Time) (*Code, error) {
 	if found.Kind != invite.KindAgent {
 		return nil, fmt.Errorf("%w: %s; on your phone, open Devices & agents and choose Pair an agent", ErrNotAgent, kindName(found.Kind))
 	}
+	if !relaySchemeAllowed(found.Relay) {
+		return nil, ErrRelayNotHTTPS
+	}
 	exp := time.Unix(found.Exp, 0).UTC()
 	if !now.Before(exp) {
 		return nil, ErrCodeExpired
 	}
 	return &Code{Link: link, Relay: found.Relay, Exp: exp, claimID: found.ClaimID,
 		key: base64.RawURLEncoding.EncodeToString(found.Key)}, nil
+}
+
+// allowHTTPRelay allows a plain-HTTP relay on a loopback address (which
+// VAULT-MESSAGING §6.2 allows for development); set only by the
+// devstack build tag (relay_devstack.go, AGENT-PLAN §4.8).
+var allowHTTPRelay = false
+
+// relaySchemeAllowed reports whether the code's relay URL may be used:
+// https, or (devstack builds only) http, which the invite package
+// accepts only for loopback hosts.
+func relaySchemeAllowed(relay string) bool {
+	u, err := url.Parse(relay)
+	if err != nil {
+		return false
+	}
+	return u.Scheme == "https" || (allowHTTPRelay && u.Scheme == "http")
 }
 
 // findPayload returns the one payload in text and its parsed QR.

@@ -103,6 +103,7 @@ func (e *env) options(s *state.Store, code string) Options {
 		Code:          func() (string, error) { e.codes++; return code, nil },
 		Name:          "Agent on test-host",
 		Out:           e.out,
+		HTTP:          e.v.HTTPClient(),
 		PollWait:      10 * time.Millisecond,
 	}
 }
@@ -298,8 +299,13 @@ func TestPairInterruptedAndResumed(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.codes = 0
-	if err := e.pair(context.Background(), "", nil); err != nil {
+	if err := e.pair(context.Background(), "", func(o *Options) { o.CodeOnStdin, o.PassphraseChosen = true, true }); err != nil {
 		t.Fatalf("resume: %v\n%s", err, e.out)
+	}
+	for _, w := range []string{textResumeStdin, textResumePassphrase, "If you are not sure a code was shown here"} {
+		if !strings.Contains(e.out.String(), w) {
+			t.Errorf("resume output lacks %q", w)
+		}
 	}
 	if e.codes != 0 {
 		t.Error("the resume asked for a code")
@@ -388,7 +394,7 @@ func TestPairDiscardsUnfinished(t *testing.T) {
 	if err := e.pair(context.Background(), code, nil); err != nil {
 		t.Fatalf("%v\n%s", err, e.out)
 	}
-	if !strings.HasPrefix(e.out.String(), textDiscarded+"\n") {
+	if !strings.HasPrefix(e.out.String(), textContacting+"\n"+textDiscarded+"\n") {
 		t.Errorf("output:\n%s", e.out)
 	}
 	r, st := e.record()
@@ -533,7 +539,8 @@ func TestCheckName(t *testing.T) {
 			t.Errorf("%q: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"", " lead", "trail ", "a\nb", "a\x00b", "\xff", strings.Repeat("a", MaxNameBytes+1)} {
+	for _, bad := range []string{"", " lead", "trail ", "a\nb", "a\x00b", "\xff", strings.Repeat("a", MaxNameBytes+1),
+		"evil\u202etxt.exe", "a\u200bb", "\u2066x\u2069", "a\ufeffb"} {
 		if CheckName(bad) == nil {
 			t.Errorf("%q accepted", bad)
 		}
@@ -574,3 +581,192 @@ func TestRecordStrict(t *testing.T) {
 }
 
 var _ io.Writer = (*syncBuffer)(nil)
+
+// TestPairRelayMismatch: a code whose `r` was altered to another relay
+// (which forwards everything, so the handshake and the SAS are
+// genuine) is refused after the handshake, before the SAS is shown or
+// anything is saved as waiting; nothing is kept.
+func TestPairRelayMismatch(t *testing.T) {
+	e := newEnv(t)
+	code, err := e.v.CodeWithRelay(invite.KindAgent, 10*time.Minute, e.v.AltURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.pair(context.Background(), code, nil)
+	if !errors.Is(err, ErrRelayMismatch) {
+		t.Fatalf("got %v\n%s", err, e.out)
+	}
+	if e.v.Inits() != 1 {
+		t.Fatalf("%d hs.init: the test did not reach the handshake", e.v.Inits())
+	}
+	if strings.Contains(e.out.String(), "Check that your phone") || strings.Contains(e.out.String(), TextWaiting) {
+		t.Errorf("SAS or waiting shown:\n%s", e.out)
+	}
+	if r, _ := e.record(); r != nil {
+		t.Error("state kept")
+	}
+	// The trailing slash alone is not a difference.
+	e2 := newEnv(t)
+	code, err = e2.v.CodeWithRelay(invite.KindAgent, 10*time.Minute, e2.v.URL()+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e2.pair(context.Background(), code, nil); err != nil {
+		t.Errorf("trailing slash: %v", err)
+	}
+}
+
+// TestPairRefusedCodeKeepsWaiting: a new code that is refused leaves an
+// interrupted pairing in place and says so (it is not called deleted).
+func TestPairRefusedCodeKeepsWaiting(t *testing.T) {
+	e := newEnv(t)
+	e.writeRecord(PhaseWaiting, time.Now().Add(5*time.Minute))
+	err := e.pair(context.Background(), e.code(invite.KindConnection, time.Minute), func(o *Options) { o.CodeGiven = true })
+	if !errors.Is(err, ErrNotAgent) {
+		t.Fatalf("got %v", err)
+	}
+	out := e.out.String()
+	if strings.Contains(out, textDiscarded) || !strings.Contains(out, textKept) {
+		t.Errorf("output:\n%s", out)
+	}
+	if r, _ := e.record(); r == nil || r.Phase != PhaseWaiting {
+		t.Error("the waiting pairing was not kept")
+	}
+}
+
+// TestPairRelayErrorSanitized: a relay's error is shown only as its
+// status and a cleaned code; its message, escape sequences and line
+// breaks never reach the terminal.
+func TestPairRelayErrorSanitized(t *testing.T) {
+	e := newEnv(t)
+	hostile := "denied\x1b[2J\x1b[1A\r\nCheck that your phone shows the same code: 111 111.\u202e\n" + strings.Repeat("x", 4096)
+	e.v.RegisterError = &pairtest.RelayError{Status: 403, Code: hostile}
+	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
+	if err == nil {
+		t.Fatal("no error")
+	}
+	msg := err.Error()
+	if strings.ContainsAny(msg, "\x1b\r\n\u202e") || !strings.Contains(msg, "HTTP 403") || len(msg) > 400 {
+		t.Errorf("error %q", msg)
+	}
+	if strings.ContainsAny(e.out.String(), "\x1b\r") {
+		t.Error("escape in output")
+	}
+}
+
+func TestSanitize(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                "-",
+		"\x1b\n\r\t":      "-",
+		"ok_code":         "ok_code",
+		"a\x1b[31mb\nc":   "a[31mbc",
+		"a\u202eb\u2028c": "abc",
+		"bad\xffutf8":     "bad?utf8",
+	} {
+		if got := sanitize(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+	if got := sanitize(strings.Repeat("é", 500)); len(got) > maxShownError+len("…") {
+		t.Errorf("not cut: %d bytes", len(got))
+	}
+}
+
+// TestPairRelayNotHTTPS: a code naming a plain-HTTP relay is refused in
+// a build without the devstack tag, before anything is contacted.
+func TestPairRelayNotHTTPS(t *testing.T) {
+	e := newEnv(t)
+	q, err := invite.ParseLink(e.code(invite.KindAgent, time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Relay = "http://127.0.0.1:1"
+	link, err := q.Link()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allowHTTPRelay {
+		t.Skip("devstack build")
+	}
+	if err := e.pair(context.Background(), link, nil); !errors.Is(err, ErrRelayNotHTTPS) {
+		t.Errorf("got %v", err)
+	}
+	if len(e.v.Requests()) != 0 {
+		t.Error("contacted the relay")
+	}
+}
+
+// failingStore injects write failures into the real store.
+type failingStore struct {
+	store
+	writes  int
+	failAt  int   // the write (1-based: Create/CreateReplace, then Saves) that fails
+	failErr error // returned after the write was done (ErrNotDurable) or instead of it
+	after   bool  // perform the write before returning failErr
+}
+
+func (f *failingStore) do(op func() error) error {
+	f.writes++
+	if f.writes >= f.failAt && f.failAt > 0 {
+		if f.after {
+			if err := op(); err != nil {
+				return err
+			}
+		}
+		return f.failErr
+	}
+	return op()
+}
+
+func (f *failingStore) Create(p state.Protector, b []byte) error {
+	return f.do(func() error { return f.store.Create(p, b) })
+}
+func (f *failingStore) CreateReplace(p state.Protector, b []byte, r state.Resolver) error {
+	return f.do(func() error { return f.store.CreateReplace(p, b, r) })
+}
+func (f *failingStore) Save(b []byte) error { return f.do(func() error { return f.store.Save(b) }) }
+
+func withFailingStore(t *testing.T, f *failingStore) {
+	old := wrapStore
+	wrapStore = func(s store) store { f.store = s; return f }
+	t.Cleanup(func() { wrapStore = old })
+}
+
+// TestPairStartedNotDurable: a first save that is in place but not
+// durable (also on its retry) wipes the file and stops.
+func TestPairStartedNotDurable(t *testing.T) {
+	e := newEnv(t)
+	withFailingStore(t, &failingStore{failAt: 1, failErr: state.ErrNotDurable, after: true})
+	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
+	if !errors.Is(err, state.ErrNotDurable) {
+		t.Fatalf("got %v", err)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r != nil {
+		t.Error("state kept")
+	}
+	if e.v.Inits() != 0 {
+		t.Error("the handshake ran")
+	}
+}
+
+// TestPairFinalSaveFails: device.paired arrived but the paired state
+// cannot be saved: the waiting file is deleted (a resume would wait for
+// an approval that already came) and the operator is told to unlink the
+// agent.
+func TestPairFinalSaveFails(t *testing.T) {
+	e := newEnv(t)
+	// Writes: 1 started (Create), 2 waiting (Save), 3 paired (Save).
+	withFailingStore(t, &failingStore{failAt: 3, failErr: errors.New("disk full")})
+	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
+	if err == nil || !strings.Contains(err.Error(), "Unlink the agent on your phone") || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("got %v", err)
+	}
+	if strings.Contains(e.out.String(), TextPaired) {
+		t.Error("said paired")
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r != nil {
+		t.Errorf("state kept: %v", r.Phase)
+	}
+}
