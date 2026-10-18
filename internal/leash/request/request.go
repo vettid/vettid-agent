@@ -96,6 +96,8 @@ const (
 	TextTooMany   = "Too many requests are waiting for your vault. Check their status, or try again later."
 	TextProtocol  = "Your vault's answer could not be read."
 	TextStopped   = "The connection to your vault has stopped."
+	// TextSuperseded is chosen (not in the spec).
+	TextSuperseded = "Another copy of this request took its place, so its answer cannot be returned here. Make the request again if you still need it."
 )
 
 // Error is a request's outcome other than a result, with a stable code
@@ -134,6 +136,7 @@ var (
 	ErrProtocol    = &Error{Code: "protocol_error", Text: TextProtocol}
 	ErrStopped     = &Error{Code: "vault_unreachable", Text: TextStopped}
 	ErrRefused     = &Error{Code: "refused", Text: vaultconn.TextRefused}
+	ErrSuperseded  = &Error{Code: "superseded", Text: TextSuperseded}
 )
 
 // Conn is what this package uses of *vaultconn.Conn.
@@ -638,6 +641,15 @@ func (c *Client) run(e *entry) {
 			return
 		case errors.Is(err, vaultconn.ErrStopped):
 			c.finish(e, nil, ErrStopped)
+			return
+		case errors.Is(err, vaultconn.ErrSuperseded):
+			// Another send under this inner id now waits for the answer,
+			// so this copy will never get it; and it was sent, so sending
+			// it again would only supersede that one in turn. This
+			// package never has two copies of one request in flight, so
+			// this is not expected; the request ends.
+			c.log.Warn("agent.request superseded", "op", e.op, "id", e.id)
+			c.finish(e, nil, ErrSuperseded)
 			return
 		case errors.Is(err, errAttemptTimeout):
 		default:

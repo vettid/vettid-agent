@@ -950,3 +950,22 @@ func TestCloseWhileSending(t *testing.T) {
 		t.Error("the request's body was not zeroed")
 	}
 }
+
+// TestSuperseded: a copy that the connection reports superseded (another
+// send under the same inner id took its place) ends the request: it is
+// not taken for a failed send and sent again.
+func TestSuperseded(t *testing.T) {
+	e := newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		if n == 1 {
+			return nil, vaultconn.ErrSuperseded
+		}
+		return ok(itemBody), nil
+	}, nil)
+	if _, err := e.c.Get(context.Background(), itemID, nil); !errors.Is(err, ErrSuperseded) || err.Error() != TextSuperseded {
+		t.Fatalf("Get: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // more than RetryPause
+	if n := len(e.conn.copies()); n != 1 {
+		t.Errorf("%d copies sent", n)
+	}
+}
