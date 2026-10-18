@@ -1,14 +1,15 @@
 package request
 
 import (
+	"encoding/json"
 	"fmt"
 	"log/slog"
 )
 
 // Item values must never reach a log or a formatted string by accident
 // (AGENT-PLAN §4.7). Result, Item, Field and Use therefore format
-// themselves, with every verb (%v, %+v, %#v, %s, %x, …), and log
-// themselves through slog, as a summary: ids, kinds and sizes, never a
+// themselves, with every verb (%v, %+v, %#v, %s, %x, …), log
+// themselves through slog, and marshal themselves to JSON, as a summary: ids, kinds and sizes, never a
 // value, a note or an HMAC. Only the MCP layer reads the values, member
 // by member.
 
@@ -87,4 +88,36 @@ func redacted(b []byte) string {
 		return "absent"
 	}
 	return fmt.Sprintf("[redacted, %d bytes]", len(b))
+}
+
+// MarshalJSON writes the field without its value (value_bytes instead):
+// encoding/json must not print a value either. The MCP layer writes
+// values itself, member by member.
+func (f Field) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		FieldID    string `json:"field_id"`
+		Label      string `json:"label"`
+		Kind       string `json:"kind"`
+		ValueBytes int    `json:"value_bytes"`
+	}{f.FieldID, f.Label, f.Kind, len(f.Value)})
+}
+
+// MarshalJSON writes the item without its name, values and notes (as
+// String).
+func (it Item) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ItemID     string  `json:"item_id"`
+		Category   string  `json:"category"`
+		Fields     []Field `json:"fields"`
+		NotesBytes int     `json:"notes_bytes"`
+	}{it.ItemID, it.Category, it.Fields, len(it.Notes)})
+}
+
+// MarshalJSON writes the use without its HMAC.
+func (u Use) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ItemID  string `json:"item_id"`
+		FieldID string `json:"field_id"`
+		Action  string `json:"action"`
+	}{u.ItemID, u.FieldID, u.Action})
 }

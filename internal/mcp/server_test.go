@@ -2,8 +2,12 @@ package mcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -28,8 +32,13 @@ func TestSecretWiped(t *testing.T) {
 	if isErr || sc["result"] != "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=" {
 		t.Fatalf("result: %v", sc)
 	}
-	s.send(`{"jsonrpc":"2.0","id":3,"method":"ping"}`)
-	s.recv() // the tool calls' goroutines have wiped by now: ping is answered after
+	// End the session: Serve returns only after every tool call's
+	// goroutine has ended, and each wipes before it ends.
+	s.in.Close()
+	if err := <-s.done; err != nil {
+		t.Fatal(err)
+	}
+	s.done <- nil // for the cleanup
 	s.writes.mu.Lock()
 	defer s.writes.mu.Unlock()
 	found := 0
@@ -197,7 +206,7 @@ func TestArguments(t *testing.T) {
 	s := newSession(t, f, nil)
 	s.init()
 	s.toolCall(1, ToolRequestSecret, `{"item_id":"`+testItem+`","fields":["password","username"]}`)
-	s.toolCall(2, ToolRequestSecret, `{"item_id":"`+testItem+`","fields":null}`)
+	s.toolCall(2, ToolRequestSecret, `{"item_id":"`+testItem+`"}`)
 	s.toolCall(3, ToolExecuteAction, `{"item_id":"`+testItem+`","field_id":"password","data":"aGk=","data_encoding":"base64"}`)
 	s.toolCall(4, ToolExecuteAction, `{"item_id":"`+testItem+`","field_id":"password","data":"aGk=","data_encoding":"text"}`)
 	s.toolCall(5, ToolCheckStatus, `{"request_id":"`+testRequest+`"}`)
@@ -215,6 +224,12 @@ func TestArguments(t *testing.T) {
 		{ToolExecuteAction, `{"item_id":"` + testItem + `","field_id":"password"}`},
 		{ToolExecuteAction, `{"item_id":"` + testItem + `","field_id":"password","data":"x","data_encoding":"hex"}`},
 		{ToolCheckStatus, `{}`},
+		{ToolRequestSecret, `{"item_id":"` + testItem + `","fields":null}`},
+		{ToolRequestSecret, `{"ITEM_ID":"` + testItem + `"}`},
+		{ToolRequestSecret, `{"item_id":"` + testItem + `","item_id":"` + testRequest + `"}`},
+		{ToolExecuteAction, `{"item_id":"` + testItem + `","Field_Id":"password","data":"x"}`},
+		{ToolExecuteAction, `{"item_id":"` + testItem + `","field_id":"password","data":"x","data_encoding":null}`},
+		{ToolCheckStatus, `{"request_id":null}`},
 		{ToolListAvailable, `{"x":1}`},
 		{ToolConnectionInfo, `{"x":1}`},
 	} {
@@ -268,5 +283,140 @@ func TestEncode(t *testing.T) {
 	}
 	if !json.Valid(c) {
 		t.Error("compact output not valid")
+	}
+}
+
+// TestSizes: the hand-written results never outgrow the slice sized for
+// them (a reallocation would leave a copy of the values behind), also
+// for strings and values that need the most escaping.
+func TestSizes(t *testing.T) {
+	worst := strings.Repeat("\x00\"\\\xff ", 20)
+	items := []*request.Item{
+		fakeItem().Item,
+		{ItemID: testItem, Fields: []request.Field{}},
+		{ItemID: worst, Name: worst, Category: worst, Notes: json.RawMessage(`"` + worst + `"`),
+			Fields: []request.Field{{FieldID: worst, Label: worst, Kind: worst, Value: json.RawMessage(`"` + worst + `"`)},
+				{FieldID: "a", Value: json.RawMessage("{ \"k\" : \"" + worst + "\" }")}}},
+	}
+	for i, it := range items {
+		b := itemJSON(it)
+		if cap(b) != itemJSONSize(it) {
+			t.Errorf("item %d: capacity %d, sized %d (grew)", i, cap(b), itemJSONSize(it))
+		}
+		if i < 2 && !json.Valid(b) {
+			t.Errorf("item %d: not valid JSON: %s", i, b)
+		}
+		id := json.RawMessage(`"` + strings.Repeat("i", MaxIDLength-2) + `"`)
+		out := &toolOut{body: b}
+		var w bytes.Buffer
+		s := &Server{out: &w}
+		s.writeToolResult(id, out)
+		if w.Len() > toolResultSize(id, b) {
+			t.Errorf("item %d: message %d bytes, sized %d", i, w.Len(), toolResultSize(id, b))
+		}
+	}
+	u := &request.Use{ItemID: worst, FieldID: worst, Action: worst, Result: make([]byte, 32)}
+	if b := useJSON(u); cap(b) != useJSONSize(u) {
+		t.Errorf("use: capacity %d, sized %d", cap(b), useJSONSize(u))
+	}
+}
+
+// TestRetryAfter: rounded up to a whole second, never before now.
+func TestRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 18, 12, 0, 0, 0, time.UTC)
+	for _, c := range []struct{ until, want time.Time }{
+		{now.Add(500 * time.Millisecond), now.Add(time.Second)},
+		{now.Add(2 * time.Second), now.Add(2 * time.Second)},
+		{now.Add(-time.Minute), now},
+		{now.Add(-time.Minute - 300*time.Millisecond), now},
+	} {
+		if got := retryAfter(c.until, now); !got.Equal(c.want) {
+			t.Errorf("retryAfter(%v) = %v, want %v", c.until, got, c.want)
+		}
+	}
+	if got := retryAfter(now.Add(-time.Minute+100*time.Millisecond), now.Add(100*time.Millisecond)); !got.Equal(now.Add(time.Second)) {
+		t.Errorf("sub-second now: %v", got)
+	}
+}
+
+// blockingWriter blocks every Write until released, as a stdout pipe
+// whose reader stopped reading.
+type blockingWriter struct {
+	release chan struct{}
+	n       atomic.Int64
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	<-w.release
+	w.n.Add(1)
+	return len(p), nil
+}
+
+// TestBackpressure: a client that keeps sending tool calls (with the
+// longest ids) and never reads standard output does not make the server
+// grow: at most MaxInFlight calls run, the read loop blocks on its own
+// writes, and goroutines and heap stay bounded.
+func TestBackpressure(t *testing.T) {
+	f := &fakeRequests{block: make(chan struct{})}
+	srv := New(Options{Requests: f, Info: fakeInfo, Version: "test", Burst: 100000, Rate: 100000})
+	inR, inW := io.Pipe()
+	w := &blockingWriter{release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+	g0 := runtime.NumGoroutine()
+	go func() { done <- srv.Serve(ctx, inR, w) }()
+	srv.mu.Lock()
+	srv.initialized = true // the initialize answer would block too
+	srv.mu.Unlock()
+	sent := make(chan int, 1)
+	go func() {
+		n := 0
+		defer func() { sent <- n }()
+		for i := 0; i < 20000; i++ {
+			id := fmt.Sprintf(`"%0*d"`, MaxIDLength-2, i)
+			line := `{"jsonrpc":"2.0","id":` + id + `,"method":"tools/call","params":{"name":"leash.request_secret","arguments":{"item_id":"` + testItem + `"}}}` + "\n"
+			if _, err := io.WriteString(inW, line); err != nil {
+				return
+			}
+			n++
+		}
+	}()
+	time.Sleep(time.Second)
+	g := runtime.NumGoroutine() - g0
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+	if g > MaxInFlight+16 {
+		t.Errorf("%d goroutines more than before", g)
+	}
+	if grown := int64(after.HeapInuse) - int64(before.HeapInuse); grown > 32<<20 {
+		t.Errorf("heap grew by %d bytes", grown)
+	}
+	if n := len(f.seen()); n > MaxInFlight {
+		t.Errorf("%d calls reached the requests", n)
+	}
+	// Release: the writes complete, the session ends.
+	close(w.release)
+	close(f.block)
+	inW.Close()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Serve did not end")
+	}
+	t.Logf("sent %d lines before the server stopped reading", <-sent)
+}
+
+// TestLongID: an id over MaxIDLength bytes is refused.
+func TestLongID(t *testing.T) {
+	s := newSession(t, &fakeRequests{}, nil)
+	s.init()
+	s.send(`{"jsonrpc":"2.0","id":"` + strings.Repeat("x", MaxIDLength) + `","method":"ping"}`)
+	if m := s.recv(); m["id"] != nil || m["error"] == nil {
+		t.Errorf("long id: %v", m)
 	}
 }

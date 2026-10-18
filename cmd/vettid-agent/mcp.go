@@ -197,7 +197,11 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		}
 	}()
 	// The grants' status statements are kept fresh (internal/leash Run).
-	go grants.Run(ctx)
+	grantsDone := make(chan struct{})
+	go func() {
+		defer close(grantsDone)
+		grants.Run(ctx)
+	}()
 	err = conn.Run(ctx)
 	// The check ends with Run (its request fails once Run stops); wait
 	// for it, and for the MCP session (whose tool calls end with ctx),
@@ -205,6 +209,10 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	cancel()
 	<-startDone
 	<-serveDone
+	<-grantsDone
+	// Requests the access manager still runs in the background end at
+	// once now that Run has (vaultconn answers ErrStopped).
+	mgr.Wait()
 	switch {
 	case errors.Is(err, context.Canceled):
 		return 0

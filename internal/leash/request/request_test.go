@@ -3,6 +3,7 @@ package request
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -836,6 +837,16 @@ func TestRedacted(t *testing.T) {
 			if strings.Contains(s, string(mac)) || strings.Contains(s, fmt.Sprintf("%x", mac)) {
 				t.Errorf("%s shows the HMAC: %s", verb, s)
 			}
+		}
+	}
+	for _, v := range []any{res, *res, res.Item, *res.Item, res.Item.Fields, res.Item.Fields[0], use, *use, out} {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("json.Marshal: %v", err)
+		}
+		noSecretIn(t, "json.Marshal", string(b))
+		if strings.Contains(string(b), base64.StdEncoding.EncodeToString(mac)) {
+			t.Errorf("json.Marshal shows the HMAC: %s", b)
 		}
 	}
 	noSecretIn(t, "log", logged.String())

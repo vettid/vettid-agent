@@ -3,6 +3,6 @@
   "id": null,
   "error": {
     "code": -32600,
-    "message": "the id must be a string or a number"
+    "message": "the id must be a string or a number of at most 256 bytes"
   }
 }

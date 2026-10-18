@@ -200,10 +200,24 @@ A tool call returns within about 20 seconds; while your vault waits for
 your daily check, a tool call makes the connector ask it again at most
 once a minute, so that the agent can continue soon after you check in.
 
-An item's values reach the agent's MCP client in the tool result and go
-no further on this computer: the connector writes them to standard
-output once, zeroes its copy, and never logs or stores them. What the
-client does with them (its context, its logs) is up to the client.
+An item's values reach the agent's MCP client in one tool result
+message, in which **each value appears twice**: in the structured
+content and in the text block that repeats the same JSON (MCP
+recommends both, and many clients pass only the text to the model). The
+connector writes that message once, from one buffer that it zeroes
+after the write, and never logs or stores a value. Before it is
+collected, a result is kept **in memory for up to 10 minutes** (a
+request still waiting for your approval, then for `leash.check_status`)
+and zeroed when it is returned or dropped. Buffers outside the MCP
+layer are **not** zeroed: the vault client's and the envelope
+package's decryption buffers, copies Go's runtime makes, and the pipe
+to the client. What the client does with a value (its context, its
+logs) is up to the client.
+
+The connector runs at most 64 tool calls at once. A client that stops
+reading standard output stops the connector reading standard input,
+so it does not grow without bound; until the client reads again, a
+written result (and its values) stays in memory.
 
 ## Access sessions and `status`
 

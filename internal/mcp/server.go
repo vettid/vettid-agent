@@ -10,8 +10,10 @@
 // messages is ever written to its output; diagnostics go to the logger
 // (standard error), with tool names, codes and request ids only.
 //
-// A tool call runs in a goroutine of its own and is answered when it
-// ends (AG9: within about 20 s, with a pending answer if the vault has
+// A tool call runs in a goroutine of its own (at most MaxInFlight at
+// once; the read loop answers a call beyond that, or over the rate
+// limit, itself, and so blocks while the client does not read) and is
+// answered when it ends (AG9: within about 20 s, with a pending answer if the vault has
 // not answered by then). notifications/cancelled cancels a call, which
 // is then not answered. When the input ends, the calls in progress are
 // cancelled and Serve returns once they have ended.
@@ -103,7 +105,18 @@ type Server struct {
 	initialized bool
 	calls       map[string]context.CancelFunc
 	wg          sync.WaitGroup
+	// slots bounds the tool calls in flight (MaxInFlight); a call that
+	// finds none is answered from the read loop.
+	slots chan struct{}
 }
+
+// MaxInFlight bounds the tool calls running at once (chosen; not in the
+// spec). Every other answer, including the refusal of a call beyond
+// this bound or over the rate limit, is written by the read loop
+// itself, so that a client that stops reading standard output stops
+// the server reading standard input: goroutines and memory stay
+// bounded.
+const MaxInFlight = 64
 
 // New returns a Server.
 func New(o Options) *Server {
@@ -122,7 +135,8 @@ func New(o Options) *Server {
 	if o.Held == nil {
 		o.Held = func() bool { return false }
 	}
-	s := &Server{o: o, log: o.Log, limit: newBucket(o.Rate, o.Burst, o.Now), calls: map[string]context.CancelFunc{}}
+	s := &Server{o: o, log: o.Log, limit: newBucket(o.Rate, o.Burst, o.Now), calls: map[string]context.CancelFunc{},
+		slots: make(chan struct{}, MaxInFlight)}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -229,10 +243,14 @@ type message struct {
 	Error   json.RawMessage `json:"error"`
 }
 
+// MaxIDLength bounds a request id as received (chosen; not in the
+// spec): ids are kept while a call runs and repeated in its answer.
+const MaxIDLength = 256
+
 // validID reports whether raw is a JSON-RPC id MCP allows: a string or
-// a number (not null).
+// a number (not null), at most MaxIDLength bytes.
 func validID(raw json.RawMessage) bool {
-	if len(raw) == 0 {
+	if len(raw) == 0 || len(raw) > MaxIDLength {
 		return false
 	}
 	switch raw[0] {
@@ -269,7 +287,7 @@ func (s *Server) handle(ctx context.Context, b []byte) {
 	if hasID {
 		if !validID(m.ID) {
 			s.log.Warn("MCP message refused", "code", codeInvalidRequest, "reason", "id")
-			s.writeError(nil, codeInvalidRequest, "the id must be a string or a number")
+			s.writeError(nil, codeInvalidRequest, "the id must be a string or a number of at most 256 bytes")
 			return
 		}
 		id = appendCompact(nil, m.ID)
@@ -403,14 +421,32 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 		return
 	}
 	key := string(id)
-	cctx, cancel := context.WithCancel(ctx)
 	s.mu.Lock()
-	if _, dup := s.calls[key]; dup {
-		s.mu.Unlock()
-		cancel()
+	_, dup := s.calls[key]
+	s.mu.Unlock()
+	if dup {
 		s.writeError(id, codeInvalidRequest, "a request with this id is in progress")
 		return
 	}
+	// The rate limit and the bound on calls in flight are applied here,
+	// in the read loop, which writes their refusals itself (it blocks
+	// while the client does not read).
+	if ok, wait := s.limit.take(); !ok {
+		out := rateLimited(s.o.Now(), wait)
+		s.log.Info("tool call", "tool", t.def.Name, "outcome", out.logCode)
+		s.writeToolResult(id, out)
+		return
+	}
+	select {
+	case s.slots <- struct{}{}:
+	default:
+		out := tooManyInFlight()
+		s.log.Info("tool call", "tool", t.def.Name, "outcome", out.logCode)
+		s.writeToolResult(id, out)
+		return
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
 	s.calls[key] = cancel
 	s.wg.Add(1)
 	s.mu.Unlock()
@@ -421,6 +457,7 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 			delete(s.calls, key)
 			s.mu.Unlock()
 			cancel()
+			<-s.slots
 		}()
 		out := s.runTool(cctx, t, args)
 		defer out.wipe()
@@ -434,11 +471,8 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 	}()
 }
 
-// runTool applies the rate limit and runs the tool.
+// runTool runs the tool (the rate limit was applied by call).
 func (s *Server) runTool(ctx context.Context, t *tool, args json.RawMessage) *toolOut {
-	if ok, wait := s.limit.take(); !ok {
-		return rateLimited(s.o.Now().Add(wait))
-	}
 	if s.o.BeforeCall != nil {
 		s.o.BeforeCall()
 	}
@@ -493,34 +527,40 @@ func (s *Server) writeRaw(id, result json.RawMessage) {
 	s.write(append(b, '\n'))
 }
 
+// The fixed parts of a tool result message (writeToolResult).
+const (
+	trHead = `{"jsonrpc":"2.0","id":`
+	trMid1 = `,"result":{"content":[{"type":"text","text":`
+	trMid2 = `}],"structuredContent":`
+	trMid3 = `,"isError":`
+	trTail = "}}\n"
+)
+
+// toolResultSize is the most bytes writeToolResult's message takes.
+func toolResultSize(id, body []byte) int {
+	return len(trHead) + len(id) + len(trMid1) + quotedBound(len(body)) + len(trMid2) + len(body) + len(trMid3) + len("false") + len(trTail)
+}
+
 // writeToolResult writes a tool's result: its structured content, and
 // the same JSON as the text content (MCP: a tool that returns
 // structured content should also return it serialised as text, for
 // clients that pass only the text to the model). The message is built
 // in one byte slice, sized up front, and zeroed once written.
 func (s *Server) writeToolResult(id json.RawMessage, out *toolOut) {
-	const (
-		head = `{"jsonrpc":"2.0","id":`
-		mid1 = `,"result":{"content":[{"type":"text","text":`
-		mid2 = `}],"structuredContent":`
-		mid3 = `,"isError":`
-		tail = "}}\n"
-	)
-	n := len(head) + len(id) + len(mid1) + quotedBound(len(out.body)) + len(mid2) + len(out.body) + len(mid3) + len("false") + len(tail)
-	b := make([]byte, 0, n)
-	b = append(b, head...)
+	b := make([]byte, 0, toolResultSize(id, out.body))
+	b = append(b, trHead...)
 	b = append(b, id...)
-	b = append(b, mid1...)
+	b = append(b, trMid1...)
 	b = appendQuoted(b, out.body)
-	b = append(b, mid2...)
+	b = append(b, trMid2...)
 	b = append(b, out.body...)
-	b = append(b, mid3...)
+	b = append(b, trMid3...)
 	if out.isError {
 		b = append(b, "true"...)
 	} else {
 		b = append(b, "false"...)
 	}
-	b = append(b, tail...)
+	b = append(b, trTail...)
 	s.write(b)
 	clear(b)
 }

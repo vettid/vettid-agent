@@ -13,10 +13,11 @@ import (
 	"github.com/vettid/vettid-agent/internal/leash/request"
 )
 
-var update = flag.Bool("update", false, "rewrite the golden files in testdata/golden")
+var update = flag.Bool("update", false, "rewrite the golden files in testdata/mcp")
 
 // TestGolden: each message the server writes for a request is compared
-// with its golden file (testdata/golden/NAME.json, indented); go test
+// with its golden file (testdata/mcp/NAME.json at the repository root,
+// AGENT-PLAN §5; indented); go test
 // -run TestGolden -update rewrites them. The values in them are fake.
 func TestGolden(t *testing.T) {
 	initLine := `{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}`
@@ -118,7 +119,7 @@ func TestGolden(t *testing.T) {
 				t.Fatalf("not JSON: %q", raw)
 			}
 			ind.WriteByte('\n')
-			path := filepath.Join("testdata", "golden", tc.name+".json")
+			path := filepath.Join("..", "..", "testdata", "mcp", tc.name+".json")
 			if *update {
 				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 					t.Fatal(err)

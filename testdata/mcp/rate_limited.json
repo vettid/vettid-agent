@@ -5,14 +5,14 @@
     "content": [
       {
         "type": "text",
-        "text": "{\"status\":\"error\",\"code\":\"rate_limited_local\",\"message\":\"Too many tool calls from this agent in a short time. Wait a moment and try again.\",\"retry_after\":\"2026-10-18T12:00:00Z\"}"
+        "text": "{\"status\":\"error\",\"code\":\"rate_limited_local\",\"message\":\"Too many tool calls from this agent in a short time. Wait a moment and try again.\",\"retry_after\":\"2026-10-18T12:00:01Z\"}"
       }
     ],
     "structuredContent": {
       "status": "error",
       "code": "rate_limited_local",
       "message": "Too many tool calls from this agent in a short time. Wait a moment and try again.",
-      "retry_after": "2026-10-18T12:00:00Z"
+      "retry_after": "2026-10-18T12:00:01Z"
     },
     "isError": true
   }

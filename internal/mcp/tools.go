@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/vettid/vettid-agent/internal/access"
@@ -158,9 +159,15 @@ func (s *Server) toolSet() []*tool {
 	}
 }
 
-// decodeArgs decodes a tool's arguments strictly: no unknown members,
-// nothing after the object.
-func decodeArgs(args json.RawMessage, v any) bool {
+// decodeArgs decodes a tool's arguments strictly: only the members
+// named in allowed, matched exactly (encoding/json alone would match
+// names case-insensitively and take the last of duplicates), each at
+// most once and never null (no member of the input schemas is
+// nullable), and nothing after the object.
+func decodeArgs(args json.RawMessage, v any, allowed ...string) bool {
+	if !checkMembers(args, allowed) {
+		return false
+	}
 	d := json.NewDecoder(bytes.NewReader(args))
 	d.DisallowUnknownFields()
 	if d.Decode(v) != nil {
@@ -170,20 +177,71 @@ func decodeArgs(args json.RawMessage, v any) bool {
 	return errors.Is(err, io.EOF) // nothing follows
 }
 
+// checkMembers reports whether args is one JSON object whose member
+// names are among allowed, exactly, each at most once, with no null
+// value.
+func checkMembers(args json.RawMessage, allowed []string) bool {
+	d := json.NewDecoder(bytes.NewReader(args))
+	if t, err := d.Token(); err != nil || t != json.Delim('{') {
+		return false
+	}
+	seen := map[string]bool{}
+	for d.More() {
+		t, err := d.Token()
+		if err != nil {
+			return false
+		}
+		name, ok := t.(string)
+		if !ok || seen[name] || !slices.Contains(allowed, name) {
+			return false
+		}
+		seen[name] = true
+		var raw json.RawMessage
+		if d.Decode(&raw) != nil || isNull(raw) {
+			return false
+		}
+	}
+	if t, err := d.Token(); err != nil || t != json.Delim('}') {
+		return false
+	}
+	_, err := d.Token()
+	return errors.Is(err, io.EOF)
+}
+
 // TextBadArguments is the answer to arguments that do not match a
 // tool's input schema (chosen; not in the spec).
 const TextBadArguments = "The arguments do not match this tool's input schema."
 
 func badArguments() *toolOut {
-	return errorOut(&request.Error{Code: "bad_request", Text: TextBadArguments})
+	return errorOut(&request.Error{Code: "bad_request", Text: TextBadArguments}, time.Time{})
 }
 
 // TextRateLimited answers a call over the local rate limit (chosen; not
 // in the spec).
 const TextRateLimited = "Too many tool calls from this agent in a short time. Wait a moment and try again."
 
-func rateLimited(until time.Time) *toolOut {
-	return errorOut(&request.Error{Code: "rate_limited_local", Text: TextRateLimited, Until: until})
+func rateLimited(now time.Time, wait time.Duration) *toolOut {
+	return errorOut(&request.Error{Code: "rate_limited_local", Text: TextRateLimited, Until: now.Add(wait)}, now)
+}
+
+// TextTooManyInFlight answers a call beyond MaxInFlight (chosen; not
+// in the spec).
+const TextTooManyInFlight = "Too many tool calls from this agent are still running. Wait for their answers and try again."
+
+func tooManyInFlight() *toolOut {
+	return errorOut(&request.Error{Code: "rate_limited_local", Text: TextTooManyInFlight}, time.Time{})
+}
+
+// retryAfter is until as a time to show: rounded up to a whole second,
+// and never before now.
+func retryAfter(until, now time.Time) time.Time {
+	if !now.IsZero() && until.Before(now) {
+		until = now
+	}
+	if t := until.Truncate(time.Second); t.Before(until) {
+		until = t.Add(time.Second)
+	}
+	return until
 }
 
 // TextInternal answers an error the connector cannot describe better.
@@ -199,8 +257,9 @@ type errorBody struct {
 }
 
 // errorOut is the tool error for err (AGENT-PLAN §4.1: a stable code,
-// the vault's or the connector's own, and the text of §11).
-func errorOut(err error) *toolOut {
+// the vault's or the connector's own, and the text of §11); now (zero:
+// not known) keeps retry_after from being in the past.
+func errorOut(err error, now time.Time) *toolOut {
 	b := errorBody{Status: "error"}
 	var until time.Time
 	var re *request.Error
@@ -217,7 +276,7 @@ func errorOut(err error) *toolOut {
 		b.Code, b.Message = "internal_error", TextInternal
 	}
 	if !until.IsZero() {
-		b.RetryAfter = until.UTC().Format(time.RFC3339)
+		b.RetryAfter = retryAfter(until, now).UTC().Format(time.RFC3339)
 	}
 	body, _ := json.Marshal(b)
 	return &toolOut{body: body, isError: true, logCode: b.Code, requestID: b.RequestID}
@@ -235,16 +294,17 @@ func pendingOut(o *request.Outcome) *toolOut {
 }
 
 // outcomeOut turns a request's outcome into the tool's result.
-func outcomeOut(o *request.Outcome, err error) *toolOut {
+func (s *Server) outcomeOut(o *request.Outcome, err error) *toolOut {
+	now := s.o.Now()
 	switch {
 	case err != nil:
-		return errorOut(err)
+		return errorOut(err, now)
 	case o == nil:
-		return errorOut(nil)
+		return errorOut(nil, now)
 	case o.Pending:
 		return pendingOut(o)
 	case o.Result == nil:
-		return errorOut(nil)
+		return errorOut(nil, now)
 	}
 	return resultOut(o.Result)
 }
@@ -272,20 +332,28 @@ func resultOut(r *request.Result) *toolOut {
 		out.body, out.secret = useJSON(r.Use), true
 	default:
 		r.Wipe()
-		return errorOut(nil)
+		return errorOut(nil, time.Time{})
 	}
 	return out
 }
 
-// itemJSON writes item.get's result by hand (encode.go), into one slice
-// sized up front.
-func itemJSON(it *request.Item) []byte {
+// itemJSONSize is the most bytes itemJSON writes: 80 for the item's
+// fixed text (76 bytes of literals), 48 per field (40), and the bounds
+// of the strings and values.
+func itemJSONSize(it *request.Item) int {
 	q := func(s string) int { return quotedBound(len(s)) }
-	n := 64 + q(it.ItemID) + q(it.Name) + q(it.Category) + compactBound(len(it.Notes))
+	n := 80 + q(it.ItemID) + q(it.Name) + q(it.Category) + compactBound(len(it.Notes))
 	for _, f := range it.Fields {
 		n += 48 + q(f.FieldID) + q(f.Label) + q(f.Kind) + compactBound(len(f.Value))
 	}
-	b := make([]byte, 0, n)
+	return n
+}
+
+// itemJSON writes item.get's result by hand (encode.go), into one slice
+// sized up front (itemJSONSize), so that no copy is left behind by a
+// reallocation.
+func itemJSON(it *request.Item) []byte {
+	b := make([]byte, 0, itemJSONSize(it))
 	str := func(s string) { b = appendQuoted(b, []byte(s)) }
 	b = append(b, `{"status":"ok","item":{"item_id":`...)
 	str(it.ItemID)
@@ -318,12 +386,16 @@ func itemJSON(it *request.Item) []byte {
 	return append(b, "}}"...)
 }
 
-// useJSON writes item.use's result by hand, into one slice sized up
-// front.
-func useJSON(u *request.Use) []byte {
-	n := 96 + quotedBound(len(u.ItemID)) + quotedBound(len(u.FieldID)) + quotedBound(len(u.Action)) +
+// useJSONSize is the most bytes useJSON writes (60 bytes of literals).
+func useJSONSize(u *request.Use) int {
+	return 64 + quotedBound(len(u.ItemID)) + quotedBound(len(u.FieldID)) + quotedBound(len(u.Action)) +
 		base64.StdEncoding.EncodedLen(len(u.Result))
-	b := make([]byte, 0, n)
+}
+
+// useJSON writes item.use's result by hand, into one slice sized up
+// front (useJSONSize).
+func useJSON(u *request.Use) []byte {
+	b := make([]byte, 0, useJSONSize(u))
 	b = append(b, `{"status":"ok","item_id":`...)
 	b = appendQuoted(b, []byte(u.ItemID))
 	b = append(b, `,"field_id":`...)
@@ -339,7 +411,7 @@ func (s *Server) listAvailable(ctx context.Context, args json.RawMessage) *toolO
 	if !decodeArgs(args, &struct{}{}) {
 		return badArguments()
 	}
-	return outcomeOut(s.o.Requests.Catalog(ctx))
+	return s.outcomeOut(s.o.Requests.Catalog(ctx))
 }
 
 func (s *Server) requestSecret(ctx context.Context, args json.RawMessage) *toolOut {
@@ -347,14 +419,14 @@ func (s *Server) requestSecret(ctx context.Context, args json.RawMessage) *toolO
 		ItemID *string   `json:"item_id"`
 		Fields *[]string `json:"fields"`
 	}
-	if !decodeArgs(args, &a) || a.ItemID == nil {
+	if !decodeArgs(args, &a, "item_id", "fields") || a.ItemID == nil {
 		return badArguments()
 	}
-	var fields []string // absent or null: all fields
+	var fields []string // absent: all fields
 	if a.Fields != nil {
 		fields = *a.Fields
 	}
-	return outcomeOut(s.o.Requests.Get(ctx, *a.ItemID, fields))
+	return s.outcomeOut(s.o.Requests.Get(ctx, *a.ItemID, fields))
 }
 
 // MaxData is leash.execute_action's largest data, in bytes.
@@ -367,7 +439,7 @@ func (s *Server) executeAction(ctx context.Context, args json.RawMessage) *toolO
 		Data         *string `json:"data"`
 		DataEncoding *string `json:"data_encoding"`
 	}
-	if !decodeArgs(args, &a) || a.ItemID == nil || a.FieldID == nil || a.Data == nil {
+	if !decodeArgs(args, &a, "item_id", "field_id", "data", "data_encoding") || a.ItemID == nil || a.FieldID == nil || a.Data == nil {
 		return badArguments()
 	}
 	var data []byte
@@ -377,23 +449,23 @@ func (s *Server) executeAction(ctx context.Context, args json.RawMessage) *toolO
 	case *a.DataEncoding == "base64":
 		d, err := base64.StdEncoding.Strict().DecodeString(*a.Data)
 		if err != nil {
-			return errorOut(&request.Error{Code: "bad_request", Text: "The request is not valid: data is not standard base64."})
+			return errorOut(&request.Error{Code: "bad_request", Text: "The request is not valid: data is not standard base64."}, time.Time{})
 		}
 		data = d
 	default:
 		return badArguments()
 	}
-	return outcomeOut(s.o.Requests.Use(ctx, *a.ItemID, *a.FieldID, data))
+	return s.outcomeOut(s.o.Requests.Use(ctx, *a.ItemID, *a.FieldID, data))
 }
 
 func (s *Server) checkStatus(ctx context.Context, args json.RawMessage) *toolOut {
 	var a struct {
 		RequestID *string `json:"request_id"`
 	}
-	if !decodeArgs(args, &a) || a.RequestID == nil {
+	if !decodeArgs(args, &a, "request_id") || a.RequestID == nil {
 		return badArguments()
 	}
-	return outcomeOut(s.o.Requests.Status(ctx, *a.RequestID))
+	return s.outcomeOut(s.o.Requests.Status(ctx, *a.RequestID))
 }
 
 // connectionInfo is leash.connection_info's result: internal/leash's
@@ -410,11 +482,11 @@ func (s *Server) connectionInfo(_ context.Context, args json.RawMessage) *toolOu
 		return badArguments()
 	}
 	if s.o.Info == nil {
-		return errorOut(nil)
+		return errorOut(nil, time.Time{})
 	}
 	body, err := json.Marshal(connectionInfo{Status: "ok", Info: s.o.Info(), WaitingForDailyCheck: s.o.Held()})
 	if err != nil {
-		return errorOut(nil)
+		return errorOut(nil, time.Time{})
 	}
 	return &toolOut{body: body, logCode: "ok"}
 }

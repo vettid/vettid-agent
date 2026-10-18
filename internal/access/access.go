@@ -110,7 +110,16 @@ type Manager struct {
 	statusAt   time.Time
 	checking   bool
 	statusHook func(ownerCheck string)
+	// bg counts the requests running in goroutines of their own (Wait).
+	bg sync.WaitGroup
 }
+
+// Wait waits for the requests this Manager runs in the background (an
+// Ensure whose caller stopped waiting, CheckHold). Each ends with its
+// answer, with RequestTimeout, or at once when the connection's Run has
+// ended (vaultconn answers ErrStopped); the caller calls Wait after Run
+// returns, so that nothing of the Manager runs after it.
+func (m *Manager) Wait() { m.bg.Wait() }
 
 // flight is a request to the vault that runs in a goroutine of its own,
 // so that a caller can stop waiting for it (its context ended) without
@@ -249,7 +258,9 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		if f == nil {
 			f = newFlight()
 			m.probing = f
+			m.bg.Add(1)
 			go func() {
+				defer m.bg.Done()
 				err := m.probe(context.WithoutCancel(ctx))
 				m.mu.Lock()
 				f.err, m.probing = err, nil
@@ -296,7 +307,9 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	m.sent = append(m.sent, now)
 	m.mu.Unlock()
 	f := newFlight()
+	m.bg.Add(1)
 	go func() {
+		defer m.bg.Done()
 		f.err = m.request(context.WithoutCancel(ctx))
 		close(f.done)
 	}()
@@ -439,8 +452,10 @@ func (m *Manager) CheckHold() {
 	}
 	m.checking, m.statusAt = true, now
 	hook := m.statusHook
+	m.bg.Add(1)
 	m.mu.Unlock()
 	go func() {
+		defer m.bg.Done()
 		defer func() {
 			m.mu.Lock()
 			m.checking = false

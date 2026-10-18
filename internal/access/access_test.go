@@ -625,3 +625,31 @@ func TestCheckHold(t *testing.T) {
 		t.Errorf("hook got %v", hooked)
 	}
 }
+
+// TestWait: Wait returns once the requests running in the background
+// (an Ensure whose caller stopped waiting, CheckHold) have ended.
+func TestWait(t *testing.T) {
+	f, _, m := setup(none)
+	release := make(chan struct{})
+	f.mu.Lock()
+	f.block = release
+	f.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_ = m.Ensure(ctx)
+	m.OnStatus("held")
+	m.CheckHold()
+	waited := make(chan struct{})
+	go func() { m.Wait(); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("Wait returned while requests were running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return")
+	}
+}
