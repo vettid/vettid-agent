@@ -291,7 +291,9 @@ func TestTooSoon(t *testing.T) {
 }
 
 // TestOwnerCheck: owner_check_required stops requests until a
-// vault.status says the hold ended, or a grant update arrives.
+// vault.status says the hold ended; a grant update or a session grant
+// does not end it (it may have been sent before the hold, or delivered
+// again), as in internal/leash.
 func TestOwnerCheck(t *testing.T) {
 	f, _, m := setup(none)
 	f.answer("device.session.request", fail("owner_check_required", `{}`))
@@ -315,8 +317,18 @@ func TestOwnerCheck(t *testing.T) {
 		t.Fatal("answer owner_check_required")
 	}
 	m.OnEvent(vaultconn.Event{Type: "leash.grant.updated"})
-	if err := ensure(t, m); errors.Is(err, ErrOwnerCheck) {
-		t.Fatal("grant update did not end the hold")
+	if err := ensure(t, m); !errors.Is(err, ErrOwnerCheck) || !m.Held() {
+		t.Fatalf("a grant update ended the hold: %v", err)
+	}
+	// A device.session.granted (for example one delivered again after a
+	// crash) does not end it either.
+	m.OnEvent(vaultconn.Event{Type: "device.session.granted"})
+	if err := ensure(t, m); !errors.Is(err, ErrOwnerCheck) || !m.Held() {
+		t.Fatalf("a session grant ended the hold: %v", err)
+	}
+	m.OnStatus("ok")
+	if err := ensure(t, m); errors.Is(err, ErrOwnerCheck) || m.Held() {
+		t.Fatalf("vault.status did not end the hold: %v", err)
 	}
 }
 
