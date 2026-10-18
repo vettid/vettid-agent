@@ -40,7 +40,53 @@ var (
 	procCreateProcessWithLogonW = modAdvapi32.NewProc("CreateProcessWithLogonW")
 	modUserenv                  = windows.NewLazySystemDLL("userenv.dll")
 	procDeleteProfileW          = modUserenv.NewProc("DeleteProfileW")
+	modNetapi32                 = windows.NewLazySystemDLL("netapi32.dll")
+	procNetUserAdd              = modNetapi32.NewProc("NetUserAdd")
+	procNetUserSetInfo          = modNetapi32.NewProc("NetUserSetInfo")
+	procNetUserDel              = modNetapi32.NewProc("NetUserDel")
 )
+
+// userInfo1 is USER_INFO_1.
+type userInfo1 struct {
+	name, password *uint16
+	passwordAge    uint32
+	priv           uint32
+	homeDir        *uint16
+	comment        *uint16
+	flags          uint32
+	scriptPath     *uint16
+}
+
+// addLocalUser creates a local user (NetUserAdd, level 1).
+func addLocalUser(t *testing.T, name, password string) {
+	t.Helper()
+	n, _ := windows.UTF16PtrFromString(name)
+	p, _ := windows.UTF16PtrFromString(password)
+	const userPrivUser, ufScript, ufDontExpirePasswd = 1, 0x1, 0x10000
+	ui := userInfo1{name: n, password: p, priv: userPrivUser, flags: ufScript | ufDontExpirePasswd}
+	var parmErr uint32
+	if r, _, _ := procNetUserAdd.Call(0, 1, uintptr(unsafe.Pointer(&ui)), uintptr(unsafe.Pointer(&parmErr))); r != 0 {
+		t.Fatalf("NetUserAdd: %v (parameter %d)", windows.Errno(r), parmErr)
+	}
+}
+
+// resetPassword sets a user's password as an administrator
+// (NetUserSetInfo, level 1003), without the old password.
+func resetPassword(t *testing.T, name, password string) {
+	t.Helper()
+	n, _ := windows.UTF16PtrFromString(name)
+	p, _ := windows.UTF16PtrFromString(password)
+	ui := struct{ password *uint16 }{p}
+	var parmErr uint32
+	if r, _, _ := procNetUserSetInfo.Call(0, uintptr(unsafe.Pointer(n)), 1003, uintptr(unsafe.Pointer(&ui)), uintptr(unsafe.Pointer(&parmErr))); r != 0 {
+		t.Fatalf("NetUserSetInfo: %v", windows.Errno(r))
+	}
+}
+
+func deleteLocalUser(name string) {
+	n, _ := windows.UTF16PtrFromString(name)
+	procNetUserDel.Call(0, uintptr(unsafe.Pointer(n)))
+}
 
 // TestDPAPIHelper is the helper mode: it runs only when the test binary
 // is started with the arguments `dpapi-helper wrap|unwrap BLOB RESULT`.
@@ -106,10 +152,7 @@ func TestDPAPIOtherUser(t *testing.T) {
 	}
 	run := func(name string, args ...string) {
 		t.Helper()
-		cmd := exec.Command(name, args...)
-		// net.exe asks to confirm a password longer than 14 characters.
-		cmd.Stdin = strings.NewReader("Y\r\n")
-		out, err := cmd.CombinedOutput()
+		out, err := exec.Command(name, args...).CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s %s: %v: %s", name, args[0], err, out)
 		}
@@ -135,14 +178,14 @@ func TestDPAPIOtherUser(t *testing.T) {
 
 	user := "vta" + randHex(t, 4)
 	pass := "Va1!" + randHex(t, 12) + "-x"
-	run("net.exe", "user", user, pass, "/add")
+	addLocalUser(t, user, pass)
 	t.Cleanup(func() {
 		if sid, _, _, err := windows.LookupSID("", user); err == nil {
 			if s, err := windows.UTF16PtrFromString(sid.String()); err == nil {
 				procDeleteProfileW.Call(uintptr(unsafe.Pointer(s)), 0, 0)
 			}
 		}
-		exec.Command("net.exe", "user", user, "/delete").Run()
+		deleteLocalUser(user)
 	})
 
 	helperRun := func(password, op, blob string) (status, kind, msg string) {
@@ -198,7 +241,7 @@ func TestDPAPIOtherUser(t *testing.T) {
 	// 3. An administrator resets the other user's password: the user's
 	// earlier key no longer opens, as a definite error.
 	pass2 := "Vb2!" + randHex(t, 12) + "-y"
-	run("net.exe", "user", user, pass2)
+	resetPassword(t, user, pass2)
 	status, kind, msg = helperRun(pass2, "unwrap", theirsPath)
 	t.Logf("other user opening its key after an administrator reset its password: %s %s: %s", status, kind, msg)
 	if status != "error" || (kind != "keylost" && kind != "refused") {
