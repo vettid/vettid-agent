@@ -216,7 +216,8 @@ expect_pass "a signed SHA256SUMS: the macOS line is left out, the rest compared"
   "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/signed-sums"
 expect_pass "-o writes the rebuilt hashes" \
   "$t/stub/repo/scripts/verify-reproducible" -o "$t/rebuilt-out" "$stub_commit" "$t/signed-sums"
-check "  the rebuilt hashes are the reproducible entries" test "$(cat "$t/rebuilt-out")" = "$(grep -v darwin "$t/entries")"
+check "  the rebuild line first" test "$(head -n1 "$t/rebuilt-out")" = "# vettid-agent-rebuild/untagged/$stub_commit"
+check "  then the reproducible entries" test "$(tail -n +2 "$t/rebuilt-out")" = "$(grep -v darwin "$t/entries")"
 grep -v darwin "$t/entries" >"$t/plain-sums"
 expect_pass "a plain SHA256SUMS still compares" \
   "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/plain-sums"

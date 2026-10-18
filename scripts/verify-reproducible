@@ -32,9 +32,12 @@
 #       every module again, checksum-verified against go.sum and the Go
 #       checksum database)
 #   -k  keep the temporary directory and say where it is
-#   -o FILE  also write the rebuilt binaries' hashes to FILE (sha256sum
-#       lines, sorted by name), when they match: what scripts/sign-release
-#       --rebuilt takes from a rebuild made on another machine
+#   -o FILE  also write the rebuilt binaries' hashes to FILE when they
+#       match: the line "# vettid-agent-rebuild/<version>/<commit>", then
+#       sha256sum lines sorted by name. scripts/sign-release --rebuilt
+#       takes it from a rebuild made on another machine, and requires
+#       that first line (so a release's own SHA256SUMS is not mistaken
+#       for a rebuild).
 #
 # Fetch the release tag first (git fetch --tags). Checking the owner's
 # signature over SHA256SUMS is a separate step: scripts/verify-release
@@ -157,7 +160,7 @@ fi
 
 if diff -u "$given" "$work/rehashed"; then
   if [ -n "$outfile" ]; then
-    cp "$work/rehashed" "$outfile"
+    { echo "# vettid-agent-rebuild/$version/$commit"; cat "$work/rehashed"; } >"$outfile"
     log "wrote the rebuilt hashes to $outfile"
   fi
   log "PASS $ref ($commit) rebuilds to the hashes in $2"

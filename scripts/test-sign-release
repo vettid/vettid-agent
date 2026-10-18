@@ -166,7 +166,7 @@ reset() {
     printf '%s %s\n' "$tag" "$n" >"$S/assets/vettid-agent-$tag-$n"
   done
   (cd "$S/assets" && for f in vettid-agent-*; do printf '%s  %s\n' "$(sha "$f")" "$f"; done | LC_ALL=C sort -k2 >SHA256SUMS)
-  cp "$S/assets/SHA256SUMS" "$t/rebuilt"
+  { echo "# vettid-agent-rebuild/$tag/$commit"; cat "$S/assets/SHA256SUMS"; } >"$t/rebuilt"
   echo true >"$S/draft"
   echo "github-actions[bot]" >"$S/author"
   # shellcheck disable=SC2016 # backquotes in the notes
@@ -248,8 +248,14 @@ reset v0.0.1
 printf 'x\n' >>"$S/assets/vettid-agent-v0.0.1-linux-arm64"
 expect_fail "a binary that does not match the draft's SHA256SUMS" "does not match its SHA256SUMS" sign v0.0.1
 reset v0.0.1
-sed -i.orig '1s/^./f/' "$t/rebuilt"
+sed -i.orig '2s/^./f/' "$t/rebuilt"
 expect_fail "a rebuild that differs" "differs from" sign v0.0.1
+reset v0.0.1
+cp "$S/assets/SHA256SUMS" "$t/rebuilt"
+expect_fail "the draft's own SHA256SUMS given as the rebuild" "does not begin with \"# vettid-agent-rebuild/v0.0.1/" sign v0.0.1
+reset v0.0.1
+sed -i.orig "1s/.*/# vettid-agent-rebuild\/v0.0.2\/$commit/" "$t/rebuilt"
+expect_fail "a rebuild of another tag" "does not begin with" sign v0.0.1
 
 echo "== sign-release: upload and publish"
 reset v0.0.5

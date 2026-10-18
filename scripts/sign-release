@@ -34,8 +34,10 @@
 #   --rebuilt FILE         skip the rebuild here and use FILE instead: the
 #                          list that `scripts/verify-reproducible -m -o FILE
 #                          TAG SHA256SUMS` wrote on another machine (a VM or
-#                          container, docs/RELEASING.md). Its lines must be
-#                          exactly the draft's binaries and hashes.
+#                          container, docs/RELEASING.md). Its first line must
+#                          be "# vettid-agent-rebuild/TAG/COMMIT" (a rebuild
+#                          of this tag, not a copy of a SHA256SUMS), the
+#                          rest exactly the draft's binaries and hashes.
 #   --yes                  publish without asking
 #   --local DIR            only write, sign and check SHA256SUMS for the
 #                          vettid-agent-TAG-* files in DIR as TAG at
@@ -354,7 +356,10 @@ while read -r h n; do
 done <"$work/repro-sums"
 if [ -n "$rebuilt" ]; then
   log "not rebuilding here: comparing with $rebuilt (--rebuilt)"
-  if ! diff -u "$work/repro-sums" <(grep -v '^#' "$rebuilt" | LC_ALL=C sort -k2); then
+  first="$(head -n1 "$rebuilt")"
+  [ "$first" = "# vettid-agent-rebuild/$tag/$commit" ] \
+    || fail "$rebuilt does not begin with \"# vettid-agent-rebuild/$tag/$commit\" (got \"$first\"): give the file that scripts/verify-reproducible -o wrote for this tag"
+  if ! diff -u "$work/repro-sums" <(tail -n +2 "$rebuilt"); then
     fail "the draft differs from $rebuilt (- draft, + rebuilt): do not sign"
   fi
 else

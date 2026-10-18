@@ -4,14 +4,14 @@ name: release
 # AG4, §6 A5; README, "Releases"; docs/RELEASING.md).
 #
 # - A tag v<major>.<minor>.<patch>[-pre] builds that release and, if the
-#   builds match and the tag is annotated, signed with a key in
+#   builds match and the tag is annotated, signed with a key in main's
 #   release/allowed_signers (scripts/verify-tag) and GitHub verified,
 #   creates a DRAFT GitHub release with the unsigned binaries and
 #   SHA256SUMS. The owner then runs scripts/sign-release on their own
 #   machine: it rebuilds and compares, adds the notarized macOS app, signs
 #   SHA256SUMS with the release key, uploads the signature and publishes.
 # - A published release is checked once more: SHA256SUMS.sig must verify
-#   against release/allowed_signers and every asset must match SHA256SUMS
+#   against main's release/allowed_signers and every asset must match SHA256SUMS
 #   (the "signature" job), or the run fails.
 # - Pull requests and pushes to main run the same builds and comparison as
 #   a dry run, without a release.
@@ -208,22 +208,25 @@ jobs:
       # Two checks of the tag's signature. GitHub's "verified" alone accepts
       # a signature by any key GitHub knows for the tagger's account (any
       # SSH or GPG signing key, or a web-flow signature), not only the
-      # release key; so the tag is also checked against
-      # release/allowed_signers at the tag with scripts/verify-tag (an SSH
-      # signature, and only that, by a listed key). scripts/sign-release
-      # repeats both checks before signing.
+      # release key; so the tag is also checked with scripts/verify-tag (an
+      # SSH signature, and only that, by a listed key) against main's
+      # release/allowed_signers, not the tagged commit's copy (which the
+      # tag itself could change). verify-tag here is the tag's own copy, so
+      # this is a consistency check; the controls are scripts/sign-release
+      # and scripts/verify-release run from main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: src
           persist-credentials: false
-      - name: the release tag is signed with a key in release/allowed_signers
+      - name: the release tag is signed with a key in main's release/allowed_signers
         working-directory: src
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          git fetch --quiet --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+          git fetch --quiet --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG" "+refs/heads/main:refs/remotes/origin/main"
           [ "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA" ] || { echo "::error::$TAG is not $GITHUB_SHA"; exit 1; }
-          scripts/verify-tag -a release/allowed_signers "$TAG" || { echo "::error::$TAG is not signed with a key in release/allowed_signers"; exit 1; }
+          git show origin/main:release/allowed_signers >"$RUNNER_TEMP/allowed_signers"
+          scripts/verify-tag -a "$RUNNER_TEMP/allowed_signers" "$TAG" || { echo "::error::$TAG is not signed with a key in main's release/allowed_signers (docs/RELEASING.md: merge the key line before tagging; delete and re-make a tag pushed earlier)"; exit 1; }
       - name: the release tag is signed (GitHub verified)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -267,7 +270,9 @@ jobs:
 
   signature:
     # A published release: the owner's signature over SHA256SUMS and every
-    # asset against it, with release/allowed_signers at the tag. Fails
+    # asset against it, with main's release/allowed_signers (and the tag's
+    # own verify-release: a consistency check; users and the owner run
+    # main's scripts/verify-release). Fails
     # loudly if the signature is missing or does not verify; it cannot
     # unpublish (no write permission), so the owner acts on the failure.
     if: github.event_name == 'release'
@@ -286,6 +291,8 @@ jobs:
           set -euo pipefail
           dir="$RUNNER_TEMP/release"
           mkdir -p "$dir"
+          git fetch --quiet --no-tags origin "+refs/heads/main:refs/remotes/origin/main"
+          git show origin/main:release/allowed_signers >"$RUNNER_TEMP/allowed_signers"
           gh release download "$TAG" --repo "$REPO" -D "$dir"
           ls -l "$dir"
           if [ ! -f "$dir/SHA256SUMS.sig" ]; then
@@ -300,7 +307,7 @@ jobs:
               *) echo "::error::$TAG has an asset that is not part of a release: $(basename "$f")"; exit 1 ;;
             esac
           done
-          if ! scripts/verify-release -a release/allowed_signers -c "$GITHUB_SHA" -A -l "$dir" "$TAG"; then
+          if ! scripts/verify-release -a "$RUNNER_TEMP/allowed_signers" -c "$GITHUB_SHA" -A -l "$dir" "$TAG"; then
             echo "::error::$TAG is published, but its signature or files do not verify (above): make it a draft again and run scripts/sign-release $TAG"
             exit 1
           fi

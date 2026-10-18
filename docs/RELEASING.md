@@ -107,8 +107,19 @@ ssh-keygen -l -f ~/.ssh/vettid-release.pub      # the fingerprint for vettid.org
 ```
 
 Until the file holds a key line, `scripts/sign-release` and
-`scripts/verify-release` refuse to run, and the workflow's check of a
-published release fails.
+`scripts/verify-release` refuse to run, and the workflow's checks fail.
+
+**Merge the key line to `main` before pushing the first tag.** The
+release workflow checks a tag against `main`'s `release/allowed_signers`
+when the tag is pushed; a tag pushed before the line was merged fails
+that check, and running the workflow again does not help (it is the tag
+push that runs it). Delete such a tag, locally and on GitHub, and make
+and push it again:
+
+```sh
+git push origin :refs/tags/v0.2.0 && git tag -d v0.2.0
+git tag -s v0.2.0 -m "vettid-agent v0.2.0" && git push origin v0.2.0
+```
 
 ### 3. Signed tags
 
@@ -262,9 +273,11 @@ scripts/verify-reproducible -m -o rebuilt-v0.2.0 v0.2.0 SHA256SUMS
 scripts/sign-release -k ~/.ssh/vettid-release --rebuilt rebuilt-v0.2.0 v0.2.0
 ```
 
-`-o` writes the rebuilt binaries' hashes only when they match;
-`--rebuilt` skips the local rebuild and requires those lines to be
-exactly the draft's binaries and hashes.
+`-o` writes the rebuilt binaries' hashes only when they match, under the
+line `# vettid-agent-rebuild/<tag>/<commit>`; `--rebuilt` skips the local
+rebuild, requires that line for this tag and its commit (so the draft's
+own `SHA256SUMS` given by mistake is refused), and requires the other
+lines to be exactly the draft's binaries and hashes.
 
 ## Checking a release (anyone)
 
