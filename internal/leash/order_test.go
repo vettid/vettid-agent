@@ -161,24 +161,66 @@ func TestVersionNeverDecreases(t *testing.T) {
 	refused(t, e, gid(1), ErrNotGranted)
 }
 
-// TestOlderUpdateNarrows: an update older (by the vault's clock) than a
-// set already applied only narrows: it adds no grant.
-func TestOlderUpdateNarrows(t *testing.T) {
+// TestUpdateOnlyNarrows: a leash.grant.updated never adds a grant: it
+// removes the ones it lacks and asks for a list, which adds the new.
+func TestUpdateOnlyNarrows(t *testing.T) {
 	e := newEnv(t)
 	now := e.c.Now()
 	g1, g2 := grant(t, now, spec{id: gid(1)}), grant(t, now, spec{id: gid(2)})
-	old, err := envelope.NewULID(now.Add(-24 * 3600e9))
+	e.listing(t, false, g1)
+	mustPresent(t, e, gid(1))
+	e.update(t, false, g2) // gid(2) issued, gid(1) revoked
+	refused(t, e, gid(2), ErrNotGranted)
+	refused(t, e, gid(1), ErrNotGranted)
+	if !needsList(e) {
+		t.Error("no list wanted")
+	}
+	e.listing(t, false, g2)
+	e.m.step(ctx)
+	mustPresent(t, e, gid(2))
+}
+
+// TestLateUpdateAfterOwnListNarrowing: an update made before a
+// revocation, delivered after the connector's own list learned of the
+// revocation, does not bring the grant back, whatever its id's time.
+func TestLateUpdateAfterOwnListNarrowing(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1, g2 := grant(t, now, spec{id: gid(1)}), grant(t, now, spec{id: gid(2)})
+	e.listing(t, false, g1, g2)
+	mustPresent(t, e, gid(1))
+	e.listing(t, false, g2) // gid(1) revoked; learned by a list
+	if err := e.m.List(ctx); err != nil {
+		t.Fatal(err)
+	}
+	refused(t, e, gid(1), ErrNotGranted)
+	late, err := envelope.NewULID(now.Add(24 * 3600e9)) // a higher time than anything so far
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.listing(t, false, g1)
+	e.m.Apply([]vaultconn.Message{{ID: late, Type: "leash.grant.updated", Body: set(t, false, g1, g2)}})
+	refused(t, e, gid(1), ErrNotGranted)
+	mustPresent(t, e, gid(2))
+	if ids := savedIDs(t, e); len(ids) != 1 || ids[0] != gid(2) {
+		t.Errorf("saved: %v", ids)
+	}
+}
+
+// TestOlderUpdateHigherTime: an update made before a revocation but
+// carrying a higher id time (the vault's clock stepped back) does not
+// bring the revoked grant back.
+func TestOlderUpdateHigherTime(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1, g2 := grant(t, now, spec{id: gid(1)}), grant(t, now, spec{id: gid(2)})
+	e.listing(t, false, g1, g2)
 	mustPresent(t, e, gid(1))
-	e.update(t, false, g1)
-	e.m.Apply([]vaultconn.Message{{ID: old, Type: "leash.grant.updated", Body: set(t, false, g2)}})
-	refused(t, e, gid(2), ErrNotGranted)
-	refused(t, e, gid(1), ErrNotGranted) // absent from it: removed
-	e.m.Apply([]vaultconn.Message{{ID: "not-a-ulid", Type: "leash.grant.updated", Body: json.RawMessage(set(t, false, g1, g2))}})
-	refused(t, e, gid(2), ErrNotGranted)
+	revoke, _ := envelope.NewULID(now.Add(1e9))
+	older, _ := envelope.NewULID(now.Add(2e9))
+	e.m.Apply([]vaultconn.Message{{ID: revoke, Type: "leash.grant.updated", Body: set(t, false, g2)}})
+	e.m.Apply([]vaultconn.Message{{ID: older, Type: "leash.grant.updated", Body: set(t, false, g1, g2)}})
+	refused(t, e, gid(1), ErrNotGranted)
+	mustPresent(t, e, gid(2))
 }
 
 // TestFailedRefreshNoGrace: the 15 s during which a statement past its

@@ -12,56 +12,53 @@ import (
 	"github.com/vettid/vettid-agent/internal/state"
 )
 
-func grantSet(deviceID string, suspended bool) []byte {
-	g := map[string]any{"grant_id": "01JB2Z6V9K3M4N5P6Q7R8S9T41", "agent_id": deviceID, "version": 1,
+// savedMember is a record's `leash` member with one grant (without a
+// delegation) for device.
+func savedMember(device string) json.RawMessage {
+	g := map[string]any{"grant_id": "01JB2Z6V9K3M4N5P6Q7R8S9T41", "agent_id": device, "version": 1,
 		"scope": "message.send", "approval": "auto", "per_hour": 60, "per_day": 1000,
 		"connections": []string{"01JB2Z6V9K3M4N5P6Q7R8S9T43"}, "status_ttl": 900,
 		"expires_at": "2099-01-01T00:00:00Z", "issued_at": "2026-10-01T12:00:00Z"}
-	b, _ := json.Marshal(map[string]any{"grants": []any{g}, "suspended": suspended})
+	b, _ := json.Marshal(map[string]any{"v": 1, "as_of": "2026-10-17T12:00:00Z", "suspended": true, "grants": []any{g}})
 	return b
 }
 
-// TestStatusShowsGrants: a leash.grant.updated received by `mcp` is saved
-// and shown by `status` (scope, approval, limits, expiry, connections),
-// with the suspension.
+// TestStatusShowsGrants: the grants saved in the state file are shown by
+// `status` (scope, approval, limits, expiry, connections), with the
+// suspension, and only for this device.
 func TestStatusShowsGrants(t *testing.T) {
 	v := newVault(t)
 	dir := pairedDir(t, v)
 	withTestStatus(t)
-	vw, err := state.ReadOnly(dir, statusResolve)
-	if err != nil {
-		t.Fatal(err)
-	}
-	rec, _ := pairing.DecodeRecord(vw.State)
-	var dev struct {
-		DeviceID string `json:"device_id"`
-	}
-	_ = json.Unmarshal(rec.Device, &dev)
-
 	var out bytes.Buffer
 	run([]string{"status", "--state-dir", dir}, &out, io.Discard)
 	if !strings.Contains(out.String(), "Grants: none saved yet") {
 		t.Errorf("before: %s", out.String())
 	}
 
-	if _, err := v.SendEvent("leash.grant.updated", grantSet(dev.DeviceID, true)); err != nil {
+	s, err := state.Open(dir)
+	if err != nil {
 		t.Fatal(err)
 	}
-	pr, pw := io.Pipe()
-	withTestMCP(t, v, pr)
-	done := make(chan int, 1)
-	go func() { done <- run([]string{"mcp", "--state-dir", dir}, &bytes.Buffer{}, &bytes.Buffer{}) }()
-	deadline := time.Now().Add(10 * time.Second)
-	for v.Pending() != 0 || !strings.Contains(strings.Join(v.Received(), ","), "vault.status") {
-		if time.Now().After(deadline) {
-			t.Fatal("the event was not collected")
+	raw, err := s.Load(statusResolve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := pairing.DecodeRecord(raw)
+	var dev struct {
+		DeviceID string `json:"device_id"`
+	}
+	_ = json.Unmarshal(rec.Device, &dev)
+	write := func(device string) {
+		rec.Leash = savedMember(device)
+		b, _ := rec.Encode()
+		if err := s.Save(b); err != nil {
+			t.Fatal(err)
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
-	pw.Close()
-	if rc := <-done; rc != 0 {
-		t.Fatalf("mcp exit %d", rc)
-	}
+	write(dev.DeviceID)
+	s.Close()
+
 	out.Reset()
 	if rc := run([]string{"status", "--state-dir", dir}, &out, io.Discard); rc != 0 {
 		t.Fatalf("status exit %d", rc)
@@ -73,6 +70,19 @@ func TestStatusShowsGrants(t *testing.T) {
 		if !strings.Contains(o, w) {
 			t.Errorf("lacks %q:\n%s", w, o)
 		}
+	}
+
+	// Grants saved for another device are not shown.
+	s, _ = state.Open(dir)
+	if _, err := s.Load(statusResolve); err != nil {
+		t.Fatal(err)
+	}
+	write("another-device")
+	s.Close()
+	out.Reset()
+	run([]string{"status", "--state-dir", dir}, &out, io.Discard)
+	if !strings.Contains(out.String(), "cannot be read") || strings.Contains(out.String(), "message.send") {
+		t.Errorf("another device's grants: %s", out.String())
 	}
 }
 

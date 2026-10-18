@@ -95,8 +95,8 @@ to `leash.grant.list` are applied in the save of their batch, before it
 is acknowledged. Their order is not relied on (VAULT-MESSAGING §8.4 gives
 none, and §8.3 sends a failed deposit again later): a set replaces the
 grants only if it is the answer to a list this process sent with nothing
-learned since, or an update newer (by the vault's message id) than every
-set applied so; anything else may only remove grants or suspend. A
+learned since; anything else (every `leash.grant.updated` included) may
+only remove grants or suspend, and a fresh list is asked for. A
 status statement (`leash.status.get`) and what a refused one teaches
 (`not_found`, a suspension) are kept in memory and saved with the next
 batch; statements are never saved, since a grant is presented only

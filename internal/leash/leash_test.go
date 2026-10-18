@@ -59,7 +59,9 @@ func TestRevokedNeverPresented(t *testing.T) {
 			t.Error("connection info shows the revoked grant")
 		}
 	}
-	// The revoked grant comes back in no later step either.
+	// The revoked grant comes back in no later step either (the list the
+	// update asked for no longer has it).
+	e.listing(t, false, g2)
 	e.c.Add(10 * time.Minute)
 	e.f.mu.Lock()
 	e.f.statusGet = statusAnswer(t, e.c, map[string]json.RawMessage{gid(1): g1, gid(2): g2})
@@ -474,7 +476,10 @@ func TestSnapshot(t *testing.T) {
 	now := e.c.Now()
 	exp := now.Add(48 * time.Hour).Truncate(time.Second)
 	g1, g2 := grant(t, now, spec{id: gid(1), exp: exp}), grant(t, now, spec{id: gid(2), scope: "message.send", approval: "ask", conns: []string{gid(20)}})
-	e.update(t, true, g2, g1)
+	e.listing(t, true, g2, g1)
+	if err := e.m.List(ctx); err != nil {
+		t.Fatal(err)
+	}
 	raw := e.m.Snapshot()
 	for _, secretish := range []string{`"status"`, `"status_sig"`, `"rotations"`} {
 		if bytes.Contains(raw, []byte(secretish)) {

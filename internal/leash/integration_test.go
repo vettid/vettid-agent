@@ -42,26 +42,28 @@ func (prot) Wipe() error { return nil }
 
 func resolve(string) state.Protector { return prot{} }
 
-// grantSpy notes, for each save, whether the record held the grant and
-// how many messages were still unacknowledged at the relay.
+// grantSpy notes, for each save whose record lacks the grant, how many
+// messages were still unacknowledged at the relay.
 type grantSpy struct {
 	vaultconn.Store
 	v      *pairtest.Vault
 	id     string
 	device string
 	mu     sync.Mutex
-	saves  []int // pending count of each save holding the grant
+	saves  []int // pending count of each save without the grant
 }
 
 func (g *grantSpy) Save(b []byte) error {
 	if r, err := pairing.DecodeRecord(b); err == nil {
 		if s, err := ReadSaved(r.Leash, g.device, time.Now()); err == nil && s != nil {
+			has := false
 			for _, gi := range s.Grants {
-				if gi.GrantID == g.id {
-					g.mu.Lock()
-					g.saves = append(g.saves, g.v.Pending())
-					g.mu.Unlock()
-				}
+				has = has || gi.GrantID == g.id
+			}
+			if !has {
+				g.mu.Lock()
+				g.saves = append(g.saves, g.v.Pending())
+				g.mu.Unlock()
 			}
 		}
 	}
@@ -89,11 +91,11 @@ func waitFor(t *testing.T, what string, f func() bool) {
 }
 
 // TestOverVault: through vaultconn and a simulated vault, a
-// leash.grant.updated is saved in the record with its batch before the
-// batch is acknowledged; it alone does not make the grant presentable.
-// At the next start the saved grant is shown as unconfirmed, and the
-// session check of internal/access (leash.grant.list) replaces it: the
-// vault lists no grants, so the grant is gone and is never presented.
+// leash.grant.updated that revokes a saved grant is saved in the record
+// with its batch before the batch is acknowledged. At the next start the
+// saved grant is shown as unconfirmed; the session check of
+// internal/access (a leash.grant.list this package did not send) only
+// narrows it away; Present's own list confirms the (empty) grants.
 func TestOverVault(t *testing.T) {
 	v, err := pairtest.New()
 	if err != nil {
@@ -163,58 +165,81 @@ func TestOverVault(t *testing.T) {
 		<-done
 	}
 
-	id := gid(1)
-	sp := &grantSpy{v: v, id: id}
-	run(func(s vaultconn.Store) vaultconn.Store { sp.Store = s; return sp }, func(o *opened) {
-		var dev struct {
-			DeviceID string `json:"device_id"`
-		}
-		_ = json.Unmarshal(o.rec.Device, &dev)
-		sp.device = dev.DeviceID
-		g := grant(t, time.Now(), spec{id: id, sub: o.c.IdentityKey(), agentID: dev.DeviceID})
+	// A first run learns the device id and identity key and saves an
+	// access session.
+	var devID string
+	var ik []byte
+	run(nil, func(o *opened) {
+		devID, ik = o.c.DeviceID(), o.c.IdentityKey()
 		if _, err := v.SendEvent("device.session.granted", []byte(`{"session_id":"s1","expires_at":"`+time.Now().Add(time.Hour).UTC().Format(time.RFC3339)+`"}`)); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := v.SendEvent("leash.grant.updated", set(t, false, g)); err != nil {
+	}, func(o *opened) {
+		waitFor(t, "the session", func() bool { return o.c.Access().SessionID == "s1" && v.Pending() == 0 })
+	})
+	id1, id2 := gid(1), gid(2)
+	g1 := grant(t, time.Now(), spec{id: id1, sub: ik, agentID: devID})
+	g2 := grant(t, time.Now(), spec{id: id2, sub: ik, agentID: devID})
+	// seed saves grants as an earlier run would have.
+	seed := func(grants ...json.RawMessage) {
+		m := New(Options{})
+		f := &fakeConn{m: m, ik: ik, device: devID, access: pairing.Access{State: pairing.AccessActive},
+			list: func() *vaultconn.Response { return ok(set(t, false, grants...)) }}
+		if err := m.Bind(f); err != nil {
 			t.Fatal(err)
 		}
-	}, func(o *opened) {
-		waitFor(t, "the grant saved", func() bool { _, ok := sp.first(); return ok })
-		if p, _ := sp.first(); p == 0 {
-			t.Error("the grant was saved only after its batch was acknowledged")
+		if err := m.List(context.Background()); err != nil {
+			t.Fatal(err)
 		}
-		in := o.m.ConnectionInfo()
-		if len(in.Grants) != 1 || in.GrantsConfirmed {
-			t.Errorf("info after the event: %+v", in)
+		s, _ := state.Open(dir)
+		defer s.Close()
+		raw, _ := s.Load(resolve)
+		rec, _ := pairing.DecodeRecord(raw)
+		rec.Leash = m.Snapshot()
+		b, _ := rec.Encode()
+		if err := s.Save(b); err != nil {
+			t.Fatal(err)
 		}
-		// The event alone is not trusted: nothing is presentable until
-		// the grants are listed.
-		o.m.mu.Lock()
-		_, err := o.m.presentable(id, time.Now())
-		o.m.mu.Unlock()
-		if !errors.Is(err, ErrUnconfirmed) {
-			t.Errorf("presentable after the event alone: %v", err)
-		}
-	})
-	saved := func() *Saved {
+	}
+	saved := func() []string {
 		t.Helper()
 		s, _ := state.Open(dir)
 		defer s.Close()
 		raw, _ := s.Load(resolve)
 		rec, _ := pairing.DecodeRecord(raw)
-		sv, err := ReadSaved(rec.Leash, sp.device, time.Now())
+		sv, err := ReadSaved(rec.Leash, devID, time.Now())
 		if err != nil || sv == nil {
 			t.Fatalf("saved grants: %+v %v", sv, err)
 		}
-		return sv
+		var ids []string
+		for _, g := range sv.Grants {
+			ids = append(ids, g.GrantID)
+		}
+		return ids
 	}
-	if sv := saved(); len(sv.Grants) != 1 || sv.Grants[0].GrantID != id {
-		t.Fatalf("file: %+v", sv)
+
+	seed(g1, g2)
+	sp := &grantSpy{v: v, id: id1, device: devID}
+	run(func(s vaultconn.Store) vaultconn.Store { sp.Store = s; return sp }, func(o *opened) {
+		if _, err := v.SendEvent("leash.grant.updated", set(t, false, g2)); err != nil { // gid(1) revoked
+			t.Fatal(err)
+		}
+	}, func(o *opened) {
+		waitFor(t, "the revocation saved", func() bool { _, ok := sp.first(); return ok })
+		if p, _ := sp.first(); p == 0 {
+			t.Error("the revocation was saved only after its batch was acknowledged")
+		}
+		in := o.m.ConnectionInfo()
+		if len(in.Grants) != 1 || in.Grants[0].GrantID != id2 || in.GrantsConfirmed {
+			t.Errorf("info after the event: %+v", in)
+		}
+	})
+	if ids := saved(); len(ids) != 1 || ids[0] != id2 {
+		t.Fatalf("file: %v", ids)
 	}
 
 	// Next start: shown as saved, unconfirmed; the session check at start
-	// lists the grants (none), which replaces them; saved with the next
-	// batch.
+	// narrows (the vault lists none); Present's own list confirms.
 	run(nil, nil, func(o *opened) {
 		if in := o.m.ConnectionInfo(); len(in.Grants) != 1 || in.GrantsConfirmed {
 			t.Errorf("info at start: %+v", in)
@@ -222,12 +247,10 @@ func TestOverVault(t *testing.T) {
 		if err := o.a.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		// The check's answer is not this package's own list, so it may
-		// only narrow: the grant it lacks is removed, nothing confirmed.
 		if in := o.m.ConnectionInfo(); len(in.Grants) != 0 || in.GrantsConfirmed {
 			t.Errorf("info after the check: %+v", in)
 		}
-		if p, err := o.m.Present(context.Background(), id); p != nil || !errors.Is(err, ErrNotGranted) {
+		if p, err := o.m.Present(context.Background(), id2); p != nil || !errors.Is(err, ErrNotGranted) {
 			t.Errorf("present: %v", err)
 		}
 		if in := o.m.ConnectionInfo(); !in.GrantsConfirmed {
@@ -238,7 +261,7 @@ func TestOverVault(t *testing.T) {
 		}
 		waitFor(t, "the batch", func() bool { return v.Pending() == 0 })
 	})
-	if sv := saved(); len(sv.Grants) != 0 {
-		t.Errorf("file after the list: %+v", sv)
+	if ids := saved(); len(ids) != 0 {
+		t.Errorf("file after the list: %v", ids)
 	}
 }

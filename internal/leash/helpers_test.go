@@ -181,6 +181,7 @@ type fakeConn struct {
 	statusGet func(id string) *vaultconn.Response
 	err       error
 	noDevice  bool
+	device    string
 }
 
 func (f *fakeConn) RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*vaultconn.Response, error) {
@@ -232,6 +233,9 @@ func (f *fakeConn) IdentityKey() ed25519.PublicKey { return f.ik }
 func (f *fakeConn) DeviceID() string {
 	if f.noDevice {
 		return ""
+	}
+	if f.device != "" {
+		return f.device
 	}
 	return testAgent
 }
@@ -303,7 +307,7 @@ func (e *env) listing(t *testing.T, suspended bool, grants ...json.RawMessage) {
 	e.f.mu.Unlock()
 }
 
-// update applies a leash.grant.updated newer than every message so far.
+// update applies a leash.grant.updated (which only narrows).
 func (e *env) update(t *testing.T, suspended bool, grants ...json.RawMessage) {
 	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.updated", Body: set(t, suspended, grants...)}})
 }

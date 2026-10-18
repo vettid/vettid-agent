@@ -18,10 +18,10 @@
 //     lifetime (at least a minute) remains.
 //
 // Messages arrive in no guaranteed order (VAULT-MESSAGING §8.4; a failed
-// deposit is sent again in a later flush, §8.3), so a grant set is
-// trusted to widen what the connector holds only when it cannot be
-// older than what the connector learned since (see Apply). Anything
-// else may only narrow it.
+// deposit is sent again in a later flush, §8.3), so only the answer to
+// a list this process sent, with nothing learned since it was sent,
+// widens what the connector holds (see Apply). Everything else, every
+// leash.grant.updated included, may only narrow it and asks for a list.
 //
 // The grants are saved in the record's `leash` member with the batch
 // that carried them (vaultconn.Part), before the batch is acknowledged;
@@ -163,9 +163,6 @@ type Manager struct {
 	// process sent to gen at the time it was sent.
 	gen   uint64
 	lists map[string]uint64
-	// lastSetMS: the vault time (the ULID of its message, in ms) of the
-	// newest grant set applied in full; an update not newer only narrows.
-	lastSetMS uint64
 	// listed: a grant set was applied in full from a list sent in this
 	// access session (in this process). Nothing is presented without it.
 	listed   bool
@@ -248,19 +245,6 @@ func (m *Manager) signal() {
 	}
 }
 
-// ulidMS returns a ULID's time in ms (ok false for anything else).
-func ulidMS(id string) (uint64, bool) {
-	if !envelope.ValidULID(id) {
-		return 0, false
-	}
-	const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-	var ms uint64
-	for i := 0; i < 10; i++ {
-		ms = ms<<5 | uint64(strings.IndexByte(crockford, id[i]))
-	}
-	return ms, true
-}
-
 // How a grant set is applied.
 type mode int
 
@@ -269,16 +253,13 @@ const (
 	// learned since it was sent. It replaces the grants, ends a
 	// suspension, revives grants answered not_found, and confirms them.
 	modeList mode = iota
-	// modeUpdate: a leash.grant.updated newer (by the vault's clock) than
-	// any set applied in full. It replaces the grants, except that it
-	// never revives a grant answered not_found, never lowers a grant's
-	// version and never ends a suspension (a list sent after it does).
-	modeUpdate
-	// modeNarrow: anything else (an older update, an answer to a list
-	// sent before something was learned, or to a list this process did
-	// not send). It only removes: grants absent from it, or present in
-	// another version, go; nothing is added; it can suspend but not
-	// resume. A fresh list is asked for.
+	// modeNarrow: anything else: every leash.grant.updated (nothing in a
+	// message tells its order: VAULT-MESSAGING §8.4 gives none, and an
+	// inner id's time is the sender's clock), an answer to a list sent
+	// before something was learned, or to a list this process did not
+	// send. It only removes: grants absent from it, or present in another
+	// version, go; nothing is added; it can suspend but not resume. A
+	// fresh list is asked for, which brings what it could not add.
 	modeNarrow
 )
 
@@ -293,13 +274,7 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 	for _, msg := range batch {
 		switch {
 		case msg.Re == "" && msg.Type == "leash.grant.updated":
-			md := modeNarrow
-			if ms, ok := ulidMS(msg.ID); ok && ms > m.lastSetMS {
-				md = modeUpdate
-			}
-			if m.applySet(msg.Body, md) && md == modeUpdate {
-				m.lastSetMS, _ = ulidMS(msg.ID)
-			}
+			m.applySet(msg.Body, modeNarrow)
 			m.gen++
 		case msg.Re != "" && msg.Type == "leash.grant.list" && msg.OK:
 			md := modeNarrow
@@ -308,11 +283,7 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 			if mine && g == m.gen {
 				md = modeList
 			}
-			if m.applySet(msg.Body, md) && md == modeList {
-				if ms, ok := ulidMS(msg.ID); ok && ms > m.lastSetMS {
-					m.lastSetMS = ms
-				}
-			}
+			m.applySet(msg.Body, md)
 		case msg.Re == "" && msg.Type == "device.session.granted":
 			m.listed, m.needList = false, true
 			m.listFails, m.nextList = 0, time.Time{}
@@ -392,7 +363,7 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 			changed = true
 		}
 		if changed {
-			m.grants, m.saved = kept, true
+			m.grants, m.asOf, m.saved = kept, now, true
 			m.gen++
 		}
 		m.needList = true
@@ -400,12 +371,9 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 		return true
 	}
 
-	// modeList and modeUpdate replace the grants.
+	// modeList replaces the grants.
 	var gs []*Grant
 	for _, g := range in {
-		if md == modeUpdate && m.dead[g.ID] {
-			continue // revived only by a list sent after the not_found
-		}
 		if old := m.find(g.ID); old != nil && g.Version < old.Version {
 			m.log.Warn("grant in an older version dropped", "grant", g.ID)
 			m.needList = true
@@ -415,10 +383,6 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 	}
 	slices.SortFunc(gs, func(a, b *Grant) int { return strings.Compare(a.ID, b.ID) })
 	suspended := *set.Suspended
-	if md == modeUpdate && m.suspended && !suspended {
-		suspended = true // a resume is confirmed by a list sent after it
-		m.needList = true
-	}
 	// Each grant's statement is the one sent with it, if any (the vault
 	// sends none for a grant not in force, while suspended or while held):
 	// statements of grants no longer present, or sent without one, go.
@@ -441,12 +405,10 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 	m.statements = stmts
 	m.fails = map[string]int{}
 	m.held = false
-	if md == modeList {
-		m.dead = map[string]bool{}
-		m.listed = true
-		if !m.needList {
-			m.listFails, m.nextList = 0, time.Time{}
-		}
+	m.dead = map[string]bool{}
+	m.listed = true
+	if !m.needList {
+		m.listFails, m.nextList = 0, time.Time{}
 	}
 	m.signal()
 	return true
