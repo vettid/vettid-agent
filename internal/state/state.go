@@ -752,3 +752,44 @@ func readNoFollow(path string, max int64, check bool) ([]byte, error) {
 func notPrivate(what, check string) error {
 	return fmt.Errorf("%w: %s %s", ErrNotOwnerOnly, what, check)
 }
+
+// View is a read-only look at a state directory (ReadOnly).
+type View struct {
+	// State is the decrypted state; the caller clears it when done.
+	State []byte
+	// Protector is the header's protector name.
+	Protector string
+	// CreatedAt is the header's created_at (the time of pairing).
+	CreatedAt time.Time
+}
+
+// ReadOnly reads and decrypts the state file in dir without taking the
+// directory's lock and without changing anything: no directory is
+// created, no temporary file removed, nothing written. It is for
+// `vettid-agent status`, which must not take the lock from a running
+// `vettid-agent mcp`. The checks are Load's: the directory and file must
+// be private to the current user, and the file must decode and decrypt
+// (ErrNotFound when there is none). A write in progress by the lock
+// holder is a rename, so a read sees the old or the new file, whole.
+func ReadOnly(dir string, resolve Resolver) (*View, error) {
+	if dir == "" {
+		return nil, errors.New("state: empty state directory")
+	}
+	dir = filepath.Clean(dir)
+	if _, err := os.Lstat(dir); errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	if err := checkDir(dir); err != nil {
+		return nil, err
+	}
+	raw, err := readNoFollow(filepath.Join(dir, StateFileName), maxFileLen, true)
+	if err != nil {
+		return nil, err
+	}
+	pt, h, _, key, err := decodeFile(raw, resolve)
+	clear(key)
+	if err != nil {
+		return nil, err
+	}
+	return &View{State: pt, Protector: h.Protector, CreatedAt: time.Unix(h.CreatedAt, 0)}, nil
+}

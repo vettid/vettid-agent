@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -727,5 +728,187 @@ func TestErrCode(t *testing.T) {
 	}
 	if got := errCode(errors.New("Get https://relay/v1/claim/secret: EOF")); got != "transport error" {
 		t.Errorf("got %q", got)
+	}
+}
+
+// accessSpy notes the access saved with each record and how many
+// messages were still unacknowledged at that moment.
+type accessSpy struct {
+	Store
+	v     *pairtest.Vault
+	mu    sync.Mutex
+	saves []string
+}
+
+func (a *accessSpy) Save(b []byte) error {
+	if r, err := pairing.DecodeRecord(b); err == nil {
+		a.mu.Lock()
+		a.saves = append(a.saves, fmt.Sprintf("%s/%s/%d", r.Access.State, r.Access.SessionID, a.v.Pending()))
+		a.mu.Unlock()
+	}
+	return a.Store.Save(b)
+}
+
+func (a *accessSpy) has(prefix string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, s := range a.saves {
+		if strings.HasPrefix(s, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *accessSpy) first(prefix string) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, s := range a.saves {
+		if strings.HasPrefix(s, prefix) {
+			return s
+		}
+	}
+	return ""
+}
+
+func granted(id string, exp time.Time) []byte {
+	return []byte(`{"session_id":"` + id + `","expires_at":"` + exp.UTC().Format(time.RFC3339) + `"}`)
+}
+
+// TestAccessSavedWithBatch: device.session.granted is applied to the
+// access session and saved in the save of its batch, while it is still
+// unacknowledged; device.session.ended makes it none the same way.
+func TestAccessSavedWithBatch(t *testing.T) {
+	e := newPaired(t)
+	exp := time.Now().Add(time.Hour).Truncate(time.Second)
+	if _, err := e.v.SendEvent("device.session.granted", granted("sess-1", exp)); err != nil {
+		t.Fatal(err)
+	}
+	sp := &accessSpy{v: e.v}
+	o := e.open(func(s Store) Store { sp.Store = s; return sp })
+	if a := o.conn.Access(); a.State != pairing.AccessUnknown {
+		t.Fatalf("after pairing: %+v", a)
+	}
+	stop := o.run()
+	nextEvent(t, o, "device.session.granted")
+	eventually(t, "the grant saved", func() bool { return sp.has("active/sess-1/") })
+	if first := sp.first("active/sess-1/"); strings.HasSuffix(first, "/0") {
+		t.Errorf("the grant was first saved with nothing unacknowledged (%s)", first)
+	}
+	if a := o.conn.Access(); a.SessionID != "sess-1" || !a.ExpiresAt.Equal(exp) {
+		t.Errorf("access %+v", a)
+	}
+	if _, err := e.v.SendEvent("device.session.ended", []byte(`{"reason":"ended"}`)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the end saved", func() bool { return sp.has("none//") })
+	stop()
+	if rec, _ := e.saved(); rec.Access.State != pairing.AccessNone {
+		t.Errorf("file: %+v", rec.Access)
+	}
+}
+
+// TestAccessReplayAfterCrash: the grant's batch is saved but never
+// acknowledged (a crash before the acks); the next process starts with
+// the saved session, and the replayed batch changes nothing.
+func TestAccessReplayAfterCrash(t *testing.T) {
+	e := newPaired(t)
+	exp := time.Now().Add(time.Hour).Truncate(time.Second)
+	e.v.FailAcks = true
+	if _, err := e.v.SendEvent("device.session.granted", granted("sess-2", exp)); err != nil {
+		t.Fatal(err)
+	}
+	sp := &accessSpy{v: e.v}
+	o := e.open(func(s Store) Store { sp.Store = s; return sp })
+	stop := o.run()
+	eventually(t, "the grant saved", func() bool { return sp.has("active/sess-2/") })
+	stop()
+	e.v.FailAcks = false
+	o2 := e.open(nil)
+	if a := o2.conn.Access(); a.SessionID != "sess-2" || !a.ExpiresAt.Equal(exp) {
+		t.Fatalf("restart: %+v", a)
+	}
+	stop2 := o2.run()
+	defer stop2()
+	eventually(t, "the replay acknowledged", func() bool { return e.v.Pending() == 0 })
+	if a := o2.conn.Access(); a.SessionID != "sess-2" {
+		t.Errorf("after replay: %+v", a)
+	}
+}
+
+// TestAccessCrashBeforeSave: the grant's save fails and the process
+// dies: the next process collects the grant again and saves it.
+func TestAccessCrashBeforeSave(t *testing.T) {
+	e := newPaired(t)
+	if _, err := e.v.SendEvent("device.session.granted", granted("sess-3", time.Now().Add(time.Hour))); err != nil {
+		t.Fatal(err)
+	}
+	fs := &failingStore{fail: true}
+	o := e.open(func(s Store) Store { fs.Store = s; return fs })
+	stop := o.run()
+	eventually(t, "a failed save", func() bool { return fs.failures() >= 1 })
+	stop()
+	if rec, _ := e.saved(); rec.Access.State != pairing.AccessUnknown {
+		t.Fatal("the failed save reached the file")
+	}
+	sp := &accessSpy{v: e.v}
+	o2 := e.open(func(s Store) Store { sp.Store = s; return sp })
+	stop2 := o2.run()
+	defer stop2()
+	eventually(t, "the grant saved on the second run", func() bool { return sp.has("active/sess-3/") })
+}
+
+// TestSetAccessSavedWithNextBatch: what internal/access learns from a
+// probe is saved with the next batch.
+func TestSetAccessSavedWithNextBatch(t *testing.T) {
+	e := newPaired(t)
+	sp := &accessSpy{v: e.v}
+	o := e.open(func(s Store) Store { sp.Store = s; return sp })
+	o.conn.SetAccess(pairing.Access{State: pairing.AccessNone})
+	o.conn.SetAccess(pairing.Access{State: "bogus"}) // ignored
+	stop := o.run()
+	defer stop()
+	eventually(t, "saved", func() bool { return sp.has("none//") })
+}
+
+func TestParseGranted(t *testing.T) {
+	if a, ok := ParseGranted(granted("x", time.Unix(1790856600, 0))); !ok || a.SessionID != "x" || a.ExpiresAt.Unix() != 1790856600 {
+		t.Errorf("%+v %v", a, ok)
+	}
+	for _, b := range []string{`{}`, `{"session_id":"x"}`, `{"session_id":"","expires_at":"2026-10-01T12:00:00Z"}`, `{"session_id":"x","expires_at":"soon"}`, `[]`} {
+		if _, ok := ParseGranted(json.RawMessage(b)); ok {
+			t.Errorf("%s accepted", b)
+		}
+	}
+}
+
+// TestOnStatus: each vault.status's owner check reaches OnStatus.
+func TestOnStatus(t *testing.T) {
+	e := newPaired(t)
+	got := make(chan string, 4)
+	s, err := state.Open(e.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.Load(e.resolve)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := pairing.DecodeRecord(raw)
+	c, err := New(Options{Store: s, Resolve: e.resolve, Record: rec, HTTP: e.v.HTTPClient(), PollWait: 10 * time.Millisecond,
+		OnStatus: func(oc string) { got <- oc }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := &opened{store: s, conn: c, rec: rec}
+	stop := o.run()
+	defer stop()
+	select {
+	case oc := <-got:
+		if oc != "ok" {
+			t.Errorf("owner check %q", oc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no OnStatus")
 	}
 }

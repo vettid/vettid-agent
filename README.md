@@ -23,9 +23,9 @@ vault.
 
 The rebuild follows the agent connector plan,
 [AGENT-PLAN](https://github.com/vettid/vettid.org/blob/master/docs/AGENT-PLAN.md),
-in small phases. Today the binary has `pair`, `version` and `mcp`
-(which keeps the vault connection; its MCP tools come later); `status`
-and `forget` are listed as not yet available.
+in small phases. Today the binary has `pair`, `version`, `status` and
+`mcp` (which keeps the vault connection; its MCP tools come later);
+`forget` is listed as not yet available.
 
 **It needs a staging vault.** Only vaults whose release channel lists the
 optional `leash` feature answer agent pairing. Staging images list it;
@@ -141,6 +141,33 @@ the protectors of this version keep no key outside it). If the relay
 refuses the agent, it collects what is still waiting for up to a minute
 in case that notice is among it, then exits saying so and keeps its
 keys; `vettid-agent forget` (to come) deletes them.
+
+## Access sessions and `status`
+
+The agent acts only within an access session that you allow on your
+phone (VAULT-MESSAGING §6.8). When a tool call needs one and there is
+none, the connector asks your vault for access (one hour, or what
+`--access-minutes` of `vettid-agent mcp` sets) and the tool
+answers "This agent needs access to your vault. Allow it on your phone,
+then try again." It never asks more than once at a time, waits 10
+minutes after you decline or leave a request unanswered, asks at most 6
+times an hour, and waits as long as your vault says when it answers that
+the last request was too recent. While your vault waits for your daily
+check, it asks for nothing.
+
+The connector saves the session your phone grants together with the
+message that brought it. Your vault has no message that tells an agent
+its current session, so at start the connector checks a saved,
+unexpired session with one request that needs a session (it shows
+nothing on your phone), and after pairing it checks the same way before
+asking for access for the first time.
+
+`vettid-agent status --state-dir DIR` shows what is saved: whether the
+connector is paired (its name, device and vault ids), the access session
+as last saved, and how the keys are protected. It does not contact the
+vault or the relay and does not take the state directory's lock, so it
+can run next to `vettid-agent mcp` and then shows that process's last
+saved state. It shows no keys or tokens.
 
 ## Keys at rest on Linux: the TPM
 

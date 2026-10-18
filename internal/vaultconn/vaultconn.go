@@ -23,6 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/vettid/vettid-relay/relayclient"
@@ -84,6 +85,9 @@ type Options struct {
 	// depend on is read again from the vault at start. device.unlinked is
 	// not passed on (vaultconn acts on it itself).
 	OnEvent func(Event)
+	// OnStatus, if set, receives the owner check state ("ok", "due",
+	// "held") of every vault.status response, in Run's goroutine.
+	OnStatus func(ownerCheck string)
 	// StatusEvery is how often Run sends vault.status after the one at
 	// start; default 6 hours.
 	StatusEvery time.Duration
@@ -152,6 +156,12 @@ type Conn struct {
 	refreshAt     time.Time
 	statusID      string
 	ownerCheck    string
+
+	// The access session (VAULT-MESSAGING §6.8) as saved with each
+	// batch. accMu guards it: Access and SetAccess are called from other
+	// goroutines.
+	accMu  sync.Mutex
+	access pairing.Access
 }
 
 // New restores the device from the record, with Persist writing the
@@ -182,7 +192,72 @@ func New(o Options) (*Conn, error) {
 		return nil, fmt.Errorf("the saved state could not be restored: %w", err)
 	}
 	c.dev = d
+	c.access = o.Record.Access
 	return c, nil
+}
+
+// Access returns the access session as last known: from the record at
+// start, then from device.session.granted and .ended (applied in the
+// save of the batch that carried them), and SetAccess.
+func (c *Conn) Access() pairing.Access {
+	c.accMu.Lock()
+	defer c.accMu.Unlock()
+	return c.access
+}
+
+// SetAccess replaces the access session (a result internal/access
+// learned from a probe or a session_required answer). It is saved with
+// the next batch.
+func (c *Conn) SetAccess(a pairing.Access) {
+	if !a.Valid() {
+		return
+	}
+	c.accMu.Lock()
+	defer c.accMu.Unlock()
+	c.access = a
+}
+
+// applyAccess applies a batch's device.session.granted and .ended to the
+// access session, in order. Idempotent: applying the same events again
+// gives the same result. A granted whose body is malformed is ignored
+// (logged).
+func (c *Conn) applyAccess(evs []*envelope.Inner) {
+	c.accMu.Lock()
+	defer c.accMu.Unlock()
+	for _, ev := range evs {
+		if ev.Re != "" {
+			continue
+		}
+		switch ev.Type {
+		case "device.session.granted":
+			a, ok := ParseGranted(ev.Body)
+			if !ok {
+				c.log.Warn("malformed event", "type", ev.Type, "id", ev.ID)
+				continue
+			}
+			c.access = a
+		case "device.session.ended":
+			c.access = pairing.Access{State: pairing.AccessNone}
+		}
+	}
+}
+
+// ParseGranted reads device.session.granted{session_id, expires_at}
+// (VAULT-MESSAGING §10.3).
+func ParseGranted(body json.RawMessage) (pairing.Access, bool) {
+	var g struct {
+		SessionID string `json:"session_id"`
+		ExpiresAt string `json:"expires_at"`
+	}
+	if json.Unmarshal(body, &g) != nil || g.SessionID == "" {
+		return pairing.Access{}, false
+	}
+	exp, err := time.Parse(time.RFC3339, g.ExpiresAt)
+	if err != nil {
+		return pairing.Access{}, false
+	}
+	a := pairing.Access{State: pairing.AccessActive, SessionID: g.SessionID, ExpiresAt: exp}
+	return a, a.Valid()
 }
 
 // persist is the client's Config.Persist: called inside Poll after a
@@ -208,7 +283,10 @@ func (c *Conn) persist(st []byte) error {
 		c.wipeErr = nil
 		return nil
 	}
-	rec := pairing.Record{Phase: pairing.PhasePaired, Device: bytes.Clone(st)}
+	// The batch's access events are applied before the save, so they are
+	// in the state file before the relay drops them.
+	c.applyAccess(evs)
+	rec := pairing.Record{Phase: pairing.PhasePaired, Device: bytes.Clone(st), Access: c.Access()}
 	b, err := rec.Encode()
 	clear(rec.Device)
 	if err != nil {
@@ -461,6 +539,9 @@ func (c *Conn) readStatus(r *Response) {
 	}
 	if json.Unmarshal(r.Body, &s) == nil {
 		c.ownerCheck = s.OwnerCheck.State
+		if c.o.OnStatus != nil && s.OwnerCheck.State != "" {
+			c.o.OnStatus(s.OwnerCheck.State)
+		}
 	}
 }
 

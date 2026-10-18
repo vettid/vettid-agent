@@ -103,6 +103,9 @@ func TestMCPNotPaired(t *testing.T) {
 	if rc := run([]string{"mcp", "--state-dir", filepath.Join(t.TempDir(), "s")}, &out, &errOut); rc != 1 || !strings.Contains(errOut.String(), "not paired") || out.Len() != 0 {
 		t.Errorf("exit %d stdout %q stderr %q", rc, out.String(), errOut.String())
 	}
+	if rc := run([]string{"mcp", "--state-dir", "x", "--access-minutes", "0"}, &out, &errOut); rc != 2 {
+		t.Errorf("--access-minutes 0: exit %d", rc)
+	}
 	if rc := run([]string{"mcp"}, &out, &errOut); rc != 2 {
 		t.Errorf("no --state-dir: exit %d", rc)
 	}
