@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# Build the macOS app bundle of vettid-agent, vettid-agent.app, and sign
+# it (AGENT-PLAN §2 AG4, §4.2, §6 A5.3). Runs on a Mac with Xcode's
+# command-line tools.
+#
+#   scripts/build-macos-app [-o OUT_DIR] [-s IDENTITY] [-t TEAM_ID] [-p PROFILE] [REF]
+#                                                    (defaults: dist-macos/, -s -, HEAD)
+#
+# Writes OUT_DIR/vettid-agent.app (an earlier one there is removed first):
+#
+#   vettid-agent.app/Contents/Info.plist                packaging/macos/Info.plist, version set
+#   vettid-agent.app/Contents/embedded.provisionprofile PROFILE (-p)
+#   vettid-agent.app/Contents/MacOS/vettid-agent        the connector, darwin/arm64, cgo
+#
+# The connector stays a command-line program, run as
+# vettid-agent.app/Contents/MacOS/vettid-agent; the bundle exists for the
+# signature, the provisioning profile and the keychain-access-groups
+# entitlement that the Keychain protector needs (README, "Keys at rest on
+# macOS").
+#
+#   -s IDENTITY  the codesign identity: the owner's "Developer ID
+#                Application: ... (TEAM_ID)" certificate in the login
+#                keychain (needs -t and -p), or "-" (the default) for an
+#                ad-hoc signature, which is only for testing the bundle:
+#                macOS gives an ad-hoc build no Keychain access, and an
+#                ad-hoc build with -t is stopped at launch (its
+#                entitlements need a provisioning profile)
+#   -t TEAM_ID   the owner's Apple Developer Team ID (also $APPLE_TEAM_ID);
+#                with it, packaging/macos/vettid-agent.entitlements is
+#                applied with TEAMID replaced by it; without it (ad-hoc
+#                only), no entitlements
+#   -p PROFILE   the owner's Developer ID provisioning profile for the App
+#                ID TEAM_ID.org.vettid.agent (also
+#                $APPLE_PROVISIONING_PROFILE); it must be a Developer ID
+#                profile (all devices) for that App ID and team, allow the
+#                access group, carry an expiry date in the future, and
+#                name the certificate the app is signed with
+#
+# Signed with the hardened runtime (--options runtime) and, for a real
+# identity, a secure timestamp: what notarization asks for. Notarizing,
+# stapling and zipping are scripts/sign-release's steps.
+#
+# The binary is built as scripts/build-release builds the others (the
+# committed tree of REF, go.mod's toolchain, GOENV=off, -trimpath,
+# -buildvcs=false, no build tags, -ldflags "-s -w -buildid= -X <release
+# stamp>", a fresh build cache, the same version rule), except
+# CGO_ENABLED=1: the Keychain protector calls the Security framework. It
+# is checked with scripts/check-release-binaries -C. It is NOT
+# reproducible across machines: the C toolchain and the macOS SDK of the
+# Mac it is built on reach the binary. It is checked by its Developer ID
+# signature and notarization instead, and by the owner's signature over
+# SHA256SUMS, which lists the zipped bundle (docs/RELEASING.md).
+set -euo pipefail
+
+usage() { echo "usage: scripts/build-macos-app [-o OUT_DIR] [-s IDENTITY] [-t TEAM_ID] [-p PROFILE] [REF]" >&2; exit 2; }
+log() { echo "build-macos-app: $*" >&2; }
+
+out="dist-macos"
+identity="-"
+team="${APPLE_TEAM_ID:-}"
+profile="${APPLE_PROVISIONING_PROFILE:-}"
+while getopts "o:s:t:p:" opt; do
+  case "$opt" in
+    o) out="$OPTARG" ;;
+    s) identity="$OPTARG" ;;
+    t) team="$OPTARG" ;;
+    p) profile="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ "$#" -le 1 ] || usage
+ref="${1:-HEAD}"
+
+[ "$(uname -s)" = Darwin ] || { log "FAIL this builds the macOS app and runs on a Mac only"; exit 1; }
+for t in codesign plutil git; do
+  command -v "$t" >/dev/null || { log "FAIL $t not found (install Xcode's command-line tools: xcode-select --install)"; exit 1; }
+done
+if [ -n "$team" ] && ! [[ "$team" =~ ^[A-Z0-9]{10}$ ]]; then
+  log "FAIL the team ID \"$team\" is not 10 letters and digits (Apple Developer, Membership details)"
+  exit 1
+fi
+if [ "$identity" != "-" ]; then
+  [ -n "$team" ] || { log "FAIL signing with $identity needs the team ID (-t or APPLE_TEAM_ID)"; exit 1; }
+  [ -n "$profile" ] || { log "FAIL signing with $identity needs the Developer ID provisioning profile (-p or APPLE_PROVISIONING_PROFILE)"; exit 1; }
+fi
+if [ -n "$profile" ]; then
+  [ -f "$profile" ] || { log "FAIL provisioning profile $profile is not a file"; exit 1; }
+  [ -n "$team" ] || { log "FAIL a provisioning profile needs the team ID (-t or APPLE_TEAM_ID)"; exit 1; }
+  profile="$(cd "$(dirname "$profile")" && pwd)/$(basename "$profile")"
+fi
+mkdir -p "$out"
+outabs="$(cd "$out" && pwd)"
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo"
+git rev-parse --git-dir >/dev/null 2>&1 || { log "FAIL not in a git repository"; exit 1; }
+
+# The version rule of scripts/build-release.
+verre='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+if [[ "$ref" =~ $verre ]] && git rev-parse --verify --quiet --end-of-options "refs/tags/$ref" >/dev/null; then
+  version="$ref"
+  commit="$(git rev-parse --verify --quiet --end-of-options "refs/tags/$ref^{commit}")" || { log "FAIL tag $ref is not a commit"; exit 1; }
+else
+  version="untagged"
+  commit="$(git rev-parse --verify --quiet --end-of-options "$ref^{commit}")" || { log "FAIL $ref is not a commit"; exit 1; }
+  log "$ref is not a version tag: version untagged"
+fi
+# CFBundleShortVersionString and CFBundleVersion: the numeric part.
+bundle_version="0.0.0"
+if [ "$version" != untagged ]; then
+  bundle_version="${version#v}"
+  bundle_version="${bundle_version%%-*}"
+fi
+
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$commit")"
+export SOURCE_DATE_EPOCH
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-macos.XXXXXXXX")"
+trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
+src="$work/src"
+mkdir -p "$src"
+git -c core.autocrlf=false archive --format=tar "$commit" | tar -x -C "$src"
+for f in packaging/macos/Info.plist packaging/macos/vettid-agent.entitlements; do
+  [ -f "$src/$f" ] || { log "FAIL $commit has no $f"; exit 1; }
+done
+
+toolchain="$(awk '$1 == "toolchain" { print $2 }' "$src/go.mod")"
+if ! [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  log "FAIL go.mod at $commit has no toolchain line naming a release (got \"$toolchain\")"
+  exit 1
+fi
+
+# The provisioning profile: for TEAM_ID.org.vettid.agent, allows the
+# access group, not expired. (`security cms -D` reads the signed plist;
+# the signature itself is checked by macOS at launch.)
+if [ -n "$profile" ]; then
+  security cms -D -i "$profile" >"$work/profile.plist" 2>/dev/null || { log "FAIL $profile is not a provisioning profile"; exit 1; }
+  pb() { /usr/libexec/PlistBuddy -c "Print :$1" "$work/profile.plist" 2>/dev/null || true; }
+  appid="$(pb Entitlements:com.apple.application-identifier)"
+  [ "$appid" = "$team.org.vettid.agent" ] || { log "FAIL $profile is for the App ID \"$appid\", not $team.org.vettid.agent"; exit 1; }
+  [ "$(pb TeamIdentifier:0)" = "$team" ] || { log "FAIL $profile is for the team $(pb TeamIdentifier:0), not $team"; exit 1; }
+  groups="$(pb Entitlements:keychain-access-groups)"
+  case "$groups" in
+    *"$team.org.vettid.agent"* | *"$team.*"*) ;;
+    *) log "FAIL $profile does not allow the keychain access group $team.org.vettid.agent (the App ID needs keychain sharing)"; exit 1 ;;
+  esac
+  if [ "$(pb ProvisionsAllDevices)" != true ]; then
+    log "FAIL $profile does not provision all devices: it is not a Developer ID profile (a development or App Store profile?)"
+    exit 1
+  fi
+  expiry="$(plutil -extract ExpirationDate raw -o - "$work/profile.plist" 2>/dev/null || true)"
+  [ -n "$expiry" ] || { log "FAIL $profile has no expiration date"; exit 1; }
+  exp_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expiry" +%s 2>/dev/null || true)"
+  [ -n "$exp_epoch" ] || { log "FAIL $profile's expiration date \"$expiry\" cannot be read"; exit 1; }
+  [ "$exp_epoch" -gt "$(date +%s)" ] || { log "FAIL $profile expired ($expiry)"; exit 1; }
+  ncerts="$(plutil -extract DeveloperCertificates raw -o - "$work/profile.plist" 2>/dev/null || true)"
+  [[ "$ncerts" =~ ^[1-9][0-9]*$ ]] || { log "FAIL $profile lists no developer certificates"; exit 1; }
+  log "provisioning profile for $appid, $ncerts certificate(s), expires $expiry"
+fi
+
+# The build environment of scripts/build-release, with cgo.
+export GOENV=off
+export GOTOOLCHAIN="$toolchain"
+export CGO_ENABLED=1
+export GOFLAGS=-mod=readonly
+export GOWORK=off
+export GOARM64=v8.0
+export GOCACHE="$work/gocache"
+unset GOEXPERIMENT GOFIPS140 GOAMD64 GODEBUG CC CXX CGO_CFLAGS CGO_CPPFLAGS CGO_CXXFLAGS CGO_LDFLAGS
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-13.0}"
+
+cd "$src"
+got="$(go env GOVERSION)"
+[ "$got" = "$toolchain" ] || { log "FAIL the go command reports $got, go.mod names $toolchain"; exit 1; }
+log "commit $commit, version $version, $toolchain, cgo, macOS SDK $(xcrun --show-sdk-version 2>/dev/null || echo unknown), SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+go mod verify >&2
+
+app="$outabs/vettid-agent.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS"
+ldflags="-s -w -buildid= -X main.releaseStamp=vettid-agent-release/$version/$commit"
+GOOS=darwin GOARCH=arm64 go build -trimpath -buildvcs=false -tags= \
+  -ldflags="$ldflags" -o "$app/Contents/MacOS/vettid-agent" ./cmd/vettid-agent
+"$repo/scripts/check-release-binaries" -C -t "$toolchain" -v "$version" -c "$commit" "$app/Contents/MacOS/vettid-agent"
+
+# Info.plist: the template with its comment dropped and VERSION set.
+sed "s|<string>VERSION</string>|<string>$bundle_version</string>|" "$src/packaging/macos/Info.plist" >"$work/Info.plist"
+plutil -convert xml1 -o "$app/Contents/Info.plist" "$work/Info.plist"
+plutil -lint "$app/Contents/Info.plist" >&2
+[ "$(plutil -extract CFBundleIdentifier raw -o - "$app/Contents/Info.plist")" = org.vettid.agent ] || { log "FAIL Info.plist's bundle identifier is not org.vettid.agent"; exit 1; }
+
+sign=(codesign --force --sign "$identity" --options runtime)
+if [ "$identity" = "-" ]; then
+  sign+=(--timestamp=none)
+else
+  sign+=(--timestamp)
+fi
+if [ -n "$team" ]; then
+  sed "s|TEAMID|$team|g" "$src/packaging/macos/vettid-agent.entitlements" >"$work/entitlements.plist"
+  plutil -convert xml1 "$work/entitlements.plist"
+  plutil -lint "$work/entitlements.plist" >&2
+  sign+=(--entitlements "$work/entitlements.plist")
+else
+  log "no team ID: ad-hoc test bundle without entitlements (it cannot use the Keychain)"
+fi
+if [ -n "$profile" ]; then
+  cp "$profile" "$app/Contents/embedded.provisionprofile"
+fi
+
+log "signing with ${identity}"
+"${sign[@]}" "$app"
+codesign --verify --strict --verbose=2 "$app" >&2
+if [ "$identity" != "-" ]; then
+  got_team="$(codesign -d --verbose=2 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
+  [ "$got_team" = "$team" ] || { log "FAIL signed for the team \"$got_team\", expected $team (check -s)"; exit 1; }
+  # The signing certificate must be one the profile names: otherwise macOS
+  # refuses the profile, and with it the entitlements, at launch.
+  mkdir "$work/certs"
+  (cd "$work/certs" && codesign -d --extract-certificates "$app" 2>/dev/null) || true
+  [ -f "$work/certs/codesign0" ] || { log "FAIL cannot read the signing certificate back from $app"; exit 1; }
+  found=0
+  i=0
+  while [ "$i" -lt "$ncerts" ]; do
+    plutil -extract "DeveloperCertificates.$i" raw -o - "$work/profile.plist" | base64 -D >"$work/certs/profile$i" 2>/dev/null || true
+    if cmp -s "$work/certs/codesign0" "$work/certs/profile$i"; then found=1; break; fi
+    i=$((i + 1))
+  done
+  [ "$found" = 1 ] || { log "FAIL the signing certificate ($identity) is not one of the $ncerts certificate(s) in $profile: make the profile with this certificate"; exit 1; }
+  log "the signing certificate is certificate $i of the provisioning profile"
+fi
+log "PASS $app ($version, $commit)"

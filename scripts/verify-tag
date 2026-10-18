@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Check that a release tag is signed with a VettID release key (AGENT-PLAN
+# §2 AG4; docs/RELEASING.md): an annotated tag, signed with an SSH key
+# listed in the allowed signers file. scripts/sign-release and the release
+# workflow use it.
+#
+#   scripts/verify-tag [-a ALLOWED_SIGNERS] TAG
+#
+# The checks; any failure stops with FAIL and a non-zero exit:
+#   1. ALLOWED_SIGNERS (default: release/allowed_signers in this checkout)
+#      holds a key; a file with only comments is refused.
+#   2. refs/tags/TAG is an annotated tag object (not a lightweight tag).
+#   3. Its signature is an SSH signature, and the only signature in it:
+#      git chooses the verifier from the signature's armor, so a PGP or
+#      X.509 signature would be checked against the caller's GnuPG
+#      keyring instead of ALLOWED_SIGNERS.
+#   4. `git verify-tag` of the tag object, with gpg.ssh.allowedSignersFile
+#      set to ALLOWED_SIGNERS and gpg.minTrustLevel=fully, succeeds and
+#      says `Good "git" signature for <principal>`, where <principal> is a
+#      principal of a key line in ALLOWED_SIGNERS.
+#
+# Prints the tag object, the commit and the principal on success. Needs
+# git 2.34 or later and OpenSSH 8.2 or later.
+set -euo pipefail
+
+usage() { echo "usage: scripts/verify-tag [-a ALLOWED_SIGNERS] TAG" >&2; exit 2; }
+log() { echo "verify-tag: $*" >&2; }
+fail() { log "FAIL $*"; exit 1; }
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+allowed="$repo/release/allowed_signers"
+while getopts "a:" opt; do
+  case "$opt" in
+    a) allowed="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ "$#" -eq 1 ] || usage
+tag="$1"
+verre='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+[[ "$tag" =~ $verre ]] || fail "\"$tag\" is not a release tag (v<major>.<minor>.<patch>[-pre])"
+
+# 1.
+[ -f "$allowed" ] || fail "$allowed is not a file"
+allowed="$(cd "$(dirname "$allowed")" && pwd)/$(basename "$allowed")"
+keylines="$(grep -Ev '^[[:space:]]*(#|$)' "$allowed" || true)"
+[ -n "$keylines" ] || fail "$allowed holds no key yet (only comments): the owner adds the release key's line (docs/RELEASING.md)"
+# The principals: the first field of each key line, a comma-separated list.
+principals="$(printf '%s\n' "$keylines" | awk '{ print $1 }' | tr ',' '\n' | sed '/^$/d')"
+
+# 2.
+obj="$(git -C "$repo" rev-parse --verify --quiet --end-of-options "refs/tags/$tag" 2>/dev/null)" || fail "no tag $tag here (git fetch the tag first)"
+[ "$(git -C "$repo" cat-file -t "$obj")" = tag ] || fail "$tag is a lightweight tag; release tags are annotated and signed (git tag -s)"
+commit="$(git -C "$repo" rev-parse --verify --quiet --end-of-options "$obj^{commit}")" || fail "$tag does not point at a commit"
+
+# 3.
+body="$(git -C "$repo" cat-file tag "$obj")"
+armors="$(printf '%s\n' "$body" | grep -E '^-----BEGIN [A-Z0-9 ]+-----$' || true)"
+case "$armors" in
+  "-----BEGIN SSH SIGNATURE-----") ;;
+  "") fail "$tag is not signed (git tag -s with gpg.format=ssh)" ;;
+  *) fail "$tag carries a signature that is not, or not only, an SSH signature ($(printf '%s' "$armors" | tr '\n' ' ')); release tags are signed with the release key (gpg.format=ssh)" ;;
+esac
+
+# 4.
+if ! out="$(git -C "$repo" -c gpg.ssh.allowedSignersFile="$allowed" -c gpg.minTrustLevel=fully verify-tag "$obj" 2>&1)"; then
+  log "git verify-tag: $out"
+  fail "the signature on $tag does not verify against $allowed"
+fi
+signer=""
+while IFS= read -r p; do
+  if printf '%s\n' "$out" | grep -qF "Good \"git\" signature for $p with "; then signer="$p"; break; fi
+done <<<"$principals"
+if [ -z "$signer" ]; then
+  log "git verify-tag: $out"
+  fail "git verify-tag did not report a good \"git\" signature by a principal of $allowed"
+fi
+log "$(printf '%s\n' "$out" | grep -F 'Good "git" signature' | head -n1)"
+log "PASS $tag: tag object $obj, commit $commit, signed by $signer"
+printf '%s %s %s\n' "$obj" "$commit" "$signer"

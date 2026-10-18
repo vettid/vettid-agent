@@ -1,0 +1,463 @@
+#!/usr/bin/env bash
+# The owner's one command to sign and publish a vettid-agent release
+# (AGENT-PLAN §2 AG4, §6 A5.2 and A5.3; docs/RELEASING.md). Runs on the
+# owner's own machine: the macOS steps on a Mac, everything else on macOS
+# or Linux. Nothing here creates, reads or stores a key: the release key
+# signs through ssh-keygen (the YubiKey asks for its PIN and a touch; the
+# fallback file key for its passphrase), and the Apple steps use the owner's
+# Developer ID identity in the login keychain and a notarytool keychain
+# profile, both by name.
+#
+#   scripts/sign-release -k KEY [--no-macos] [--yes] [Apple options] TAG
+#   scripts/sign-release -k KEY --local DIR -c COMMIT TAG
+#
+#   -k KEY                 the release key for `ssh-keygen -Y sign -f KEY`
+#                          (also $VETTID_RELEASE_KEY): the handle file of
+#                          the owner's YubiKey key (ed25519-sk, resident,
+#                          verify-required; signing asks for its PIN and a
+#                          touch), or, as a fallback, an offline Ed25519
+#                          file key. Its public key must be at KEY.pub and
+#                          in the allowed signers file.
+#   -a ALLOWED_SIGNERS     default release/allowed_signers in this checkout
+#   --team-id ID           Apple Developer Team ID (also $APPLE_TEAM_ID)
+#   --identity NAME        the codesign identity (also $APPLE_SIGN_IDENTITY;
+#                          default "Developer ID Application", which must
+#                          then match one certificate)
+#   --profile PATH         the Developer ID provisioning profile for
+#                          TEAM_ID.org.vettid.agent (also
+#                          $APPLE_PROVISIONING_PROFILE)
+#   --notary-profile NAME  the keychain profile saved once with `xcrun
+#                          notarytool store-credentials` (also
+#                          $NOTARY_PROFILE; default vettid-notary)
+#   --no-macos             no macOS app in this release; required when not
+#                          on a Mac, so a release never lacks it by accident
+#   --rebuilt FILE         skip the rebuild here and use FILE instead: the
+#                          list that `scripts/verify-reproducible -m -o FILE
+#                          TAG SHA256SUMS` wrote on another machine (a VM or
+#                          container, docs/RELEASING.md). Its first line must
+#                          be "# vettid-agent-rebuild/TAG/COMMIT" (a rebuild
+#                          of this tag, not a copy of a SHA256SUMS), the
+#                          rest exactly the draft's binaries and hashes.
+#   --yes                  publish without asking
+#   --local DIR            only write, sign and check SHA256SUMS for the
+#                          vettid-agent-TAG-* files in DIR as TAG at
+#                          COMMIT (-c): no GitHub, no rebuild, no Apple
+#                          steps (the tests use it)
+#
+# What a run does, stopping at the first failure:
+#   1. Checks the release key's public key is in the allowed signers file
+#      (a file with only comments is refused).
+#   2. Fetches the tag from GitHub (never replacing a local tag that
+#      differs) and checks it with scripts/verify-tag: an annotated tag
+#      with an SSH signature, and only that, by a key in the allowed
+#      signers file. GitHub's tag must be the same tag object, shown as
+#      verified.
+#   3. Requires TAG's release to be a draft made by github-actions[bot] in
+#      a successful run of .github/workflows/release.yml (by its path, from
+#      the runs API) for the push of the tag's commit, with no assets but
+#      the expected ones. A release already published is checked instead,
+#      with the asset list of the workflow's signature job, and left alone.
+#   4. Downloads the draft's binaries and SHA256SUMS, checks their hashes,
+#      and rebuilds the tag on this machine with scripts/verify-reproducible
+#      -m (or takes --rebuilt): the rebuild must be byte-identical to the
+#      draft's binaries. The rebuild runs the tag's own build scripts here
+#      (docs/RELEASING.md, "The rebuild").
+#   5. On a Mac (unless --no-macos): builds vettid-agent.app with
+#      scripts/build-macos-app (Developer ID, hardened runtime, the
+#      keychain-access-groups entitlement and the provisioning profile),
+#      notarizes it (`xcrun notarytool submit --wait`), staples the ticket,
+#      checks it with Gatekeeper (`spctl`), runs its `version` (it must
+#      name TAG and the commit, not be stopped by macOS) and zips it as
+#      vettid-agent-TAG-darwin-arm64.zip (`ditto`). This build is not
+#      reproducible; its Developer ID signature and notarization check it.
+#   6. Writes SHA256SUMS: the line "# vettid-agent-release/TAG/COMMIT"
+#      (binding the tag and its commit; the binaries carry the same stamp),
+#      then "<sha256>  <file>" for every release file, sorted by name.
+#      `sha256sum -c` skips the "#" line.
+#   7. Signs it: `ssh-keygen -Y sign -n vettid-agent-release -f KEY
+#      SHA256SUMS`, giving SHA256SUMS.sig (OpenSSH's signature format,
+#      which names the key's algorithm), and checks the signature and
+#      every file with scripts/verify-release -A.
+#   8. Uploads the zip, SHA256SUMS and SHA256SUMS.sig to the draft
+#      (replacing earlier uploads), then checks the draft: its asset list
+#      is exactly the files signed here, and every asset, downloaded
+#      again, is byte-identical to them and passes scripts/verify-release
+#      -A.
+#   9. Asks for the tag to be typed (unless --yes), checks the draft as in
+#      step 8 once more, publishes it, and checks it again: if the
+#      published release differs, it is turned back into a draft and the
+#      run fails. The release workflow then checks it once more.
+#
+# Safe to run again after any failure: nothing is published before step 9,
+# and each run starts from the draft's state. A draft whose assets were
+# replaced by an earlier run is checked the same way.
+set -euo pipefail
+
+usage() {
+  echo "usage: scripts/sign-release -k KEY [-a ALLOWED_SIGNERS] [--no-macos] [--rebuilt FILE] [--yes] [--team-id ID] [--identity NAME] [--profile PATH] [--notary-profile NAME] TAG" >&2
+  echo "       scripts/sign-release -k KEY [-a ALLOWED_SIGNERS] --local DIR -c COMMIT TAG" >&2
+  echo "  KEY: the YubiKey key's handle file (for example ~/.ssh/vettid-release), or the fallback offline file key; KEY.pub next to it" >&2
+  exit 2
+}
+log() { echo "sign-release: $*" >&2; }
+fail() { log "FAIL $*"; exit 1; }
+step() { echo >&2; log "== $*"; }
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+key="${VETTID_RELEASE_KEY:-}"
+allowed="$repo/release/allowed_signers"
+team="${APPLE_TEAM_ID:-}"
+identity="${APPLE_SIGN_IDENTITY:-Developer ID Application}"
+profile="${APPLE_PROVISIONING_PROFILE:-}"
+notary="${NOTARY_PROFILE:-vettid-notary}"
+no_macos=0
+rebuilt=""
+yes=0
+local_dir=""
+commit_arg=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -k) [ "$#" -ge 2 ] || usage; key="$2"; shift 2 ;;
+    -a) [ "$#" -ge 2 ] || usage; allowed="$2"; shift 2 ;;
+    -c) [ "$#" -ge 2 ] || usage; commit_arg="$2"; shift 2 ;;
+    --team-id) [ "$#" -ge 2 ] || usage; team="$2"; shift 2 ;;
+    --identity) [ "$#" -ge 2 ] || usage; identity="$2"; shift 2 ;;
+    --profile) [ "$#" -ge 2 ] || usage; profile="$2"; shift 2 ;;
+    --notary-profile) [ "$#" -ge 2 ] || usage; notary="$2"; shift 2 ;;
+    --local) [ "$#" -ge 2 ] || usage; local_dir="$2"; shift 2 ;;
+    --rebuilt) [ "$#" -ge 2 ] || usage; rebuilt="$2"; shift 2 ;;
+    --no-macos) no_macos=1; shift ;;
+    --yes) yes=1; shift ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+[ "$#" -eq 1 ] || usage
+tag="$1"
+
+namespace="vettid-agent-release"
+verre='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+[[ "$tag" =~ $verre ]] || fail "\"$tag\" is not a release tag (v<major>.<minor>.<patch>[-pre])"
+gh_repo="${VETTID_AGENT_REPO:-vettid/vettid-agent}"
+# Where the tag is fetched from (the tests point it at a local repository).
+git_url="${VETTID_AGENT_GIT_URL:-https://github.com/$gh_repo}"
+
+if command -v sha256sum >/dev/null; then
+  sha256() { sha256sum "$1" | awk '{ print $1 }'; }
+else
+  sha256() { shasum -a 256 "$1" | awk '{ print $1 }'; }
+fi
+
+# 1. The key and the allowed signers file.
+check_key() {
+  [ -n "$key" ] || fail "no release key: -k KEY or VETTID_RELEASE_KEY (docs/RELEASING.md)"
+  [ -f "$key" ] || fail "the release key $key is not a file"
+  [ -f "$key.pub" ] || fail "no $key.pub: the release key's public key is expected next to it"
+  [ -f "$allowed" ] || fail "$allowed is not a file"
+  if ! grep -Evq '^[[:space:]]*(#|$)' "$allowed"; then
+    fail "$allowed holds no key yet (only comments): add the release key's line first (docs/RELEASING.md, \"One-time setup\")"
+  fi
+  local blob
+  blob="$(awk 'NF >= 2 { print $2; exit }' "$key.pub")"
+  [ -n "$blob" ] || fail "$key.pub is not an OpenSSH public key"
+  if ! grep -Ev '^[[:space:]]*(#|$)' "$allowed" | grep -qF -- " $blob"; then
+    fail "the public key in $key.pub is not in $allowed: wrong key, or the allowed signers file is not updated"
+  fi
+  log "release key $key ($(ssh-keygen -l -f "$key.pub" | awk '{ print $2, $NF }'))"
+}
+
+# 6. and 7. SHA256SUMS for the vettid-agent-TAG-* files in $1, signed and
+# checked.
+sign_dir() {
+  local d="$1" commit="$2" f names=()
+  for f in "$d"/vettid-agent-"$tag"-*; do
+    [ -f "$f" ] && names+=("$(basename "$f")")
+  done
+  [ "${#names[@]}" -gt 0 ] || fail "no vettid-agent-$tag-* files in $d"
+  rm -f "$d/SHA256SUMS" "$d/SHA256SUMS.sig"
+  {
+    echo "# vettid-agent-release/$tag/$commit"
+    for f in "${names[@]}"; do printf '%s  %s\n' "$(sha256 "$d/$f")" "$f"; done | LC_ALL=C sort -k2
+  } >"$d/SHA256SUMS.new"
+  mv "$d/SHA256SUMS.new" "$d/SHA256SUMS"
+  log "SHA256SUMS:"
+  cat "$d/SHA256SUMS" >&2
+  log "signing SHA256SUMS (namespace $namespace; the YubiKey asks for its PIN and a touch)"
+  ssh-keygen -Y sign -n "$namespace" -f "$key" "$d/SHA256SUMS" >&2 || fail "ssh-keygen could not sign"
+  [ -f "$d/SHA256SUMS.sig" ] || fail "ssh-keygen wrote no SHA256SUMS.sig"
+  "$repo/scripts/verify-release" -a "$allowed" -c "$commit" -A -l "$d" "$tag" || fail "the new signature does not verify; nothing was uploaded"
+}
+
+if [ -n "$local_dir" ]; then
+  [[ "$commit_arg" =~ ^[0-9a-f]{40}$ ]] || fail "--local needs -c COMMIT (the full commit hash)"
+  [ -d "$local_dir" ] || fail "$local_dir is not a directory"
+  command -v ssh-keygen >/dev/null || fail "ssh-keygen not found (OpenSSH 8.2 or later)"
+  check_key
+  sign_dir "$local_dir" "$commit_arg"
+  log "PASS $local_dir: SHA256SUMS signed for $tag at $commit_arg"
+  exit 0
+fi
+[ -z "$commit_arg" ] || usage
+
+# Which steps run.
+on_mac=0
+[ "$(uname -s)" = Darwin ] && on_mac=1
+if [ "$no_macos" = 0 ] && [ "$on_mac" = 0 ]; then
+  fail "the macOS app is built, signed and notarized on a Mac; on $(uname -s), pass --no-macos to publish this release without it"
+fi
+for t in git gh ssh-keygen; do
+  command -v "$t" >/dev/null || fail "$t not found"
+done
+if [ "$no_macos" = 0 ]; then
+  for t in xcrun codesign ditto spctl plutil; do
+    command -v "$t" >/dev/null || fail "$t not found (install Xcode's command-line tools)"
+  done
+  [ -n "$team" ] || fail "the macOS steps need the team ID: --team-id or APPLE_TEAM_ID"
+  [ -n "$profile" ] || fail "the macOS steps need the Developer ID provisioning profile: --profile or APPLE_PROVISIONING_PROFILE"
+  [ -f "$profile" ] || fail "provisioning profile $profile is not a file"
+  [ "$identity" != "-" ] || fail "a release is never signed ad hoc"
+fi
+if [ -n "$rebuilt" ]; then
+  [ -f "$rebuilt" ] || fail "--rebuilt $rebuilt is not a file"
+  rebuilt="$(cd "$(dirname "$rebuilt")" && pwd)/$(basename "$rebuilt")"
+fi
+gh auth status >/dev/null 2>&1 || fail "gh is not signed in (gh auth login)"
+
+step "1. the release key"
+check_key
+
+cd "$repo"
+work="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-sign.XXXXXXXX")"
+cleanup() { cd /; chmod -R u+w "$work" 2>/dev/null || true; rm -rf "$work"; }
+trap cleanup EXIT
+
+# The assets a published release may have: the asset list of the release
+# workflow's signature job.
+allowed_asset() {
+  case "$1" in
+    SHA256SUMS | SHA256SUMS.sig | "vettid-agent-$tag-"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# check_draft LABEL: the release's asset list is exactly the files in
+# $work/out, and every asset, downloaded again into a new directory, is
+# byte-identical to its file in $work/out and passes verify-release -A.
+# Returns non-zero (after saying why) on any difference.
+check_count=0
+check_draft() {
+  local label="$1" d want got f b
+  check_count=$((check_count + 1))
+  d="$work/check-$check_count"
+  mkdir "$d"
+  want="$(for f in "$work"/out/*; do basename "$f"; done | LC_ALL=C sort)"
+  got="$(gh release view "$tag" --repo "$gh_repo" --json assets --jq '.assets[].name' | LC_ALL=C sort)" || { log "$label: cannot list the assets"; return 1; }
+  if [ "$got" != "$want" ]; then
+    log "$label: the release's assets are [$(echo "$got" | tr '\n' ' ')], the files signed here [$(echo "$want" | tr '\n' ' ')]"
+    return 1
+  fi
+  gh release download "$tag" --repo "$gh_repo" -D "$d" || { log "$label: cannot download the assets"; return 1; }
+  for f in "$work"/out/*; do
+    b="$(basename "$f")"
+    if [ ! -f "$d/$b" ] || ! cmp -s "$f" "$d/$b"; then
+      log "$label: the release's $b is not the file signed here"
+      return 1
+    fi
+  done
+  for f in "$d"/*; do
+    [ -f "$work/out/$(basename "$f")" ] || { log "$label: the release has $(basename "$f"), which was not signed here"; return 1; }
+  done
+  if ! "$repo/scripts/verify-release" -a "$allowed" -c "$commit" -A -l "$d" "$tag"; then
+    log "$label: the release does not verify"
+    return 1
+  fi
+  log "$label: the release's assets are the files signed here, and they verify"
+}
+
+step "2. the tag $tag is signed"
+if ! git fetch --quiet --no-tags "$git_url" "refs/tags/$tag:refs/tags/$tag"; then
+  fail "could not fetch the tag $tag from $git_url (not pushed yet, or a local tag $tag that differs: compare with git ls-remote)"
+fi
+read -r tag_obj commit signer < <("$repo/scripts/verify-tag" -a "$allowed" "$tag") || fail "the tag $tag is not signed with a release key"
+[ -n "${signer:-}" ] || fail "the tag $tag is not signed with a release key"
+remote="$(gh api "repos/$gh_repo/git/ref/tags/$tag" --jq '.object.type + " " + .object.sha')" || fail "GitHub has no tag $tag"
+[ "$remote" = "tag $tag_obj" ] || fail "GitHub's $tag ($remote) is not the tag object fetched ($tag_obj)"
+verified="$(gh api "repos/$gh_repo/git/tags/$tag_obj" --jq '(.verification.verified | tostring) + " " + .verification.reason')"
+[ "${verified%% *}" = true ] || fail "GitHub does not show $tag's signature as verified (${verified#* }): add the release key to the owner's GitHub account as a signing key"
+log "$tag ($tag_obj) is commit $commit, signed by $signer, verified by GitHub (${verified#* })"
+
+step "3. the draft release of $tag"
+rel="$(gh release view "$tag" --repo "$gh_repo" --json isDraft,isPrerelease,author --jq '[(.isDraft | tostring), (.isPrerelease | tostring), .author.login] | join(" ")')" \
+  || fail "no release for $tag yet: wait for the release workflow's draft job (gh run list --workflow release.yml)"
+read -r is_draft is_pre author <<<"$rel"
+gh release view "$tag" --repo "$gh_repo" --json assets --jq '.assets[].name' >"$work/assets"
+gh release view "$tag" --repo "$gh_repo" --json body --jq '.body' >"$work/body"
+
+if [ "$is_draft" != true ]; then
+  log "$tag is already published; checking it"
+  while IFS= read -r a; do
+    allowed_asset "$a" || fail "$tag is published with an asset that is not part of a release: $a"
+  done <"$work/assets"
+  mkdir "$work/published"
+  gh release download "$tag" --repo "$gh_repo" -D "$work/published"
+  if "$repo/scripts/verify-release" -a "$allowed" -c "$commit" -A -l "$work/published" "$tag"; then
+    log "PASS $tag is published and signed; nothing to do"
+    exit 0
+  fi
+  fail "$tag is published but does not verify: make it a draft again (gh release edit $tag --draft) and run this again"
+fi
+
+[ "$author" = "github-actions[bot]" ] || fail "the draft of $tag was made by $author, not by the release workflow"
+# shellcheck disable=SC2016 # backquotes in the notes, not an expansion
+built="$(grep -oE 'built from `[0-9a-f]{40}` by \[run [0-9]+\]' "$work/body" | head -n1 || true)"
+[ -n "$built" ] || fail "the draft's notes do not say which run built it"
+draft_commit="$(printf '%s' "$built" | grep -oE '[0-9a-f]{40}')"
+run_id="$(printf '%s' "$built" | sed -E 's/.*\[run ([0-9]+)\].*/\1/')"
+[ "$draft_commit" = "$commit" ] || fail "the draft was built from $draft_commit, but $tag is $commit"
+# The run, from the runs API: identified by its workflow file, not by the
+# workflow's name (any workflow can call itself "release").
+run="$(gh api "repos/$gh_repo/actions/runs/$run_id" \
+  --jq '[.path, .event, .head_sha, .head_branch, .repository.full_name, .head_repository.full_name, .status, (.conclusion // "none"), .html_url] | join(" ")')" \
+  || fail "cannot read the run $run_id"
+read -r r_path r_event r_sha r_branch r_repo r_head_repo r_status r_concl run_url <<<"$run"
+[ "$r_path" = .github/workflows/release.yml ] || fail "run $run_id is of $r_path, not .github/workflows/release.yml"
+[ "$r_event" = push ] || fail "run $run_id was started by $r_event, not by the tag push"
+[ "$r_sha" = "$commit" ] || fail "run $run_id built $r_sha, but $tag is $commit"
+[ "$r_branch" = "$tag" ] || fail "run $run_id is for $r_branch, not $tag"
+[ "$r_repo" = "$gh_repo" ] && [ "$r_head_repo" = "$gh_repo" ] || fail "run $run_id is not a run of $gh_repo's own code ($r_repo, $r_head_repo)"
+[ "$r_status" = completed ] || fail "run $run_id has not finished ($r_status); run this again when it has"
+[ "$r_concl" = success ] || fail "run $run_id did not succeed ($r_concl)"
+log "draft made by run $run_id of .github/workflows/release.yml for the push of $tag at $commit"
+
+repro=()
+while IFS= read -r a; do
+  case "$a" in
+    SHA256SUMS | SHA256SUMS.sig | "vettid-agent-$tag-darwin-arm64.zip") ;;
+    "vettid-agent-$tag-"*) repro+=("$a") ;;
+    *) fail "the draft has an unexpected asset: $a" ;;
+  esac
+done <"$work/assets"
+grep -qxF SHA256SUMS "$work/assets" || fail "the draft has no SHA256SUMS"
+[ "${#repro[@]}" -gt 0 ] || fail "the draft has no binaries"
+
+step "4. the draft's binaries, rebuilt"
+mkdir "$work/draft"
+pats=(-p SHA256SUMS)
+for a in "${repro[@]}"; do pats+=(-p "$a"); done
+gh release download "$tag" --repo "$gh_repo" -D "$work/draft" "${pats[@]}"
+# The reproducible entries of the draft's SHA256SUMS: the workflow's
+# file, or one this script uploaded on an earlier run.
+grep -v '^#' "$work/draft/SHA256SUMS" | grep -vE "  vettid-agent-$tag-darwin-arm64\.zip\$" | LC_ALL=C sort -k2 >"$work/repro-sums" || true
+listed="$(awk '{ print $2 }' "$work/repro-sums")"
+[ "$listed" = "$(printf '%s\n' "${repro[@]}" | LC_ALL=C sort)" ] || fail "the draft's SHA256SUMS lists [$(echo "$listed" | tr '\n' ' ')], its binaries are [${repro[*]}]"
+while read -r h n; do
+  [ "$(sha256 "$work/draft/$n")" = "$h" ] || fail "the draft's $n does not match its SHA256SUMS"
+done <"$work/repro-sums"
+if [ -n "$rebuilt" ]; then
+  log "not rebuilding here: comparing with $rebuilt (--rebuilt)"
+  first="$(head -n1 "$rebuilt")"
+  [ "$first" = "# vettid-agent-rebuild/$tag/$commit" ] \
+    || fail "$rebuilt does not begin with \"# vettid-agent-rebuild/$tag/$commit\" (got \"$first\"): give the file that scripts/verify-reproducible -o wrote for this tag"
+  if ! diff -u "$work/repro-sums" <(tail -n +2 "$rebuilt"); then
+    fail "the draft differs from $rebuilt (- draft, + rebuilt): do not sign"
+  fi
+else
+  "$repo/scripts/verify-reproducible" -m "$tag" "$work/repro-sums" || fail "the rebuild here differs from the draft: do not sign"
+fi
+log "the draft's binaries are byte-identical to the rebuild"
+
+mkdir "$work/out"
+for a in "${repro[@]}"; do cp "$work/draft/$a" "$work/out/$a"; done
+
+if [ "$no_macos" = 0 ]; then
+  step "5. the macOS app: build, sign, notarize"
+  "$repo/scripts/build-macos-app" -o "$work/mac" -s "$identity" -t "$team" -p "$profile" "$tag"
+  app="$work/mac/vettid-agent.app"
+  ditto -c -k --keepParent "$app" "$work/notarize.zip"
+  log "submitting to Apple's notary service (keychain profile $notary); this takes a few minutes"
+  xcrun notarytool submit "$work/notarize.zip" --keychain-profile "$notary" --wait --output-format json >"$work/notary.json" \
+    || { cat "$work/notary.json" >&2 || true; fail "notarytool submit failed"; }
+  n_status="$(plutil -extract status raw -o - "$work/notary.json" 2>/dev/null || true)"
+  n_id="$(plutil -extract id raw -o - "$work/notary.json" 2>/dev/null || true)"
+  if [ "$n_status" != Accepted ]; then
+    [ -z "$n_id" ] || xcrun notarytool log "$n_id" --keychain-profile "$notary" >&2 || true
+    fail "notarization of the app: \"$n_status\" (submission $n_id)"
+  fi
+  log "notarized (submission $n_id)"
+  xcrun stapler staple "$app" >&2
+  xcrun stapler validate "$app" >&2
+  spctl --assess --type execute --verbose=2 "$app" >&2 || fail "Gatekeeper does not accept the notarized app"
+  # The signed app starts: macOS stops a binary whose entitlements its
+  # provisioning profile does not allow (killed, exit status above 128).
+  # The Keychain itself has no quick probe command; it is checked by hand
+  # (README, "Checking the Keychain protector on a Mac").
+  set +e
+  ver="$("$app/Contents/MacOS/vettid-agent" version 2>&1)"
+  rc=$?
+  set -e
+  if [ "$rc" -gt 128 ]; then
+    fail "the signed app was stopped by macOS (signal $((rc - 128))): check the provisioning profile and the entitlements; $ver"
+  elif [ "$rc" != 0 ]; then
+    fail "the signed app's version failed (exit $rc): $ver"
+  fi
+  [ "$(printf '%s\n' "$ver" | head -n2)" = "$(printf 'vettid-agent %s\ncommit: %s' "$tag" "$commit")" ] \
+    || fail "the signed app's version says: $ver"
+  log "the signed app runs: $(printf '%s' "$ver" | head -n1)"
+  ditto -c -k --keepParent "$app" "$work/out/vettid-agent-$tag-darwin-arm64.zip"
+  log "vettid-agent-$tag-darwin-arm64.zip"
+else
+  step "5. no macOS app in this release (--no-macos)"
+fi
+
+step "6. and 7. SHA256SUMS, signed"
+sign_dir "$work/out" "$commit"
+
+step "8. uploading to the draft"
+up=()
+[ "$no_macos" = 1 ] || up+=("$work/out/vettid-agent-$tag-darwin-arm64.zip")
+up+=("$work/out/SHA256SUMS" "$work/out/SHA256SUMS.sig")
+gh release upload "$tag" --repo "$gh_repo" --clobber "${up[@]}"
+if [ "$no_macos" = 1 ] && grep -qxF "vettid-agent-$tag-darwin-arm64.zip" "$work/assets"; then
+  log "removing the macOS zip of an earlier run (not in this SHA256SUMS)"
+  gh release delete-asset "$tag" "vettid-agent-$tag-darwin-arm64.zip" --repo "$gh_repo" --yes
+fi
+check_draft "after the upload" || fail "the draft as uploaded is not what was signed here; it stays a draft (run this again)"
+
+step "9. publish"
+macos_notes=""
+if [ "$no_macos" = 0 ]; then
+  macos_notes="
+
+macOS: \`vettid-agent-$tag-darwin-arm64.zip\` holds \`vettid-agent.app\`, signed with the owner's Developer ID and notarized by Apple. It is not reproducible; it is checked by those signatures and by \`SHA256SUMS\`."
+fi
+cat >"$work/notes.md" <<EOF
+vettid-agent $tag, built from \`$commit\` by [run $run_id]($run_url).
+
+Signed by the owner: \`SHA256SUMS.sig\` is an SSH signature (namespace \`vettid-agent-release\`) over \`SHA256SUMS\`, by the release key in [release/allowed_signers](https://github.com/$gh_repo/blob/main/release/allowed_signers), also published on vettid.org. Check a download with \`scripts/verify-release $tag\` (README, "Releases").
+
+The Linux and Windows binaries rebuild byte for byte: \`scripts/verify-reproducible $tag SHA256SUMS\`.$macos_notes
+EOF
+log "ready: vettid-agent $tag ($commit), $(grep -vc '^#' "$work/out/SHA256SUMS") files, signed and checked"
+if [ "$yes" = 0 ]; then
+  [ -r /dev/tty ] || fail "no terminal to confirm on: pass --yes to publish"
+  printf 'sign-release: type %s to publish it: ' "$tag" >/dev/tty
+  read -r answer </dev/tty
+  [ "$answer" = "$tag" ] || fail "not confirmed; $tag stays a signed draft (run this again to publish it)"
+fi
+# Right before publishing: the draft may have changed since step 8.
+check_draft "before publishing" || fail "the draft changed after it was checked; it stays a draft (run this again)"
+pre=(--prerelease=false)
+if [ "$is_pre" = true ] || [[ "$tag" == *-* ]]; then pre=(--prerelease=true --latest=false); fi
+gh release edit "$tag" --repo "$gh_repo" --draft=false "${pre[@]}" --notes-file "$work/notes.md" >/dev/null
+# And right after: a release that differs from what was signed goes back
+# to being a draft.
+if ! check_draft "after publishing"; then
+  log "turning $tag back into a draft"
+  if gh release edit "$tag" --repo "$gh_repo" --draft=true >/dev/null; then
+    fail "the published release was not what was signed here; it is a draft again (run this again)"
+  fi
+  fail "the published release is not what was signed here, and it could not be turned back into a draft (an immutable release?): delete it or publish a new version, and check github.com/$gh_repo/releases now"
+fi
+log "PASS published $(gh release view "$tag" --repo "$gh_repo" --json url --jq .url)"
+log "the release workflow's \"signature\" job checks the published release once more"
