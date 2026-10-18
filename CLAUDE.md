@@ -29,6 +29,7 @@ go build -o vettid-agent ./cmd/vettid-agent
 go vet ./...
 go test -p 1 ./...
 go test -p 1 -race ./...   # Linux and macOS
+make devstack-test         # against vettid-vault's local dev stack (README, "Dev-stack tests")
 ```
 
 ## Conventions
