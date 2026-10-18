@@ -84,11 +84,15 @@ var dpapiProvider = []byte{0xd0, 0x8c, 0x9d, 0xdf, 0x01, 0x15, 0xd1, 0x11, 0x8c,
 var (
 	// ErrDPAPIBlobFormat: the wrapped key is not a DPAPI protector blob.
 	ErrDPAPIBlobFormat = errors.New("the wrapped key is not in the DPAPI protector's format")
-	// ErrDPAPIRefused: DPAPI refused the blob for this Windows user, or
-	// what it returned is not this protector's key.
-	ErrDPAPIRefused = errors.New("Windows (DPAPI) does not open the state file's key for this user: the file was made by another Windows user (or under another user's profile), or it was altered")
+	// ErrDPAPIRefused: DPAPI found the blob invalid (ERROR_INVALID_DATA:
+	// its integrity check failed, or other entropy), or what it returned
+	// is not this protector's key.
+	ErrDPAPIRefused = errors.New("Windows (DPAPI) does not open the state file's key: the file was altered, or its key was not made by this connector")
 	// ErrDPAPIKeyLost: Windows could not use the user's DPAPI master key
-	// the blob was made under.
+	// the blob was made under (NTE_BAD_KEY_STATE): the master key is not
+	// in this user's profile (another user, another computer, a
+	// recreated profile), or it is there but cannot be decrypted (an
+	// administrator reset the user's password).
 	ErrDPAPIKeyLost = errors.New("Windows (DPAPI) could not use this user's key for the state file")
 	// ErrDPAPIProfile: the user's profile or logon credentials are not
 	// available to DPAPI in this logon (environmental, not definite).

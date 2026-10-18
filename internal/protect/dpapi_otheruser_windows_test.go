@@ -188,10 +188,10 @@ func TestDPAPIOtherUser(t *testing.T) {
 		deleteLocalUser(user)
 	})
 
-	helperRun := func(password, op, blob string) (status, kind, msg string) {
+	helperRunAs := func(user, password string, logonFlags uintptr, op, blob string) (status, kind, msg string) {
 		t.Helper()
 		res := filepath.Join(dir, "result-"+randHex(t, 4))
-		code := runAsUser(t, user, password, dir, helper,
+		code := runAsUser(t, user, password, logonFlags, dir, helper,
 			"-test.run=^TestDPAPIHelper$", "-test.count=1", "-test.timeout=2m",
 			"dpapi-helper", op, blob, res)
 		b, err := os.ReadFile(res)
@@ -203,6 +203,10 @@ func TestDPAPIOtherUser(t *testing.T) {
 			parts = append(parts, "")
 		}
 		return parts[0], parts[1], parts[2]
+	}
+	helperRun := func(password, op, blob string) (string, string, string) {
+		t.Helper()
+		return helperRunAs(user, password, logonWithProfile, op, blob)
 	}
 
 	// 1. A key wrapped by this user does not open for the other user.
@@ -216,8 +220,10 @@ func TestDPAPIOtherUser(t *testing.T) {
 	}
 	status, kind, msg := helperRun(pass, "unwrap", minePath)
 	t.Logf("other user opening this user's key: %s %s: %s", status, kind, msg)
-	if status != "error" || (kind != "refused" && kind != "keylost") {
-		t.Errorf("other user opening this user's key: %s %s: %s; want a definite refusal", status, kind, msg)
+	// Windows answers NTE_BAD_KEY_STATE: the blob's master key is not
+	// in the other user's profile.
+	if status != "error" || kind != "keylost" || !strings.Contains(msg, "another Windows user") {
+		t.Errorf("other user opening this user's key: %s %s: %s; want ErrDPAPIKeyLost naming another user", status, kind, msg)
 	}
 
 	// 2. The other user's key opens for that user and not here.
@@ -234,8 +240,8 @@ func TestDPAPIOtherUser(t *testing.T) {
 	}
 	_, err = NewDPAPI().Unwrap(theirs)
 	t.Logf("this user opening the other user's key: %v", err)
-	if k := kindOf(err); err == nil || (k != "refused" && k != "keylost") {
-		t.Errorf("this user opening the other user's key: %v; want a definite refusal", err)
+	if !errors.Is(err, ErrDPAPIKeyLost) || !strings.Contains(err.Error(), "another Windows user") {
+		t.Errorf("this user opening the other user's key: %v; want ErrDPAPIKeyLost naming another user", err)
 	}
 
 	// 3. An administrator resets the other user's password: the user's
@@ -244,9 +250,27 @@ func TestDPAPIOtherUser(t *testing.T) {
 	resetPassword(t, user, pass2)
 	status, kind, msg = helperRun(pass2, "unwrap", theirsPath)
 	t.Logf("other user opening its key after an administrator reset its password: %s %s: %s", status, kind, msg)
-	if status != "error" || (kind != "keylost" && kind != "refused") {
-		t.Errorf("after a password reset: %s %s: %s; want a definite error", status, kind, msg)
+	// NTE_BAD_KEY_STATE again, but the master key file is present.
+	if status != "error" || kind != "keylost" || !strings.Contains(msg, "administrator reset") {
+		t.Errorf("after a password reset: %s %s: %s; want ErrDPAPIKeyLost naming the reset", status, kind, msg)
 	}
+	// 4. A user whose profile is not loaded (a new user, started without
+	// loading its profile): DPAPI cannot reach the user's keys, an
+	// environmental error, not a definite one.
+	user2 := "vtb" + randHex(t, 4)
+	pass3 := "Vc3!" + randHex(t, 12) + "-z"
+	addLocalUser(t, user2, pass3)
+	t.Cleanup(func() {
+		if sid, _, _, err := windows.LookupSID("", user2); err == nil {
+			if s, err := windows.UTF16PtrFromString(sid.String()); err == nil {
+				procDeleteProfileW.Call(uintptr(unsafe.Pointer(s)), 0, 0)
+			}
+		}
+		deleteLocalUser(user2)
+	})
+	status, kind, msg = helperRunAs(user2, pass3, logonNoProfile, "wrap", filepath.Join(dir, "noprofile.blob"))
+	t.Logf("a user without a loaded profile wrapping a key: %s %s: %s", status, kind, msg)
+
 	// And new keys work again for that user.
 	newPath := filepath.Join(dir, "new.blob")
 	if status, kind, msg := helperRun(pass2, "wrap", newPath); status != "ok" {
@@ -256,9 +280,15 @@ func TestDPAPIOtherUser(t *testing.T) {
 	}
 }
 
+// CreateProcessWithLogonW's logon flags: 0 does not load the profile.
+const (
+	logonWithProfile = 1
+	logonNoProfile   = 0
+)
+
 // runAsUser starts app with args as user (a local account) with the
 // user's profile loaded, waits for it, and returns its exit code.
-func runAsUser(t *testing.T, user, password, cwd, app string, args ...string) uint32 {
+func runAsUser(t *testing.T, user, password string, logonFlags uintptr, cwd, app string, args ...string) uint32 {
 	t.Helper()
 	u, _ := windows.UTF16PtrFromString(user)
 	d, _ := windows.UTF16PtrFromString(".")
@@ -268,10 +298,9 @@ func runAsUser(t *testing.T, user, password, cwd, app string, args ...string) ui
 	w, _ := windows.UTF16PtrFromString(cwd)
 	si := windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{})), Flags: windows.STARTF_USESHOWWINDOW, ShowWindow: windows.SW_HIDE}
 	var pi windows.ProcessInformation
-	const logonWithProfile = 1
 	r, _, e := procCreateProcessWithLogonW.Call(
 		uintptr(unsafe.Pointer(u)), uintptr(unsafe.Pointer(d)), uintptr(unsafe.Pointer(p)),
-		logonWithProfile, uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(c)),
+		logonFlags, uintptr(unsafe.Pointer(a)), uintptr(unsafe.Pointer(c)),
 		windows.CREATE_NO_WINDOW|windows.CREATE_UNICODE_ENVIRONMENT, 0, uintptr(unsafe.Pointer(w)),
 		uintptr(unsafe.Pointer(&si)), uintptr(unsafe.Pointer(&pi)))
 	if r == 0 {

@@ -40,12 +40,18 @@ package protect
 // local account or a Microsoft account without roaming, the file opens
 // only on this computer.
 //
-// Errors are of three kinds. Definite: ErrDPAPIRefused (DPAPI says the
-// data is invalid for this user, or what it returned is not this
-// protector's key) and ErrDPAPIKeyLost (Windows could not use the
-// user's master key, as after an administrator reset the user's
-// password). Environmental: ErrDPAPIProfile (no loaded profile, or a
-// logon without the user's password). Anything else keeps its cause.
+// Errors are of three kinds. Definite: ErrDPAPIRefused
+// (ERROR_INVALID_DATA, NTE_BAD_DATA, ERROR_PASSWORD_RESTRICTION: the
+// blob's integrity check failed, so it was altered or made with other
+// entropy; or what DPAPI returned is not this protector's key) and
+// ErrDPAPIKeyLost (NTE_BAD_KEY_STATE: Windows could not use the master
+// key the blob names). The Windows CI job shows NTE_BAD_KEY_STATE both
+// for another local user's blob (in either direction) and for the
+// user's own blob after an administrator reset the password; whether
+// the master key file is in this user's profile tells the two apart
+// for the message (keyLostHint). Environmental: ErrDPAPIProfile (no
+// loaded profile, or a logon without the user's password). Anything
+// else keeps its cause.
 //
 // Wipe deletes nothing: the DPAPI blob lives only in the state file;
 // Windows keeps no per-blob key, and the user's master keys belong to
