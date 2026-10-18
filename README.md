@@ -109,11 +109,12 @@ decision. `--name` sets the name your phone shows (default "Agent on
 <host name>"). Everything is written to standard error; the pairing code
 is never written anywhere, and the six-digit code only to your terminal.
 
-The keys are protected as described below: the TPM on Linux, DPAPI on
-Windows, a passphrase where there is neither (macOS until its Keychain
-protector exists). A TPM or DPAPI that is present but does not work
-makes `pair` stop with the cause and the fix; `--passphrase` chooses
-the passphrase protector instead (not bound to this computer).
+The keys are protected as described below: the TPM on Linux, the
+Keychain on macOS (signed app only), DPAPI on Windows, a passphrase
+where there is none of these. A TPM, Keychain or DPAPI that is present
+but does not work makes `pair` stop with the cause and the fix;
+`--passphrase` chooses the passphrase protector instead (not bound to
+this computer).
 
 If the wait is interrupted after the six-digit code was shown, the keys
 are kept: run `vettid-agent pair --state-dir …` again, without a code,
@@ -373,6 +374,86 @@ backup, a file system snapshot, a block an SSD remapped) can still be
 opened on this computer until its TPM is cleared. Opening such a copy
 needs the copy (from a backup, a snapshot or the raw disk) and access to
 this computer's TPM.
+
+## Keys at rest on macOS: the Keychain
+
+On macOS the connector keeps a key for its state file's key in the
+Keychain, as an item that stays on this Mac (`ThisDeviceOnly`: not
+synced with iCloud Keychain, not restored from a backup onto another
+Mac) and opens only for your user while the Mac is unlocked. The state
+file holds the state file's key encrypted under that Keychain key, and
+the item's random name; neither opens anything without the other, so a
+copy of the state file does not open on another Mac or for another user.
+The connector reads the item back after storing it and checks that
+macOS kept it this-device-only and not synchronized, and checks that
+again each time it opens the state file; otherwise it refuses.
+
+Only the **signed vettid-agent app** can use it. macOS gives access to
+this kind of Keychain item only to a program signed with an Apple
+Developer ID and a provisioning profile that allows it, so the connector
+is shipped (AGENT-PLAN A5, not yet released) as
+`vettid-agent.app`, run from
+`vettid-agent.app/Contents/MacOS/vettid-agent` like any command-line
+program. A binary built from source, or any copy without that
+signature, cannot use the Keychain at all: `pair` then says so and uses
+a passphrase (not bound to this computer), as on a Linux computer
+without a TPM; the older file-based login keychain is never used,
+because it ignores "this device only". A state file paired with the app
+opens only with the app: another build says the Keychain is not
+available to it, rather than that the key is gone.
+
+The Keychain is locked while no one is logged in at the Mac, so the
+connector cannot open its keys over SSH or from a launch daemon in that
+case; it says so (run it as the logged-in user while the Mac is
+unlocked). If the item is gone (deleted, or the state file comes from
+another Mac or user), it says that too; pair again with `pair --restart`.
+
+The item is named after the state directory (a hash of its path), so
+wiping a state directory deletes its Keychain item even when the state
+file no longer opens. After a wipe, an old copy of the state file
+recovered from the disk opens nowhere. Two cases leave an item behind:
+a state directory moved or renamed after pairing and then wiped without
+its file being opened (the item opens nothing without an old copy of
+the file), and a pairing interrupted between creating the item and
+writing the state file (the next wipe of that state directory deletes
+it).
+
+### Checking the Keychain protector on a Mac
+
+The CI job (`macos-15`) cannot run the signed app, so it checks the
+format, the decisions and what macOS answers a binary without the
+entitlement; the following is checked by hand on a Mac once the signed
+app exists (A5). Use a test state directory and, for step 5, a second
+Mac or a second user.
+
+1. Pair: `vettid-agent.app/Contents/MacOS/vettid-agent pair --state-dir
+   ~/vettid-kc-test`. It says "Keys are bound to this computer: macOS
+   Keychain, this Mac only." (with a source build it says the Keychain
+   is not available and asks for a passphrase instead).
+2. `vettid-agent.app/Contents/MacOS/vettid-agent status --state-dir
+   ~/vettid-kc-test` shows the pairing without the "not bound to this
+   computer" notice: the key round-trips through the Keychain, and the
+   item read back was this-device-only and not synchronizable (the
+   connector refuses it otherwise).
+3. Run `status` from a source build of the same version: it says the
+   Keychain is not available to that build (not that the key is gone).
+4. Over SSH with no one logged in at the Mac (or with the Mac locked
+   at the login window), `status` says the Keychain is locked, with the
+   fix.
+5. Copy `~/vettid-kc-test` (keeping its mode `0700`/`0600`) to another
+   Mac signed in to the same Apple Account with iCloud Keychain on, or
+   to another user's home, and run `status` there with the signed app:
+   it says the Keychain has no item for the state file's key. This is
+   the "not synchronized" check end to end.
+6. Copy the state directory aside, `cp -Rp ~/vettid-kc-test
+   ~/vettid-kc-copy`, and check that `status --state-dir
+   ~/vettid-kc-copy` opens it (the copy uses the same item).
+7. Pair the test directory again, `pair --restart --state-dir
+   ~/vettid-kc-test` (and remove the old pairing on the phone). Then
+   `status --state-dir ~/vettid-kc-copy` says the Keychain has no item
+   for the state file's key: the wipe deleted the old item, so the old
+   copy of the state file opens nowhere. Delete both test directories
+   (`pair --restart` on the copy is not needed: its item is gone).
 
 ## Keys at rest on Windows: DPAPI
 

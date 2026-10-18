@@ -38,7 +38,7 @@ members, in this order, without white space:
 | Member | Value |
 |---|---|
 | `v` | `1` |
-| `protector` | the protector's name: `[a-z][a-z0-9-]{0,31}` (`passphrase`, `tpm`, `dpapi`, and later `keychain`) |
+| `protector` | the protector's name: `[a-z][a-z0-9-]{0,31}` (`passphrase`, `tpm`, `dpapi`, `keychain`) |
 | `wrapped_key` | the data key as the protector wrapped it, standard base64 with padding, 1 to 4096 bytes before encoding; its inner format is the protector's |
 | `nonce` | the AEAD nonce for `ct`, standard base64 with padding, 24 bytes before encoding |
 | `created_at` | when the data key was made (the pairing), Unix seconds, positive |
@@ -210,13 +210,51 @@ CryptUnprotectData may succeed with corrupted output). The entropy is a
 public constant: it keeps these blobs apart from other programs' DPAPI
 blobs, and any process running as the same user can open them.
 
+## The `keychain` wrapped key (macOS)
+
+The Keychain protector's `wrapped_key` (internal/protect/keychain.go):
+
+```
+wrapped_key = version (1 byte, 0x01) || name (16 bytes) || nonce (24 bytes) || sealed
+sealed      = XChaCha20-Poly1305(KEK, nonce, data key (32 bytes),
+                                 ad = "vettid-agent/protect/keychain/v1\x00" || version || name)
+```
+
+exactly 89 bytes; any other length or version is refused before the
+Keychain is asked. `name` and `nonce` are random, made at each `Wrap`.
+The KEK (32 random bytes) is the data of a generic password item in the
+data protection keychain (never the file-based login keychain):
+
+| attribute | value |
+|---|---|
+| `kSecAttrService` | `vettid-agent/` + the first 16 bytes, in lower-case hex, of SHA-256(`"vettid-agent/protect/keychain/v1 dir\x00"` \|\| the state directory's canonical path) |
+| `kSecAttrAccount` | `name`, in lower-case hex |
+| `kSecAttrLabel` | `vettid-agent data key` |
+| `kSecAttrAccessible` | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` |
+| `kSecAttrSynchronizable` | false |
+
+The canonical path is the one macOS reports for the open directory
+(`fcntl` `F_GETPATH`: symbolic links resolved, the letter case the
+volume stores). `Wrap` reads the item back and refuses it unless its
+data, service, accessibility and synchronizable attributes are as
+written; `Unwrap` looks the item up by `name` alone (so a moved state
+directory still opens) and refuses it unless it is this-device-only,
+not synchronizable and its service starts with `vettid-agent/`. A
+binary without the `keychain-access-groups` entitlement cannot use the
+data protection keychain (macOS answers `errSecMissingEntitlement`, and
+lookups find nothing), so the protector checks its own entitlement
+first and reports the Keychain as not available instead of asking.
+
 ## Wipe
 
 `forget` and `device.unlinked` (AGENT-PLAN AG12) wipe in this order:
 
-1. The protector's key first (`Protector.Wipe`: a Keychain item;
-   nothing for the passphrase, TPM and DPAPI protectors, whose wrapped
-   key lives only in the file). The protector
+1. The protector's key first (`Protector.Wipe`: for the Keychain
+   protector, every item whose service is the state directory's, then
+   the items the protector opened or made in this process, the key in
+   use last, an item already gone counting as deleted; nothing for the
+   passphrase, TPM and DPAPI protectors, whose wrapped key lives only
+   in the file). The protector
    is the one that created or opened the file or, when the file was not
    opened (a forgotten passphrase), the one named in the header. If its
    wipe fails, the state file is kept and the error returned, so that a
