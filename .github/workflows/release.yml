@@ -67,6 +67,7 @@ jobs:
         if: ${{ !matrix.setup-go }}
         working-directory: ${{ matrix.path }}
         run: |
+          set -euo pipefail
           if ! command -v go >/dev/null; then
             # The image's preinstalled Go, newest first; it only fetches the toolchain.
             gobin="$(ls -d /opt/hostedtoolcache/go/*/*/bin 2>/dev/null | sort -V | tail -n1)"
@@ -79,7 +80,12 @@ jobs:
           # toolchains, into an empty module cache; `go mod download`
           # checks it against the Go checksum database (GOSUMDB).
           export GOMODCACHE="$RUNNER_TEMP/gomodcache" GOFLAGS=-modcacherw
-          dir="$(cd / && GOTOOLCHAIN=local GOSUMDB=sum.golang.org go mod download -json "$mod" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("Error") or ""); print(d["Dir"])' | { read -r err; read -r d; [ -z "$err" ] || { echo "::error::$err" >&2; exit 1; }; echo "$d"; })"
+          json="$(cd / && GOTOOLCHAIN=local GOSUMDB=sum.golang.org go mod download -json "$mod")" || { echo "$json"; echo "::error::could not download $mod"; exit 1; }
+          echo "$json"
+          dir="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Dir") or "")')"
+          if [ -z "$dir" ] || [ ! -d "$dir" ] || [ ! -f "$dir/bin/go" ] || [ -z "$(ls -A "$dir/pkg/tool" 2>/dev/null)" ]; then
+            echo "::error::the downloaded toolchain $mod is missing or empty (dir: \"$dir\")"; exit 1
+          fi
           # Module zips carry no execute bits; the go command sets them
           # on bin/ and pkg/tool/ when it switches, and so does this step.
           chmod +x "$dir"/bin/* "$dir"/pkg/tool/*/*
@@ -96,6 +102,30 @@ jobs:
           command -v go
           (cd / && GOTOOLCHAIN=local go version)
           scripts/build-release -o "$RUNNER_TEMP/out" "$REF"
+      - name: the version rule (local tags in a throwaway clone, never pushed)
+        if: matrix.builder == 'a'
+        working-directory: ${{ matrix.path }}
+        run: |
+          set -euo pipefail
+          # Two version tags on one commit: each builds as itself, and
+          # HEAD builds as untagged.
+          c="$RUNNER_TEMP/version-rule"
+          git clone --quiet --no-local . "$c"
+          commit="$(git -C "$c" rev-parse HEAD)"
+          git -C "$c" tag v0.0.0-rc.1
+          git -C "$c" -c user.name=ci -c user.email=ci@invalid tag -a -m "version rule check" v0.0.0
+          for v in v0.0.0 v0.0.0-rc.1 untagged; do
+            ref="$v"; [ "$v" = untagged ] && ref=HEAD
+            "$c/scripts/build-release" -o "$RUNNER_TEMP/vr-$v" "$ref" >/dev/null
+            names="$(cd "$RUNNER_TEMP/vr-$v" && ls vettid-agent-* | tr '\n' ' ')"
+            want="vettid-agent-$v-linux-amd64 vettid-agent-$v-linux-arm64 vettid-agent-$v-windows-amd64.exe "
+            [ "$names" = "$want" ] || { echo "::error::$ref built [$names], want [$want]"; exit 1; }
+            # shellcheck disable=SC2086 # names is a list of file names
+            (cd "$RUNNER_TEMP/vr-$v" && "$c/scripts/check-release-binaries" -v "$v" -c "$commit" $names)
+            got="$("$RUNNER_TEMP/vr-$v/vettid-agent-$v-linux-amd64" version | head -n2)"
+            [ "$got" = "$(printf 'vettid-agent %s\ncommit: %s' "$v" "$commit")" ] || { echo "::error::$ref: version says $got"; exit 1; }
+            echo "$ref builds as $v"
+          done
       - name: the devstack guard refuses a devstack build
         working-directory: ${{ matrix.path }}
         run: |

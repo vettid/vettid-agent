@@ -14,10 +14,14 @@
 # rebuilt binaries, checks them with this checkout's
 # scripts/check-release-binaries (toolchain from REF's go.mod, version
 # and commit from REF), and compares the hashes with SHA256SUMS: the same
-# file names and the same hashes, nothing more and nothing less. It
-# exits 0 only if everything matches, and 1 on any difference (printed
-# as a diff). It also prints how REF's scripts/ differ from this
-# checkout's, for the reader to judge.
+# file names and the same hashes, nothing more and nothing less. On
+# Linux amd64 and arm64 it also runs the binary for this machine and
+# requires `version` to name REF's version and commit. It exits 0 only if
+# everything matches, and 1 on any difference (printed as a diff).
+#
+# Before running REF's scripts it prints how REF's scripts/ differ from
+# this checkout's, for the reader to judge. REF's scripts run as the
+# calling user: run this in a container or a throwaway VM.
 #
 #   -m  also use a fresh Go module cache (downloads the toolchain and
 #       every module again, checksum-verified against go.sum and the Go
@@ -74,12 +78,15 @@ git -C "$work/repo" -c advice.detachedHead=false checkout --quiet "$commit"
 if [ "$fresh_modcache" = 1 ]; then
   export GOMODCACHE="$work/gomodcache"
 fi
+# Shown before REF's scripts run: what REF's build script does that this
+# checkout's does not. REF's scripts run as the calling user (README:
+# verify in a container or a throwaway VM).
+log "REF's scripts/ compared with this checkout's (informational; - REF, + this checkout):"
+diff -ru "$work/repo/scripts" "$repo/scripts" >&2 || true
+
 # REF's own build script, in the clone; nothing from the caller's
 # environment selects the version.
 (unset VETTID_RELEASE_VERSION; TMPDIR="$work" "$work/repo/scripts/build-release" -o "$work/out" "$build_ref")
-
-log "REF's scripts/ compared with this checkout's (informational; - REF, + this checkout):"
-diff -ru "$work/repo/scripts" "$repo/scripts" >&2 || true
 
 # From here on, this checkout's tools only.
 cd "$work/out"
@@ -91,6 +98,28 @@ if ! "$repo/scripts/check-release-binaries" -t "$toolchain" -v "$version" -c "$c
   log "FAIL the rebuilt binaries are not release builds of $ref ($commit)"
   exit 1
 fi
+# The binary for this machine, if one was built, says the same version and
+# commit (Linux amd64 and arm64; elsewhere this step is skipped).
+host=""
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64|Linux/amd64) host="linux-amd64" ;;
+  Linux/aarch64|Linux/arm64) host="linux-arm64" ;;
+esac
+if [ -n "$host" ] && [ -f "vettid-agent-$version-$host" ]; then
+  got="$("./vettid-agent-$version-$host" version)" || { log "FAIL vettid-agent-$version-$host version failed"; exit 1; }
+  want="$(printf 'vettid-agent %s\ncommit: %s' "$version" "$commit")"
+  if [ "$(printf '%s\n' "$got" | head -n2)" != "$want" ] || [ "$(printf '%s\n' "$got" | grep -c '^build:' || true)" != 0 ]; then
+    log "FAIL vettid-agent-$version-$host version says:"
+    printf '%s\n' "$got" >&2
+    log "expected it to begin with:"
+    printf '%s\n' "$want" >&2
+    exit 1
+  fi
+  log "vettid-agent-$version-$host version: $version, commit $commit"
+else
+  log "no binary for this machine ($(uname -s)/$(uname -m)); not running \`version\`"
+fi
+
 if command -v sha256sum >/dev/null; then
   sha256sum "${bins[@]}" | LC_ALL=C sort -k2 >"$work/rehashed"
 else
