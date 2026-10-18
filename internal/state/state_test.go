@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The lock helper: the test binary re-executed with this variable set
@@ -824,22 +825,118 @@ func TestCreateReplaceProbeErrorChangesNothing(t *testing.T) {
 	}
 }
 
-// A flush failure after the rename says the new file is in place but
-// may not be durable.
-func TestFlushFailureMessage(t *testing.T) {
+// A flush failure after the rename is ErrNotDurable. The Store holds
+// the new key as loaded: a following Save works (not ErrNotLoaded), a
+// Create is refused as ErrExists (not pushed into CreateReplace), and
+// Load reads the new state.
+func TestNotDurable(t *testing.T) {
 	old := makeDurable
 	makeDurable = func(string, string) error { return errors.New("flush refused") }
 	defer func() { makeDurable = old }()
 	s := openTest(t)
 	p := newFixedProtector(seq(0x40, 32))
 	err := s.Create(p, []byte("a"))
-	if err == nil || !strings.Contains(err.Error(), "in place but may not be durable") || !strings.Contains(err.Error(), "flush refused") {
-		t.Fatalf("Create = %v", err)
+	if !errors.Is(err, ErrNotDurable) || !strings.Contains(err.Error(), "in place but may not be durable") || !strings.Contains(err.Error(), "flush refused") {
+		t.Fatalf("Create = %v, want ErrNotDurable", err)
+	}
+	if err := s.Save([]byte("b")); !errors.Is(err, ErrNotDurable) {
+		t.Fatalf("Save while flushes fail = %v, want ErrNotDurable", err)
 	}
 	makeDurable = old
-	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "a" {
-		t.Errorf("the new file should be in place: %q, %v", got, err)
+	if err := s.Save([]byte("c")); err != nil {
+		t.Fatalf("Save after the flush recovers: %v", err)
 	}
+	if err := s.Create(p, []byte("d")); !errors.Is(err, ErrExists) {
+		t.Errorf("Create after ErrNotDurable = %v, want ErrExists", err)
+	}
+	if got, err := s.Load(resolverFor(p)); err != nil || string(got) != "c" {
+		t.Errorf("Load = %q, %v", got, err)
+	}
+}
+
+// CreateReplace with a flush that fails once after the rename: on
+// Windows the flush is retried, and once it succeeds the old bytes are
+// overwritten. (POSIX does not retry fsync; see TestCreateReplaceNeverDurable.)
+func TestCreateReplaceFlushRetried(t *testing.T) {
+	if flushRetries == 0 {
+		t.Skip("flushes are not retried on this system")
+	}
+	s, oldP, link, size := replaceSetup(t)
+	calls := 0
+	old, oldDelay := makeDurable, durableRetryDelay
+	durableRetryDelay = time.Millisecond
+	makeDurable = func(dir, path string) error {
+		calls++
+		if calls == 1 {
+			return errors.New("flush refused")
+		}
+		return old(dir, path)
+	}
+	defer func() { makeDurable, durableRetryDelay = old, oldDelay }()
+	newP := newFixedProtector(seq(0x50, 32))
+	newP.name = "test-new"
+	if err := s.CreateReplace(newP, []byte("new state"), resolverFor(oldP)); err != nil {
+		t.Fatalf("CreateReplace: %v", err)
+	}
+	if calls != 2 {
+		t.Errorf("%d flush attempts, want 2", calls)
+	}
+	if link != "" {
+		if got, _ := os.ReadFile(link); int64(len(got)) != size || !bytes.Equal(got, make([]byte, size)) {
+			t.Error("the old bytes were not overwritten after the flush succeeded")
+		}
+	}
+}
+
+// A flush that never succeeds (on POSIX: a flush that fails once, as it
+// is not retried): ErrNotDurable, the old bytes are left in place, and
+// the new state is loaded and readable.
+func TestCreateReplaceNeverDurable(t *testing.T) {
+	s, oldP, link, _ := replaceSetup(t)
+	var before []byte
+	if link != "" {
+		before, _ = os.ReadFile(link)
+	}
+	old, oldDelay := makeDurable, durableRetryDelay
+	durableRetryDelay = time.Millisecond
+	calls := 0
+	makeDurable = func(string, string) error { calls++; return errors.New("flush refused") }
+	defer func() { makeDurable, durableRetryDelay = old, oldDelay }()
+	newP := newFixedProtector(seq(0x50, 32))
+	newP.name = "test-new"
+	err := s.CreateReplace(newP, []byte("new state"), resolverFor(oldP))
+	if !errors.Is(err, ErrNotDurable) {
+		t.Fatalf("CreateReplace = %v, want ErrNotDurable", err)
+	}
+	if calls != 1+flushRetries {
+		t.Errorf("%d flush attempts, want %d", calls, 1+flushRetries)
+	}
+	if link != "" {
+		if got, _ := os.ReadFile(link); !bytes.Equal(got, before) {
+			t.Error("the old bytes were changed although no flush succeeded")
+		}
+	}
+	makeDurable = old
+	if got, err := s.Load(resolverFor(newP)); err != nil || string(got) != "new state" {
+		t.Fatalf("Load = %q, %v", got, err)
+	}
+}
+
+// replaceSetup makes a store with an old state and, where hard links
+// work, a second name for the old file to observe its bytes.
+func replaceSetup(t *testing.T) (*Store, *fixedProtector, string, int64) {
+	t.Helper()
+	s := openTest(t)
+	oldP := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(oldP, []byte("old state")); err != nil {
+		t.Fatal(err)
+	}
+	size := fileSize(t, s.Path())
+	link := filepath.Join(t.TempDir(), "old")
+	if os.Link(s.Path(), link) != nil {
+		link = ""
+	}
+	return s, oldP, link, size
 }
 
 // A typed nil pointer in WipeAll does not crash the wipe.

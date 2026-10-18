@@ -160,24 +160,32 @@ func checkDir(dir string) error {
 	return checkSecurity("state directory", sd)
 }
 
-func checkFile(f *os.File) error {
-	h := windows.Handle(f.Fd())
+func checkFile(f *os.File) error { return checkHandle(windows.Handle(f.Fd()), "state file") }
+
+// CheckOwnerOnlyHandle applies the state file's owner-only rule to an
+// open file handle (what names it in errors): a regular file with one
+// link, owned by the current user, with no access-allowed entry for
+// anyone else. The handle needs READ_CONTROL (GENERIC_READ includes it).
+// internal/protect uses it for passphrase files and handles.
+func CheckOwnerOnlyHandle(h windows.Handle, what string) error { return checkHandle(h, what) }
+
+func checkHandle(h windows.Handle, what string) error {
 	var info windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
-		return fmt.Errorf("state: state file: %w", err)
+		return fmt.Errorf("state: %s: %w", what, err)
 	}
 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
-		return notPrivate("state file", "is not a regular file")
+		return notPrivate(what, "is not a regular file")
 	}
 	if info.NumberOfLinks != 1 {
-		return notPrivate("state file", "has more than one link")
+		return notPrivate(what, "has more than one link")
 	}
 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
-		return notPrivate("state file", "security is unreadable")
+		return notPrivate(what, "security is unreadable")
 	}
-	return checkSecurity("state file", sd)
+	return checkSecurity(what, sd)
 }
 
 // openNoFollow opens path with FILE_FLAG_OPEN_REPARSE_POINT, so that a
@@ -298,9 +306,18 @@ func flushPath(path string, flags uint32) error {
 	return windows.FlushFileBuffers(h)
 }
 
-// renamePOSIXProbe is the rename the probe uses; tests replace it to
-// inject errors.
-var renamePOSIXProbe = renamePOSIX
+// The probe's steps; tests replace them to inject errors.
+var (
+	renamePOSIXProbe = renamePOSIX
+	probeCreateTemp  = createTemp
+)
+
+// probeSetupError is a failure to create or open the probe's own files,
+// as opposed to the answer of the rename being probed.
+type probeSetupError struct{ err error }
+
+func (e *probeSetupError) Error() string { return "set up the rename probe: " + e.err.Error() }
+func (e *probeSetupError) Unwrap() error { return e.err }
 
 // replaceOpenFileSupport probes, in dir, whether a POSIX-semantics rename
 // can replace a file that is held open: it creates two temporary files,
@@ -310,11 +327,12 @@ var renamePOSIXProbe = renamePOSIX
 // Open deletes.
 //
 // A sharing violation or access denied (antivirus or an indexer holding
-// a probe file for a moment) is retried, five attempts in all with
-// backoff from 20 ms. Only a definite "not supported" answer from the
-// rename (ERROR_NOT_SUPPORTED, ERROR_INVALID_PARAMETER,
-// ERROR_INVALID_FUNCTION) reports false with no error; any other
-// failure is returned, and CreateReplace then stops before wiping
+// a probe file for a moment), in the set-up or the rename, is retried:
+// five attempts in all with backoff from 20 ms. Only a definite "not
+// supported" answer from the rename itself (ERROR_NOT_SUPPORTED,
+// ERROR_INVALID_PARAMETER, ERROR_INVALID_FUNCTION) reports false with no
+// error. Any other failure, including any failure to set up the probe's
+// files, is returned, and CreateReplace then stops before wiping
 // anything.
 func replaceOpenFileSupport(dir string) (bool, error) {
 	var err error
@@ -325,10 +343,12 @@ func replaceOpenFileSupport(dir string) (bool, error) {
 			delay *= 2
 		}
 		err = probeOnce(dir)
+		var setup *probeSetupError
+		isSetup := errors.As(err, &setup)
 		switch {
 		case err == nil:
 			return true, nil
-		case notSupported(err):
+		case !isSetup && notSupported(err):
 			return false, nil
 		case errors.Is(err, windows.ERROR_SHARING_VIOLATION) || errors.Is(err, windows.ERROR_ACCESS_DENIED):
 			continue
@@ -340,21 +360,21 @@ func replaceOpenFileSupport(dir string) (bool, error) {
 }
 
 func probeOnce(dir string) error {
-	a, an, err := createTemp(dir, tempPrefix, tempSuffix)
+	a, an, err := probeCreateTemp(dir, tempPrefix, tempSuffix)
 	if err != nil {
-		return err
+		return &probeSetupError{err}
 	}
 	a.Close()
 	defer os.Remove(an)
-	b, bn, err := createTemp(dir, tempPrefix, tempSuffix)
+	b, bn, err := probeCreateTemp(dir, tempPrefix, tempSuffix)
 	if err != nil {
-		return err
+		return &probeSetupError{err}
 	}
 	b.Close()
 	defer os.Remove(bn)
 	held, err := openNoFollow(bn, windows.GENERIC_READ)
 	if err != nil {
-		return err
+		return &probeSetupError{err}
 	}
 	defer held.Close()
 	return renamePOSIXProbe(an, bn)
@@ -468,3 +488,6 @@ func lockDir(path string) (io.Closer, error) {
 	}
 	return &winLock{h: h}, nil
 }
+
+// flushRetries: FlushFileBuffers may be retried (see retryDurable).
+const flushRetries = 3

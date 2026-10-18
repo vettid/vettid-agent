@@ -93,6 +93,19 @@ var (
 	// determined, so its key may remain. WipeAll with every known
 	// protector deletes it.
 	ErrProtectorUnknown = errors.New("the state file's protector is not known, so its key may remain; wipe with every known protector")
+	// ErrNotDurable: the new state file was renamed into place, but a
+	// flush after the rename failed, so it may not survive a crash. The
+	// Store treats the new state as written (a following Save works, and
+	// a Create is not retried); saving again is the way to make it
+	// durable (on POSIX a failed fsync is not retried, see retryDurable).
+	// From CreateReplace it means the flush failed (on Windows also on
+	// retry), and the old state file's bytes were left in place (not
+	// overwritten; where the replace had to overwrite first, because the
+	// file system cannot rename over an open file, they were already
+	// overwritten). For protectors whose Wipe deletes nothing (the
+	// passphrase and TPM protectors) those old bytes can still be opened
+	// with the old secret.
+	ErrNotDurable = errors.New("state: the new state file is in place but may not be durable")
 	// ErrNothingToWipe: Wipe found no state file and nothing loaded.
 	ErrNothingToWipe = errors.New("no state file: nothing to wipe (not paired)")
 	// ErrNotLoaded: Save before Create or Load.
@@ -285,10 +298,25 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 	// flushed (file and directory), so the old bytes are overwritten
 	// only once the new state is durable.
 	if err := s.create(p, state); err != nil {
-		if old != nil {
-			old.Close()
+		if old != nil && errors.Is(err, ErrNotDurable) {
+			// The new file is in place but not yet durable. The old
+			// bytes are overwritten only once a flush succeeds, so keep
+			// the handle and retry the flush where that is sound
+			// (Windows; never on POSIX, see retryDurable).
+			if err = s.retryDurable(); err != nil {
+				// Never flushed: the old file's bytes are left in place
+				// (closing the handle releases the file). Protectors
+				// whose Wipe deletes nothing (passphrase, TPM) can
+				// still open them with the old secret.
+				old.Close()
+				return err
+			}
+		} else {
+			if old != nil {
+				old.Close()
+			}
+			return err
 		}
-		return err
 	}
 	if old == nil {
 		return nil
@@ -303,6 +331,26 @@ func (s *Store) CreateReplace(p Protector, state []byte, resolve Resolver) error
 // probeReplaceOpen reports whether the file system can rename over a
 // file this process holds open; tests replace it.
 var probeReplaceOpen = replaceOpenFileSupport
+
+// retryDurable retries the flushes after a rename (makeDurable)
+// flushRetries more times, 20 ms apart; it returns ErrNotDurable if they
+// all fail. On POSIX flushRetries is 0: after a failed fsync, Linux can
+// report a later fsync as successful without the data being on disk, so
+// a failed flush is final there. On Windows FlushFileBuffers can be
+// retried.
+func (s *Store) retryDurable() error {
+	err := errors.New("flush failed")
+	for i := 0; i < flushRetries; i++ {
+		time.Sleep(durableRetryDelay)
+		if err = makeDurable(s.dir, s.Path()); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w (flush failed): %w", ErrNotDurable, err)
+}
+
+// durableRetryDelay is the pause between flush retries; tests shorten it.
+var durableRetryDelay = 20 * time.Millisecond
 
 func checkProtector(p Protector) error {
 	if p == nil || !protectorName.MatchString(p.Name()) {
@@ -322,13 +370,16 @@ func (s *Store) create(p Protector, state []byte) error {
 		return fmt.Errorf("state: protector %s could not wrap the key: %w", p.Name(), err)
 	}
 	h := &header{V: Version, Protector: p.Name(), WrappedKey: wrapped, CreatedAt: time.Now().Unix()}
-	if err := s.write(h, key, state); err != nil {
+	err = s.write(h, key, state)
+	if err != nil && !errors.Is(err, ErrNotDurable) {
 		clear(key)
 		return err
 	}
+	// Written (durably, or in place with ErrNotDurable): the file on disk
+	// is under this key, so the Store holds it as loaded either way.
 	s.forget()
 	s.prot, s.wrapped, s.dataKey, s.createdAt = p, wrapped, key, h.CreatedAt
-	return nil
+	return err
 }
 
 // Save writes state under the data key of the last Create or Load, with
@@ -607,7 +658,7 @@ func writeAtomic(dir, path string, raw []byte) error {
 		return fmt.Errorf("state: replace state file: %w", err)
 	}
 	if err := makeDurable(dir, path); err != nil {
-		return fmt.Errorf("state: the new state file is in place but may not be durable (flush failed): %w", err)
+		return fmt.Errorf("%w (flush failed): %w", ErrNotDurable, err)
 	}
 	return nil
 }

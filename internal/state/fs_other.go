@@ -25,3 +25,5 @@ func replaceOpenFileSupport(string) (bool, error)                 { return false
 func flushRenamed(string) error                                   { return errUnsupported }
 func syncDir(string) error                                        { return errUnsupported }
 func lockDir(string) (io.Closer, error)                           { return nil, errUnsupported }
+
+const flushRetries = 0
