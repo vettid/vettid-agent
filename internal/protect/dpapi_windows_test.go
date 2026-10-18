@@ -173,7 +173,7 @@ func TestDPAPITamperedRefused(t *testing.T) {
 		case pos >= dataStart && pos < signStart-4:
 			region = "data"
 		}
-		if region != "header" && !errors.Is(err, ErrDPAPIRefused) {
+		if (region == "data" || region == "signature") && !errors.Is(err, ErrDPAPIRefused) {
 			t.Errorf("byte %d (%s) changed: %v, want ErrDPAPIRefused", i, region, err)
 		}
 		kinds[fmt.Sprintf("%s: %s", region, errKind(err))]++

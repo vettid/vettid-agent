@@ -130,7 +130,9 @@ Nothing follows `dpapi`. Before calling Windows, a reader refuses any
 other version byte and checks the DPAPI blob's layout (all little
 endian): blob version 1, the DPAPI provider GUID
 `{df9d8cd0-1501-11d1-8c7a-00c04fc297eb}`, master key version 1, the
-flags without `CRYPTPROTECT_LOCAL_MACHINE` (0x4), the description above
+flags exactly 0 (what Windows writes for a user-scope blob made with
+`CRYPTPROTECT_UI_FORBIDDEN`; so a machine-scope blob, flag
+`CRYPTPROTECT_LOCAL_MACHINE`, is refused), the description above
 (UTF-16 with its terminating NUL), AES-128, -192 or -256 with SHA-256,
 -384 or -512, each length-prefixed field non-empty (the HMAC key may be
 empty) and at most 1024 bytes, and nothing left over. Microsoft does not

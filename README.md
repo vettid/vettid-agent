@@ -101,6 +101,12 @@ Exceptions that come with Windows itself:
   connector says so; set the old password back if you can, or pair
   again.
 
+When Windows cannot use the key it needs, the connector first asks you
+to check that you are signed in as the user who paired it, with your
+profile loaded and, for a domain account, the domain reachable (a
+domain controller out of reach or a roaming profile not yet synced can
+cause this for a while); pair again only if it persists.
+
 If DPAPI does not work in the logon the connector runs in (for example
 a service or scheduled task without your loaded profile or stored
 password), the connector says what is wrong and how to fix it, and uses
