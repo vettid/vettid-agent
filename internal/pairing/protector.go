@@ -18,9 +18,9 @@ const (
 // §2 AG3; owner decisions of 2026-10-18):
 //
 //   - by default the platform protector protect.ChooseProtector picks;
-//     with no platform protector at all (no TPM; macOS and Windows until
-//     theirs exist) the passphrase protector, with the "not bound to
-//     this computer" notice;
+//     with no platform protector at all (no TPM; on macOS a build
+//     without the Keychain entitlement) the passphrase protector, with
+//     the "not bound to this computer" notice;
 //   - a platform protector that is present but does not work (a TPM the
 //     user cannot open): an error with the cause and the fix;
 //   - Passphrase (--passphrase): the passphrase protector, chosen
@@ -39,6 +39,11 @@ type Protectors struct {
 	// standard input carries MCP messages); a passphrase must come from
 	// --passphrase-fd or --passphrase-file.
 	NoPrompt bool
+
+	// Dir is the state directory. A protector that keeps a key outside
+	// the state file (the macOS Keychain) names its key by it, so that
+	// it can delete the key from the header alone.
+	Dir string
 
 	choose   func(protect.ChooseOptions) (protect.Choice, error)
 	platform func(string) state.Protector
@@ -59,7 +64,7 @@ func (c *Protectors) platformFn() func(string) state.Protector {
 	if c.platform != nil {
 		return c.platform
 	}
-	return protect.Platform
+	return func(name string) state.Protector { return protect.Platform(name, c.Dir) }
 }
 
 func (c *Protectors) dpapiNotices() func() []string {

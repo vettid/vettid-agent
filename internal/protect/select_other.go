@@ -1,15 +1,16 @@
-//go:build !linux && !windows
+//go:build !linux && !windows && !(darwin && cgo)
 
 package protect
 
 import "runtime"
 
-// ChooseProtector: no platform protector is built for this system yet
-// (AGENT-PLAN §6 A1.5 macOS Keychain), so the
-// passphrase protector is chosen.
+// ChooseProtector: no platform protector is built for this system (on
+// macOS: a build without cgo, which the Keychain protector needs), so
+// the passphrase protector is chosen.
 func ChooseProtector(ChooseOptions) (Choice, error) {
-	return Choice{
-		Protector: PassphraseName,
-		Reason:    "no platform protector in this build for " + runtime.GOOS + " yet; using a passphrase",
-	}, nil
+	reason := "no platform protector in this build for " + runtime.GOOS
+	if runtime.GOOS == "darwin" {
+		reason = "this vettid-agent build was made without cgo, so it cannot use the macOS Keychain (only the signed vettid-agent app can)"
+	}
+	return Choice{Protector: PassphraseName, Reason: reason + "; using a passphrase"}, nil
 }

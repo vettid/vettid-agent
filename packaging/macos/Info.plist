@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template, used by AGENT-PLAN §6 A5 (macOS signing); nothing builds or
+  signs with it yet. The Info.plist of the app wrapper that lets the
+  command-line connector carry a provisioning profile:
+
+    vettid-agent.app/
+      Contents/
+        Info.plist                    this file, VERSION set by A5
+        embedded.provisionprofile     the owner's Developer ID profile (A5)
+        MacOS/vettid-agent            the connector, run directly from here
+
+  The connector stays a command-line program (an MCP client starts it,
+  with standard input and output); the wrapper only exists for the
+  signature, the profile and the entitlements (vettid-agent.entitlements).
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>org.vettid.agent</string>
+	<key>CFBundleName</key>
+	<string>vettid-agent</string>
+	<key>CFBundleExecutable</key>
+	<string>vettid-agent</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>VERSION</string>
+	<key>CFBundleVersion</key>
+	<string>VERSION</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>

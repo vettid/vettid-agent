@@ -79,6 +79,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "vettid-agent mcp: %v\n", err)
 		return 1
 	}
+	prot.Dir = *dir
 	defer prot.Clear()
 	if prot.Source.FD >= 0 {
 		pass, err := prot.Source.Read("", false)

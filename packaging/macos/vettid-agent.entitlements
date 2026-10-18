@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template, used by AGENT-PLAN §6 A5 (macOS signing); nothing builds or
+  signs with it yet. The entitlements of vettid-agent.app: the
+  keychain-access-groups entitlement is what lets the Keychain protector
+  (internal/protect/keychain.go) use the data protection keychain. macOS
+  honours it only in a binary signed with the owner's Developer ID whose
+  embedded provisioning profile (Contents/embedded.provisionprofile)
+  allows the same App ID and access group; a binary signed with these
+  entitlements but no such profile is stopped at launch.
+
+  TEAMID is the owner's Apple Developer Team ID; org.vettid.agent the App
+  ID (both set in A5).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.application-identifier</key>
+	<string>TEAMID.org.vettid.agent</string>
+	<key>com.apple.developer.team-identifier</key>
+	<string>TEAMID</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>TEAMID.org.vettid.agent</string>
+	</array>
+</dict>
+</plist>

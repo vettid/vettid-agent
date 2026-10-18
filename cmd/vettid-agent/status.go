@@ -51,6 +51,7 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 		fs.Usage()
 		return 2
 	}
+	prot.Dir = *dir
 	defer prot.Clear()
 	resolve := state.Resolver(prot.Resolve)
 	if statusResolve != nil {
