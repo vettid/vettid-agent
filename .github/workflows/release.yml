@@ -4,7 +4,8 @@ name: release
 # AG4, §6 A5; README, "Releases"; docs/RELEASING.md).
 #
 # - A tag v<major>.<minor>.<patch>[-pre] builds that release and, if the
-#   builds match and the tag is annotated and signed (GitHub verified),
+#   builds match and the tag is annotated, signed with a key in
+#   release/allowed_signers (scripts/verify-tag) and GitHub verified,
 #   creates a DRAFT GitHub release with the unsigned binaries and
 #   SHA256SUMS. The owner then runs scripts/sign-release on their own
 #   machine: it rebuilds and compares, adds the notarized macOS app, signs
@@ -204,10 +205,25 @@ jobs:
     permissions:
       contents: write
     steps:
-      # The owner signs release tags with the release key (git's
-      # gpg.format=ssh; the key is also a signing key on the owner's GitHub
-      # account). scripts/sign-release checks the same signature against
-      # release/allowed_signers before signing the release.
+      # Two checks of the tag's signature. GitHub's "verified" alone accepts
+      # a signature by any key GitHub knows for the tagger's account (any
+      # SSH or GPG signing key, or a web-flow signature), not only the
+      # release key; so the tag is also checked against
+      # release/allowed_signers at the tag with scripts/verify-tag (an SSH
+      # signature, and only that, by a listed key). scripts/sign-release
+      # repeats both checks before signing.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          persist-credentials: false
+      - name: the release tag is signed with a key in release/allowed_signers
+        working-directory: src
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          git fetch --quiet --no-tags --force origin "+refs/tags/$TAG:refs/tags/$TAG"
+          [ "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA" ] || { echo "::error::$TAG is not $GITHUB_SHA"; exit 1; }
+          scripts/verify-tag -a release/allowed_signers "$TAG" || { echo "::error::$TAG is not signed with a key in release/allowed_signers"; exit 1; }
       - name: the release tag is signed (GitHub verified)
         env:
           GH_TOKEN: ${{ github.token }}

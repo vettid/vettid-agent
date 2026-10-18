@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# Tests of scripts/sign-release's steps 2 to 9 and scripts/verify-tag,
+# without GitHub: a stub `gh` on PATH keeps a fake release in a
+# directory, and the tag comes from a local bare repository
+# (VETTID_AGENT_GIT_URL). The rebuild is given with --rebuilt (no Go
+# build); the macOS steps are off (--no-macos). `make release-sign-test`;
+# CI runs it on Linux and macOS.
+#
+# Keys: throwaway Ed25519 keys (and, where gpg exists, a throwaway OpenPGP
+# key in a throwaway GNUPGHOME) made in a new temporary directory for this
+# run and deleted with it: never a VettID key, never written to the
+# repository, ~/.ssh or ~/.gnupg. Nothing here uses the network.
+set -euo pipefail
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+t="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-flowtest.XXXXXXXX")"
+# A short GNUPGHOME: gpg-agent's socket path has a length limit.
+gh_home="$(mktemp -d /tmp/vgpg.XXXXXX)"
+cleanup() {
+  if command -v gpgconf >/dev/null; then GNUPGHOME="$gh_home" gpgconf --kill all >/dev/null 2>&1 || true; fi
+  rm -rf "$t" "$gh_home"
+}
+trap cleanup EXIT
+pass=0
+failed=0
+ok() { echo "ok   $*"; pass=$((pass + 1)); }
+bad() { echo "FAIL $*"; failed=$((failed + 1)); }
+check() {
+  local desc="$1"; shift
+  if "$@"; then ok "$desc"; else bad "$desc"; fi
+}
+expect_pass() {
+  local desc="$1"; shift
+  if out="$("$@" 2>&1)"; then ok "$desc"; else bad "$desc"; printf '%s\n' "$out" | sed 's/^/     /'; fi
+}
+expect_fail() {
+  local desc="$1" pat="$2"; shift 2
+  if out="$("$@" 2>&1)"; then
+    bad "$desc (exited 0)"; printf '%s\n' "$out" | sed 's/^/     /'
+  elif ! printf '%s\n' "$out" | grep -q -- "$pat"; then
+    bad "$desc (no \"$pat\" in the output)"; printf '%s\n' "$out" | sed 's/^/     /'
+  else
+    ok "$desc"
+  fi
+}
+sha() { { sha256sum "$1" 2>/dev/null || shasum -a 256 "$1"; } | awk '{ print $1 }'; }
+
+ssh-keygen -q -t ed25519 -N '' -C flowtest -f "$t/key"
+ssh-keygen -q -t ed25519 -N '' -C flowtest-other -f "$t/other"
+gitc=(-c user.name=flowtest -c user.email=flowtest@invalid -c commit.gpgsign=false -c tag.gpgSign=false)
+
+# The "repository": this checkout's scripts and an allowed signers file
+# with the test key, committed in a new repository (sign-release fetches
+# tags into the checkout it runs from, so not into this one).
+mkdir -p "$t/work"
+git -C "$t/work" init -q
+cp -R "$repo/scripts" "$t/work/scripts"
+mkdir -p "$t/work/release"
+printf 'flowtest namespaces="git,vettid-agent-release" %s\n' "$(cut -d' ' -f1,2 "$t/key.pub")" >"$t/work/release/allowed_signers"
+git -C "$t/work" add -A
+git -C "$t/work" "${gitc[@]}" commit -q -m "flow test"
+commit="$(git -C "$t/work" rev-parse HEAD)"
+git clone -q --bare "$t/work" "$t/bare.git"
+git clone -q "$t/bare.git" "$t/owner"
+
+# The owner's tags, pushed to the bare repository.
+sshtag() { git -C "$t/owner" "${gitc[@]}" -c gpg.format=ssh -c user.signingkey="$1" tag -s -m "vettid-agent $2" "$2"; }
+sshtag "$t/key" v0.0.1
+sshtag "$t/other" v0.0.2
+git -C "$t/owner" "${gitc[@]}" tag v0.0.3
+sshtag "$t/key" v0.0.5
+sshtag "$t/key" v0.0.6
+sshtag "$t/key" v0.0.7
+sshtag "$t/key" v0.0.8
+pgp=0
+if command -v gpg >/dev/null; then
+  export GNUPGHOME="$gh_home"
+  if gpg --batch --pinentry-mode loopback --passphrase '' --quick-gen-key 'Flow Test <flowtest@invalid>' ed25519 sign 1d >/dev/null 2>&1; then
+    fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ { print $10; exit }')"
+    git -C "$t/owner" "${gitc[@]}" -c gpg.format=openpgp -c user.signingkey="$fpr" tag -s -m "vettid-agent v0.0.4" v0.0.4
+    pgp=1
+  fi
+fi
+git -C "$t/owner" push -q origin --tags
+
+# The stub gh. State in $STUB_GH: draft, author, body, run, verified,
+# assets/; STUB_TAMPER_AT_DOWNLOAD=N changes $STUB_TAMPER_FILE among the
+# assets just before the Nth `release download` (1: step 4, 2: after the
+# upload, 3: before publishing, 4: after publishing); STUB_EDIT_DRAFT_FAILS
+# makes `release edit --draft=true` fail.
+mkdir -p "$t/bin"
+cat >"$t/bin/gh" <<'STUB'
+#!/usr/bin/env bash
+set -euo pipefail
+S="$STUB_GH"
+echo "$*" >>"$S/calls"
+cmd="$1"; shift
+case "$cmd" in
+  auth) exit 0 ;;
+  api)
+    path="$1"
+    case "$path" in
+      repos/*/git/ref/tags/*)
+        o="$(git -C "$STUB_BARE" rev-parse --verify --quiet "refs/tags/${path##*/}")" || { echo "Not Found" >&2; exit 1; }
+        echo "$(git -C "$STUB_BARE" cat-file -t "$o") $o" ;;
+      repos/*/git/tags/*) cat "$S/verified" ;;
+      repos/*/actions/runs/*) cat "$S/run" ;;
+      *) echo "stub gh: no api $path" >&2; exit 1 ;;
+    esac ;;
+  release)
+    sub="$1"; tag="$2"; shift 2
+    [ -d "$S/assets" ] || { echo "release not found" >&2; exit 1; }
+    case "$sub" in
+      view)
+        json=""
+        while [ "$#" -gt 0 ]; do case "$1" in --json) json="$2"; shift 2 ;; *) shift ;; esac; done
+        case "$json" in
+          isDraft,isPrerelease,author) echo "$(cat "$S/draft") false $(cat "$S/author")" ;;
+          assets) for f in "$S"/assets/*; do if [ -e "$f" ]; then basename "$f"; fi; done ;;
+          body) cat "$S/body" ;;
+          url) echo "https://example.invalid/releases/$tag" ;;
+          *) echo "stub gh: no view --json $json" >&2; exit 1 ;;
+        esac ;;
+      download)
+        n=$(( $(cat "$S/downloads" 2>/dev/null || echo 0) + 1 ))
+        echo "$n" >"$S/downloads"
+        if [ "${STUB_TAMPER_AT_DOWNLOAD:-}" = "$n" ]; then printf 'changed\n' >>"$S/assets/$STUB_TAMPER_FILE"; fi
+        dir=""; pats=()
+        while [ "$#" -gt 0 ]; do case "$1" in -D) dir="$2"; shift 2 ;; -p) pats+=("$2"); shift 2 ;; *) shift ;; esac; done
+        mkdir -p "$dir"
+        for f in "$S"/assets/*; do
+          b="$(basename "$f")"; want=0
+          if [ "${#pats[@]}" -eq 0 ]; then want=1; fi
+          for p in "${pats[@]}"; do
+            # shellcheck disable=SC2053 # a glob, as gh's -p
+            if [[ "$b" == $p ]]; then want=1; fi
+          done
+          if [ "$want" = 1 ]; then cp "$f" "$dir/$b"; fi
+        done ;;
+      upload)
+        while [ "$#" -gt 0 ]; do
+          case "$1" in --repo) shift 2 ;; --*) shift ;; *) cp "$1" "$S/assets/"; shift ;; esac
+        done ;;
+      edit)
+        for a in "$@"; do
+          case "$a" in
+            --draft=true) if [ -n "${STUB_EDIT_DRAFT_FAILS:-}" ]; then echo "immutable" >&2; exit 1; fi; echo true >"$S/draft" ;;
+            --draft=false) echo false >"$S/draft" ;;
+          esac
+        done ;;
+      delete-asset) rm -f "$S/assets/$1" ;;
+      *) echo "stub gh: no release $sub" >&2; exit 1 ;;
+    esac ;;
+  *) echo "stub gh: no $cmd" >&2; exit 1 ;;
+esac
+STUB
+chmod +x "$t/bin/gh"
+
+# reset TAG: a fresh draft of TAG, as the release workflow makes it, and
+# the rebuilt list (--rebuilt) that matches it.
+S="$t/gh"
+reset() {
+  local tag="$1" n
+  rm -rf "$S"; mkdir -p "$S/assets"
+  for n in linux-amd64 linux-arm64 windows-amd64.exe; do
+    printf '%s %s\n' "$tag" "$n" >"$S/assets/vettid-agent-$tag-$n"
+  done
+  (cd "$S/assets" && for f in vettid-agent-*; do printf '%s  %s\n' "$(sha "$f")" "$f"; done | LC_ALL=C sort -k2 >SHA256SUMS)
+  cp "$S/assets/SHA256SUMS" "$t/rebuilt"
+  echo true >"$S/draft"
+  echo "github-actions[bot]" >"$S/author"
+  # shellcheck disable=SC2016 # backquotes in the notes
+  printf 'vettid-agent %s, built from `%s` by [run 42](https://example.invalid/runs/42).\n\nUnsigned draft.\n' "$tag" "$commit" >"$S/body"
+  echo ".github/workflows/release.yml push $commit $tag vettid/vettid-agent vettid/vettid-agent completed success https://example.invalid/runs/42" >"$S/run"
+  echo "true valid" >"$S/verified"
+}
+sign() {
+  env PATH="$t/bin:$PATH" STUB_GH="$S" STUB_BARE="$t/bare.git" VETTID_AGENT_GIT_URL="$t/bare.git" \
+    VETTID_AGENT_REPO=vettid/vettid-agent "$t/work/scripts/sign-release" -k "$t/key" --no-macos --rebuilt "$t/rebuilt" --yes "$@"
+}
+vtag() { "$t/work/scripts/verify-tag" "$@"; }
+git -C "$t/work" fetch -q "$t/bare.git" '+refs/tags/*:refs/tags/*'
+
+echo "== verify-tag"
+expect_pass "an SSH tag by a listed key" vtag v0.0.1
+expect_fail "an SSH tag by a key not listed" "does not verify against" vtag v0.0.2
+expect_fail "a lightweight tag" "lightweight tag" vtag v0.0.3
+if [ "$pgp" = 1 ]; then
+  # Plain `git verify-tag` accepts it (the key is in this GNUPGHOME,
+  # ultimately trusted), even with gpg.format=ssh and minTrustLevel=fully.
+  expect_pass "(git verify-tag alone accepts the PGP tag)" \
+    git -C "$t/work" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$t/work/release/allowed_signers" -c gpg.minTrustLevel=fully verify-tag v0.0.4
+  expect_fail "a PGP-signed tag whose key is in the GnuPG keyring" "not, or not only, an SSH signature" vtag v0.0.4
+else
+  echo "note gpg not found: the PGP-signed tag is not tested"
+fi
+cp "$t/work/release/allowed_signers" "$t/allowed.keep"
+grep '^#' "$repo/release/allowed_signers" >"$t/work/release/allowed_signers" || true
+expect_fail "the placeholder allowed signers file" "holds no key yet" vtag v0.0.1
+cp "$t/allowed.keep" "$t/work/release/allowed_signers"
+
+echo "== sign-release: the tag"
+reset v0.0.2
+expect_fail "an SSH tag by a key not listed" "not signed with a release key" sign v0.0.2
+reset v0.0.3
+expect_fail "a lightweight tag" "lightweight tag" sign v0.0.3
+if [ "$pgp" = 1 ]; then
+  reset v0.0.4
+  expect_fail "a PGP-signed tag" "not, or not only, an SSH signature" sign v0.0.4
+fi
+reset v0.0.1
+echo "false unsigned" >"$S/verified"
+expect_fail "a tag GitHub does not show as verified" "does not show v0.0.1's signature as verified" sign v0.0.1
+reset v0.0.9
+expect_fail "a tag that is not pushed" "could not fetch the tag" sign v0.0.9
+
+echo "== sign-release: the draft's provenance"
+reset v0.0.1
+echo "someone" >"$S/author"
+expect_fail "a draft not made by the workflow" "made by someone" sign v0.0.1
+reset v0.0.1
+sed -i.orig "s/$commit/$(printf '%040d' 0)/" "$S/body"
+expect_fail "notes naming another commit" "the draft was built from" sign v0.0.1
+reset v0.0.1
+echo ".github/workflows/release-copy.yml push $commit v0.0.1 vettid/vettid-agent vettid/vettid-agent completed success u" >"$S/run"
+expect_fail "a run of another workflow file" "not .github/workflows/release.yml" sign v0.0.1
+reset v0.0.1
+echo ".github/workflows/release.yml workflow_dispatch $commit v0.0.1 vettid/vettid-agent vettid/vettid-agent completed success u" >"$S/run"
+expect_fail "a run not started by the push" "not by the tag push" sign v0.0.1
+reset v0.0.1
+echo ".github/workflows/release.yml push $(printf '%040d' 1) v0.0.1 vettid/vettid-agent vettid/vettid-agent completed success u" >"$S/run"
+expect_fail "a run of another commit" "but v0.0.1 is" sign v0.0.1
+reset v0.0.1
+echo ".github/workflows/release.yml push $commit v0.0.1 vettid/vettid-agent someone/fork completed success u" >"$S/run"
+expect_fail "a run of a fork's code" "not a run of vettid/vettid-agent's own code" sign v0.0.1
+reset v0.0.1
+echo ".github/workflows/release.yml push $commit v0.0.1 vettid/vettid-agent vettid/vettid-agent completed failure u" >"$S/run"
+expect_fail "a failed run" "did not succeed" sign v0.0.1
+reset v0.0.1
+echo ".github/workflows/release.yml push $commit v0.0.1 vettid/vettid-agent vettid/vettid-agent in_progress none u" >"$S/run"
+expect_fail "an unfinished run" "has not finished" sign v0.0.1
+
+echo "== sign-release: the draft's files"
+reset v0.0.1
+echo "#!/bin/sh" >"$S/assets/install.sh"
+expect_fail "an unexpected asset" "unexpected asset: install.sh" sign v0.0.1
+reset v0.0.1
+printf 'x\n' >>"$S/assets/vettid-agent-v0.0.1-linux-arm64"
+expect_fail "a binary that does not match the draft's SHA256SUMS" "does not match its SHA256SUMS" sign v0.0.1
+reset v0.0.1
+sed -i.orig '1s/^./f/' "$t/rebuilt"
+expect_fail "a rebuild that differs" "differs from" sign v0.0.1
+
+echo "== sign-release: upload and publish"
+reset v0.0.5
+STUB_TAMPER_AT_DOWNLOAD=2 STUB_TAMPER_FILE=vettid-agent-v0.0.5-linux-amd64 \
+  expect_fail "an asset changed after the upload" "after the upload: the release's vettid-agent-v0.0.5-linux-amd64 is not the file signed here" sign v0.0.5
+check "  and it stays a draft" test "$(cat "$S/draft")" = true
+reset v0.0.6
+STUB_TAMPER_AT_DOWNLOAD=3 STUB_TAMPER_FILE=SHA256SUMS.sig \
+  expect_fail "an asset changed before publishing" "the draft changed after it was checked" sign v0.0.6
+check "  and it stays a draft" test "$(cat "$S/draft")" = true
+# shellcheck disable=SC2016 # expanded by sh -c
+check "  and it was never published" sh -c '! grep -q -- "--draft=false" "$1/calls"' sh "$S"
+reset v0.0.7
+STUB_TAMPER_AT_DOWNLOAD=4 STUB_TAMPER_FILE=vettid-agent-v0.0.7-windows-amd64.exe \
+  expect_fail "an asset changed as it is published" "it is a draft again" sign v0.0.7
+check "  and it is a draft again" test "$(cat "$S/draft")" = true
+reset v0.0.8
+STUB_TAMPER_AT_DOWNLOAD=4 STUB_TAMPER_FILE=SHA256SUMS STUB_EDIT_DRAFT_FAILS=1 \
+  expect_fail "the same, when the release cannot go back to a draft" "could not be turned back into a draft" sign v0.0.8
+
+reset v0.0.1
+printf 'old zip\n' >"$S/assets/vettid-agent-v0.0.1-darwin-arm64.zip"
+expect_pass "a good release is signed and published (a stale macOS zip is removed)" sign v0.0.1
+check "  it is published" test "$(cat "$S/draft")" = false
+check "  with SHA256SUMS.sig" test -f "$S/assets/SHA256SUMS.sig"
+check "  without the stale zip" test ! -e "$S/assets/vettid-agent-v0.0.1-darwin-arm64.zip"
+check "  SHA256SUMS binds the tag and commit" test "$(head -n1 "$S/assets/SHA256SUMS")" = "# vettid-agent-release/v0.0.1/$commit"
+expect_pass "  and verify-release accepts it" "$t/work/scripts/verify-release" -A -c "$commit" -l "$S/assets" v0.0.1
+expect_pass "running it again finds it published and signed" sign v0.0.1
+check "  and says so" grep -q "nothing to do" <<<"$out"
+printf 'x\n' >"$S/assets/notes.txt"
+expect_fail "a published release with an extra asset" "not part of a release: notes.txt" sign v0.0.1
+rm "$S/assets/notes.txt"
+printf 'x\n' >>"$S/assets/vettid-agent-v0.0.1-linux-amd64"
+expect_fail "a published release whose file changed" "is published but does not verify" sign v0.0.1
+
+echo
+echo "$pass passed, $failed failed"
+[ "$failed" = 0 ]

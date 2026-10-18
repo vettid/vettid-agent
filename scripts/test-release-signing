@@ -214,6 +214,9 @@ stub_commit="$(git -C "$t/stub/repo" rev-parse HEAD)"
 { printf '# vettid-agent-release/untagged/%s\n' "$stub_commit"; cat "$t/entries"; } >"$t/signed-sums"
 expect_pass "a signed SHA256SUMS: the macOS line is left out, the rest compared" \
   "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/signed-sums"
+expect_pass "-o writes the rebuilt hashes" \
+  "$t/stub/repo/scripts/verify-reproducible" -o "$t/rebuilt-out" "$stub_commit" "$t/signed-sums"
+check "  the rebuilt hashes are the reproducible entries" test "$(cat "$t/rebuilt-out")" = "$(grep -v darwin "$t/entries")"
 grep -v darwin "$t/entries" >"$t/plain-sums"
 expect_pass "a plain SHA256SUMS still compares" \
   "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/plain-sums"
@@ -223,6 +226,20 @@ expect_fail "a first line naming another commit" "not \"# vettid-agent-release/u
 grep -v linux-arm64 "$t/signed-sums" >"$t/short-sums"
 expect_fail "a missing binary line" "differs" \
   "$t/stub/repo/scripts/verify-reproducible" "$stub_commit" "$t/short-sums"
+
+if [ -n "${VETTID_TEST_MACOS_APP:-}" ]; then
+  echo "== verify-release's macOS app check, with an ad-hoc app ($VETTID_TEST_MACOS_APP)"
+  # The code path runs (unpack, codesign); an ad-hoc app is refused as not
+  # a release build before Gatekeeper, which does not apply to it.
+  rm -rf "$t/m"; mkdir -p "$t/m"
+  printf 'linux binary\n' >"$t/m/vettid-agent-$tag-linux-amd64"
+  ditto -c -k --keepParent "$VETTID_TEST_MACOS_APP" "$t/m/vettid-agent-$tag-darwin-arm64.zip"
+  "$repo/scripts/sign-release" --local "$t/m" -c "$commit" -k "$t/key" -a "$t/allowed" "$tag" >/dev/null 2>&1 || true
+  check "  the list is signed" test -f "$t/m/SHA256SUMS.sig"
+  expect_fail "an ad-hoc app is refused (Gatekeeper not applicable)" "signed ad hoc, not with a Developer ID" \
+    verify -a "$t/allowed" -l "$t/m" "$tag"
+  check "  after its code signature verified" grep -q "the code signature verifies" <<<"$out"
+fi
 
 echo
 echo "$pass passed, $failed failed"

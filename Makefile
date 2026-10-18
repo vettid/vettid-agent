@@ -15,11 +15,12 @@ test:
 	$(GO) vet ./...
 	$(GO) test -p 1 ./...
 
-# The release signature scripts (sign-release --local, verify-release,
-# verify-reproducible's reading of a signed SHA256SUMS), with a throwaway
-# key made for the run; no Go build, no network.
+# The release signature scripts (sign-release, verify-release,
+# verify-tag, verify-reproducible's reading of a signed SHA256SUMS), with
+# throwaway keys made for the run and a stub gh; no Go build, no network.
 release-sign-test:
 	scripts/test-release-signing
+	scripts/test-sign-release
 
 # The exit tests of A2 and A3 (about 5 minutes on a running stack),
 # without the hold step.

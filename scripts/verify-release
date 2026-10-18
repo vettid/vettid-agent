@@ -29,8 +29,8 @@
 #      from the list. With -A every listed file must be in DIR.
 #   5. On a Mac, a listed vettid-agent-<version>-darwin-arm64.zip is
 #      unpacked into a temporary directory and vettid-agent.app is checked
-#      with codesign and Gatekeeper (spctl). Elsewhere it is checked by its
-#      hash only.
+#      with codesign (an ad-hoc signature is refused: not a release) and
+#      Gatekeeper (spctl). Elsewhere it is checked by its hash only.
 #
 # Needs bash, OpenSSH 8.2 or later (ssh-keygen -Y), sha256sum or shasum,
 # and curl for the download form. VETTID_AGENT_REPO (default
@@ -204,6 +204,10 @@ check_macos_app() {
   [ -d "$tmp/vettid-agent.app" ] || { rm -rf "$tmp"; fail "$(basename "$zip") holds no vettid-agent.app"; }
   if ! out="$(codesign --verify --strict --deep --verbose=2 "$tmp/vettid-agent.app" 2>&1)"; then
     log "$out"; rm -rf "$tmp"; fail "vettid-agent.app: the code signature does not verify"
+  fi
+  log "vettid-agent.app: the code signature verifies"
+  if codesign -d --verbose=2 "$tmp/vettid-agent.app" 2>&1 | grep -qx 'Signature=adhoc'; then
+    rm -rf "$tmp"; fail "vettid-agent.app is signed ad hoc, not with a Developer ID: not a release build (Gatekeeper check not applicable)"
   fi
   if ! out="$(spctl --assess --type execute --verbose=2 "$tmp/vettid-agent.app" 2>&1)"; then
     log "$out"; rm -rf "$tmp"; fail "vettid-agent.app: Gatekeeper does not accept it (not notarized?)"

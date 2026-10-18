@@ -160,13 +160,18 @@ git config tag.gpgSign true
     --apple-id <your Apple Account email> --team-id <TEAMID>
   ```
 
-### 5. Optional: immutable releases
+### 5. Recommended: immutable releases
 
-GitHub's release immutability (repository Settings, Releases) locks a
-release's assets and tag once it is published. `sign-release` uploads
-and checks everything before publishing, so it works with it; but a
-published release can then no longer be turned back into a draft to fix
-it, only replaced by a new version.
+Turn on GitHub's release immutability for the repository (Settings,
+General, Releases, "Enable release immutability"; a repository setting
+only the owner changes). Once a release is published, its assets and
+its tag can then no longer be changed or replaced, by anyone with write
+access or a leaked token. `sign-release` uploads and checks everything
+while the release is a draft, checks it again right before publishing
+and once more right after, so it works with immutability. The cost: a
+published release that is wrong cannot be turned back into a draft
+(`sign-release` then says so and stops); it is deleted or replaced by a
+new version.
 
 ## Each release (the owner)
 
@@ -200,24 +205,66 @@ it, only replaced by a new version.
 4. The release workflow's `signature` job checks the published release;
    it should be green.
 
-`sign-release`'s checks, in order: the key is in `allowed_signers`; the
-tag is annotated, verifies against `allowed_signers` and is verified on
-GitHub; the release is a draft made by the release workflow's successful
-run for that tag and commit, with only the expected assets; the draft's
-binaries match its `SHA256SUMS` and a fresh rebuild on this machine
-(`scripts/verify-reproducible -m`); then the macOS app is built
-(`scripts/build-macos-app`), notarized (`xcrun notarytool submit
---wait`), stapled and checked with Gatekeeper; `SHA256SUMS` is written
-and signed and checked with `scripts/verify-release -A`; the files are
-uploaded, downloaded again and checked again; only then is the release
-published. The rebuild runs the tag's own build script as you (it is
-your tag).
+`sign-release`'s checks, in order:
+
+- the key's public key is in `allowed_signers`;
+- the tag (`scripts/verify-tag`): an annotated tag whose only signature
+  is an SSH signature (git picks the verifier from the signature's
+  armor, so a PGP or X.509 signature would be checked against your GnuPG
+  keyring instead), which `git verify-tag` with
+  `gpg.minTrustLevel=fully` reports as a good `git` signature by a
+  principal of `allowed_signers`; GitHub's tag is the same object and is
+  shown as verified. (GitHub's "verified" alone accepts any signing key
+  of the tagger's account; the release workflow runs `verify-tag` too.)
+- the draft: made by `github-actions[bot]`; the run its notes name is,
+  according to the runs API, a run of `.github/workflows/release.yml`
+  (by path, not by name) for the push of the tag's commit in this
+  repository, finished successfully; only the expected assets;
+- the draft's binaries match its `SHA256SUMS` and a fresh rebuild
+  (`scripts/verify-reproducible -m`, or `--rebuilt`, below);
+- the macOS app is built (`scripts/build-macos-app`: the profile must
+  be a Developer ID profile for the App ID, allow the access group, not
+  be expired, and name the signing certificate), notarized (`xcrun
+  notarytool submit --wait`, status Accepted), stapled, accepted by
+  Gatekeeper, and its `version` runs and names the tag and commit (macOS
+  stops an app whose entitlements the profile does not allow). The
+  Keychain itself has no quick probe command: check it by hand once per
+  new profile or certificate (README, "Checking the Keychain protector
+  on a Mac");
+- `SHA256SUMS` is written, signed and checked with `scripts/verify-release
+  -A`;
+- after the upload, right before publishing and right after it: the
+  release's asset list is exactly the files signed here, and every
+  asset, downloaded again, is byte-identical to them and verifies. If
+  the published release differs, it is turned back into a draft and the
+  run fails.
 
 If anything fails, fix it and run the same command again: nothing is
 published before the last step, and each run starts again from the
 draft. If a release was published without a valid signature, make it a
 draft again (`gh release edit v0.2.0 --draft`) and run `sign-release`
 again.
+
+### The rebuild
+
+The rebuild step runs the tag's own `scripts/build-release` (through
+`scripts/verify-reproducible`) on the signing machine, as you, next to
+the release key handle, the login keychain and the notarization
+credentials. That is an accepted risk: the tag is yours, signed by you,
+and its scripts are what was merged to `main`. To keep the signing
+Mac out of it, run the rebuild in a VM or a container instead and give
+its result to `sign-release`:
+
+```sh
+# in the VM or container, with the tag fetched and the draft's SHA256SUMS:
+scripts/verify-reproducible -m -o rebuilt-v0.2.0 v0.2.0 SHA256SUMS
+# copy rebuilt-v0.2.0 to the Mac, then:
+scripts/sign-release -k ~/.ssh/vettid-release --rebuilt rebuilt-v0.2.0 v0.2.0
+```
+
+`-o` writes the rebuilt binaries' hashes only when they match;
+`--rebuilt` skips the local rebuild and requires those lines to be
+exactly the draft's binaries and hashes.
 
 ## Checking a release (anyone)
 

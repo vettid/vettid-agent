@@ -80,7 +80,13 @@ jobs:
           grep -q 'needs the team ID' "$RUNNER_TEMP/err"
       - name: release signature scripts
         if: runner.os != 'Windows'
-        run: scripts/test-release-signing
+        env:
+          # On macOS: verify-release's app check runs on the ad-hoc app
+          # built above.
+          VETTID_TEST_MACOS_APP: ${{ runner.os == 'macOS' && format('{0}/app/vettid-agent.app', runner.temp) || '' }}
+        run: |
+          scripts/test-release-signing
+          scripts/test-sign-release
       # The devstack build (vettid-vault's local dev stack; never a
       # release): vetted, and its unit tests run. The dev-stack tests
       # themselves need a running stack and skip with -short.

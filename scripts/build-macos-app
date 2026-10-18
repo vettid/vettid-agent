@@ -31,8 +31,10 @@
 #                only), no entitlements
 #   -p PROFILE   the owner's Developer ID provisioning profile for the App
 #                ID TEAM_ID.org.vettid.agent (also
-#                $APPLE_PROVISIONING_PROFILE); it is checked for that App
-#                ID, the access group and its expiry date
+#                $APPLE_PROVISIONING_PROFILE); it must be a Developer ID
+#                profile (all devices) for that App ID and team, allow the
+#                access group, carry an expiry date in the future, and
+#                name the certificate the app is signed with
 #
 # Signed with the hardened runtime (--options runtime) and, for a real
 # identity, a secure timestamp: what notarization asks for. Notarizing,
@@ -144,15 +146,17 @@ if [ -n "$profile" ]; then
     *) log "FAIL $profile does not allow the keychain access group $team.org.vettid.agent (the App ID needs keychain sharing)"; exit 1 ;;
   esac
   if [ "$(pb ProvisionsAllDevices)" != true ]; then
-    log "warning: $profile does not say ProvisionsAllDevices; a Developer ID profile does (is it a development profile?)"
+    log "FAIL $profile does not provision all devices: it is not a Developer ID profile (a development or App Store profile?)"
+    exit 1
   fi
-  plutil -extract ExpirationDate raw -o "$work/expiry" "$work/profile.plist" 2>/dev/null || true
-  expiry="$(cat "$work/expiry" 2>/dev/null || true)"
-  if [ -n "$expiry" ]; then
-    exp_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expiry" +%s 2>/dev/null || echo 0)"
-    [ "$exp_epoch" -gt "$(date +%s)" ] || { log "FAIL $profile expired ($expiry)"; exit 1; }
-    log "provisioning profile for $appid, expires $expiry"
-  fi
+  expiry="$(plutil -extract ExpirationDate raw -o - "$work/profile.plist" 2>/dev/null || true)"
+  [ -n "$expiry" ] || { log "FAIL $profile has no expiration date"; exit 1; }
+  exp_epoch="$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$expiry" +%s 2>/dev/null || true)"
+  [ -n "$exp_epoch" ] || { log "FAIL $profile's expiration date \"$expiry\" cannot be read"; exit 1; }
+  [ "$exp_epoch" -gt "$(date +%s)" ] || { log "FAIL $profile expired ($expiry)"; exit 1; }
+  ncerts="$(plutil -extract DeveloperCertificates raw -o - "$work/profile.plist" 2>/dev/null || true)"
+  [[ "$ncerts" =~ ^[1-9][0-9]*$ ]] || { log "FAIL $profile lists no developer certificates"; exit 1; }
+  log "provisioning profile for $appid, $ncerts certificate(s), expires $expiry"
 fi
 
 # The build environment of scripts/build-release, with cgo.
@@ -210,5 +214,19 @@ codesign --verify --strict --verbose=2 "$app" >&2
 if [ "$identity" != "-" ]; then
   got_team="$(codesign -d --verbose=2 "$app" 2>&1 | sed -n 's/^TeamIdentifier=//p')"
   [ "$got_team" = "$team" ] || { log "FAIL signed for the team \"$got_team\", expected $team (check -s)"; exit 1; }
+  # The signing certificate must be one the profile names: otherwise macOS
+  # refuses the profile, and with it the entitlements, at launch.
+  mkdir "$work/certs"
+  (cd "$work/certs" && codesign -d --extract-certificates "$app" 2>/dev/null) || true
+  [ -f "$work/certs/codesign0" ] || { log "FAIL cannot read the signing certificate back from $app"; exit 1; }
+  found=0
+  i=0
+  while [ "$i" -lt "$ncerts" ]; do
+    plutil -extract "DeveloperCertificates.$i" raw -o - "$work/profile.plist" | base64 -D >"$work/certs/profile$i" 2>/dev/null || true
+    if cmp -s "$work/certs/codesign0" "$work/certs/profile$i"; then found=1; break; fi
+    i=$((i + 1))
+  done
+  [ "$found" = 1 ] || { log "FAIL the signing certificate ($identity) is not one of the $ncerts certificate(s) in $profile: make the profile with this certificate"; exit 1; }
+  log "the signing certificate is certificate $i of the provisioning profile"
 fi
 log "PASS $app ($version, $commit)"

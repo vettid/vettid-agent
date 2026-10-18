@@ -677,22 +677,26 @@ machine whose data matters.
 The release workflow
 ([.github/workflows/release.yml](.github/workflows/release.yml)) builds
 every version tag twice, on an amd64 and an arm64 runner, requires
-identical output, requires the tag to be annotated and signed (GitHub
-verified), and creates a **draft** GitHub release with the **unsigned**
+identical output, requires the tag to be annotated, signed with a key
+in `release/allowed_signers` (`scripts/verify-tag`) and verified by
+GitHub, and creates a **draft** GitHub release with the **unsigned**
 binaries and `SHA256SUMS`. The owner then runs one command on their own
 Mac, `scripts/sign-release v0.2.0`: it checks the tag's signature against
 `release/allowed_signers`, checks that the draft came from the workflow's
 run for that tag, rebuilds the tag and requires byte-identical binaries,
 builds, signs and notarizes the macOS app, writes and signs
-`SHA256SUMS` with the release key, checks the result, uploads it and
-publishes after a confirmation. When the release is published, the
+`SHA256SUMS` with the release key, checks the result, uploads it, and
+publishes after a confirmation, checking the release's assets again
+right before and right after publishing (a release that differs goes
+back to being a draft). When the release is published, the
 workflow checks the signature once more. The steps, the one-time setup
 and the formats are in [docs/RELEASING.md](docs/RELEASING.md).
 
 No CI system or other third party holds a VettID signing key, an Apple
 certificate or notarization credentials: the release key stays with the
-owner, on a YubiKey (an offline file key is the fallback), and signing happens on the
-owner's machine. The connector does not update itself. Pull requests
+owner, on a YubiKey (an offline file key is the fallback), and signing
+happens on the owner's machine. Turning on GitHub's immutable releases
+for the repository is recommended (docs/RELEASING.md). The connector does not update itself. Pull requests
 run the same two builds and comparison as a dry run.
 
 ### macOS and Windows binaries
