@@ -218,7 +218,8 @@ JSON in text, with `status` `ok`, `pending` (with a `request_id`) or
 The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
 `not_found`, `limit`, …) or the connector's own: `access_requested`,
 `access_denied`, `vault_unreachable`, `owner_check_required`,
-`suspended`, `expired`, `bad_request` and `rate_limited_local`.
+`suspended`, `expired`, `bad_request`, `rate_limited_local` and
+`superseded` (not expected: another copy of the request took its place).
 
 The connector answers up to 120 tool calls in a burst and then 2 a
 second; calls beyond that get `rate_limited_local` before anything
@@ -304,6 +305,10 @@ asks you on your phone first.
 - If your vault does not answer within 30 seconds, `leash.check_status`
   says "Your vault did not answer. It may be locked; unlock it on your
   phone." and the request stays open.
+- While your vault waits for your approval, `leash.check_status` says
+  so. Once the time for it has passed, it says that instead and the
+  request stays pending until your vault's own answer comes (normally
+  `approval_timeout`).
 - If your vault starts asking for your approval only after every copy
   of a request went unanswered (for example, it was locked for longer
   than the copies wait, and is unlocked later), the connector has
