@@ -7,6 +7,7 @@ toolchain go1.26.9
 require (
 	github.com/google/go-tpm v0.9.8
 	github.com/google/go-tpm-tools v0.4.11
+	github.com/vettid/vettid-relay v0.0.0-20261015153542-cc3ce892f9dc
 	github.com/vettid/vettid-vault v0.0.0-20261017190144-1ef2dd9ec686
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
@@ -24,5 +25,4 @@ require (
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/decred/dcrd/crypto/blake256 v1.1.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
-	github.com/vettid/vettid-relay v0.0.0-20261015153542-cc3ce892f9dc // indirect
 )

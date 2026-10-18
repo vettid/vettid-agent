@@ -50,6 +50,25 @@ another case, a duplicate or unknown member, base64 without padding or
 with line breaks) is refused. So a header has one encoding, and nothing
 in it escapes the authentication through a quirk of a JSON parser.
 
+## What the state holds
+
+The plaintext under the data key is the connector's record
+(`internal/pairing`, `Record`), compact JSON:
+
+```
+{"v":1,"phase":"started"|"waiting"|"paired","deadline":"<RFC 3339>","device":{…}}
+```
+
+| Member | What |
+|---|---|
+| `v` | 1 |
+| `phase` | `started`: fresh keys, mailbox registered, no SAS shown yet (discarded by the next `pair`); `waiting`: the handshake completed and the SAS was shown, the connector waits for the owner's decision (resumable until `deadline`); `paired`: `device.paired` arrived |
+| `deadline` | present exactly while `phase` is `started` or `waiting`: the end of the 10 minutes after `hs.init` (VAULT-MESSAGING §6.7), measured from just before the keys were created |
+| `device` | the vault client's `Save()` output: the `ik`, `kem` and relay-key seeds, the vault record with tokens, the session keyring |
+
+It is parsed strictly (no unknown members, nothing after it). The
+pairing code and the SAS are never stored.
+
 ## Keys and writes
 
 - **Data key**: 32 random bytes, made at `Create` (each pairing) and
