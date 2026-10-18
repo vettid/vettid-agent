@@ -1,6 +1,7 @@
 package pairing
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -179,6 +180,10 @@ var wrapStore = func(s store) store { return s }
 type run struct {
 	o  Options
 	st store
+	// cur is the record of this run (its phase and deadline), for
+	// persist; persistedPaired is set once persist saved it as paired.
+	cur             *Record
+	persistedPaired bool
 	// replacing says what the first write replaces ("unfinished",
 	// "paired" or "unreadable"); replaced is set once it did.
 	replacing string
@@ -293,6 +298,7 @@ func (r *run) resume(ctx context.Context, rec *Record) error {
 		// destroyed without the operator asking.
 		return errors.New("the saved pairing is not a pending agent pairing; to discard it, run `vettid-agent pair --restart`")
 	}
+	r.cur = rec
 	d, err := client.Load(r.clientConfig(client.Config{}), rec.Device)
 	if err != nil {
 		return errors.New("the saved pairing could not be restored; to discard it, run `vettid-agent pair --restart`")
@@ -311,7 +317,51 @@ func (r *run) resume(ctx context.Context, rec *Record) error {
 
 func (r *run) clientConfig(c client.Config) client.Config {
 	c.HTTP, c.Now, c.PollWait = r.o.HTTP, r.o.Now, r.o.PollWait
+	c.Persist = r.persist
 	return c
+}
+
+// persist is the client's Config.Persist while pairing: it saves the
+// device state with the current phase after each collected batch and
+// before the batch is acknowledged, so that device.paired (which the
+// client records while handling it) is in the state file before the
+// relay drops it. A batch whose state holds the device id is saved as
+// paired. A rejection (the client dropped the vault record) is not
+// saved: the state is wiped right after. An error leaves the batch
+// unacknowledged.
+func (r *run) persist(st []byte) error {
+	if !r.created || r.cur == nil {
+		return nil // no batch is collected before the first write
+	}
+	var cs struct {
+		DeviceID string          `json:"device_id"`
+		Vault    json.RawMessage `json:"vault"`
+	}
+	if err := json.Unmarshal(st, &cs); err != nil {
+		return errors.New("the device state could not be read for saving")
+	}
+	rec := Record{Phase: r.cur.Phase, Deadline: r.cur.Deadline}
+	switch {
+	case cs.DeviceID != "":
+		rec.Phase, rec.Deadline = PhasePaired, time.Time{}
+	case len(cs.Vault) == 0 || string(cs.Vault) == "null":
+		return nil
+	}
+	rec.Device = bytes.Clone(st)
+	b, err := rec.Encode()
+	clear(rec.Device)
+	if err != nil {
+		return err
+	}
+	err = r.st.Save(b)
+	clear(b)
+	if err != nil {
+		return err
+	}
+	if rec.Phase == PhasePaired {
+		r.persistedPaired = true
+	}
+	return nil
 }
 
 func (r *run) pairNew(ctx context.Context) error {
@@ -340,6 +390,7 @@ func (r *run) pairNew(ctx context.Context) error {
 	rec := &Record{Phase: PhaseStarted, Deadline: o.Now().Add(Window)}
 	wctx, cancel := deadlineCtx(ctx, rec.Deadline, o.Now())
 	defer cancel()
+	r.cur = rec
 	d, err := client.New(wctx, r.clientConfig(client.Config{Role: "agent", Name: o.Name, RelayURL: code.Relay}))
 	if err != nil {
 		// Nothing was written yet.
@@ -385,6 +436,10 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 	defer cancel()
 	err := d.AwaitPaired(wctx)
 	switch {
+	case err == nil && r.persistedPaired:
+		// Saved as paired before device.paired was acknowledged.
+		fmt.Fprintln(o.Out, TextPaired)
+		return nil
 	case err == nil:
 		rec.Phase, rec.Deadline = PhasePaired, time.Time{}
 		if err := r.save(d, rec); err != nil {

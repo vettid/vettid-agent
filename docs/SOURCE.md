@@ -8,7 +8,7 @@ tests passing (AGENT-PLAN §5, §10 risk 2).
 
 | Module | Version in `go.mod` | Commit | Date (UTC) |
 |---|---|---|---|
-| `github.com/vettid/vettid-vault` | `v0.0.0-20261017190144-1ef2dd9ec686` | `1ef2dd9ec68627a80e18d665032fcd58e3a61a1d` (`main`, "Staging release 16 (S16): release number", #108) | 2026-10-17 19:01:44 |
+| `github.com/vettid/vettid-vault` | `v0.0.0-20261018021545-271f3e23c033` | `271f3e23c0331d5fcd33c3bcb6fb2fc579a4911d` (`main`, "client: Config.Persist, save before acknowledging a collected batch", #111) | 2026-10-18 02:15:45 |
 | `github.com/vettid/vettid-relay` (the version vettid-vault requires; imported directly since A2.1) | `v0.0.0-20261015153542-cc3ce892f9dc` | `cc3ce892f9dcb990e9e9752f19c3e0e296dd12b9` (`main`, RELAY-PROTOCOL 0.9.4 byte budgets, #14) | 2026-10-15 15:35:42 |
 
 Other direct dependencies are ordinary tagged releases chosen in the PR
@@ -21,13 +21,17 @@ job); it is not linked into the binary.
 
 ## Why these commits
 
-- **vettid-vault `1ef2dd9`** is the `main` head when A0.2 was written and
-  the commit AGENT-PLAN 0.1.2 was checked against (§1, §3.2): the agent
-  side of pairing, access sessions and LEASH in the enclave, and the
-  reference client's `client/leash.go`. The module has no tags, so the
-  dependency is a pseudo-version of a `main` commit.
+- **vettid-vault `271f3e2`** (A2.2) adds to the A0.2 pin `1ef2dd9` the
+  client's `Config.Persist` (AGENT-PLAN §7.1 AV1: the device state is
+  saved after a collected batch is handled and before it is
+  acknowledged, with the deposits that handling makes kept in a saved
+  outbox, and `device.paired` recorded while it is handled), the wallet
+  calls moved to `client/wallet` (AV4), and the vault's bound on
+  access-session prompts (AV6). The vault's vectors used here are
+  unchanged between the two commits (same sha256). The module has no
+  tags, so the dependency is a pseudo-version of a `main` commit.
 - **vettid-relay `cc3ce89`** is not chosen here: it is the version
-  vettid-vault `1ef2dd9` requires in its own `go.mod` (the relay client
+  vettid-vault `271f3e2` requires in its own `go.mod` (the relay client
   and token packages its `client` imports), and Go's minimal version
   selection keeps it. It is recorded so that a relay change reaching the
   connector is visible in review.
@@ -48,9 +52,9 @@ job); it is not linked into the binary.
 
 Both are outside the vault module's `internal/`; their own imports of
 `internal/strictjson`, `internal/cbor` and `internal/der` are allowed
-because those packages are inside the vault module. Until AGENT-PLAN §7.1
-AV4 moves `client/wallet.go` out of `client`, importing `client` also
-compiles btcsuite/btcd and decred secp256k1.
+because those packages are inside the vault module. Since AV4 the wallet
+calls are in `client/wallet`, which the connector does not import, so
+btcsuite/btcd and decred secp256k1 are no longer compiled in.
 
 ## Checks
 

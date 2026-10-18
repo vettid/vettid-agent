@@ -1,0 +1,142 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/vettid/vettid-agent/internal/pairing"
+	"github.com/vettid/vettid-agent/internal/state"
+	"github.com/vettid/vettid-agent/internal/vaultconn"
+)
+
+// Standard input of `mcp` and a hook for the connection's options,
+// replaced in tests.
+var (
+	mcpIn      io.Reader = os.Stdin
+	mcpOptions func(*vaultconn.Options)
+	// mcpResolve replaces the protector resolver (tests' protector).
+	mcpResolve state.Resolver
+)
+
+const mcpUsage = `Usage: vettid-agent mcp --state-dir DIR [--passphrase-fd N | --passphrase-file PATH]
+
+Runs the connector for the MCP client that starts it, over standard
+input and output, with the pairing in DIR. It stays connected to your
+vault until the client closes standard input. Standard output carries
+only MCP messages; notices go to standard error. (The MCP tools are not
+available yet: this version keeps the vault connection only.)
+
+Flags:
+`
+
+func runMCP(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dir := fs.String("state-dir", "", "the state `DIR`ectory of this MCP client's pairing (required)")
+	verbose := fs.Bool("verbose", false, "log each message type and id to standard error")
+	prot := &pairing.Protectors{NoPrompt: true}
+	prot.Source.AddFlags(fs)
+	fs.Usage = func() {
+		fmt.Fprint(stderr, mcpUsage)
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if *dir == "" || fs.NArg() != 0 {
+		fs.Usage()
+		return 2
+	}
+	fail := func(err error) int {
+		fmt.Fprintf(stderr, "vettid-agent mcp: %v\n", err)
+		return 1
+	}
+	defer prot.Clear()
+	if prot.Source.FD >= 0 {
+		pass, err := prot.Source.Read("", false)
+		if err != nil {
+			return fail(err)
+		}
+		prot.Pass = pass
+	}
+	store, err := state.Open(*dir)
+	if err != nil {
+		return fail(err)
+	}
+	defer store.Close()
+	if ok, err := store.Exists(); err != nil {
+		return fail(err)
+	} else if !ok {
+		return fail(vaultconn.ErrNotPaired)
+	}
+	resolve := state.Resolver(prot.Resolve)
+	if mcpResolve != nil {
+		resolve = mcpResolve
+	}
+	raw, err := store.Load(resolve)
+	if err != nil {
+		if rerr := prot.ResolveErr(); rerr != nil {
+			err = rerr
+		}
+		return fail(fmt.Errorf("the state file cannot be opened: %w", err))
+	}
+	rec, err := pairing.DecodeRecord(raw)
+	clear(raw)
+	if err != nil {
+		return fail(err)
+	}
+	if rec.Phase != pairing.PhasePaired {
+		return fail(errors.New("the pairing is not finished: run `vettid-agent pair`"))
+	}
+	level := slog.LevelWarn
+	if *verbose {
+		level = slog.LevelInfo
+	}
+	o := vaultconn.Options{
+		Store:   store,
+		Resolve: resolve,
+		Record:  rec,
+		Out:     stderr,
+		Log:     slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})),
+	}
+	if mcpOptions != nil {
+		mcpOptions(&o)
+	}
+	conn, err := vaultconn.New(o)
+	if err != nil {
+		return fail(err)
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// The MCP client ends the session by closing standard input. The MCP
+	// messages themselves are handled from A3.3 on; until then they are
+	// read and dropped, and nothing is written to standard output.
+	in := mcpIn
+	go func() {
+		_, _ = io.Copy(io.Discard, in)
+		cancel()
+	}()
+	err = conn.Run(ctx)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return 0
+	case errors.Is(err, vaultconn.ErrUnlinked), errors.Is(err, vaultconn.ErrRefused):
+		// Run has told the operator.
+		return 1
+	default:
+		return fail(err)
+	}
+}
