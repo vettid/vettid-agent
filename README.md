@@ -410,13 +410,20 @@ another Mac or user), it says that too; pair again with `pair --restart`.
 
 The item is named after the state directory (a hash of its path), so
 wiping a state directory deletes its Keychain item even when the state
-file no longer opens. After a wipe, an old copy of the state file
-recovered from the disk opens nowhere. Two cases leave an item behind:
-a state directory moved or renamed after pairing and then wiped without
-its file being opened (the item opens nothing without an old copy of
-the file), and a pairing interrupted between creating the item and
-writing the state file (the next wipe of that state directory deletes
-it).
+file no longer opens. When a state directory is moved or renamed (or
+copied), the item follows the file the next time it is opened at its
+new place, so a new pairing at the old path, and wiping it, leave the
+moved one alone. After a wipe, an old copy of the state file recovered
+from the disk opens nowhere. Two cases leave an item behind: a state
+directory moved after pairing and wiped at its new path without its
+file ever being opened there (the item opens nothing without an old
+copy of the file), and a pairing interrupted between creating the item
+and writing the state file (the next wipe of that state directory
+deletes it). A build without the Keychain entitlement cannot see items
+at all: when it discards a state file whose protector it cannot read
+(`pair --restart` over a damaged file), it leaves any item the signed
+app made for that directory; the signed app's next wipe of the
+directory deletes it.
 
 ### Checking the Keychain protector on a Mac
 

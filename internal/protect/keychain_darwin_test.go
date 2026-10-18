@@ -96,15 +96,22 @@ func TestKeychainDarwinNotEntitled(t *testing.T) {
 	if len(all) != 1 || all[0].Name() != PassphraseName {
 		t.Errorf("All: %v", all)
 	}
-	store, err := state.Open(dir)
+	sdir := filepath.Join(dir, "state")
+	if err := os.Mkdir(sdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := state.Open(sdir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	if err := os.WriteFile(filepath.Join(dir, state.StateFileName), []byte("not a state file"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(sdir, state.StateFileName), []byte("not a state file"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.WipeAll(All(dir)); err != nil {
+	if err := store.WipeAll(All(sdir)); err != nil {
 		t.Errorf("WipeAll over an unreadable header: %v", err)
 	}
 	if ok, err := store.Exists(); err != nil || ok {

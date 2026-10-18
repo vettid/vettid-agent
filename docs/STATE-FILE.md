@@ -235,7 +235,11 @@ data protection keychain (never the file-based login keychain):
 
 The canonical path is the one macOS reports for the open directory
 (`fcntl` `F_GETPATH`: symbolic links resolved, the letter case the
-volume stores). `Wrap` reads the item back and refuses it unless its
+volume stores); a directory that cannot be opened is refused by `Wrap`
+and `Wipe`, never replaced by a guessed path. When `Unwrap` opens an
+item whose service names another directory (the state directory was
+moved, renamed or copied), it sets the item's service to the current
+directory's (`SecItemUpdate`; a failure does not fail `Unwrap`). `Wrap` reads the item back and refuses it unless its
 data, service, accessibility and synchronizable attributes are as
 written; `Unwrap` looks the item up by `name` alone (so a moved state
 directory still opens) and refuses it unless it is this-device-only,
@@ -250,9 +254,11 @@ first and reports the Keychain as not available instead of asking.
 `forget` and `device.unlinked` (AGENT-PLAN AG12) wipe in this order:
 
 1. The protector's key first (`Protector.Wipe`: for the Keychain
-   protector, every item whose service is the state directory's, then
-   the items the protector opened or made in this process, the key in
-   use last, an item already gone counting as deleted; nothing for the
+   protector, the items listed under the state directory's service and
+   those the protector opened or made in this process, deleted one by
+   one by name, the key in use (the one opened in this process, else the
+   newest listed) last and nothing that can fail after it, an item
+   already gone counting as deleted; nothing for the
    passphrase, TPM and DPAPI protectors, whose wrapped key lives only
    in the file). The protector
    is the one that created or opened the file or, when the file was not
