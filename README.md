@@ -170,6 +170,35 @@ vault or the relay and does not take the state directory's lock, so it
 can run next to `vettid-agent mcp` and then shows that process's last
 saved state. It shows no keys or tokens.
 
+## Requests for items and approvals
+
+The MCP tools (to come) reach your items through your vault's LEASH
+requests (VAULT-MESSAGING §10.11): the list of items you shared with the
+agent, reading an item, and using a field without revealing it (an
+HMAC-SHA-256 keyed with the field's value). Your vault decides each
+request from the agent's permissions: it answers at once, refuses, or
+asks you on your phone first.
+
+- A tool call waits up to 20 seconds. If your vault has not answered by
+  then, for example because it is waiting for your approval (up to 5
+  minutes), the tool answers with a request id, and
+  `leash.check_status` gives the outcome later. The connector keeps
+  waiting for the answer while it runs.
+- A request that gets no answer is sent again, at most twice, as the
+  same message, so that your vault answers the copy instead of running
+  it again. A request your vault answered (refused, declined on your
+  phone, timed out, or anything else) is never sent again on its own.
+- If your vault does not answer within 30 seconds, `leash.check_status`
+  says "Your vault did not answer. It may be locked; unlock it on your
+  phone." and the request stays open.
+- Results are kept in memory for at most 10 minutes and returned once;
+  an item's values are zeroed in memory once passed to the agent or
+  dropped. Nothing of a request is written to the state file, so a
+  result does not survive a restart of the connector: the agent asks
+  again.
+- Logs carry the kind of request, its id and the vault's error code,
+  never an item's name or values.
+
 ## Keys at rest on Linux: the TPM
 
 On Linux the connector seals its state file's key to the computer's TPM

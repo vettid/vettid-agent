@@ -54,6 +54,9 @@ var (
 	ErrStopped = errors.New("the connection to the vault has stopped")
 	// ErrNotPaired: the record is not a completed pairing.
 	ErrNotPaired = errors.New("this connector is not paired: run `vettid-agent pair`")
+	// ErrSuperseded: a RequestWithID with the same inner id was sent
+	// while this one still waited; that one takes the response.
+	ErrSuperseded = errors.New("a retransmission of this request replaced it")
 )
 
 // Store is what vaultconn uses of *state.Store (opened, locked and
@@ -121,6 +124,7 @@ type result struct {
 }
 
 type call struct {
+	id   string // "": a new inner id
 	typ  string
 	body json.RawMessage
 	done chan result // buffered, 1
@@ -482,7 +486,7 @@ func (c *Conn) takeCalls(ctx context.Context) {
 				cl.done <- result{err: ErrRefused}
 				continue
 			}
-			id, err := c.dev.Send(ctx, cl.typ, cl.body)
+			id, err := c.dev.SendWithID(ctx, cl.id, cl.typ, cl.body)
 			if err != nil {
 				c.sendFailed(err)
 				if c.refused {
@@ -493,6 +497,9 @@ func (c *Conn) takeCalls(ctx context.Context) {
 				continue
 			}
 			c.log.Info("sent", "type", cl.typ, "id", id)
+			if old, ok := c.pending[id]; ok {
+				old.done <- result{err: ErrSuperseded}
+			}
 			c.pending[id] = cl
 		default:
 			return
@@ -559,7 +566,27 @@ func (c *Conn) readStatus(r *Response) {
 // Request sends a request to the vault through Run's goroutine and
 // waits for its response, ctx's end or Run's end.
 func (c *Conn) Request(ctx context.Context, typ string, body json.RawMessage) (*Response, error) {
-	cl := &call{typ: typ, body: body, done: make(chan result, 1), ctx: ctx}
+	return c.request(ctx, "", typ, body)
+}
+
+// RequestWithID is Request with a caller-chosen inner id (a ULID, see
+// NewID). An application retry passes the id of the request it repeats,
+// so that the vault answers it from its dedupe (VAULT-MESSAGING §8.2,
+// §8.6) instead of executing it again, and a request the vault holds for
+// approval (§6.8) is not held twice. A call still waiting under the same
+// id ends with ErrSuperseded: only the latest one is answered.
+func (c *Conn) RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*Response, error) {
+	if !envelope.ValidULID(id) {
+		return nil, errors.New("vaultconn: the inner id is not a ULID")
+	}
+	return c.request(ctx, id, typ, body)
+}
+
+// NewID returns a fresh inner id (a ULID) for RequestWithID.
+func (c *Conn) NewID() (string, error) { return envelope.NewULID(c.o.Now()) }
+
+func (c *Conn) request(ctx context.Context, id, typ string, body json.RawMessage) (*Response, error) {
+	cl := &call{id: id, typ: typ, body: body, done: make(chan result, 1), ctx: ctx}
 	select {
 	case c.calls <- cl:
 	case <-ctx.Done():

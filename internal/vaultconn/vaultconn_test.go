@@ -945,3 +945,72 @@ func TestGrantedThenEndedOneBatch(t *testing.T) {
 		t.Errorf("saved %+v", rec.Access)
 	}
 }
+
+// TestRequestWithID: a retransmission goes out under the caller's
+// inner id; a call still waiting under that id ends with ErrSuperseded
+// and the latest one takes the response. An id that is not a ULID is
+// refused before anything is sent.
+func TestRequestWithID(t *testing.T) {
+	e := newPaired(t)
+	var mu sync.Mutex
+	var ids []string
+	e.v.OnRequest = func(id, typ string, body []byte) {
+		if typ == "test.req" {
+			mu.Lock()
+			ids = append(ids, id)
+			mu.Unlock()
+		}
+	}
+	o := e.open(nil)
+	stop := o.run()
+	defer stop()
+	if _, err := o.conn.RequestWithID(context.Background(), "not-a-ulid", "test.req", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("a malformed id was accepted")
+	}
+	id, err := o.conn.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() {
+		_, err := o.conn.RequestWithID(context.Background(), id, "test.req", json.RawMessage(`{}`))
+		first <- err
+	}()
+	sent := func(n int) func() bool {
+		return func() bool { mu.Lock(); defer mu.Unlock(); return len(ids) == n }
+	}
+	eventually(t, "the first copy", sent(1))
+	second := make(chan *Response, 1)
+	go func() {
+		r, err := o.conn.RequestWithID(context.Background(), id, "test.req", json.RawMessage(`{}`))
+		if err != nil {
+			t.Error(err)
+		}
+		second <- r
+	}()
+	select {
+	case err := <-first:
+		if !errors.Is(err, ErrSuperseded) {
+			t.Fatalf("first: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first call was not superseded")
+	}
+	eventually(t, "the second copy", sent(2))
+	mu.Lock()
+	if ids[0] != id || ids[1] != id {
+		t.Errorf("ids: %v, want %s", ids, id)
+	}
+	mu.Unlock()
+	if _, err := e.v.SendResponse(id, "test.req", []byte(`{"x":1}`), ""); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-second:
+		if r == nil || !r.OK || string(r.Body) != `{"x":1}` {
+			t.Fatalf("second: %+v", r)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no response")
+	}
+}
