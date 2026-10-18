@@ -41,6 +41,11 @@ jobs:
         env:
           VETTID_AGENT_TEST_OTHER_USER: ${{ runner.os == 'Windows' && '1' || '' }}
         run: go test ${{ matrix.race }} -count=1 ./...
+      - name: DPAPI tests, verbose (the record of what Windows answered)
+        if: runner.os == 'Windows'
+        env:
+          VETTID_AGENT_TEST_OTHER_USER: "1"
+        run: go test -count=1 -v -run "TestDPAPI|TestChooseProtectorWindows|TestClassifyDPAPI" ./internal/protect
       - name: build and run
         shell: bash
         run: |
