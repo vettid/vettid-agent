@@ -123,6 +123,13 @@ func TestDPAPIHelper(t *testing.T) {
 			return
 		}
 		result("ok\n")
+	case "choose":
+		c, err := ChooseProtector(ChooseOptions{})
+		if err != nil {
+			result("error\n" + kindOf(err) + "\n" + err.Error())
+			return
+		}
+		result("ok\n" + c.Protector + "\n")
 	default:
 		t.Fatalf("unknown op %q", op)
 	}
@@ -270,6 +277,20 @@ func TestDPAPIOtherUser(t *testing.T) {
 	})
 	status, kind, msg = helperRunAs(user2, pass3, logonNoProfile, "wrap", filepath.Join(dir, "noprofile.blob"))
 	t.Logf("a user without a loaded profile wrapping a key: %s %s: %s", status, kind, msg)
+	if status != "error" || kind != "profile" {
+		t.Errorf("without a loaded profile: %s %s: %s; want ErrDPAPIProfile", status, kind, msg)
+	}
+	// ChooseProtector there: an error with the cause, not a silent
+	// passphrase.
+	status, kind, msg = helperRunAs(user2, pass3, logonNoProfile, "choose", "-")
+	t.Logf("ChooseProtector without a loaded profile: %s %s: %s", status, kind, msg)
+	if status != "error" || kind != "profile" || !strings.Contains(msg, "choose a passphrase") {
+		t.Errorf("ChooseProtector without a loaded profile: %s %s: %s; want ErrDPAPIProfile", status, kind, msg)
+	}
+	// With the profile loaded, the same user gets DPAPI.
+	if status, kind, msg := helperRunAs(user2, pass3, logonWithProfile, "choose", "-"); status != "ok" || kind != DPAPIName {
+		t.Errorf("ChooseProtector with the profile loaded: %s %s: %s", status, kind, msg)
+	}
 
 	// And new keys work again for that user.
 	newPath := filepath.Join(dir, "new.blob")
