@@ -161,7 +161,7 @@ func TestDPAPITamperedRefused(t *testing.T) {
 		switch {
 		case pos >= signStart:
 			region = "signature"
-		case pos >= dataStart:
+		case pos >= dataStart && pos < signStart-4:
 			region = "data"
 		}
 		if region != "header" && !errors.Is(err, ErrDPAPIRefused) {
@@ -196,8 +196,8 @@ func errKind(err error) string {
 	return "other: " + err.Error()
 }
 
-// locateDataSign returns the offsets of the encrypted data and the
-// signature fields' contents in a DPAPI blob.
+// locateDataSign returns the offsets of the encrypted data's and the
+// signature's contents (after their length fields) in a DPAPI blob.
 func locateDataSign(t *testing.T, b []byte) (int, int) {
 	t.Helper()
 	le := binary.LittleEndian
@@ -209,8 +209,8 @@ func locateDataSign(t *testing.T, b []byte) (int, int) {
 	skip()   // hmac key
 	off += 8 // algHash, len
 	skip()   // hmac2
-	data := skip() - 4
-	sign := skip() - 4
+	data := skip()
+	sign := skip()
 	if off != len(b) {
 		t.Fatalf("layout walk ended at %d of %d", off, len(b))
 	}

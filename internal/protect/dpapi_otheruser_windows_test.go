@@ -106,7 +106,10 @@ func TestDPAPIOtherUser(t *testing.T) {
 	}
 	run := func(name string, args ...string) {
 		t.Helper()
-		out, err := exec.Command(name, args...).CombinedOutput()
+		cmd := exec.Command(name, args...)
+		// net.exe asks to confirm a password longer than 14 characters.
+		cmd.Stdin = strings.NewReader("Y\r\n")
+		out, err := cmd.CombinedOutput()
 		if err != nil {
 			t.Fatalf("%s %s: %v: %s", name, args[0], err, out)
 		}
