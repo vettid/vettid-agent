@@ -22,7 +22,10 @@
 // no longer kept here. Nothing of a request is written to the state
 // file. Item values are kept as their JSON text in byte slices that
 // Result.Wipe zeroes; the vault's response body is zeroed once it is
-// parsed, and a result that is not collected is zeroed when it is
+// parsed; the request's body is zeroed when the request ends, and each
+// copy of it handed to the connection once the connection is done with
+// it (a copy whose send was cancelled is left to the garbage
+// collector); and a result that is not collected is zeroed when it is
 // dropped. Logs carry the op, the request id and the error code, never
 // a body, an item value or a name.
 package request
@@ -695,7 +698,15 @@ func (c *Client) attempt(e *entry) (*vaultconn.Response, error) {
 			}
 		}
 	}()
-	resp, err := c.conn.RequestWithID(ctx, e.id, "agent.request", e.body)
+	// Each copy gets its own body, handed to the connection: after a
+	// cancellation (a timeout, or Close) the connection may still be
+	// encrypting it, so it is zeroed only once the connection has
+	// answered for it, and e.body (which finish zeroes) is never shared.
+	body := append(json.RawMessage(nil), e.body...)
+	resp, err := c.conn.RequestWithID(ctx, e.id, "agent.request", body)
+	if handedBack(err) {
+		clear(body)
+	}
 	if err != nil {
 		select {
 		case <-timedOut:
@@ -705,6 +716,15 @@ func (c *Client) attempt(e *entry) (*vaultconn.Response, error) {
 		return nil, err
 	}
 	return resp, nil
+}
+
+// handedBack reports whether RequestWithID's outcome err means the
+// connection is done with the body: it answered, or failed the send.
+// After a cancellation or a stop it may still hold the body, which is
+// then left to the garbage collector.
+func handedBack(err error) bool {
+	return err == nil || !(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, vaultconn.ErrStopped))
 }
 
 // answer records the vault's answer; the response body is zeroed once

@@ -922,6 +922,95 @@ func TestCreateReplaceNeverDurable(t *testing.T) {
 	}
 }
 
+// Where the old file is overwritten and closed before the rename (the
+// file system cannot rename over an open file), a flush failure after
+// the rename is plain ErrNotDurable: the new file is in place and
+// loaded, so it is not ErrReplaceIncomplete.
+func TestCreateReplaceOverwriteFirstNotDurable(t *testing.T) {
+	oldProbe := probeReplaceOpen
+	probeReplaceOpen = func(string) (bool, error) { return false, nil }
+	defer func() { probeReplaceOpen = oldProbe }()
+	s, oldP, link, size := replaceSetup(t)
+	old, oldDelay := makeDurable, durableRetryDelay
+	durableRetryDelay = time.Millisecond
+	makeDurable = func(string, string) error { return errors.New("flush refused") }
+	defer func() { makeDurable, durableRetryDelay = old, oldDelay }()
+	newP := newFixedProtector(seq(0x50, 32))
+	newP.name = "test-new"
+	err := s.CreateReplace(newP, []byte("new state"), resolverFor(oldP))
+	if !errors.Is(err, ErrNotDurable) || errors.Is(err, ErrReplaceIncomplete) || errors.Is(err, ErrReplacedPartly) {
+		t.Fatalf("CreateReplace = %v, want ErrNotDurable alone", err)
+	}
+	if oldP.hasKey {
+		t.Error("old protector key remains")
+	}
+	if link != "" {
+		if got, _ := os.ReadFile(link); int64(len(got)) != size || !bytes.Equal(got, make([]byte, size)) {
+			t.Error("the old file's bytes were not overwritten")
+		}
+	}
+	// The Store holds the new file as created: Save works once flushes
+	// do, and the file loads under the new protector.
+	makeDurable = old
+	if err := s.Save([]byte("newer state")); err != nil {
+		t.Fatalf("Save after ErrNotDurable: %v", err)
+	}
+	if got, err := s.Load(resolverFor(newP)); err != nil || string(got) != "newer state" {
+		t.Fatalf("Load = %q, %v", got, err)
+	}
+}
+
+// A symbolic link at the state file's path: CreateReplace replaces the
+// link itself with the new file and never writes to its target. A flush
+// failure after the rename is plain ErrNotDurable there too: no old
+// file is held, and the new file is in place and loaded.
+func TestCreateReplaceSymlinkAtPath(t *testing.T) {
+	for _, flushFails := range []bool{false, true} {
+		s := openTest(t)
+		oldP := newFixedProtector(seq(0x40, 32))
+		if err := s.Create(oldP, []byte("old state")); err != nil {
+			t.Fatal(err)
+		}
+		target := filepath.Join(t.TempDir(), "elsewhere")
+		if err := os.WriteFile(target, []byte("untouched"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(s.Path()); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(target, s.Path()); err != nil {
+			t.Skipf("cannot create a symbolic link here: %v", err)
+		}
+		old, oldDelay := makeDurable, durableRetryDelay
+		durableRetryDelay = time.Millisecond
+		if flushFails {
+			makeDurable = func(string, string) error { return errors.New("flush refused") }
+		}
+		newP := newFixedProtector(seq(0x50, 32))
+		newP.name = "test-new"
+		err := s.CreateReplace(newP, []byte("new state"), nil)
+		makeDurable, durableRetryDelay = old, oldDelay
+		switch {
+		case !flushFails && err != nil:
+			t.Fatalf("CreateReplace: %v", err)
+		case flushFails && (!errors.Is(err, ErrNotDurable) || errors.Is(err, ErrReplaceIncomplete) || errors.Is(err, ErrReplacedPartly)):
+			t.Fatalf("flush failing: CreateReplace = %v, want ErrNotDurable alone", err)
+		}
+		if oldP.hasKey {
+			t.Errorf("flush failing %v: old protector key remains", flushFails)
+		}
+		if fi, err := os.Lstat(s.Path()); err != nil || !fi.Mode().IsRegular() {
+			t.Errorf("flush failing %v: the path is not the new file: %v", flushFails, err)
+		}
+		if got, _ := os.ReadFile(target); string(got) != "untouched" {
+			t.Errorf("flush failing %v: the link's target was written: %q", flushFails, got)
+		}
+		if got, err := s.Load(resolverFor(newP)); err != nil || string(got) != "new state" {
+			t.Fatalf("flush failing %v: Load = %q, %v", flushFails, got, err)
+		}
+	}
+}
+
 // replaceSetup makes a store with an old state and, where hard links
 // work, a second name for the old file to observe its bytes.
 func replaceSetup(t *testing.T) (*Store, *fixedProtector, string, int64) {

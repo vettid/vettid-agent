@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -468,5 +469,90 @@ func TestMCPHeldRecheck(t *testing.T) {
 	case <-done:
 	case <-time.After(20 * time.Second):
 		t.Fatal("mcp did not exit")
+	}
+}
+
+// stopWithUnreadStdout runs `mcp` with standard output w, which nobody
+// reads, sends enough pings to block a write to it, then sends the
+// signal: `mcp` must exit within a bounded time. It returns standard
+// error.
+func stopWithUnreadStdout(t *testing.T, w io.Writer) string {
+	t.Helper()
+	v := newVault(t)
+	dir := pairedDir(t, v)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { pw.Close() })
+	withTestMCP(t, v, pr)
+	sigCtx, sendSignal := context.WithCancel(context.Background())
+	oldSignals, oldWait := mcpSignals, mcpStopWait
+	mcpSignals = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return context.WithCancel(sigCtx)
+	}
+	mcpStopWait = 100 * time.Millisecond
+	t.Cleanup(func() { mcpSignals, mcpStopWait = oldSignals, oldWait })
+	errOut := &lineLog{w: io.Discard}
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"mcp", "--state-dir", dir}, w, errOut) }()
+	// More answers than a pipe buffers (64 KiB on Linux and macOS):
+	// sent from a goroutine, as the input stops being read once a write
+	// blocks.
+	go func() {
+		ping := []byte(`{"jsonrpc":"2.0","id":1,"method":"ping"}` + "\n")
+		for i := 0; i < 4000; i++ {
+			if _, err := pw.Write(ping); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond) // the writes block
+	start := time.Now()
+	sendSignal()
+	select {
+	case rc := <-done:
+		if rc != 0 {
+			t.Errorf("exit %d", rc)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("mcp did not exit after the signal")
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("exit took %v", d)
+	} else if d < mcpStopWait {
+		t.Errorf("exit after %v: no write was blocked, which the test needs", d)
+	}
+	errOut.mu.Lock()
+	defer errOut.mu.Unlock()
+	return errOut.buf.String()
+}
+
+const textUnreadStdout = "does not read standard output"
+
+// TestMCPSignalUnreadStdout: a signal stops `mcp` within a bounded time
+// although a write to standard output is blocked (the MCP client keeps
+// it open and does not read it), where standard output has no write
+// deadline (here an in-process pipe): the write is abandoned and said
+// so on standard error.
+func TestMCPSignalUnreadStdout(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pr.Close() // ends the abandoned write
+	if errOut := stopWithUnreadStdout(t, pw); !strings.Contains(errOut, textUnreadStdout) {
+		t.Errorf("stderr: %q", errOut)
+	}
+}
+
+// TestMCPSignalUnreadStdoutFile: the same with an OS pipe. Where the Go
+// runtime polls it (Linux, macOS), the write deadline ends the blocked
+// write and the session ends normally; elsewhere the write is
+// abandoned.
+func TestMCPSignalUnreadStdoutFile(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	errOut := stopWithUnreadStdout(t, w)
+	if runtime.GOOS != "windows" && strings.Contains(errOut, textUnreadStdout) {
+		t.Errorf("the write deadline did not end the write: %q", errOut)
 	}
 }

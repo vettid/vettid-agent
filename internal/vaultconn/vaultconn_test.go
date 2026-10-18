@@ -364,7 +364,7 @@ func TestRunStatusAndRequests(t *testing.T) {
 // the vault, and the new epoch works.
 func TestCrashAfterSaveBeforeAck(t *testing.T) {
 	e := newPaired(t)
-	e.v.FailAcks = true
+	e.v.SetFailAcks(true)
 	if _, err := e.v.SendEvent("test.before", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestCrashAfterSaveBeforeAck(t *testing.T) {
 		t.Fatalf("%d messages pending; the test needs the unacknowledged batch", e.v.Pending())
 	}
 
-	e.v.FailAcks = false
+	e.v.SetFailAcks(false)
 	o2 := e.open(nil)
 	stop2 := o2.run()
 	defer stop2()
@@ -814,7 +814,7 @@ func TestAccessSavedWithBatch(t *testing.T) {
 func TestAccessReplayAfterCrash(t *testing.T) {
 	e := newPaired(t)
 	exp := time.Now().Add(time.Hour).Truncate(time.Second)
-	e.v.FailAcks = true
+	e.v.SetFailAcks(true)
 	if _, err := e.v.SendEvent("device.session.granted", granted("sess-2", exp)); err != nil {
 		t.Fatal(err)
 	}
@@ -823,7 +823,7 @@ func TestAccessReplayAfterCrash(t *testing.T) {
 	stop := o.run()
 	eventually(t, "the grant saved", func() bool { return sp.has("active/sess-2/") })
 	stop()
-	e.v.FailAcks = false
+	e.v.SetFailAcks(false)
 	o2 := e.open(nil)
 	if a := o2.conn.Access(); a.SessionID != "sess-2" || !a.ExpiresAt.Equal(exp) {
 		t.Fatalf("restart: %+v", a)

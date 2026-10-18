@@ -923,6 +923,30 @@ func (f *replaceFailStore) CreateReplace(p state.Protector, b []byte, r state.Re
 	return f.err
 }
 
+// TestPairReplaceNotDurable: a replace whose new file is in place but
+// not flushed (state.ErrNotDurable alone, as CreateReplace returns it
+// then) counts as replaced: the old state is said to be discarded,
+// never "kept" or "may be gone", the next save makes the file durable,
+// and the pairing completes.
+func TestPairReplaceNotDurable(t *testing.T) {
+	e := newEnv(t)
+	e.writeRecord(PhaseStarted, time.Now().Add(time.Minute))
+	old := wrapStore
+	wrapStore = func(s store) store { return &replaceFailStore{store: s, real: true, err: state.ErrNotDurable} }
+	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
+	wrapStore = old
+	if err != nil {
+		t.Fatalf("pair: %v", err)
+	}
+	out := e.out.String()
+	if !strings.Contains(out, textDiscarded) || strings.Contains(out, textKept) || strings.Contains(out, textMaybeReplaced) || !strings.Contains(out, TextPaired) {
+		t.Errorf("output:\n%s", out)
+	}
+	if r, _ := e.record(); r == nil || r.Phase != PhasePaired {
+		t.Errorf("record after pairing: %+v", r)
+	}
+}
+
 // TestPairReplaceFailures: what a failed replace of a discarded pairing
 // does depends only on what the failure says it left (never on which
 // protector the store holds; here the old and the new protector are the

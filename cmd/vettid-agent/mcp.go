@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/vettid/vettid-agent/internal/access"
 	"github.com/vettid/vettid-agent/internal/leash"
@@ -30,6 +31,14 @@ var (
 	mcpRequestOptions func(*request.Options)
 	// mcpResolve replaces the protector resolver (tests' protector).
 	mcpResolve state.Resolver
+	// mcpSignals returns a context that ends on SIGINT or SIGTERM
+	// (tests end it themselves).
+	mcpSignals = func(ctx context.Context) (context.Context, context.CancelFunc) {
+		return signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	}
+	// mcpStopWait bounds each of the two waits for the MCP session to end
+	// at shutdown (stopSession).
+	mcpStopWait = 2 * time.Second
 )
 
 const mcpUsage = `Usage: vettid-agent mcp --state-dir DIR [--passphrase-fd N | --passphrase-file PATH]
@@ -173,7 +182,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		Log:     logger,
 	})
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := mcpSignals(context.Background())
 	defer stop()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -205,10 +214,13 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	err = conn.Run(ctx)
 	// The check ends with Run (its request fails once Run stops); wait
 	// for it, and for the MCP session (whose tool calls end with ctx),
-	// so that nothing writes to standard output or error after return.
+	// so that nothing writes to standard output or error after return;
+	// except that a write to standard output that the MCP client does
+	// not read is abandoned after a bounded wait (stopSession), as the
+	// process then exits.
 	cancel()
 	<-startDone
-	<-serveDone
+	stopSession(serveDone, stdout, logger)
 	<-grantsDone
 	// Requests the access manager still runs in the background end at
 	// once now that Run has (vaultconn answers ErrStopped).
@@ -235,4 +247,34 @@ func newGrants(rec *pairing.Record, logger *slog.Logger, onAnswer func(string, p
 	_ = json.Unmarshal(rec.Device, &dev)
 	return leash.New(leash.Options{Saved: rec.Leash, VaultID: dev.VaultID, Name: dev.Name,
 		OnAnswer: onAnswer, Log: logger})
+}
+
+// stopSession waits for the MCP session (serveDone) to end once its
+// context has: its tool calls are cancelled, and it ends at once unless
+// a write to standard output is blocked because the MCP client keeps
+// standard output open but does not read it. Then, after mcpStopWait, a
+// write deadline in the past makes that write fail where standard
+// output supports deadlines (a pipe or socket the Go runtime polls; not
+// a blocking pipe, which is what most MCP clients hand over). If the
+// session still has not ended after mcpStopWait more, the connector
+// stops without it: the blocked write is abandoned (the process exits
+// right after), so a client that never reads cannot keep the connector
+// running after a signal.
+func stopSession(serveDone <-chan struct{}, stdout io.Writer, logger *slog.Logger) {
+	t := time.NewTimer(mcpStopWait)
+	defer t.Stop()
+	select {
+	case <-serveDone:
+		return
+	case <-t.C:
+	}
+	if f, ok := stdout.(*os.File); ok {
+		_ = f.SetWriteDeadline(time.Now())
+	}
+	t.Reset(mcpStopWait)
+	select {
+	case <-serveDone:
+	case <-t.C:
+		logger.Warn("the MCP client does not read standard output; stopping without finishing the write")
+	}
 }

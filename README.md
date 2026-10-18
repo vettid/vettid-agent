@@ -244,7 +244,10 @@ logs) is up to the client.
 The connector runs at most 64 tool calls at once. A client that stops
 reading standard output stops the connector reading standard input,
 so it does not grow without bound; until the client reads again, a
-written result (and its values) stays in memory.
+written result (and its values) stays in memory. On SIGINT or SIGTERM
+the connector still exits within about 4 seconds: it ends a write the
+client does not read where the pipe allows that, and otherwise exits
+without finishing it, saying so on standard error.
 
 ## Access sessions and `status`
 
@@ -301,6 +304,13 @@ asks you on your phone first.
 - If your vault does not answer within 30 seconds, `leash.check_status`
   says "Your vault did not answer. It may be locked; unlock it on your
   phone." and the request stays open.
+- If your vault starts asking for your approval only after every copy
+  of a request went unanswered (for example, it was locked for longer
+  than the copies wait, and is unlocked later), the connector has
+  already answered `vault_unreachable` and no longer waits. Your phone
+  still asks you, and your vault still runs the request if you approve,
+  but the answer is dropped and never reaches the agent. Decline such a
+  late request; the agent asks again if it still needs it.
 - Results are kept in memory for at most 10 minutes and returned once;
   an item's values are zeroed in memory once passed to the agent or
   dropped. Nothing of a request is written to the state file, so a

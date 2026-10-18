@@ -907,3 +907,46 @@ func TestAccessWithinBudget(t *testing.T) {
 		t.Error("sent without access")
 	}
 }
+
+// lateConn is a connection whose sender is still reading a copy's body
+// (encrypting it) after the call was cancelled, as vaultconn's may be:
+// the copy waits in its queue while RequestWithID returns.
+type lateConn struct {
+	fakeConn
+	read chan string // what the sender read, once the request was cancelled
+}
+
+func (l *lateConn) RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*vaultconn.Response, error) {
+	go func() {
+		<-ctx.Done()
+		time.Sleep(20 * time.Millisecond) // after Close has finished
+		l.read <- string(body)
+	}()
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// TestCloseWhileSending: Close ends a request whose copy the connection
+// still reads after the cancellation; that copy is not zeroed under it
+// (no data race, and the sender reads the body as sent), while the
+// request's own body is zeroed.
+func TestCloseWhileSending(t *testing.T) {
+	l := &lateConn{read: make(chan string, 1)}
+	c := New(l, &fakeAccess{snap: session}, Options{Wait: 50 * time.Millisecond, Attempt: time.Minute})
+	data := []byte("data to sign")
+	out, err := c.Use(context.Background(), itemID, "pw", data)
+	if err != nil || !out.Pending {
+		t.Fatalf("Use: %+v, %v", out, err)
+	}
+	c.mu.Lock()
+	en := c.entries[out.RequestID]
+	c.mu.Unlock()
+	c.Close()
+	got := <-l.read
+	if !strings.Contains(got, base64.StdEncoding.EncodeToString(data)) || strings.ContainsRune(got, 0) {
+		t.Errorf("the sender read %q", got)
+	}
+	if len(bytes.Trim(en.body, "\x00")) != 0 {
+		t.Error("the request's body was not zeroed")
+	}
+}
