@@ -155,7 +155,7 @@ type result struct {
 }
 
 type call struct {
-	id   string // "": a new inner id
+	id   string // caller-chosen inner id (a ULID); "": a new one from the client
 	typ  string
 	body json.RawMessage
 	done chan result // buffered, 1
@@ -236,6 +236,9 @@ func New(o Options) (*Conn, error) {
 	c.ik = d.IdentityKey()
 	return c, nil
 }
+
+// DeviceID returns this agent's device id (from the client's state).
+func (c *Conn) DeviceID() string { return c.dev.DeviceID() }
 
 // IdentityKey returns this agent's identity public key (its `ik`, the
 // `sub` of its LEASH delegations).
@@ -633,17 +636,19 @@ func (c *Conn) readStatus(r *Response) {
 // Request sends a request to the vault through Run's goroutine and
 // waits for its response, ctx's end or Run's end.
 func (c *Conn) Request(ctx context.Context, typ string, body json.RawMessage) (*Response, error) {
-	return c.request(ctx, "", typ, body)
+	return c.RequestWithID(ctx, "", typ, body)
 }
 
 // RequestWithID is Request with a caller-chosen inner id (a ULID, see
-// NewID). An application retry passes the id of the request it repeats,
-// so that the vault answers it from its dedupe (VAULT-MESSAGING §8.2,
-// §8.6) instead of executing it again, and a request the vault holds for
-// approval (§6.8) is not held twice. A call still waiting under the same
-// id ends with ErrSuperseded: only the latest one is answered.
+// NewID; "": a new one chosen by the client). An application retry
+// passes the id of the request it repeats, so that the vault answers it
+// from its dedupe (VAULT-MESSAGING §8.2, §8.6) instead of executing it
+// again, and a request the vault holds for approval (§6.8) is not held
+// twice; a Part recognises the response to its own request by its `re`.
+// A call still waiting under the same id ends with ErrSuperseded: only
+// the latest one is answered.
 func (c *Conn) RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*Response, error) {
-	if !envelope.ValidULID(id) {
+	if id != "" && !envelope.ValidULID(id) {
 		return nil, errors.New("vaultconn: the inner id is not a ULID")
 	}
 	return c.request(ctx, id, typ, body)

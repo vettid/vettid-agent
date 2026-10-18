@@ -110,7 +110,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	// The access policy (AG8) sees each event and vault.status; it is
 	// created once the connection exists (the callbacks run only in Run).
 	var mgr *access.Manager
-	grants := newGrants(rec, logger, func(code string) { mgr.OnAnswer(code) })
+	grants := newGrants(rec, logger, func(code string, sentWith pairing.Access) { mgr.OnAnswer(code, sentWith) })
 	o := vaultconn.Options{
 		Store:   store,
 		Resolve: resolve,
@@ -132,7 +132,11 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		return fail(err)
 	}
 	mgr = access.New(conn, *accessMinutes*60, nil)
-	grants.Bind(conn)
+	// Every grant must name this device (the client's device id); without
+	// one nothing could be checked, so the connector does not run.
+	if err := grants.Bind(conn); err != nil {
+		return fail(err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -174,14 +178,14 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 }
 
 // newGrants returns the LEASH grants kept for the paired record
-// (internal/leash), with the saved ones loaded.
-func newGrants(rec *pairing.Record, logger *slog.Logger, onAnswer func(string)) *leash.Manager {
+// (internal/leash); Bind loads the saved ones and takes the device id
+// from the vault client.
+func newGrants(rec *pairing.Record, logger *slog.Logger, onAnswer func(string, pairing.Access)) *leash.Manager {
 	var dev struct {
-		Name     string `json:"name"`
-		VaultID  string `json:"vault_id"`
-		DeviceID string `json:"device_id"`
+		Name    string `json:"name"`
+		VaultID string `json:"vault_id"`
 	}
 	_ = json.Unmarshal(rec.Device, &dev)
-	return leash.New(leash.Options{Saved: rec.Leash, DeviceID: dev.DeviceID, VaultID: dev.VaultID, Name: dev.Name,
+	return leash.New(leash.Options{Saved: rec.Leash, VaultID: dev.VaultID, Name: dev.Name,
 		OnAnswer: onAnswer, Log: logger})
 }

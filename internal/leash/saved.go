@@ -94,13 +94,13 @@ type Saved struct {
 	AsOf time.Time
 }
 
-// ReadSaved reads the record's `leash` member; nil gives (nil, nil): no
-// grants were ever saved.
-func ReadSaved(raw json.RawMessage, now time.Time) (*Saved, error) {
+// ReadSaved reads the record's `leash` member, whose grants must all be
+// for deviceID; nil gives (nil, nil): no grants were ever saved.
+func ReadSaved(raw json.RawMessage, deviceID string, now time.Time) (*Saved, error) {
 	if raw == nil {
 		return nil, nil
 	}
-	s, err := decodeSaved(raw, "")
+	s, err := decodeSaved(raw, deviceID)
 	if err != nil {
 		return nil, err
 	}

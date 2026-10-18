@@ -78,7 +78,7 @@ func TestStatusShowsGrants(t *testing.T) {
 
 func TestWriteGrantsUnreadable(t *testing.T) {
 	var out bytes.Buffer
-	writeGrants(&out, json.RawMessage(`{"v":9}`), time.Now())
+	writeGrants(&out, json.RawMessage(`{"v":9}`), "d", time.Now())
 	if !strings.Contains(out.String(), "cannot be read") {
 		t.Errorf("%s", out.String())
 	}

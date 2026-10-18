@@ -83,7 +83,7 @@ func (m *Manager) ConnectionInfo() Info {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
-	in := Info{VaultID: m.o.VaultID, DeviceID: m.o.DeviceID, Name: m.o.Name, Suspended: m.suspended,
+	in := Info{VaultID: m.o.VaultID, DeviceID: m.deviceID, Name: m.o.Name, Suspended: m.suspended,
 		GrantsAsOf: timePtr(m.asOf), AccessSession: "unknown"}
 	var a pairing.Access
 	if m.conn != nil {

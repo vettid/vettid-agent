@@ -102,13 +102,14 @@ func parseTime(s string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// parseGrant checks a grant's members and its delegation. agentID, if
-// set, must be the grant's agent_id.
+// parseGrant checks a grant's members and its delegation. agentID is
+// this agent's device id and must be the grant's agent_id (an empty one
+// refuses every grant).
 func parseGrant(w *wireGrant, agentID string) (*Grant, error) {
 	g := &Grant{ID: w.GrantID, AgentID: w.AgentID, Version: w.Version, Scope: w.Scope, Approval: w.Approval,
 		Connections: w.Connections, Tags: w.Tags, Match: w.Match, Access: w.Access, Uses: w.Uses,
 		PerHour: w.PerHour, PerDay: w.PerDay, StatusTTL: time.Duration(w.StatusTTL) * time.Second}
-	if !envelope.ValidULID(g.ID) || g.AgentID == "" || agentID != "" && g.AgentID != agentID || g.Version < 1 {
+	if !envelope.ValidULID(g.ID) || agentID == "" || g.AgentID != agentID || g.Version < 1 {
 		return nil, errGrant
 	}
 	if len(g.Scope) > maxScope || !opRE.MatchString(g.Scope) || g.Approval != "ask" && g.Approval != "auto" {

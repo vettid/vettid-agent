@@ -111,11 +111,13 @@ func TestLeashVectorsPresented(t *testing.T) {
 			t.Fatal(err)
 		}
 		newAt := func(now time.Time, body json.RawMessage) (*Manager, *fakeConn) {
-			m := New(Options{DeviceID: testAgent, Now: func() time.Time { return now }})
+			m := New(Options{Now: func() time.Time { return now }})
 			f := &fakeConn{m: m, ik: agentIK, access: pairing.Access{State: pairing.AccessActive},
 				list:      func() *vaultconn.Response { return ok(body) },
 				statusGet: func(string) *vaultconn.Response { return fail("internal") }}
-			m.Bind(f)
+			if err := m.Bind(f); err != nil {
+				t.Fatal(err)
+			}
 			return m, f
 		}
 
@@ -170,10 +172,10 @@ func TestLeashVectorsPresented(t *testing.T) {
 					t.Errorf("%s: presented at %v", name, now)
 				}
 			}
-			m := New(Options{DeviceID: testAgent, Now: func() time.Time { return at }})
+			m := New(Options{Now: func() time.Time { return at }})
 			f := &fakeConn{m: m, ik: pub(otherKey), access: pairing.Access{State: pairing.AccessActive},
 				list: func() *vaultconn.Response { return ok(set(t, false, wireFromVector(t, d, del, sig, st, stSig))) }}
-			m.Bind(f)
+			_ = m.Bind(f)
 			if p, err := m.Present(ctx, d.GrantID); p != nil || err == nil {
 				t.Errorf("%s: presented for another agent key", name)
 			}

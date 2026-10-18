@@ -222,6 +222,16 @@ longer lists, that has ended, or anything at all while your vault has
 paused the agent after repeated refused requests ("suspended"; you
 resume it on your phone).
 
+Messages from your vault can arrive out of order, so a list answer or
+an update that may be older than what the connector learned since can
+only take grants away or pause the agent, never add a grant, bring back
+a removed one or end a pause; the connector then asks for the grants
+again. A pause ends only when a list sent after it says so.
+
+In the background the connector refreshes a statement only for a grant
+it was asked to present in the last 15 minutes, at most once a minute;
+other statements are refreshed when they are needed.
+
 ## Keys at rest on Linux: the TPM
 
 On Linux the connector seals its state file's key to the computer's TPM

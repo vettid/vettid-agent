@@ -13,8 +13,8 @@ import (
 // writeGrants prints the LEASH grants as last saved (internal/leash):
 // scope, approval, limits, expiry and connections, never delegations or
 // statements. Every string from the vault is printed through printable.
-func writeGrants(w io.Writer, raw json.RawMessage, now time.Time) {
-	s, err := leash.ReadSaved(raw, now)
+func writeGrants(w io.Writer, raw json.RawMessage, deviceID string, now time.Time) {
+	s, err := leash.ReadSaved(raw, deviceID, now)
 	switch {
 	case err != nil:
 		fmt.Fprintln(w, "Grants: the saved grants cannot be read (they are listed again from your vault when `vettid-agent mcp` next has access)")

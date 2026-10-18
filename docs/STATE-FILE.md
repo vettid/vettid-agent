@@ -91,16 +91,21 @@ without it reads as before. A build older than this member refuses a
 record that has it (strict parsing); no such build was released.
 
 `leash` is written the same way: `leash.grant.updated` and the answer
-to `leash.grant.list` are applied, in the order collected, in the save
-of their batch, before it is acknowledged. A status statement
-(`leash.status.get`) and a suspension learned from a refused one are
-kept in memory and saved with the next batch; statements are never
-saved, since a grant is presented only after the grants were listed
-again in the current access session, and that list carries fresh ones.
-The member is parsed strictly and each grant is checked as when it
-arrived (its delegation's signature and members); a member that fails
-is ignored and replaced by the next grant set. A build older than this
-member refuses a record that has it; no such build was released.
+to `leash.grant.list` are applied in the save of their batch, before it
+is acknowledged. Their order is not relied on (VAULT-MESSAGING §8.4 gives
+none, and §8.3 sends a failed deposit again later): a set replaces the
+grants only if it is the answer to a list this process sent with nothing
+learned since, or an update newer (by the vault's message id) than every
+set applied so; anything else may only remove grants or suspend. A
+status statement (`leash.status.get`) and what a refused one teaches
+(`not_found`, a suspension) are kept in memory and saved with the next
+batch; statements are never saved, since a grant is presented only
+after the grants were listed again in the current access session, and
+that list carries fresh ones. The member is parsed strictly and each
+grant is checked as when it arrived (its device id, its delegation's
+signature and members); a member that fails is ignored and replaced by
+the next grant set. A build older than this member refuses a record
+that has it; no such build was released.
 
 ### Pairing's last batch
 

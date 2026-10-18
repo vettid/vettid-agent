@@ -46,15 +46,16 @@ func resolve(string) state.Protector { return prot{} }
 // how many messages were still unacknowledged at the relay.
 type grantSpy struct {
 	vaultconn.Store
-	v     *pairtest.Vault
-	id    string
-	mu    sync.Mutex
-	saves []int // pending count of each save holding the grant
+	v      *pairtest.Vault
+	id     string
+	device string
+	mu     sync.Mutex
+	saves  []int // pending count of each save holding the grant
 }
 
 func (g *grantSpy) Save(b []byte) error {
 	if r, err := pairing.DecodeRecord(b); err == nil {
-		if s, err := ReadSaved(r.Leash, time.Now()); err == nil && s != nil {
+		if s, err := ReadSaved(r.Leash, g.device, time.Now()); err == nil && s != nil {
 			for _, gi := range s.Grants {
 				if gi.GrantID == g.id {
 					g.mu.Lock()
@@ -133,7 +134,7 @@ func TestOverVault(t *testing.T) {
 		}
 		_ = json.Unmarshal(rec.Device, &dev)
 		o := &opened{rec: rec}
-		o.m = New(Options{Saved: rec.Leash, DeviceID: dev.DeviceID, OnAnswer: func(code string) { o.a.OnAnswer(code) }})
+		o.m = New(Options{Saved: rec.Leash, OnAnswer: func(code string, sentWith pairing.Access) { o.a.OnAnswer(code, sentWith) }})
 		var st vaultconn.Store = s
 		if wrap != nil {
 			st = wrap(s)
@@ -145,7 +146,12 @@ func TestOverVault(t *testing.T) {
 			t.Fatal(err)
 		}
 		o.a = access.New(o.c, 0, nil)
-		o.m.Bind(o.c)
+		if err := o.m.Bind(o.c); err != nil {
+			t.Fatal(err)
+		}
+		if o.c.DeviceID() != dev.DeviceID {
+			t.Fatal("device id")
+		}
 		if before != nil {
 			before(o)
 		}
@@ -164,6 +170,7 @@ func TestOverVault(t *testing.T) {
 			DeviceID string `json:"device_id"`
 		}
 		_ = json.Unmarshal(o.rec.Device, &dev)
+		sp.device = dev.DeviceID
 		g := grant(t, time.Now(), spec{id: id, sub: o.c.IdentityKey(), agentID: dev.DeviceID})
 		if _, err := v.SendEvent("device.session.granted", []byte(`{"session_id":"s1","expires_at":"`+time.Now().Add(time.Hour).UTC().Format(time.RFC3339)+`"}`)); err != nil {
 			t.Fatal(err)
@@ -195,7 +202,7 @@ func TestOverVault(t *testing.T) {
 		defer s.Close()
 		raw, _ := s.Load(resolve)
 		rec, _ := pairing.DecodeRecord(raw)
-		sv, err := ReadSaved(rec.Leash, time.Now())
+		sv, err := ReadSaved(rec.Leash, sp.device, time.Now())
 		if err != nil || sv == nil {
 			t.Fatalf("saved grants: %+v %v", sv, err)
 		}
@@ -215,11 +222,16 @@ func TestOverVault(t *testing.T) {
 		if err := o.a.Start(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		if in := o.m.ConnectionInfo(); len(in.Grants) != 0 || !in.GrantsConfirmed {
+		// The check's answer is not this package's own list, so it may
+		// only narrow: the grant it lacks is removed, nothing confirmed.
+		if in := o.m.ConnectionInfo(); len(in.Grants) != 0 || in.GrantsConfirmed {
 			t.Errorf("info after the check: %+v", in)
 		}
 		if p, err := o.m.Present(context.Background(), id); p != nil || !errors.Is(err, ErrNotGranted) {
 			t.Errorf("present: %v", err)
+		}
+		if in := o.m.ConnectionInfo(); !in.GrantsConfirmed {
+			t.Errorf("not confirmed by its own list: %+v", in)
 		}
 		if _, err := v.SendEvent("test.ping", []byte(`{}`)); err != nil {
 			t.Fatal(err)

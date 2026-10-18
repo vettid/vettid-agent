@@ -17,6 +17,12 @@
 //   - A status statement is refreshed when less than a quarter of its
 //     lifetime (at least a minute) remains.
 //
+// Messages arrive in no guaranteed order (VAULT-MESSAGING §8.4; a failed
+// deposit is sent again in a later flush, §8.3), so a grant set is
+// trusted to widen what the connector holds only when it cannot be
+// older than what the connector learned since (see Apply). Anything
+// else may only narrow it.
+//
 // The grants are saved in the record's `leash` member with the batch
 // that carried them (vaultconn.Part), before the batch is acknowledged;
 // status statements are kept in memory only (the list at the next
@@ -39,6 +45,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vettid/vettid-vault/vms/envelope"
 	"github.com/vettid/vettid-vault/vms/leashwire"
 	"github.com/vettid/vettid-vault/vms/suite"
 
@@ -51,19 +58,29 @@ import (
 const (
 	// RequestTimeout bounds one request to the vault (as internal/access).
 	RequestTimeout = access.RequestTimeout
-	// listGrace: at process start internal/access checks a saved session
-	// with a leash.grant.list, whose answer is applied here; the
-	// background loop sends its own only if none was applied by then.
+	// listGrace: at process start the background loop waits this long
+	// before listing on its own, unless something asked for a list.
 	listGrace = 30 * time.Second
-	// minGap is the shortest time between two leash.status.get for one
-	// grant: a statement of the shortest lifetime (60 s) is always within
-	// a minute of its end, so the quarter rule alone would refresh it
-	// continuously.
+	// minGap: Present uses a statement past its refresh time (but still
+	// current) if it was successfully refreshed less than minGap ago: a
+	// statement of the shortest lifetime (60 s) is always within a minute
+	// of its end, so the quarter rule alone would refresh it on every
+	// presentation.
 	minGap = 15 * time.Second
+	// bgMinGap: the background loop refreshes one grant's statement at
+	// most once per bgMinGap after a successful refresh.
+	bgMinGap = time.Minute
+	// wantedFor: the background loop refreshes only the statements of
+	// grants Present was asked for within this time; the others are
+	// refreshed on demand.
+	wantedFor = 15 * time.Minute
 	// retryMax bounds the pause after failed requests.
 	retryMax = 5 * time.Minute
 	// idle is how long the background loop sleeps with nothing due.
 	idle = time.Minute
+	// listTries bounds the lists one List sends when answers keep being
+	// overtaken by newer events.
+	listTries = 3
 )
 
 // Error is an outcome with a stable code (AGENT-PLAN §4.1).
@@ -94,27 +111,31 @@ var (
 	// ErrUnconfirmed: the grants have not been listed in this session
 	// and could not be (chosen text).
 	ErrUnconfirmed = &Error{Code: "vault_unreachable", Text: "This agent's grants could not be confirmed with your vault. Try again."}
+	// ErrNoDevice: the connection has no device id, so no grant could be
+	// checked as this agent's.
+	ErrNoDevice = errors.New("the saved pairing has no device id: run `vettid-agent pair --restart`")
 )
 
 // Conn is what this package uses of vaultconn.Conn.
 type Conn interface {
-	Request(ctx context.Context, typ string, body json.RawMessage) (*vaultconn.Response, error)
+	RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*vaultconn.Response, error)
 	Access() pairing.Access
+	DeviceID() string
 	IdentityKey() ed25519.PublicKey
 	LastContact() time.Time
 }
 
 // Options configure New.
 type Options struct {
-	// Saved is the record's `leash` member (nil: none).
+	// Saved is the record's `leash` member (nil: none), loaded by Bind.
 	Saved json.RawMessage
-	// DeviceID is this agent's device id (a grant for another agent is
-	// dropped); VaultID and Name are shown by ConnectionInfo.
-	DeviceID, VaultID, Name string
+	// VaultID and Name are shown by ConnectionInfo.
+	VaultID, Name string
 	// OnAnswer, if set, receives session_required and
-	// owner_check_required answers to this package's requests
+	// owner_check_required answers to this package's requests, with the
+	// access session as it was when the request was sent
 	// (access.Manager.OnAnswer). It is called without locks held.
-	OnAnswer func(code string)
+	OnAnswer func(code string, sentWith pairing.Access)
 	Now      func() time.Time
 	Log      *slog.Logger
 }
@@ -127,16 +148,26 @@ type Manager struct {
 	log  *slog.Logger
 	wake chan struct{}
 
-	mu   sync.Mutex
-	conn Conn
-	ik   ed25519.PublicKey
-	// The grants as the vault last sent them, sorted by id; asOf: when.
+	mu       sync.Mutex
+	conn     Conn
+	deviceID string
+	ik       ed25519.PublicKey
+	// The grants as last applied, sorted by id; asOf: when.
 	grants    []*Grant
 	suspended bool
 	asOf      time.Time
 	saved     bool // grants, suspended and asOf hold something to save
-	// listed: a leash.grant.list answer was applied since the access
-	// session started (in this process). Nothing is presented without it.
+	// gen counts what the connector learned that a list sent earlier may
+	// not reflect: every applied leash.grant.updated, every narrowing,
+	// not_found and forbidden. lists maps the id of each list this
+	// process sent to gen at the time it was sent.
+	gen   uint64
+	lists map[string]uint64
+	// lastSetMS: the vault time (the ULID of its message, in ms) of the
+	// newest grant set applied in full; an update not newer only narrows.
+	lastSetMS uint64
+	// listed: a grant set was applied in full from a list sent in this
+	// access session (in this process). Nothing is presented without it.
 	listed   bool
 	needList bool
 	listing  chan struct{} // closed when the list in flight ends
@@ -147,53 +178,60 @@ type Manager struct {
 	// until leash.grant.updated or vault.status shows the hold ended.
 	held bool
 	// Statements by grant id (memory only), and per grant: when one was
-	// last asked for, consecutive failures, and grants the vault said are
-	// not in force (not_found) until the next grant set.
+	// last asked for, last refreshed successfully, last wanted by
+	// Present, consecutive failures, and grants the vault said are not in
+	// force (not_found), until a list sent after that says otherwise.
 	statements map[string]*statement
 	fetched    map[string]time.Time
+	refreshed  map[string]time.Time
+	wanted     map[string]time.Time
 	fails      map[string]int
 	dead       map[string]bool
 	started    time.Time
 }
 
-// New returns a Manager with the saved grants (for display only until
-// they are listed again). A saved member that does not parse is
-// ignored (logged): nothing in it would be presented anyway.
+// New returns a Manager; Bind loads the saved grants (for display only
+// until they are listed again).
 func New(o Options) *Manager {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	m := &Manager{o: o, now: o.Now, log: o.Log, wake: make(chan struct{}, 1),
-		statements: map[string]*statement{}, fetched: map[string]time.Time{}, fails: map[string]int{}, dead: map[string]bool{}}
+	m := &Manager{o: o, now: o.Now, log: o.Log, wake: make(chan struct{}, 1), lists: map[string]uint64{},
+		statements: map[string]*statement{}, fetched: map[string]time.Time{}, refreshed: map[string]time.Time{},
+		wanted: map[string]time.Time{}, fails: map[string]int{}, dead: map[string]bool{}}
 	if m.log == nil {
 		m.log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	m.started = m.now()
-	if o.Saved != nil {
-		s, err := decodeSaved(o.Saved, o.DeviceID)
-		if err != nil {
-			m.log.Warn("saved grants ignored", "err", err)
-		} else {
-			m.grants, m.suspended, m.asOf, m.saved = s.grants, s.suspended, s.asOf, true
-		}
-	}
 	return m
 }
 
-// Bind gives the Manager its connection; Apply drops grants whose
-// delegation is not for conn's identity key.
-func (m *Manager) Bind(conn Conn) {
+// Bind gives the Manager its connection, whose device id and identity
+// key every grant must name, and loads the saved grants. It fails when
+// the connection has no device id (nothing could be checked as this
+// agent's). A saved member that does not parse is ignored (logged):
+// nothing in it would be presented anyway.
+func (m *Manager) Bind(conn Conn) error {
+	id := conn.DeviceID()
+	if id == "" {
+		return ErrNoDevice
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.conn, m.ik = conn, conn.IdentityKey()
-	m.grants = m.forMe(m.grants)
+	m.conn, m.deviceID, m.ik = conn, id, conn.IdentityKey()
+	if m.o.Saved != nil {
+		s, err := decodeSaved(m.o.Saved, id)
+		if err != nil {
+			m.log.Warn("saved grants ignored", "err", err)
+		} else {
+			m.grants, m.suspended, m.asOf, m.saved = m.forMe(s.grants), s.suspended, s.asOf, true
+		}
+	}
+	return nil
 }
 
 // forMe drops grants whose delegation names another agent key.
 func (m *Manager) forMe(gs []*Grant) []*Grant {
-	if m.ik == nil {
-		return gs
-	}
 	return slices.DeleteFunc(slices.Clone(gs), func(g *Grant) bool {
 		if g.del != nil && !suite.EqualPublic(g.del.Sub, m.ik) {
 			m.log.Warn("grant dropped: its delegation names another agent", "grant", g.ID)
@@ -210,20 +248,71 @@ func (m *Manager) signal() {
 	}
 }
 
-// Apply takes a batch of messages inside its save (vaultconn.Part), in
-// order: leash.grant.updated and answers to leash.grant.list replace the
-// grants; device.session.granted starts a session, whose grants are
-// listed again before anything is presented; device.session.ended ends
-// it. Applying the same batch again gives the same result.
+// ulidMS returns a ULID's time in ms (ok false for anything else).
+func ulidMS(id string) (uint64, bool) {
+	if !envelope.ValidULID(id) {
+		return 0, false
+	}
+	const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+	var ms uint64
+	for i := 0; i < 10; i++ {
+		ms = ms<<5 | uint64(strings.IndexByte(crockford, id[i]))
+	}
+	return ms, true
+}
+
+// How a grant set is applied.
+type mode int
+
+const (
+	// modeList: the answer to a list this process sent, with nothing
+	// learned since it was sent. It replaces the grants, ends a
+	// suspension, revives grants answered not_found, and confirms them.
+	modeList mode = iota
+	// modeUpdate: a leash.grant.updated newer (by the vault's clock) than
+	// any set applied in full. It replaces the grants, except that it
+	// never revives a grant answered not_found, never lowers a grant's
+	// version and never ends a suspension (a list sent after it does).
+	modeUpdate
+	// modeNarrow: anything else (an older update, an answer to a list
+	// sent before something was learned, or to a list this process did
+	// not send). It only removes: grants absent from it, or present in
+	// another version, go; nothing is added; it can suspend but not
+	// resume. A fresh list is asked for.
+	modeNarrow
+)
+
+// Apply takes a batch of messages inside its save (vaultconn.Part):
+// leash.grant.updated and answers to leash.grant.list (see mode);
+// device.session.granted starts a session, whose grants are listed
+// again before anything is presented; device.session.ended ends it.
+// Applying the same batch again gives the same result or a narrower one.
 func (m *Manager) Apply(batch []vaultconn.Message) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, msg := range batch {
 		switch {
 		case msg.Re == "" && msg.Type == "leash.grant.updated":
-			m.applySet(msg.Body, false)
+			md := modeNarrow
+			if ms, ok := ulidMS(msg.ID); ok && ms > m.lastSetMS {
+				md = modeUpdate
+			}
+			if m.applySet(msg.Body, md) && md == modeUpdate {
+				m.lastSetMS, _ = ulidMS(msg.ID)
+			}
+			m.gen++
 		case msg.Re != "" && msg.Type == "leash.grant.list" && msg.OK:
-			m.applySet(msg.Body, true)
+			md := modeNarrow
+			g, mine := m.lists[msg.Re]
+			delete(m.lists, msg.Re)
+			if mine && g == m.gen {
+				md = modeList
+			}
+			if m.applySet(msg.Body, md) && md == modeList {
+				if ms, ok := ulidMS(msg.ID); ok && ms > m.lastSetMS {
+					m.lastSetMS = ms
+				}
+			}
 		case msg.Re == "" && msg.Type == "device.session.granted":
 			m.listed, m.needList = false, true
 			m.listFails, m.nextList = 0, time.Time{}
@@ -242,19 +331,20 @@ type grantSet struct {
 	Suspended *bool              `json:"suspended"`
 }
 
-// applySet replaces the grants with a grant set (m.mu held). A set that
-// does not parse presents nothing until a list parses; a grant that does
-// not parse, is for another agent or appears twice is dropped.
-func (m *Manager) applySet(body json.RawMessage, fromList bool) {
+// applySet applies a grant set in a mode (m.mu held) and reports
+// whether it parsed. A set that does not parse presents nothing until a
+// list is applied; a grant that does not parse, is for another agent or
+// appears twice is dropped.
+func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 	now := m.now()
 	var set grantSet
 	if json.Unmarshal(body, &set) != nil || set.Grants == nil || set.Suspended == nil || len(*set.Grants) > MaxGrants {
-		m.log.Warn("malformed grant set; nothing is presented until the grants are listed again", "list", fromList)
+		m.log.Warn("malformed grant set; nothing is presented until the grants are listed again")
 		m.listed, m.needList = false, true
 		m.signal()
-		return
+		return false
 	}
-	var gs []*Grant
+	var in []*Grant
 	seen := map[string]int{}
 	raw := map[string]*wireGrant{}
 	for _, r := range *set.Grants {
@@ -263,49 +353,103 @@ func (m *Manager) applySet(body json.RawMessage, fromList bool) {
 			m.log.Warn("malformed grant dropped")
 			continue
 		}
-		g, err := parseGrant(&w, m.o.DeviceID)
+		g, err := parseGrant(&w, m.deviceID)
 		if err != nil {
 			m.log.Warn("invalid grant dropped", "grant", logID(w.GrantID))
 			continue
 		}
 		seen[g.ID]++
 		raw[g.ID] = &w
-		gs = append(gs, g)
+		in = append(in, g)
 	}
-	gs = slices.DeleteFunc(gs, func(g *Grant) bool {
+	in = slices.DeleteFunc(in, func(g *Grant) bool {
 		if seen[g.ID] > 1 {
 			m.log.Warn("grant listed twice dropped", "grant", g.ID)
 			return true
 		}
 		return false
 	})
-	gs = m.forMe(gs)
+	in = m.forMe(in)
+	byID := map[string]*Grant{}
+	for _, g := range in {
+		byID[g.ID] = g
+	}
+
+	if md == modeNarrow {
+		changed := false
+		var kept []*Grant
+		for _, g := range m.grants {
+			if n := byID[g.ID]; n != nil && n.Version == g.Version {
+				kept = append(kept, g)
+				continue
+			}
+			delete(m.statements, g.ID)
+			changed = true
+		}
+		if *set.Suspended && !m.suspended {
+			m.suspended = true
+			m.statements = map[string]*statement{}
+			changed = true
+		}
+		if changed {
+			m.grants, m.saved = kept, true
+			m.gen++
+		}
+		m.needList = true
+		m.signal()
+		return true
+	}
+
+	// modeList and modeUpdate replace the grants.
+	var gs []*Grant
+	for _, g := range in {
+		if md == modeUpdate && m.dead[g.ID] {
+			continue // revived only by a list sent after the not_found
+		}
+		if old := m.find(g.ID); old != nil && g.Version < old.Version {
+			m.log.Warn("grant in an older version dropped", "grant", g.ID)
+			m.needList = true
+			continue
+		}
+		gs = append(gs, g)
+	}
 	slices.SortFunc(gs, func(a, b *Grant) int { return strings.Compare(a.ID, b.ID) })
+	suspended := *set.Suspended
+	if md == modeUpdate && m.suspended && !suspended {
+		suspended = true // a resume is confirmed by a list sent after it
+		m.needList = true
+	}
 	// Each grant's statement is the one sent with it, if any (the vault
 	// sends none for a grant not in force, while suspended or while held):
 	// statements of grants no longer present, or sent without one, go.
 	stmts := map[string]*statement{}
-	for _, g := range gs {
-		w := raw[g.ID]
-		if w.Status == nil && w.StatusSig == nil {
-			continue
+	if !suspended {
+		for _, g := range gs {
+			w := raw[g.ID]
+			if w.Status == nil && w.StatusSig == nil {
+				continue
+			}
+			st, err := checkStatement(g, w.Status, w.StatusSig, w.Rotations, now)
+			if err != nil {
+				m.log.Warn("status statement refused", "grant", g.ID)
+				continue
+			}
+			stmts[g.ID] = st
 		}
-		st, err := checkStatement(g, w.Status, w.StatusSig, w.Rotations, now)
-		if err != nil {
-			m.log.Warn("status statement refused", "grant", g.ID)
-			continue
-		}
-		stmts[g.ID] = st
 	}
-	m.grants, m.suspended, m.asOf, m.saved = gs, *set.Suspended, now, true
+	m.grants, m.suspended, m.asOf, m.saved = gs, suspended, now, true
 	m.statements = stmts
-	m.dead, m.fails = map[string]bool{}, map[string]int{}
+	m.fails = map[string]int{}
 	m.held = false
-	if fromList {
-		m.listed, m.needList = true, false
-		m.listFails, m.nextList = 0, time.Time{}
+	if md == modeList {
+		m.dead = map[string]bool{}
+		m.listed = true
+		if !m.needList {
+			m.listFails, m.nextList = 0, time.Time{}
+		}
 	}
 	m.signal()
+	return true
 }
 
 // Snapshot returns the record's `leash` member (vaultconn.Part).
@@ -338,15 +482,17 @@ func activeAt(a pairing.Access, now time.Time) bool {
 	return a.State == pairing.AccessActive && (a.ExpiresAt.IsZero() || now.Before(a.ExpiresAt))
 }
 
-func (m *Manager) answer(code string) {
+func (m *Manager) answer(code string, sentWith pairing.Access) {
 	if m.o.OnAnswer != nil {
-		m.o.OnAnswer(code)
+		m.o.OnAnswer(code, sentWith)
 	}
 }
 
 // List asks the vault for the grants (leash.grant.list) unless a list is
 // in flight, in which case it waits for that one. The answer itself is
-// applied by Apply, inside the save of its batch.
+// applied by Apply, inside the save of its batch; it confirms the grants
+// only if nothing was learned while it was on its way, otherwise List
+// sends another (at most listTries in all).
 func (m *Manager) List(ctx context.Context) error {
 	m.mu.Lock()
 	if m.conn == nil {
@@ -362,7 +508,7 @@ func (m *Manager) List(ctx context.Context) error {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
-		if !m.listed {
+		if !m.listed || m.needList {
 			return ErrUnconfirmed
 		}
 		return nil
@@ -377,18 +523,46 @@ func (m *Manager) List(ctx context.Context) error {
 		close(ch)
 		m.mu.Unlock()
 	}()
+	for try := 0; try < listTries; try++ {
+		done, err := m.listOnce(ctx, conn)
+		if done || err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	m.listFailed()
+	m.mu.Unlock()
+	return ErrUnconfirmed
+}
 
+// listOnce sends one list; done is false when its answer was overtaken
+// (applied only as a narrowing).
+func (m *Manager) listOnce(ctx context.Context, conn Conn) (done bool, err error) {
+	now := m.now()
+	id, err := envelope.NewULID(now)
+	if err != nil {
+		return false, ErrUnconfirmed
+	}
+	sentWith := conn.Access()
+	m.mu.Lock()
+	m.lists[id] = m.gen
+	m.needList = false
+	m.mu.Unlock()
 	rctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
-	r, err := conn.Request(rctx, "leash.grant.list", json.RawMessage(`{}`))
+	r, err := conn.RequestWithID(rctx, id, "leash.grant.list", json.RawMessage(`{}`))
 	m.mu.Lock()
+	if err != nil || !r.OK {
+		delete(m.lists, id)
+		m.needList = true
+	}
 	if err != nil {
 		m.listFailed()
 		m.mu.Unlock()
 		if errors.Is(err, vaultconn.ErrRefused) {
-			return err
+			return true, err
 		}
-		return ErrUnconfirmed
+		return true, ErrUnconfirmed
 	}
 	if !r.OK {
 		code := r.ErrorCode
@@ -405,19 +579,27 @@ func (m *Manager) List(ctx context.Context) error {
 			out = fmt.Errorf("%w (the vault answered %s)", ErrUnconfirmed, logID(code))
 		}
 		m.mu.Unlock()
-		m.answer(code)
-		return out
+		m.answer(code, sentWith)
+		return true, out
 	}
-	ok := m.listed
-	if !ok {
-		// Answered, but the set did not parse (Apply logged it).
+	defer m.mu.Unlock()
+	if _, pending := m.lists[id]; pending {
+		// Answered but never applied (no Apply saw it).
+		delete(m.lists, id)
+		m.needList = true
 		m.listFailed()
+		return true, ErrUnconfirmed
 	}
-	m.mu.Unlock()
-	if !ok {
-		return ErrUnconfirmed
+	if m.needList {
+		// Overtaken by something learned meanwhile (applied only as a
+		// narrowing), or the set did not parse: list again.
+		return false, nil
 	}
-	return nil
+	if !m.listed {
+		m.listFailed()
+		return true, ErrUnconfirmed
+	}
+	return true, nil
 }
 
 func (m *Manager) listFailed() {
@@ -444,10 +626,11 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 	if conn == nil {
 		return ErrUnconfirmed
 	}
+	sentWith := conn.Access()
 	body, _ := json.Marshal(map[string]string{"grant_id": id})
 	rctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
-	r, err := conn.Request(rctx, "leash.status.get", body)
+	r, err := conn.RequestWithID(rctx, "", "leash.status.get", body)
 	m.mu.Lock()
 	if err != nil {
 		m.fails[id]++
@@ -463,16 +646,19 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 		switch code {
 		case "not_found":
 			// Not this agent's grant or not in force (revoked or
-			// expired): drop its statement and list the grants again.
+			// expired): never presented again until a list sent after
+			// this says otherwise.
 			delete(m.statements, id)
 			m.dead[id] = true
+			m.gen++
 			m.needList = true
 			out = ErrNotGranted
 		case "forbidden":
-			// Suspended (§10.11): nothing is presented until a grant set
-			// says otherwise.
+			// Suspended (§10.11): nothing is presented until a list sent
+			// after this says otherwise.
 			m.suspended, m.saved = true, true
 			m.statements = map[string]*statement{}
+			m.gen++
 			m.needList = true
 			out = ErrSuspended
 		case "owner_check_required":
@@ -486,7 +672,7 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 			out = fmt.Errorf("%w (the vault answered %s)", ErrUnconfirmed, logID(code))
 		}
 		m.mu.Unlock()
-		m.answer(code)
+		m.answer(code, sentWith)
 		m.signal()
 		return out
 	}
@@ -498,9 +684,12 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 		Rotations []json.RawMessage `json:"rotations"`
 	}
 	g := m.find(id)
-	if g == nil {
+	if g == nil || m.dead[id] {
 		// Revoked while the answer was on its way.
 		return ErrNotGranted
+	}
+	if m.suspended {
+		return ErrSuspended
 	}
 	if json.Unmarshal(r.Body, &b) != nil || b.GrantID != id {
 		m.fails[id]++
@@ -513,6 +702,7 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 		return ErrUnconfirmed
 	}
 	m.statements[id] = st
+	m.refreshed[id] = m.now()
 	m.fails[id] = 0
 	return nil
 }
@@ -552,12 +742,17 @@ func (m *Manager) presentable(id string, now time.Time) (*Grant, error) {
 }
 
 // usable reports whether st may be presented at now without a refresh:
-// before its refresh time, or (just refreshed) still current.
+// current, and before its refresh time or successfully refreshed less
+// than minGap ago.
 func (m *Manager) usable(id string, st *statement, now time.Time) bool {
 	if st == nil || now.Before(st.issuedAt.Add(-leashwire.StatusSkew)) || !now.Before(st.notAfter) {
 		return false
 	}
-	return now.Before(st.refreshAt()) || now.Before(m.fetched[id].Add(minGap))
+	if now.Before(st.refreshAt()) {
+		return true
+	}
+	r, ok := m.refreshed[id]
+	return ok && now.Before(r.Add(minGap))
 }
 
 // Present returns what this agent shows a relying party for one of its
@@ -571,6 +766,7 @@ func (m *Manager) usable(id string, st *statement, now time.Time) bool {
 // session.
 func (m *Manager) Present(ctx context.Context, id string) (*leashwire.Presented, error) {
 	m.mu.Lock()
+	m.wanted[id] = m.now()
 	_, err := m.presentable(id, m.now())
 	m.mu.Unlock()
 	if errors.Is(err, ErrUnconfirmed) {
@@ -610,12 +806,15 @@ func (m *Manager) Present(ctx context.Context, id string) (*leashwire.Presented,
 	return presented(g, st), nil
 }
 
-// Run keeps the statements fresh until ctx ends (AGENT-PLAN §3.3): while
-// the connector has an access session and the vault is not held, it
-// lists the grants when a session started (or if internal/access's
-// check at start brought none within listGrace), and refreshes each
-// presentable grant's statement at its refresh time. Bind must be
-// called first.
+// Run keeps the grants and statements current until ctx ends (AGENT-PLAN
+// §3.3), while the connector has an access session and the vault is not
+// held: it lists the grants when a list is wanted (a session started, a
+// set could only narrow, not_found, forbidden, a resume to confirm; also
+// while suspended), or if none was listed within listGrace of start; and
+// it refreshes a statement that is due only for a grant Present was
+// asked for within wantedFor, at most once per bgMinGap after a
+// successful refresh. Other statements are refreshed by Present when it
+// needs them. Bind must be called first.
 func (m *Manager) Run(ctx context.Context) {
 	for {
 		next := m.step(ctx)
@@ -640,7 +839,7 @@ func (m *Manager) step(ctx context.Context) time.Time {
 		m.mu.Unlock()
 		return now.Add(idle)
 	}
-	if !m.listed {
+	if m.needList || !m.listed {
 		at := m.nextList
 		if !m.needList {
 			at = latest(at, m.started.Add(listGrace))
@@ -653,7 +852,7 @@ func (m *Manager) step(ctx context.Context) time.Time {
 			m.log.Warn("grants not listed", "err", errText(err))
 		}
 		m.mu.Lock()
-		if !m.listed {
+		if !m.listed || m.needList {
 			next := m.nextList
 			m.mu.Unlock()
 			return earliest(next, now.Add(idle))
@@ -666,15 +865,19 @@ func (m *Manager) step(ctx context.Context) time.Time {
 	var due []string
 	next := now.Add(idle)
 	for _, g := range m.grants {
-		if g.del == nil || g.expired(now) || m.dead[g.ID] {
+		w, ok := m.wanted[g.ID]
+		if g.del == nil || g.expired(now) || m.dead[g.ID] || !ok || !now.Before(w.Add(wantedFor)) {
 			continue
 		}
 		at := now // no statement: as soon as allowed
 		if st := m.statements[g.ID]; st != nil {
 			at = st.refreshAt()
 		}
-		if f, ok := m.fetched[g.ID]; ok {
-			at = latest(at, f.Add(backoff(minGap, retryMax, m.fails[g.ID]+1)))
+		if r, ok := m.refreshed[g.ID]; ok {
+			at = latest(at, r.Add(bgMinGap))
+		}
+		if f, ok := m.fetched[g.ID]; ok && m.fails[g.ID] > 0 {
+			at = latest(at, f.Add(backoff(minGap, retryMax, m.fails[g.ID])))
 		}
 		if !now.Before(at) {
 			due = append(due, g.ID)

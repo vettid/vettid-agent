@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vettid/vettid-vault/vms/envelope"
 	"github.com/vettid/vettid-vault/vms/leashwire"
 
 	"github.com/vettid/vettid-agent/internal/pairing"
@@ -179,9 +180,10 @@ type fakeConn struct {
 	list      func() *vaultconn.Response
 	statusGet func(id string) *vaultconn.Response
 	err       error
+	noDevice  bool
 }
 
-func (f *fakeConn) Request(ctx context.Context, typ string, body json.RawMessage) (*vaultconn.Response, error) {
+func (f *fakeConn) RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*vaultconn.Response, error) {
 	f.mu.Lock()
 	f.sent = append(f.sent, typ)
 	list, sg, err := f.list, f.statusGet, f.err
@@ -197,7 +199,7 @@ func (f *fakeConn) Request(ctx context.Context, typ string, body json.RawMessage
 		}
 		r = list()
 		if r.OK {
-			f.m.Apply([]vaultconn.Message{{ID: "r1", Type: typ, Re: "q1", OK: true, Body: r.Body}})
+			f.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: typ, Re: id, OK: true, Body: r.Body}})
 		}
 	case "leash.status.get":
 		var b struct {
@@ -227,7 +229,13 @@ func (f *fakeConn) setAccess(a pairing.Access) {
 }
 
 func (f *fakeConn) IdentityKey() ed25519.PublicKey { return f.ik }
-func (f *fakeConn) LastContact() time.Time         { return time.Time{} }
+func (f *fakeConn) DeviceID() string {
+	if f.noDevice {
+		return ""
+	}
+	return testAgent
+}
+func (f *fakeConn) LastContact() time.Time { return time.Time{} }
 
 func (f *fakeConn) count(typ string) int {
 	f.mu.Lock()
@@ -279,9 +287,11 @@ type env struct {
 func newEnv(t *testing.T) *env {
 	t.Helper()
 	c := &clock{t: time.Unix(1790856000, 0).UTC()}
-	m := New(Options{DeviceID: testAgent, VaultID: "vault-1", Name: "test agent", Now: c.Now})
+	m := New(Options{VaultID: "vault-1", Name: "test agent", Now: c.Now})
 	f := &fakeConn{m: m, ik: pub(agentKey), access: pairing.Access{State: pairing.AccessActive}}
-	m.Bind(f)
+	if err := m.Bind(f); err != nil {
+		t.Fatal(err)
+	}
 	return &env{c: c, f: f, m: m}
 }
 
@@ -293,6 +303,35 @@ func (e *env) listing(t *testing.T, suspended bool, grants ...json.RawMessage) {
 	e.f.mu.Unlock()
 }
 
+// update applies a leash.grant.updated newer than every message so far.
 func (e *env) update(t *testing.T, suspended bool, grants ...json.RawMessage) {
-	e.m.Apply([]vaultconn.Message{{ID: "e1", Type: "leash.grant.updated", Body: set(t, suspended, grants...)}})
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.updated", Body: set(t, suspended, grants...)}})
+}
+
+// ulidMSBase and ulidN number the test vault's messages: each nextULID
+// is 1 ms after the one before, so they are ordered by the vault's clock.
+var (
+	ulidMu sync.Mutex
+	ulidN  int64
+)
+
+func nextULID() string {
+	ulidMu.Lock()
+	ulidN++
+	n := ulidN
+	ulidMu.Unlock()
+	id, err := envelope.NewULID(time.UnixMilli(1790856000000 + n))
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+// staleList applies the answer to a list sent before the last thing the
+// connector learned (as if it arrived late).
+func (e *env) staleList(t *testing.T, suspended bool, grants ...json.RawMessage) {
+	e.m.mu.Lock()
+	e.m.lists["01JB2Z6V9K3M4N5P6Q7R8S9TZZ"] = e.m.gen - 1
+	e.m.mu.Unlock()
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.list", Re: "01JB2Z6V9K3M4N5P6Q7R8S9TZZ", OK: true, Body: set(t, suspended, grants...)}})
 }

@@ -92,7 +92,7 @@ func writeStatus(w io.Writer, dir string, v *state.View, rec *pairing.Record, no
 		fmt.Fprintf(w, "Paired: yes, as \"%s\" (device %s of vault %s), on %s\n", pairing.Sanitize(dev.Name),
 			pairing.Sanitize(dev.DeviceID), pairing.Sanitize(dev.VaultID), v.CreatedAt.Local().Format("2006-01-02 15:04"))
 		fmt.Fprintf(w, "Access session: %s (as last saved; the vault is not contacted)\n", access.Describe(rec.Access, now))
-		writeGrants(w, rec.Leash, now)
+		writeGrants(w, rec.Leash, dev.DeviceID, now)
 	case pairing.PhaseWaiting:
 		if now.Before(rec.Deadline) {
 			fmt.Fprintf(w, "Paired: not yet; waiting for approval on your phone until %s (run `vettid-agent pair` to keep waiting)\n", rec.Deadline.Local().Format("15:04"))

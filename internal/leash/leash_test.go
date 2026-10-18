@@ -148,10 +148,15 @@ func TestNothingWhileSuspended(t *testing.T) {
 			t.Error("a statement shown while suspended")
 		}
 	}
-	// Resumed (leash.agent.resume sends leash.grant.updated).
+	// Resumed (leash.agent.resume sends leash.grant.updated): the update
+	// alone does not end the suspension; the list the background loop
+	// sends then (while suspended) does.
 	now = e.c.Now()
 	g1 = grant(t, now, spec{id: gid(1)})
 	e.update(t, false, g1)
+	refused(t, e, gid(1), ErrSuspended)
+	e.listing(t, false, g1)
+	e.m.step(ctx)
 	mustPresent(t, e, gid(1))
 }
 
@@ -169,7 +174,7 @@ func TestForbiddenSuspends(t *testing.T) {
 	refused(t, e, gid(1), ErrSuspended)
 	e.c.Add(-650 * time.Second) // gid(2)'s statement would be fresh again
 	refused(t, e, gid(2), ErrSuspended)
-	s, err := ReadSaved(e.m.Snapshot(), e.c.Now())
+	s, err := ReadSaved(e.m.Snapshot(), testAgent, e.c.Now())
 	if err != nil || !s.Suspended {
 		t.Errorf("saved: %+v %v", s, err)
 	}
@@ -262,9 +267,11 @@ func TestListedAtSessionStart(t *testing.T) {
 
 	// A new process with the saved grants: nothing until a list answers.
 	saved := e.m.Snapshot()
-	m2 := New(Options{Saved: saved, DeviceID: testAgent, Now: e.c.Now})
+	m2 := New(Options{Saved: saved, Now: e.c.Now})
 	f2 := &fakeConn{m: m2, ik: pub(agentKey), access: pairing.Access{State: pairing.AccessActive}}
-	m2.Bind(f2)
+	if err := m2.Bind(f2); err != nil {
+		t.Fatal(err)
+	}
 	f2.list = func() *vaultconn.Response { return fail("session_required") }
 	if p, err := m2.Present(ctx, gid(1)); p != nil || !errors.Is(err, ErrNoSession) {
 		t.Fatalf("saved grants presented: %v", err)
@@ -431,7 +438,7 @@ func TestStatementChecks(t *testing.T) {
 func TestHeld(t *testing.T) {
 	e := newEnv(t)
 	var answered []string
-	e.m.o.OnAnswer = func(code string) { answered = append(answered, code) }
+	e.m.o.OnAnswer = func(code string, _ pairing.Access) { answered = append(answered, code) }
 	now := e.c.Now()
 	g1 := grant(t, now, spec{id: gid(1)})
 	e.listing(t, false, g1)
@@ -440,7 +447,7 @@ func TestHeld(t *testing.T) {
 	e.f.statusGet = func(string) *vaultconn.Response { return fail("owner_check_required") }
 	refused(t, e, gid(1), access.ErrOwnerCheck)
 	n := e.f.count("leash.status.get")
-	e.c.Add(time.Hour)
+	e.c.Add(10 * time.Minute)
 	e.m.step(ctx)
 	if e.f.count("leash.status.get") != n {
 		t.Error("refreshed while held")
@@ -474,7 +481,7 @@ func TestSnapshot(t *testing.T) {
 			t.Errorf("saved member holds %s", secretish)
 		}
 	}
-	s, err := ReadSaved(raw, now)
+	s, err := ReadSaved(raw, testAgent, now)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,12 +489,21 @@ func TestSnapshot(t *testing.T) {
 		!s.Grants[0].ExpiresAt.Equal(exp) || s.Grants[0].PerHour != 60 || s.Grants[1].Connections[0] != gid(20) {
 		t.Errorf("read back: %+v", s)
 	}
-	m2 := New(Options{Saved: raw, DeviceID: testAgent, Now: e.c.Now})
+	m2 := New(Options{Saved: raw, Now: e.c.Now})
+	if err := m2.Bind(&fakeConn{m: m2, ik: pub(agentKey)}); err != nil {
+		t.Fatal(err)
+	}
 	if got := m2.Snapshot(); !bytes.Equal(got, raw) {
 		t.Errorf("reloaded snapshot differs:\n%s\n%s", got, raw)
 	}
-	if s, _ := ReadSaved(raw, exp); len(s.Grants) != 1 {
+	if s, _ := ReadSaved(raw, testAgent, exp); len(s.Grants) != 1 {
 		t.Errorf("expired grant shown: %+v", s.Grants)
+	}
+	if _, err := ReadSaved(raw, "", now); err == nil {
+		t.Error("read without a device id")
+	}
+	if _, err := ReadSaved(raw, "another-device", now); err == nil {
+		t.Error("read for another device")
 	}
 	for _, alt := range []string{
 		strings.Replace(string(raw), `"v":1`, `"v":2`, 1),
@@ -495,11 +511,11 @@ func TestSnapshot(t *testing.T) {
 		strings.Replace(string(raw), `"approval":"ask"`, `"approval":"auto"`, 1),
 		string(raw) + " {}",
 	} {
-		if _, err := ReadSaved(json.RawMessage(alt), now); err == nil {
+		if _, err := ReadSaved(json.RawMessage(alt), testAgent, now); err == nil {
 			t.Errorf("altered member accepted: %s", alt)
 		}
 	}
-	if s, err := ReadSaved(nil, now); s != nil || err != nil {
+	if s, err := ReadSaved(nil, testAgent, now); s != nil || err != nil {
 		t.Error("nil member")
 	}
 }
@@ -557,6 +573,22 @@ func TestRunLoop(t *testing.T) {
 	go func() { e.m.Run(rctx); close(done) }()
 	e.m.Apply([]vaultconn.Message{{ID: "e", Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
 	deadline := time.Now().Add(10 * time.Second)
+	for e.f.count("leash.grant.list") == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no list")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// A grant nobody asked to present is not refreshed in the background;
+	// one that was is.
+	time.Sleep(100 * time.Millisecond)
+	if n := e.f.count("leash.status.get"); n != 0 {
+		t.Fatalf("an unwanted statement refreshed (%d)", n)
+	}
+	e.m.mu.Lock()
+	e.m.wanted[gid(1)] = e.c.Now()
+	e.m.mu.Unlock()
+	e.m.signal()
 	for e.f.count("leash.status.get") == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("no list and refresh")
