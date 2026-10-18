@@ -114,7 +114,9 @@ type Options struct {
 type Part interface {
 	// Apply is called inside the save of a batch (in Run's goroutine,
 	// before the record is written and the batch acknowledged) with the
-	// batch's messages, responses included, in the order collected. It
+	// batch's messages, responses included, as collected (VAULT-MESSAGING
+	// §8.4 guarantees no order between them; a Part must not rely on
+	// one). It
 	// must not block or call Conn. Idempotent handling is required: a
 	// batch may be applied again by the next process after a crash
 	// between the save and the acknowledgement.
