@@ -101,8 +101,7 @@ type Manager struct {
 	// sent: times of automatic requests in the last hour.
 	sent []time.Time
 	// held: the vault answered owner_check_required, or vault.status
-	// says held; it ends with a vault.status that is not held (or a
-	// granted session).
+	// says held; only a vault.status that is not held ends it.
 	held bool
 	// probing is set while an unknown session is being checked.
 	probing *flight
@@ -390,7 +389,6 @@ func (m *Manager) OnEvent(ev vaultconn.Event) {
 	switch ev.Type {
 	case "device.session.granted":
 		m.outstanding = false
-		m.held = false
 	case "device.session.ended":
 		var b struct {
 			Reason string `json:"reason"`
@@ -404,11 +402,12 @@ func (m *Manager) OnEvent(ev vaultconn.Event) {
 			m.quietUntil, m.denied = m.now().Add(QuietAfterRefusal), true
 		}
 	}
-	// A leash.grant.updated does not end a hold: events arrive out of
-	// order (VAULT-MESSAGING §8.4), so one sent before the hold can come
-	// after it, and nothing in it says the hold ended. Only a vault.status
-	// that is not held ends it (OnStatus; CheckHold asks at most once per
-	// HoldRecheck), as in internal/leash.
+	// No event ends a hold, neither leash.grant.updated nor
+	// device.session.granted: events arrive out of order and are
+	// delivered again after a crash (VAULT-MESSAGING §8.4), so one sent
+	// before the hold can come after it, and nothing in it says the hold
+	// ended. Only a vault.status that is not held ends it (OnStatus;
+	// CheckHold asks at most once per HoldRecheck), as in internal/leash.
 }
 
 // OnStatus takes the owner check state of each vault.status
