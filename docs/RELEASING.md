@@ -5,8 +5,8 @@ How a release is built, signed and published, and how anyone checks it
 machine; the steps are scripted so that a release is one command after
 the tag is pushed.
 
-**No third party holds a VettID signing key.** The release key is a
-security key (YubiKey) or an offline file key that only the owner holds;
+**No third party holds a VettID signing key.** The release key is on
+the owner's YubiKey (an offline file key is the fallback);
 the Developer ID certificate and the notarization credentials live in the
 owner's Mac's login keychain. Nothing in GitHub Actions signs anything,
 and no secret for signing is stored in GitHub. There is no cloud signing
@@ -59,10 +59,13 @@ reproducible original by removing the signature and comparing.
 
 ## One-time setup (the owner)
 
-### 1. The release key
+### 1. The release key: a YubiKey
 
-A security key is recommended: the private key never leaves it, and
-each signature needs a touch and the PIN.
+The release key lives on a YubiKey (owner decision, 2026-10-18): an
+`ed25519-sk` key, resident, with user verification. The private key
+never leaves the YubiKey, and each signature needs the YubiKey's FIDO2
+PIN and a touch. Set the FIDO2 PIN first if the YubiKey has none (`ykman
+fido access change-pin`), then:
 
 ```sh
 ssh-keygen -t ed25519-sk -O resident -O verify-required \
@@ -70,21 +73,26 @@ ssh-keygen -t ed25519-sk -O resident -O verify-required \
   -f ~/.ssh/vettid-release
 ```
 
-This writes `~/.ssh/vettid-release` (a handle, not the key itself) and
-`~/.ssh/vettid-release.pub`. `-O resident` keeps the handle on the
-security key, so `ssh-keygen -K` recovers it on another machine. Make a
-second key the same way on a spare security key, kept elsewhere, and
-list both in `release/allowed_signers`.
+This writes `~/.ssh/vettid-release`, a handle that is useless without
+the YubiKey, and `~/.ssh/vettid-release.pub`. `-O resident` keeps the
+handle on the YubiKey too, so on another machine `ssh-keygen -K` (in an
+empty directory) writes it out again. Make a second key the same way on
+a spare YubiKey kept elsewhere, and list both in
+`release/allowed_signers`: losing one YubiKey then loses nothing.
 
-Or an offline file key, kept on removable media that stays offline, with
-a strong passphrase:
+`scripts/sign-release -k ~/.ssh/vettid-release` takes the handle file
+and expects the public key next to it as `~/.ssh/vettid-release.pub`.
+
+**Fallback: an offline file key.** If a YubiKey cannot be used, an
+ordinary Ed25519 file key works the same way with `-k`: kept on
+removable media that stays offline, with a strong passphrase, and
+plugged in only to sign. It is weaker (the key exists as a file, and
+any machine it is plugged into can copy it), so use it only as a
+fallback:
 
 ```sh
 ssh-keygen -t ed25519 -C vettid-release -f /Volumes/RELEASE-KEY/vettid-release
 ```
-
-Either way, `scripts/sign-release -k <path>` takes the private file and
-expects the public key next to it as `<path>.pub`.
 
 ### 2. Publish the public key
 
@@ -104,14 +112,21 @@ published release fails.
 
 ### 3. Signed tags
 
-Add the same `.pub` to the owner's GitHub account as a **signing key**
+Release tags are signed with an SSH key from `release/allowed_signers`
+(namespace `git`), and that key can live on the YubiKey as well: the
+release key itself (the suggested allowed signers line allows both the
+`git` and `vettid-agent-release` namespaces), or a separate tag-signing
+`ed25519-sk` key made as in step 1 with its own line (namespaces="git"
+only). Either way each tag signature asks for the PIN and a touch.
+
+Add that key's `.pub` to the owner's GitHub account as a **signing key**
 (Settings, SSH and GPG keys, New SSH key, key type "Signing Key"), so
 that GitHub shows release tags as verified; the tagger email must be a
 verified email of that account. Then, in the vettid-agent checkout:
 
 ```sh
 git config gpg.format ssh
-git config user.signingkey ~/.ssh/vettid-release
+git config user.signingkey ~/.ssh/vettid-release   # or the tag-signing key's handle file
 git config gpg.ssh.allowedSignersFile "$(pwd)/release/allowed_signers"
 git config tag.gpgSign true
 ```

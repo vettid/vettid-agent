@@ -3,8 +3,8 @@
 # (AGENT-PLAN §2 AG4, §6 A5.2 and A5.3; docs/RELEASING.md). Runs on the
 # owner's own machine: the macOS steps on a Mac, everything else on macOS
 # or Linux. Nothing here creates, reads or stores a key: the release key
-# signs through ssh-keygen (a security key asks for a touch and its PIN,
-# a file key for its passphrase), and the Apple steps use the owner's
+# signs through ssh-keygen (the YubiKey asks for its PIN and a touch; the
+# fallback file key for its passphrase), and the Apple steps use the owner's
 # Developer ID identity in the login keychain and a notarytool keychain
 # profile, both by name.
 #
@@ -12,10 +12,12 @@
 #   scripts/sign-release -k KEY --local DIR -c COMMIT TAG
 #
 #   -k KEY                 the release key for `ssh-keygen -Y sign -f KEY`
-#                          (also $VETTID_RELEASE_KEY): a security key's
-#                          handle file (ed25519-sk) or an offline file key.
-#                          Its public key must be at KEY.pub and in the
-#                          allowed signers file.
+#                          (also $VETTID_RELEASE_KEY): the handle file of
+#                          the owner's YubiKey key (ed25519-sk, resident,
+#                          verify-required; signing asks for its PIN and a
+#                          touch), or, as a fallback, an offline Ed25519
+#                          file key. Its public key must be at KEY.pub and
+#                          in the allowed signers file.
 #   -a ALLOWED_SIGNERS     default release/allowed_signers in this checkout
 #   --team-id ID           Apple Developer Team ID (also $APPLE_TEAM_ID)
 #   --identity NAME        the codesign identity (also $APPLE_SIGN_IDENTITY;
@@ -80,6 +82,7 @@ set -euo pipefail
 usage() {
   echo "usage: scripts/sign-release -k KEY [-a ALLOWED_SIGNERS] [--no-macos] [--yes] [--team-id ID] [--identity NAME] [--profile PATH] [--notary-profile NAME] TAG" >&2
   echo "       scripts/sign-release -k KEY [-a ALLOWED_SIGNERS] --local DIR -c COMMIT TAG" >&2
+  echo "  KEY: the YubiKey key's handle file (for example ~/.ssh/vettid-release), or the fallback offline file key; KEY.pub next to it" >&2
   exit 2
 }
 log() { echo "sign-release: $*" >&2; }
@@ -162,7 +165,7 @@ sign_dir() {
   mv "$d/SHA256SUMS.new" "$d/SHA256SUMS"
   log "SHA256SUMS:"
   cat "$d/SHA256SUMS" >&2
-  log "signing SHA256SUMS (namespace $namespace; a security key asks for a touch)"
+  log "signing SHA256SUMS (namespace $namespace; the YubiKey asks for its PIN and a touch)"
   ssh-keygen -Y sign -n "$namespace" -f "$key" "$d/SHA256SUMS" >&2 || fail "ssh-keygen could not sign"
   [ -f "$d/SHA256SUMS.sig" ] || fail "ssh-keygen wrote no SHA256SUMS.sig"
   "$repo/scripts/verify-release" -a "$allowed" -c "$commit" -A -l "$d" "$tag" || fail "the new signature does not verify; nothing was uploaded"

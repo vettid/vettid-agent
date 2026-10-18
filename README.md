@@ -691,7 +691,7 @@ and the formats are in [docs/RELEASING.md](docs/RELEASING.md).
 
 No CI system or other third party holds a VettID signing key, an Apple
 certificate or notarization credentials: the release key stays with the
-owner (a security key or an offline file), and signing happens on the
+owner, on a YubiKey (an offline file key is the fallback), and signing happens on the
 owner's machine. The connector does not update itself. Pull requests
 run the same two builds and comparison as a dry run.
 

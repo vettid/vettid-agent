@@ -11,12 +11,13 @@
 #
 # One line per key, in ssh-keygen's allowed signers format (ssh-keygen(1),
 # "ALLOWED SIGNERS"): a principal, the namespaces the key may sign for,
-# and the public key (the first two fields of the .pub file). For a
-# security key made with `ssh-keygen -t ed25519-sk`:
+# and the public key (the first two fields of the .pub file). For the
+# owner's YubiKey key, made with `ssh-keygen -t ed25519-sk` (the primary
+# path, docs/RELEASING.md):
 #
 #   vettid-release namespaces="git,vettid-agent-release" sk-ssh-ed25519@openssh.com AAAA...
 #
-# or for a file key made with `ssh-keygen -t ed25519`:
+# or for the fallback offline file key, made with `ssh-keygen -t ed25519`:
 #
 #   vettid-release namespaces="git,vettid-agent-release" ssh-ed25519 AAAA...
 #
