@@ -366,6 +366,7 @@ func TestKeychainWipeMoved(t *testing.T) {
 	if len(f.items) != 0 {
 		t.Fatal("the moved directory's item remains")
 	}
+	// remove(service) found nothing, then the remembered name.
 	name := hexOf(blob[1:17])
 	if len(f.removed) != 2 || f.removed[0] != keychainDirService("/new") || f.removed[1] != name {
 		t.Fatalf("deletion order %v", f.removed)
@@ -406,11 +407,44 @@ func TestKeychainWipeAllOrNothing(t *testing.T) {
 	if err := k2.Wipe(); err != nil {
 		t.Fatalf("retry: %v", err)
 	}
-	// No state directory: Wipe cannot find its items and says so.
+	// No state directory: Wipe cannot find its items and Wrap makes
+	// none, and both say so.
 	k3 := newKeychain(f, "", errors.New("no state directory"))
 	if err := k3.Wipe(); err == nil {
 		t.Fatal("Wipe without a state directory succeeded")
 	}
+	n := len(f.items)
+	if _, err := k3.Wrap(testDataKey()); err == nil || len(f.items) != n {
+		t.Fatalf("Wrap without a state directory: %v", err)
+	}
+}
+
+// TestKeychainWipeOneAtATime: Wipe repeats the deletion until no item
+// of the state directory is left.
+func TestKeychainWipeOneAtATime(t *testing.T) {
+	f := &oneAtATime{newFakeKeychain()}
+	svc := keychainDirService("/d")
+	k := newKeychain(f, svc, nil)
+	for i := 0; i < 3; i++ {
+		if _, err := k.Wrap(testDataKey()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := newKeychain(f, svc, nil).Wipe(); err != nil || len(f.items) != 0 {
+		t.Fatalf("Wipe: %v, %d items left", err, len(f.items))
+	}
+}
+
+type oneAtATime struct{ *fakeKeychain }
+
+func (f *oneAtATime) remove(service, account string) int32 {
+	for a, it := range f.items {
+		if (service != "" && it.service == service) || (account != "" && a == account) {
+			delete(f.items, a)
+			return 0
+		}
+	}
+	return errSecItemNotFound
 }
 
 // TestKeychainDirTag: the service names the directory by a hash, not

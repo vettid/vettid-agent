@@ -106,6 +106,10 @@ const (
 	keychainService   = "vettid-agent/"
 	keychainLabel     = "vettid-agent data key"
 	keychainProbeName = keychainService + "probe"
+
+	// maxKeychainDeletes bounds Wipe's repeated deletion of a state
+	// directory's items.
+	maxKeychainDeletes = 64
 )
 
 // Keychain status codes (Security/SecBase.h) the protector tells apart.
@@ -220,6 +224,10 @@ func (k *Keychain) Wrap(dataKey []byte) ([]byte, error) {
 	if !k.ops.entitled() {
 		return nil, fmt.Errorf("%w; %s", ErrKeychainUnavailable, keychainUnavailableFix)
 	}
+	if k.dirErr != nil {
+		// An item made now could not be found by a Wipe from the header.
+		return nil, fmt.Errorf("Keychain protector: the state directory could not be resolved: %w", k.dirErr)
+	}
 	kek := make([]byte, keychainKEKLen)
 	defer clear(kek)
 	id := make([]byte, keychainNameLen)
@@ -300,8 +308,19 @@ func (k *Keychain) Wipe() error {
 	if k.dirErr != nil {
 		return fmt.Errorf("Keychain protector: the state directory could not be resolved, so its Keychain items cannot be found: %w", k.dirErr)
 	}
-	if st := k.ops.remove(k.service, ""); st != errSecSuccess && st != errSecItemNotFound {
-		return k.statusError("delete the key", st, false)
+	// SecItemDelete deletes every match in the data protection keychain;
+	// repeat until none is left in case a release deletes one at a time.
+	for i := 0; ; i++ {
+		st := k.ops.remove(k.service, "")
+		if st == errSecItemNotFound {
+			break
+		}
+		if st != errSecSuccess {
+			return k.statusError("delete the key", st, false)
+		}
+		if i == maxKeychainDeletes {
+			return errors.New("Keychain protector: the state directory's items are still there after deleting them")
+		}
 	}
 	for len(k.names) > 0 {
 		if st := k.ops.remove("", k.names[0]); st != errSecSuccess && st != errSecItemNotFound {
