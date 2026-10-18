@@ -5,7 +5,9 @@ package protect
 // The macOS Keychain calls for the Keychain protector (keychain.go),
 // through the Security framework. Only the data protection keychain is
 // used (kSecUseDataProtectionKeychain on every call), never the
-// file-based login keychain; no call shows a user interface.
+// file-based login keychain. The items carry no access control object
+// (kSecAttrAccessControl), only an accessibility class, so the data
+// protection keychain never shows a prompt for them.
 //
 // The KEK passes through CoreFoundation objects (CFData) that the
 // framework allocates and frees; they cannot be cleared from here. The
@@ -101,7 +103,6 @@ static OSStatus vk_get(const char *account, unsigned char *out, int outcap, int 
 	CFDictionarySetValue(q, kSecReturnAttributes, kCFBooleanTrue);
 	CFDictionarySetValue(q, kSecReturnData, kCFBooleanTrue);
 	CFDictionarySetValue(q, kSecMatchLimit, kSecMatchLimitOne);
-	CFDictionarySetValue(q, kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
 	CFTypeRef r = NULL;
 	OSStatus st = SecItemCopyMatching(q, &r);
 	CFRelease(q);

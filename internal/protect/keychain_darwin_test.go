@@ -81,7 +81,7 @@ func TestKeychainDarwinNotEntitled(t *testing.T) {
 	err = p.Wipe()
 	t.Logf("Wipe: %v", err)
 	checkUnavailable(t, "Wipe", err)
-	if Platform(TPMName, dir) != nil || Platform(DPAPIName, dir) != nil {
+	if Platform("tpm", dir) != nil || Platform(DPAPIName, dir) != nil {
 		t.Error("other platform protectors in a macOS build")
 	}
 	all := All(dir)
