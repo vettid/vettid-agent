@@ -6,6 +6,8 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -70,7 +72,13 @@ func (s *syncBuf) String() string {
 	return s.b.String()
 }
 
+func TestMain(m *testing.M) {
+	retryBase, retryMax, statusRetryMax = 20*time.Millisecond, 100*time.Millisecond, 100*time.Millisecond
+	os.Exit(m.Run())
+}
+
 type env struct {
+	log  *syncBuf
 	t    *testing.T
 	v    *pairtest.Vault
 	dir  string
@@ -87,7 +95,7 @@ func newPaired(t *testing.T) *env {
 		t.Fatal(err)
 	}
 	t.Cleanup(v.Close)
-	e := &env{t: t, v: v, dir: filepath.Join(t.TempDir(), "state"), out: &syncBuf{}}
+	e := &env{t: t, v: v, dir: filepath.Join(t.TempDir(), "state"), out: &syncBuf{}, log: &syncBuf{}}
 	e.prot = &testProtector{key: [32]byte{9}, out: e.out}
 	code, err := v.Code(invite.KindAgent, 10*time.Minute)
 	if err != nil {
@@ -147,6 +155,7 @@ func (e *env) open(wrap func(Store) Store) *opened {
 	}
 	o := &opened{store: s, rec: rec, evs: make(chan Event, 100)}
 	o.conn, err = New(Options{Store: st, Resolve: e.resolve, Record: rec, Out: e.out, HTTP: e.v.HTTPClient(),
+		Log:      slog.New(slog.NewTextHandler(e.log, nil)),
 		PollWait: 10 * time.Millisecond, OnEvent: func(ev Event) { o.evs <- ev }})
 	if err != nil {
 		s.Close()
@@ -450,10 +459,12 @@ func TestCrashBeforeSaveKeepsRekey(t *testing.T) {
 	eventually(t, "the mailbox to drain", func() bool { return e.v.Pending() == 0 })
 }
 
-// TestPersistErrorRequeriesStatus: after a failed save, Run sends
-// vault.status again (what the vault holds is read again), and once
-// saving works the batch is acknowledged.
-func TestPersistErrorRequeriesStatus(t *testing.T) {
+// TestSaveFailureBounded: while saves keep failing, the batch stays
+// unacknowledged and is retried with a growing pause; no vault.status is
+// sent beyond the one at start (each would add a response to the
+// unacknowledged mailbox), and only the first failure and the recovery
+// are logged. Once saving works the batch is acknowledged.
+func TestSaveFailureBounded(t *testing.T) {
 	e := newPaired(t)
 	fs := &failingStore{}
 	o := e.open(func(s Store) Store { fs.Store = s; return fs })
@@ -467,8 +478,11 @@ func TestPersistErrorRequeriesStatus(t *testing.T) {
 	if _, err := e.v.SendEvent("test.ping", []byte(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	eventually(t, "a failed save", func() bool { return fs.failures() >= 1 })
-	eventually(t, "vault.status again", func() bool { return count(e.v.Received(), "vault.status") >= 2 })
+	eventually(t, "several failed saves", func() bool { return fs.failures() >= 4 })
+	time.Sleep(300 * time.Millisecond)
+	if n := count(e.v.Received(), "vault.status"); n != 1 {
+		t.Errorf("%d vault.status during the failure, want only the one at start", n)
+	}
 	if e.v.Pending() == 0 {
 		t.Error("acknowledged without a save")
 	}
@@ -476,6 +490,108 @@ func TestPersistErrorRequeriesStatus(t *testing.T) {
 	fs.fail = false
 	fs.mu.Unlock()
 	eventually(t, "the batch to be acknowledged", func() bool { return e.v.Pending() == 0 })
+	nextEvent(t, o, "test.ping")
+	noEvent(t, o, "test.ping") // delivered once although collected several times
+	logs := e.log.String()
+	if n := strings.Count(logs, "state not saved"); n != 1 {
+		t.Errorf("failure logged %d times:\n%s", n, logs)
+	}
+	if n := strings.Count(logs, "state saved again"); n != 1 {
+		t.Errorf("recovery logged %d times:\n%s", n, logs)
+	}
+	if b := backoff(time.Second, 30*time.Second, 1); b != time.Second {
+		t.Errorf("backoff 1: %v", b)
+	}
+	if b := backoff(time.Second, 30*time.Second, 10); b != 30*time.Second {
+		t.Errorf("backoff 10: %v", b)
+	}
+}
+
+// TestStatusRetriedAtStart: a vault.status at start that cannot be sent
+// is retried after a short pause, not after StatusEvery.
+func TestStatusRetriedAtStart(t *testing.T) {
+	e := newPaired(t)
+	e.v.DepositError = &pairtest.RelayError{Status: 400, Code: "bad_request"}
+	o := e.open(nil)
+	stop := o.run()
+	defer stop()
+	time.Sleep(150 * time.Millisecond)
+	if n := count(e.v.Received(), "vault.status"); n != 0 {
+		t.Fatalf("%d vault.status got through", n)
+	}
+	e.v.SetDepositError(nil)
+	eventually(t, "vault.status after the retry", func() bool { return count(e.v.Received(), "vault.status") == 1 })
+}
+
+// wipeFailStore fails Wipe while fail is set.
+type wipeFailStore struct {
+	Store
+	fail bool
+}
+
+func (w *wipeFailStore) Wipe(r state.Resolver) error {
+	if w.fail {
+		return errors.New("read-only file system")
+	}
+	return w.Store.Wipe(r)
+}
+
+// TestUnlinkedWipeFails: the wipe fails: Run returns once with advice
+// that is accurate for this build, the batch stays unacknowledged and
+// the state file stays; the next process collects device.unlinked again
+// and wipes.
+func TestUnlinkedWipeFails(t *testing.T) {
+	e := newPaired(t)
+	if _, err := e.v.SendEvent("device.unlinked", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	o := e.open(func(s Store) Store { return &wipeFailStore{Store: s, fail: true} })
+	err := o.runUntilEnd(t)
+	var wf *wipeFailed
+	if !errors.As(err, &wf) || errors.Is(err, ErrUnlinked) {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Run `vettid-agent mcp` again to retry, or delete the state directory") {
+		t.Errorf("advice: %v", err)
+	}
+	if strings.Contains(e.out.String(), TextUnlinked) {
+		t.Error("said the keys were deleted")
+	}
+	if e.v.Pending() == 0 {
+		t.Fatal("device.unlinked was acknowledged although the wipe failed")
+	}
+	if rec, _ := e.saved(); rec == nil {
+		t.Fatal("the state file is gone although the wipe failed")
+	}
+	o2 := e.open(nil)
+	if err := o2.runUntilEnd(t); !errors.Is(err, ErrUnlinked) {
+		t.Fatalf("second run: %v", err)
+	}
+	if rec, _ := e.saved(); rec != nil {
+		t.Fatal("not wiped on the second run")
+	}
+}
+
+// TestRefusedDrainBounded: refused, and the saves keep failing, so the
+// same batch comes back on every collect: the drain still ends after a
+// bounded number of collects with the refused text.
+func TestRefusedDrainBounded(t *testing.T) {
+	e := newPaired(t)
+	e.v.DepositError = &pairtest.RelayError{Status: 403, Code: "token_revoked"}
+	if _, err := e.v.SendEvent("test.ping", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	fs := &failingStore{fail: true}
+	o := e.open(func(s Store) Store { fs.Store = s; return fs })
+	if err := o.runUntilEnd(t); !errors.Is(err, ErrRefused) {
+		t.Fatalf("Run: %v", err)
+	}
+	if n := fs.failures(); n < 1 || n > drainMaxCollect {
+		t.Errorf("%d collects with a failed save", n)
+	}
+	if !strings.Contains(e.out.String(), TextRefused) {
+		t.Error("no refused text")
+	}
 }
 
 // TestUnlinkedWipes: device.unlinked wipes the state file and the
@@ -550,10 +666,10 @@ func TestRequestRefused(t *testing.T) {
 	stop := o.run()
 	defer stop()
 	eventually(t, "vault.status at start", func() bool { return count(e.v.Received(), "vault.status") >= 1 })
-	e.v.DepositError = &pairtest.RelayError{Status: 403, Code: "token_revoked"}
+	e.v.SetDepositError(&pairtest.RelayError{Status: 403, Code: "token_revoked"})
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if _, err := o.conn.Request(ctx, "vault.status", json.RawMessage(`{}`)); !errors.Is(err, ErrRefused) && !errors.Is(err, ErrStopped) {
+	if _, err := o.conn.Request(ctx, "vault.status", json.RawMessage(`{}`)); !errors.Is(err, ErrRefused) {
 		t.Errorf("got %v", err)
 	}
 }

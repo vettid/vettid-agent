@@ -339,6 +339,13 @@ func (v *Vault) Rotate() (ed25519.PublicKey, error) {
 	return nk.Public().(ed25519.PublicKey), nil
 }
 
+// SetDepositError sets DepositError while the vault runs.
+func (v *Vault) SetDepositError(e *RelayError) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.DepositError = e
+}
+
 // RekeyResps returns how many hs.resp the vault's rekeys received
 // (a repeated one is counted and ignored).
 func (v *Vault) RekeyResps() int {

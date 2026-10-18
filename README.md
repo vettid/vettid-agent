@@ -128,14 +128,19 @@ message's type and id, never its contents).
 
 While it runs it collects what the vault sent and saves its state before
 telling the relay a message was received, so that a crash never loses a
-key change or a token: what was not saved is collected again. It asks
-the vault for its status when it starts, every 6 hours and after a
-failed save, rather than relying on having seen every notice.
+key change or a token: what was not saved is collected again (a save
+that keeps failing, such as on a full disk, is retried with a pause of
+up to 30 seconds, and logged once when it starts failing and once when
+it works again). It asks the vault for its status when it starts and
+every 6 hours, rather than relying on having seen every notice.
 
 If you remove the agent on your phone, the vault tells the connector,
-which deletes its keys from this computer and exits saying so. If the
-relay refuses the agent but no such notice arrives, it exits saying so
-and keeps its keys; `vettid-agent forget` (to come) deletes them.
+which deletes its keys from this computer and exits saying so (if the
+deletion fails, run it again to retry, or delete the state directory:
+the protectors of this version keep no key outside it). If the relay
+refuses the agent, it collects what is still waiting for up to a minute
+in case that notice is among it, then exits saying so and keeps its
+keys; `vettid-agent forget` (to come) deletes them.
 
 ## Keys at rest on Linux: the TPM
 

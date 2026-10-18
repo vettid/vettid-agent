@@ -72,12 +72,20 @@ type Options struct {
 	Out io.Writer
 	// Log is for diagnostics (types, ids, codes); nil discards.
 	Log *slog.Logger
-	// OnEvent, if set, receives every event (a message without `re`) of
-	// a batch after the batch was saved, in Run's goroutine; it must not
-	// block or call back into Conn synchronously.
+	// OnEvent, if set, receives the events (messages without `re`) of a
+	// batch after Poll returns, in Run's goroutine; it must not block or
+	// call back into Conn synchronously. An event is delivered even when
+	// its batch could not be saved (the batch is then collected again but
+	// recognised as handled, so not delivered twice in this process), and
+	// after a crash between the save and the acknowledgement it may be
+	// delivered again by the next process... or, if the crash came after
+	// the acknowledgement, not at all. Handlers must therefore be
+	// idempotent and must not rely on seeing every event: the state they
+	// depend on is read again from the vault at start. device.unlinked is
+	// not passed on (vaultconn acts on it itself).
 	OnEvent func(Event)
-	// StatusEvery is how often Run sends vault.status (also at start and
-	// after a failed save); default 6 hours.
+	// StatusEvery is how often Run sends vault.status after the one at
+	// start; default 6 hours.
 	StatusEvery time.Duration
 
 	// HTTP, Now and PollWait go to the client (nil and zero: its
@@ -132,11 +140,18 @@ type Conn struct {
 	wipeErr    error
 	persistErr error
 	refused    bool
-	// lastBatchEmpty: the last Poll brought no response or event.
-	lastBatchEmpty bool
-	refreshAt      time.Time
-	statusID       string
-	ownerCheck     string
+	refusedAt  time.Time
+	drains     int // collects since the refusal
+	// collected: the last Poll collected at least one message (persist
+	// ran), whether or not anything was handed over.
+	collected bool
+	// saveFails counts consecutive failed saves (an episode); retry is
+	// the pause after the next failure.
+	saveFails     int
+	statusBackoff time.Duration
+	refreshAt     time.Time
+	statusID      string
+	ownerCheck    string
 }
 
 // New restores the device from the record, with Persist writing the
@@ -176,6 +191,7 @@ func New(o Options) (*Conn, error) {
 // device.unlinked it wipes the state instead of saving it; otherwise it
 // writes the record durably. An error leaves the batch unacknowledged.
 func (c *Conn) persist(st []byte) error {
+	c.collected = true
 	evs := c.dev.Events()
 	c.events = append(c.events, evs...)
 	for _, ev := range evs {
@@ -207,15 +223,31 @@ func (c *Conn) persist(st []byte) error {
 		c.persistErr = err
 		return err
 	}
+	if c.saveFails > 0 {
+		c.log.Warn("state saved again", "after_failures", c.saveFails)
+		c.saveFails = 0
+	}
 	return nil
 }
 
+// Pauses after failures; tests shorten them.
+var (
+	retryBase       = time.Second
+	retryMax        = 30 * time.Second
+	statusRetryMax  = 5 * time.Minute
+	drainMaxCollect = 5
+	drainMaxTime    = time.Minute
+)
+
 // Run owns the device until ctx ends, device.unlinked arrives
 // (ErrUnlinked, after the wipe) or the relay refuses this agent
-// (ErrRefused, nothing wiped). It sends vault.status at start, every
-// StatusEvery and after a failed save, so that what the vault holds is
-// read again rather than inferred from events that may have been lost
-// (an event is acknowledged once saved, and handed over only after).
+// (ErrRefused, nothing wiped). It sends vault.status at start (retried
+// with a growing pause until it is sent) and every StatusEvery, so that
+// what the vault holds is read again at start rather than inferred from
+// events a crash may have lost (an event is acknowledged once saved, and
+// handed over only after). A save that fails is retried with a pause
+// growing from retryBase to retryMax; only the first failure of an
+// episode and the recovery are logged.
 func (c *Conn) Run(ctx context.Context) (err error) {
 	defer func() {
 		c.runErr = err
@@ -234,11 +266,18 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 			c.sendStatus(ctx)
 		}
 		c.takeCalls(ctx)
+		c.collected = false
 		perr := c.dev.Poll(ctx)
 		c.dispatch()
 		if c.unlinked {
 			if c.wipeErr != nil {
-				return fmt.Errorf("%w\nBut its keys could not be deleted from this computer (%v); delete the state directory yourself", errors.New("This agent was removed from your vault."), c.wipeErr)
+				// The batch stays unacknowledged, so device.unlinked is
+				// collected again by the next run. The protectors in
+				// this build keep no key outside the state file (the
+				// TPM's sealed object and the DPAPI blob live in it; a
+				// passphrase has none), so deleting the directory
+				// removes everything.
+				return &wipeFailed{c.wipeErr}
 			}
 			fmt.Fprintln(c.o.Out, TextUnlinked)
 			return ErrUnlinked
@@ -248,24 +287,49 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 		}
 		switch {
 		case c.persistErr != nil:
-			c.log.Warn("state not saved; the batch stays unacknowledged", "err", c.persistErr)
+			// No vault.status here: it would add a response to the
+			// unacknowledged mailbox on every retry; the one at start
+			// covers a crash.
+			if c.saveFails == 0 {
+				c.log.Warn("state not saved; the batch stays unacknowledged and is retried", "err", c.persistErr)
+			}
+			c.saveFails++
 			c.persistErr = nil
-			c.refreshAt = c.o.Now() // read what the vault holds again
-			pause(ctx, time.Second)
+			pause(ctx, backoff(retryBase, retryMax, c.saveFails))
 		case perr != nil:
 			c.log.Warn("collect failed", "err", errCode(perr))
-			pause(ctx, time.Second)
+			pause(ctx, retryBase)
 		}
 		if c.refused {
 			// Keep collecting while device.unlinked may still be
-			// waiting (VAULT-MESSAGING §8.6); stop once a collect
-			// brings nothing.
-			if perr == nil && c.lastBatchEmpty {
+			// waiting (VAULT-MESSAGING §8.6): until a collect brings
+			// nothing, but at most drainMaxCollect collects or
+			// drainMaxTime, even if collects or saves keep failing.
+			c.drains++
+			empty := perr == nil && !c.collected
+			if empty || c.drains >= drainMaxCollect || c.o.Now().Sub(c.refusedAt) >= drainMaxTime {
 				fmt.Fprintln(c.o.Out, TextRefused)
 				return ErrRefused
 			}
 		}
 	}
+}
+
+// wipeFailed: device.unlinked arrived but the wipe failed.
+type wipeFailed struct{ err error }
+
+func (e *wipeFailed) Error() string {
+	return fmt.Sprintf("This agent was removed from your vault, but its keys could not be deleted from this computer (%v). Run `vettid-agent mcp` again to retry, or delete the state directory (the protectors of this version keep no key outside it).", e.err)
+}
+func (e *wipeFailed) Unwrap() error { return e.err }
+
+// backoff returns base doubled n-1 times, at most max.
+func backoff(base, max time.Duration, n int) time.Duration {
+	d := base
+	for i := 1; i < n && d < max; i++ {
+		d *= 2
+	}
+	return min(d, max)
 }
 
 // pause waits d or until ctx ends.
@@ -279,13 +343,23 @@ func pause(ctx context.Context, d time.Duration) {
 }
 
 // sendStatus sends vault.status; its response is read in dispatch.
+// A failed send is retried after a pause growing from retryBase to
+// statusRetryMax; only a sent request schedules the next one at
+// StatusEvery.
 func (c *Conn) sendStatus(ctx context.Context) {
-	c.refreshAt = c.o.Now().Add(c.o.StatusEvery)
 	id, err := c.dev.Send(ctx, "vault.status", json.RawMessage(`{}`))
 	if err != nil {
 		c.sendFailed(err)
+		if c.statusBackoff == 0 {
+			c.statusBackoff = retryBase
+		} else {
+			c.statusBackoff = min(2*c.statusBackoff, statusRetryMax)
+		}
+		c.refreshAt = c.o.Now().Add(c.statusBackoff)
 		return
 	}
+	c.statusBackoff = 0
+	c.refreshAt = c.o.Now().Add(c.o.StatusEvery)
 	c.statusID = id
 	c.log.Info("sent", "type", "vault.status", "id", id)
 }
@@ -293,8 +367,8 @@ func (c *Conn) sendStatus(ctx context.Context) {
 // sendFailed records a failed deposit to the vault's mailbox.
 func (c *Conn) sendFailed(err error) {
 	c.log.Warn("send failed", "err", errCode(err))
-	if relayclient.IsCode(err, "token_revoked") {
-		c.refused = true
+	if relayclient.IsCode(err, "token_revoked") && !c.refused {
+		c.refused, c.refusedAt = true, c.o.Now()
 		c.failPending(ErrRefused)
 	}
 }
@@ -342,7 +416,6 @@ func (c *Conn) takeCalls(ctx context.Context) {
 func (c *Conn) dispatch() {
 	evs := c.events
 	c.events = nil
-	c.lastBatchEmpty = len(evs) == 0
 	for id, cl := range c.pending {
 		if cl.ctx.Err() != nil {
 			delete(c.pending, id)
@@ -367,6 +440,9 @@ func (c *Conn) dispatch() {
 			continue
 		}
 		c.log.Info("event", "type", in.Type, "id", in.ID)
+		if in.Type == "device.unlinked" {
+			continue // acted on in persist
+		}
 		if c.o.OnEvent != nil {
 			c.o.OnEvent(Event{ID: in.ID, Type: in.Type, Body: in.Body})
 		}
