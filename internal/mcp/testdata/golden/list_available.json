@@ -1,0 +1,41 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"ok\",\"items\":[{\"item_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9XYZ\",\"name\":\"Example login\",\"category\":\"login\",\"labels\":[{\"field_id\":\"username\",\"label\":\"Username\",\"kind\":\"text\"},{\"field_id\":\"password\",\"label\":\"Password\",\"kind\":\"password\"}]},{\"item_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9AAA\",\"name\":\"Empty note\",\"category\":\"note\",\"labels\":[]}]}"
+      }
+    ],
+    "structuredContent": {
+      "status": "ok",
+      "items": [
+        {
+          "item_id": "01JB2Z6V9K3M4N5P6Q7R8S9XYZ",
+          "name": "Example login",
+          "category": "login",
+          "labels": [
+            {
+              "field_id": "username",
+              "label": "Username",
+              "kind": "text"
+            },
+            {
+              "field_id": "password",
+              "label": "Password",
+              "kind": "password"
+            }
+          ]
+        },
+        {
+          "item_id": "01JB2Z6V9K3M4N5P6Q7R8S9AAA",
+          "name": "Empty note",
+          "category": "note",
+          "labels": []
+        }
+      ]
+    },
+    "isError": false
+  }
+}

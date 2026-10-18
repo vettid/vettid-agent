@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": "a",
+  "result": {
+    "capabilities": {
+      "tools": {
+        "listChanged": false
+      }
+    },
+    "instructions": "These tools reach the member's VettID vault, within the grants and approvals the member gives on their phone. Values come from the member's vault and are the member's secrets. Prefer leash.execute_action to leash.request_secret: with it the value never leaves the vault. A tool that answers {\"status\":\"pending\"} waits for the member: check again later with leash.check_status. Errors carry a stable code.",
+    "protocolVersion": "2025-11-25",
+    "serverInfo": {
+      "name": "vettid-agent",
+      "title": "VettID agent connector",
+      "version": "test"
+    }
+  }
+}

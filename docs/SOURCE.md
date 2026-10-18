@@ -19,6 +19,27 @@ v0.4.11 (Apache-2.0) is used only by tests, for its TPM 2.0 simulator
 (the Microsoft reference implementation, built with cgo on the Linux CI
 job); it is not linked into the binary.
 
+`github.com/modelcontextprotocol/go-sdk` v1.8.0 (the official MCP Go
+SDK, 2026-09-04; MIT, with new contributions under Apache-2.0, both
+compatible with AGPL-3.0) is used only by tests: its client drives the
+connector's MCP server over standard input and output, as an MCP client
+would (A3.3). It is not linked into the binary (`deps_test.go`
+checks), and neither are the modules it brings into `go.mod`
+(`google/jsonschema-go`, `segmentio/encoding` and `asm`,
+`yosida95/uritemplate`, `golang.org/x/oauth2`, `x/sync`, `x/time`).
+
+The server itself, `internal/mcp`, is written here on the standard
+library: MCP's stdio transport is newline-delimited JSON-RPC 2.0, and
+the connector needs only `initialize`, `ping`, `tools/list`,
+`tools/call` and `notifications/cancelled`. The SDK's server package
+would compile in its HTTP transports (streamable HTTP and SSE, with
+their OAuth support) and several third-party modules, none of which a
+stdio-only connector may use (AGENT-PLAN AG1a), and it builds tool
+results through `encoding/json`, which the connector avoids for item
+values so that it can zero its copy (README, "Configuring an MCP
+client"). Supported MCP versions: 2025-11-25, 2025-06-18, 2025-03-26
+and 2024-11-05.
+
 ## Why these commits
 
 - **vettid-vault `271f3e2`** (A2.2) adds to the A0.2 pin `1ef2dd9` the
@@ -65,5 +86,6 @@ btcsuite/btcd and decred secp256k1 are no longer compiled in.
 - `go mod verify` (CI, every platform).
 - `deps_test.go`: imports `client` and `vms/leashwire` and uses one
   exported function of each.
+- `deps_test.go`: the binary imports no package of the MCP Go SDK.
 - `vectors_test.go`: the vault's `leash.json` vectors against
   `leashwire.VerifyPresented`; see `testdata/vectors/SOURCE.md`.

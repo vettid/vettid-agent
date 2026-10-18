@@ -1,0 +1,19 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"error\",\"code\":\"vault_unreachable\",\"message\":\"Your vault did not answer. It may be locked; unlock it on your phone.\",\"request_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9REQ\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "error",
+      "code": "vault_unreachable",
+      "message": "Your vault did not answer. It may be locked; unlock it on your phone.",
+      "request_id": "01JB2Z6V9K3M4N5P6Q7R8S9REQ"
+    },
+    "isError": true
+  }
+}

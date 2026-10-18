@@ -1,0 +1,37 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"ok\",\"vault_id\":\"vault-test\",\"device_id\":\"device-test\",\"name\":\"Agent on test\",\"last_contact\":\"2026-10-18T12:00:00Z\",\"access_session\":\"active\",\"access_session_until\":\"2026-10-18T13:00:00Z\",\"suspended\":false,\"grants\":[{\"grant_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9GRA\",\"scope\":\"items.read\",\"approval\":\"ask\",\"per_hour\":60,\"per_day\":600,\"expires_at\":\"2026-11-17T12:00:00Z\",\"status_until\":\"2026-10-18T13:00:00Z\"}],\"grants_as_of\":\"2026-10-18T12:00:00Z\",\"grants_confirmed\":true,\"waiting_for_daily_check\":true}"
+      }
+    ],
+    "structuredContent": {
+      "status": "ok",
+      "vault_id": "vault-test",
+      "device_id": "device-test",
+      "name": "Agent on test",
+      "last_contact": "2026-10-18T12:00:00Z",
+      "access_session": "active",
+      "access_session_until": "2026-10-18T13:00:00Z",
+      "suspended": false,
+      "grants": [
+        {
+          "grant_id": "01JB2Z6V9K3M4N5P6Q7R8S9GRA",
+          "scope": "items.read",
+          "approval": "ask",
+          "per_hour": 60,
+          "per_day": 600,
+          "expires_at": "2026-11-17T12:00:00Z",
+          "status_until": "2026-10-18T13:00:00Z"
+        }
+      ],
+      "grants_as_of": "2026-10-18T12:00:00Z",
+      "grants_confirmed": true,
+      "waiting_for_daily_check": true
+    },
+    "isError": false
+  }
+}

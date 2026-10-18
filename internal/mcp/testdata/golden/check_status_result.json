@@ -1,0 +1,50 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"ok\",\"item\":{\"item_id\":\"01JB2Z6V9K3M4N5P6Q7R8S9XYZ\",\"name\":\"Example login\",\"category\":\"login\",\"fields\":[{\"field_id\":\"username\",\"label\":\"Username\",\"kind\":\"text\",\"value\":\"member@example.test\"},{\"field_id\":\"password\",\"label\":\"Password\",\"kind\":\"password\",\"value\":\"test-value-not-a-secret\"},{\"field_id\":\"address\",\"label\":\"Address\",\"kind\":\"address\",\"value\":{\"city\":\"Testville\",\"line1\":\"1 \\\"Quoted\\\" St\"}},{\"field_id\":\"empty\",\"label\":\"Empty\",\"kind\":\"text\"}],\"notes\":\"note line 1\\nline 2 \\u2028 <&> \\ufffd\"}}"
+      }
+    ],
+    "structuredContent": {
+      "status": "ok",
+      "item": {
+        "item_id": "01JB2Z6V9K3M4N5P6Q7R8S9XYZ",
+        "name": "Example login",
+        "category": "login",
+        "fields": [
+          {
+            "field_id": "username",
+            "label": "Username",
+            "kind": "text",
+            "value": "member@example.test"
+          },
+          {
+            "field_id": "password",
+            "label": "Password",
+            "kind": "password",
+            "value": "test-value-not-a-secret"
+          },
+          {
+            "field_id": "address",
+            "label": "Address",
+            "kind": "address",
+            "value": {
+              "city": "Testville",
+              "line1": "1 \"Quoted\" St"
+            }
+          },
+          {
+            "field_id": "empty",
+            "label": "Empty",
+            "kind": "text"
+          }
+        ],
+        "notes": "note line 1\nline 2 \u2028 <&> \ufffd"
+      }
+    },
+    "isError": false
+  }
+}

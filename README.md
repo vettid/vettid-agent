@@ -24,8 +24,8 @@ vault.
 The rebuild follows the agent connector plan,
 [AGENT-PLAN](https://github.com/vettid/vettid.org/blob/master/docs/AGENT-PLAN.md),
 in small phases. Today the binary has `pair`, `version`, `status` and
-`mcp` (which keeps the vault connection; its MCP tools come later);
-`forget` is listed as not yet available.
+`mcp` (the MCP server with the five LEASH tools); `forget` is listed as
+not yet available.
 
 **It needs a staging vault.** Only vaults whose release channel lists the
 optional `leash` feature answer agent pairing. Staging images list it;
@@ -142,6 +142,69 @@ refuses the agent, it collects what is still waiting for up to a minute
 in case that notice is among it, then exits saying so and keeps its
 keys; `vettid-agent forget` (to come) deletes them.
 
+## Configuring an MCP client
+
+Give each MCP client its own state directory, and pair it first
+(`vettid-agent pair --state-dir DIR`, above). Then add the connector to
+the client as a **stdio** server whose command is `vettid-agent` with
+the arguments `mcp --state-dir DIR`. Most clients take a JSON entry of
+this shape (the file and the name of the top-level member differ from
+client to client; see its documentation):
+
+```json
+{
+  "mcpServers": {
+    "vettid": {
+      "command": "/usr/local/bin/vettid-agent",
+      "args": ["mcp", "--state-dir", "/home/you/.config/vettid-agent/my-client"]
+    }
+  }
+}
+```
+
+Clients that add servers from the command line take the same command,
+for example `<client> mcp add vettid -- vettid-agent mcp --state-dir
+DIR`. Use absolute paths: the client may start the connector in another
+directory and with a smaller `PATH`. Where the keys are protected by a
+passphrase, add `"--passphrase-file", "/path/to/file"` (a file only you
+can read); `mcp` never prompts. Other flags: `--access-minutes N` (the
+access session it asks your phone for, default 60) and `--verbose`
+(logs each message's type and id, and each tool call's name and
+outcome, to standard error, which most clients keep in their MCP log).
+
+The connector speaks MCP versions 2025-11-25, 2025-06-18, 2025-03-26 and
+2024-11-05 (a client that asks for a newer one is offered 2025-11-25),
+over standard input and output only. It offers these tools:
+
+| Tool | What it does |
+|---|---|
+| `leash.list_available` | The items you shared with this agent: id, name, category and field labels, never values |
+| `leash.request_secret` | An item's values (all fields, or those named) |
+| `leash.execute_action` | HMAC-SHA-256 of the agent's data keyed with one field's value, computed in your vault: the value never reaches the agent (preferred where it suffices) |
+| `leash.check_status` | The outcome of a request that answered `pending` |
+| `leash.connection_info` | The vault and device ids, last contact, access session, grants, whether the agent is paused, whether your vault waits for your daily check |
+
+Every result is a JSON object, as structured content and as the same
+JSON in text, with `status` `ok`, `pending` (with a `request_id`) or
+`error` (with a stable `code` and a `message`, and `request_id` or
+`retry_after` where they apply; the result is then marked as an error).
+The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
+`not_found`, `limit`, …) or the connector's own: `access_requested`,
+`access_denied`, `vault_unreachable`, `owner_check_required`,
+`suspended`, `expired`, `bad_request` and `rate_limited_local`.
+
+The connector answers up to 120 tool calls in a burst and then 2 a
+second; calls beyond that get `rate_limited_local` before anything
+reaches your vault.
+A tool call returns within about 20 seconds; while your vault waits for
+your daily check, a tool call makes the connector ask it again at most
+once a minute, so that the agent can continue soon after you check in.
+
+An item's values reach the agent's MCP client in the tool result and go
+no further on this computer: the connector writes them to standard
+output once, zeroes its copy, and never logs or stores them. What the
+client does with them (its context, its logs) is up to the client.
+
 ## Access sessions and `status`
 
 The agent acts only within an access session that you allow on your
@@ -153,7 +216,8 @@ then try again." It never asks more than once at a time, waits 10
 minutes after you decline or leave a request unanswered, asks at most 6
 times an hour, and waits as long as your vault says when it answers that
 the last request was too recent. While your vault waits for your daily
-check, it asks for nothing.
+check, it asks for no access (it only asks your vault whether the check
+was done, at most once a minute and only when a tool is called).
 
 The connector saves the session your phone grants together with the
 message that brought it, including a first session granted with the
@@ -172,18 +236,23 @@ saved state. It shows no keys or tokens.
 
 ## Requests for items and approvals
 
-The MCP tools (to come) reach your items through your vault's LEASH
+The MCP tools reach your items through your vault's LEASH
 requests (VAULT-MESSAGING §10.11): the list of items you shared with the
 agent, reading an item, and using a field without revealing it (an
 HMAC-SHA-256 keyed with the field's value). Your vault decides each
 request from the agent's permissions: it answers at once, refuses, or
 asks you on your phone first.
 
-- A tool call waits up to 20 seconds. If your vault has not answered by
-  then, for example because it is waiting for your approval (up to 5
-  minutes), the tool answers with a request id, and
+- A tool call waits up to 20 seconds in all, including asking your
+  vault whether it has an access session. If your vault has not
+  answered by then, for example because it is waiting for your approval
+  (up to 5 minutes), the tool answers with a request id, and
   `leash.check_status` gives the outcome later. The connector keeps
-  waiting for the answer while it runs.
+  waiting for the answer while it runs (also through a pause of up to
+  30 seconds while it cannot save its state). A request for access that
+  your vault has not answered within the 20 seconds goes on in the
+  background; the tool answers "Your vault did not answer…", and the
+  next call says access was requested.
 - A request that gets no answer is sent again, at most twice, as the
   same message, so that your vault answers the copy instead of running
   it again. A request your vault answered (refused, declined on your

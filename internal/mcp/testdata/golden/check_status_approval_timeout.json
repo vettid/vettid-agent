@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"error\",\"code\":\"approval_timeout\",\"message\":\"Your phone did not answer in time, and the request was dropped. Make it again if you still need it.\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "error",
+      "code": "approval_timeout",
+      "message": "Your phone did not answer in time, and the request was dropped. Make it again if you still need it."
+    },
+    "isError": true
+  }
+}
