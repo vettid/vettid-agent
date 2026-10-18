@@ -40,18 +40,23 @@ package protect
 // local account or a Microsoft account without roaming, the file opens
 // only on this computer.
 //
-// Errors are of three kinds. Definite: ErrDPAPIRefused
+// Errors from Unwrap are of three kinds. Definite: ErrDPAPIRefused
 // (ERROR_INVALID_DATA, NTE_BAD_DATA, ERROR_PASSWORD_RESTRICTION: the
 // blob's integrity check failed, so it was altered or made with other
-// entropy; or what DPAPI returned is not this protector's key) and
-// ErrDPAPIKeyLost (NTE_BAD_KEY_STATE: Windows could not use the master
-// key the blob names). The Windows CI job shows NTE_BAD_KEY_STATE both
-// for another local user's blob (in either direction) and for the
-// user's own blob after an administrator reset the password; whether
-// the master key file is in this user's profile tells the two apart
-// for the message (keyLostHint). Environmental: ErrDPAPIProfile (no
-// loaded profile, or a logon without the user's password). Anything
-// else keeps its cause.
+// entropy; or what DPAPI returned is not this protector's key).
+// Possibly temporary, so not definite: ErrDPAPIKeyLost
+// (NTE_BAD_KEY_STATE: Windows could not use the master key the blob
+// names). The Windows CI job shows NTE_BAD_KEY_STATE for another local
+// user's blob (in either direction), for the user's own blob after an
+// administrator reset the password, and for a blob whose master key
+// GUID was changed; for a domain account whose domain controller is
+// unreachable, or a roaming profile not yet synced, it can pass. Its
+// message says what to check first and to pair again only if it
+// persists; whether the master key file is in this user's profile
+// picks the likelier causes (keyLostHint). Environmental:
+// ErrDPAPIProfile (no loaded profile, or a logon without the user's
+// password). Anything else keeps its cause. Wrap's errors never speak
+// of a state file (there is none yet).
 //
 // Wipe deletes nothing: the DPAPI blob lives only in the state file;
 // Windows keeps no per-blob key, and the user's master keys belong to
@@ -139,7 +144,7 @@ func (DPAPI) Wrap(dataKey []byte) ([]byte, error) {
 	entropy := []byte(dpapiEntropyLabel)
 	var out windows.DataBlob
 	if err := cryptProtect(dataBlob(plain), desc, dataBlob(entropy), 0, nil, dpapiFlags, &out); err != nil {
-		return nil, classifyDPAPI("protect the key", err, nil)
+		return nil, classifyProtect(err)
 	}
 	inner := takeBlob(&out)
 	if _, err := checkDPAPIInner(inner); err != nil {
@@ -176,9 +181,30 @@ func (DPAPI) Unwrap(blob []byte) ([]byte, error) {
 	return dpapiKeyFromPlaintext(plain)
 }
 
-// classifyDPAPI maps a DPAPI failure to a definite, environmental or
-// other error, with the fix. info, when known, refines the message for
-// a key Windows could not use.
+// classifyProtect maps a CryptProtectData failure (Wrap: no state file
+// exists yet). Only the profile case has its own error.
+func classifyProtect(err error) error {
+	var errno windows.Errno
+	if !errors.As(err, &errno) {
+		return fmt.Errorf("DPAPI: protect a new key: %w", err)
+	}
+	switch uint32(errno) {
+	case uint32(windows.ERROR_FILE_NOT_FOUND), uint32(windows.ERROR_PATH_NOT_FOUND),
+		uint32(windows.ERROR_NO_SUCH_LOGON_SESSION), uint32(windows.ERROR_NOT_FOUND):
+		return fmt.Errorf("%w; %s (%s)", ErrDPAPIProfile, profileFix, codeOf(errno))
+	case uint32(windows.NTE_BAD_KEY_STATE):
+		return fmt.Errorf("DPAPI: Windows could not use this user's key to protect a new key: check that you are signed in normally as this user with the profile loaded and, for a domain account, that the domain is reachable (%s)", codeOf(errno))
+	default:
+		return fmt.Errorf("DPAPI: protect a new key: %s", codeOf(errno))
+	}
+}
+
+const profileFix = "run the connector in a logon with the user's password and a loaded profile (not a service or scheduled task without a loaded profile or a stored password); with a roaming profile, wait until the profile is available"
+
+// classifyDPAPI maps a CryptUnprotectData failure to a definite,
+// possibly temporary, environmental or other error, with the fix.
+// info, when known, refines the message for a key Windows could not
+// use.
 func classifyDPAPI(step string, err error, info *dpapiInfo) error {
 	var errno windows.Errno
 	if !errors.As(err, &errno) {
@@ -192,7 +218,7 @@ func classifyDPAPI(step string, err error, info *dpapiInfo) error {
 		return fmt.Errorf("%w: %s (%s)", ErrDPAPIKeyLost, keyLostHint(info), codeOf(errno))
 	case uint32(windows.ERROR_FILE_NOT_FOUND), uint32(windows.ERROR_PATH_NOT_FOUND),
 		uint32(windows.ERROR_NO_SUCH_LOGON_SESSION), uint32(windows.ERROR_NOT_FOUND):
-		return fmt.Errorf("%w; run the connector in a logon with the user's password and a loaded profile (not a service or scheduled task without a loaded profile or a stored password); with a roaming profile, wait until the profile is available (%s)", ErrDPAPIProfile, codeOf(errno))
+		return fmt.Errorf("%w; %s (%s)", ErrDPAPIProfile, profileFix, codeOf(errno))
 	default:
 		return fmt.Errorf("DPAPI: %s: %s", step, codeOf(errno))
 	}
@@ -202,23 +228,24 @@ func codeOf(e windows.Errno) string {
 	return fmt.Sprintf("Windows error 0x%08X: %v", uint32(e), e)
 }
 
-// keyLostHint says which case NTE_BAD_KEY_STATE is most likely, from
-// whether the blob's master key file exists in this user's profile
-// (%APPDATA%\Microsoft\Protect\<SID>\<GUID>; a layout Windows does not
-// document, so this is a hint only: it never changes the error's kind).
+// keyLostHint says what to check for NTE_BAD_KEY_STATE, and the
+// likelier causes, from whether the blob's master key file exists in
+// this user's profile (%APPDATA%\Microsoft\Protect\<SID>\<GUID>; a
+// layout Windows does not document, so this only picks the message: it
+// never changes the error's kind). It can be temporary (a domain
+// controller out of reach, a roaming profile not yet synced), so it
+// asks to check those first and to pair again only if it persists.
 func keyLostHint(info *dpapiInfo) string {
-	const reset = "if an administrator reset this user's password (rather than the user changing it), Windows can no longer use the keys made before; set the old password back if you can, or pair again (`vettid-agent forget`, then `pair`)"
-	const other = "the state file was made by another Windows user or on another computer (or this user's profile was recreated); run the connector as the user who paired it, or pair again (`vettid-agent forget`, then `pair`)"
-	if info == nil {
-		return reset + "; or " + other
-	}
-	switch masterKeyPresent(*info) {
-	case 1:
-		return reset
-	case 0:
-		return other
+	const check = "check first that you are signed in as the Windows user who paired the connector, with the user profile loaded and, for a domain account, the domain reachable; if it persists, pair again (`vettid-agent forget`, then `pair`)"
+	const reset = "the key Windows needs is on this computer but cannot be used, as after an administrator reset this user's password (rather than the user changing it; then set the old password back if you can), or for a domain account whose domain is out of reach"
+	const absent = "the key Windows needs is not in this user's profile: the state file was made by another Windows user or on another computer, this user's profile was recreated or is not fully loaded (a roaming profile not yet synced), or the file was altered or damaged"
+	switch {
+	case info != nil && masterKeyPresent(*info) == 1:
+		return reset + "; " + check
+	case info != nil && masterKeyPresent(*info) == 0:
+		return absent + "; " + check
 	default:
-		return reset + "; or " + other
+		return "the key Windows needs is missing or cannot be used: the state file was made by another Windows user or on another computer, an administrator reset this user's password, the profile is not fully loaded or the domain is out of reach, or the file was altered or damaged; " + check
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -83,9 +84,74 @@ func resetPassword(t *testing.T, name, password string) {
 	}
 }
 
-func deleteLocalUser(name string) {
+// addTestUser creates a local user, registers its deletion (profile
+// first, then the account; a failure is a test error) and returns its
+// SID.
+func addTestUser(t *testing.T, name, password string) string {
+	t.Helper()
+	addLocalUser(t, name, password)
+	sid, _, _, err := windows.LookupSID("", name)
+	if err != nil {
+		deleteLocalUser(t, name)
+		t.Fatalf("LookupSID %s: %v", name, err)
+	}
+	s := sid.String()
+	t.Cleanup(func() {
+		deleteProfile(t, s)
+		deleteLocalUser(t, name)
+	})
+	return s
+}
+
+// deleteProfile deletes a user's profile, retrying while Windows still
+// has it loaded; a profile that was never created is not an error.
+func deleteProfile(t *testing.T, sid string) {
+	t.Helper()
+	p, _ := windows.UTF16PtrFromString(sid)
+	var errno windows.Errno
+	for i := 0; i < 15; i++ {
+		r, _, e := procDeleteProfileW.Call(uintptr(unsafe.Pointer(p)), 0, 0)
+		if r != 0 {
+			return
+		}
+		errno, _ = e.(windows.Errno)
+		if errno == windows.ERROR_FILE_NOT_FOUND || errno == windows.ERROR_PATH_NOT_FOUND {
+			return
+		}
+		time.Sleep(time.Second)
+	}
+	t.Errorf("the profile of %s was not deleted: %v", sid, errno)
+}
+
+func deleteLocalUser(t *testing.T, name string) {
+	t.Helper()
 	n, _ := windows.UTF16PtrFromString(name)
-	procNetUserDel.Call(0, uintptr(unsafe.Pointer(n)))
+	if r, _, _ := procNetUserDel.Call(0, uintptr(unsafe.Pointer(n))); r != 0 {
+		t.Errorf("NetUserDel %s: %v", name, windows.Errno(r))
+	}
+}
+
+// restrictDir gives dir a protected DACL with full access for
+// Administrators and the given SIDs only (inherited by what is created
+// in it).
+func restrictDir(t *testing.T, dir string, sids ...string) {
+	t.Helper()
+	sddl := "D:P(A;OICI;FA;;;BA)"
+	for _, s := range sids {
+		sddl += "(A;OICI;FA;;;" + s + ")"
+	}
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Fatalf("set the test directory's DACL: %v", err)
+	}
 }
 
 // TestDPAPIHelper is the helper mode: it runs only when the test binary
@@ -157,43 +223,43 @@ func TestDPAPIOtherUser(t *testing.T) {
 	if !windows.GetCurrentProcessToken().IsElevated() {
 		t.Fatalf("%s=1 needs an elevated (administrator) process", otherUserEnv)
 	}
-	run := func(name string, args ...string) {
-		t.Helper()
-		out, err := exec.Command(name, args...).CombinedOutput()
-		if err != nil {
-			t.Fatalf("%s %s: %v: %s", name, args[0], err, out)
-		}
-	}
 	// The secondary logon service runs CreateProcessWithLogonW.
 	exec.Command("sc.exe", "config", "seclogon", "start=", "demand").Run()
 	exec.Command("sc.exe", "start", "seclogon").Run()
 
-	// A directory the other user can read and write: the helper binary,
-	// the blobs and the results.
+	// Two test users: the other user, and one started without its
+	// profile (step 4). Each is deleted with its profile afterwards; a
+	// failure to delete fails the test.
+	user := "vta" + randHex(t, 4)
+	pass := "Va1!" + randHex(t, 12) + "-x"
+	sid1 := addTestUser(t, user, pass)
+	user2 := "vtb" + randHex(t, 4)
+	pass3 := "Vc3!" + randHex(t, 12) + "-z"
+	sid2 := addTestUser(t, user2, pass3)
+
+	// A directory only the test users and Administrators can use: the
+	// helper binary, the blobs and the results.
 	dir, err := os.MkdirTemp(os.Getenv("SystemDrive")+`\`, "vettid-agent-dpapi-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	run("icacls.exe", dir, "/grant", "*S-1-5-11:(OI)(CI)M") // Authenticated Users
+	t.Cleanup(func() {
+		var err error
+		for i := 0; i < 10; i++ {
+			if err = os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(time.Second)
+		}
+		t.Errorf("the test directory %s was not removed: %v", dir, err)
+	})
+	restrictDir(t, dir, sid1, sid2)
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(dir, "helper.exe")
 	copyFile(t, self, helper)
-
-	user := "vta" + randHex(t, 4)
-	pass := "Va1!" + randHex(t, 12) + "-x"
-	addLocalUser(t, user, pass)
-	t.Cleanup(func() {
-		if sid, _, _, err := windows.LookupSID("", user); err == nil {
-			if s, err := windows.UTF16PtrFromString(sid.String()); err == nil {
-				procDeleteProfileW.Call(uintptr(unsafe.Pointer(s)), 0, 0)
-			}
-		}
-		deleteLocalUser(user)
-	})
 
 	helperRunAs := func(user, password string, logonFlags uintptr, op, blob string) (status, kind, msg string) {
 		t.Helper()
@@ -252,7 +318,7 @@ func TestDPAPIOtherUser(t *testing.T) {
 	}
 
 	// 3. An administrator resets the other user's password: the user's
-	// earlier key no longer opens, as a definite error.
+	// earlier key no longer opens (ErrDPAPIKeyLost naming the reset).
 	pass2 := "Vb2!" + randHex(t, 12) + "-y"
 	resetPassword(t, user, pass2)
 	status, kind, msg = helperRun(pass2, "unwrap", theirsPath)
@@ -264,17 +330,6 @@ func TestDPAPIOtherUser(t *testing.T) {
 	// 4. A user whose profile is not loaded (a new user, started without
 	// loading its profile): DPAPI cannot reach the user's keys, an
 	// environmental error, not a definite one.
-	user2 := "vtb" + randHex(t, 4)
-	pass3 := "Vc3!" + randHex(t, 12) + "-z"
-	addLocalUser(t, user2, pass3)
-	t.Cleanup(func() {
-		if sid, _, _, err := windows.LookupSID("", user2); err == nil {
-			if s, err := windows.UTF16PtrFromString(sid.String()); err == nil {
-				procDeleteProfileW.Call(uintptr(unsafe.Pointer(s)), 0, 0)
-			}
-		}
-		deleteLocalUser(user2)
-	})
 	status, kind, msg = helperRunAs(user2, pass3, logonNoProfile, "wrap", filepath.Join(dir, "noprofile.blob"))
 	t.Logf("a user without a loaded profile wrapping a key: %s %s: %s", status, kind, msg)
 	if status != "error" || kind != "profile" {

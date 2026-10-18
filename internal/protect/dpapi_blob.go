@@ -12,8 +12,9 @@ package protect
 // with nothing after. The DPAPI part is checked before it is given to
 // Windows: its framing (every length field, nothing left over), the
 // DPAPI blob version 1 and provider GUID, master key version 1, the
-// flags (no CRYPTPROTECT_LOCAL_MACHINE: a machine-scope blob, which any
-// user of the computer could open, is refused), this protector's
+// flags (exactly 0, what Windows writes for a user-scope blob, so a
+// machine-scope blob, which any user of the computer could open, is
+// refused), this protector's
 // description, and the algorithms (AES with SHA-2 only). Microsoft does
 // not document this layout; it is the long-known one (as read by
 // forensic tools such as dpapick and mimikatz). Wrap checks its own
@@ -69,12 +70,14 @@ const (
 
 	// From wincrypt.h / dpapi.h.
 	cryptprotectLocalMachine = 0x4
-	calgAES128               = 0x660e
-	calgAES192               = 0x660f
-	calgAES256               = 0x6610
-	calgSHA256               = 0x800c
-	calgSHA384               = 0x800d
-	calgSHA512               = 0x800e
+	// dpapiBlobFlags is the only flags value accepted in a DPAPI blob.
+	dpapiBlobFlags = 0
+	calgAES128     = 0x660e
+	calgAES192     = 0x660f
+	calgAES256     = 0x6610
+	calgSHA256     = 0x800c
+	calgSHA384     = 0x800d
+	calgSHA512     = 0x800e
 )
 
 // dpapiProvider is the DPAPI provider GUID
@@ -89,10 +92,12 @@ var (
 	// is not this protector's key.
 	ErrDPAPIRefused = errors.New("Windows (DPAPI) does not open the state file's key: the file was altered, or its key was not made by this connector")
 	// ErrDPAPIKeyLost: Windows could not use the user's DPAPI master key
-	// the blob was made under (NTE_BAD_KEY_STATE): the master key is not
-	// in this user's profile (another user, another computer, a
-	// recreated profile), or it is there but cannot be decrypted (an
-	// administrator reset the user's password).
+	// the blob names (NTE_BAD_KEY_STATE): the master key is not in this
+	// user's profile (another user, another computer, a recreated or not
+	// yet synced profile, an altered master key GUID), or it is there
+	// but cannot be decrypted (an administrator reset the user's
+	// password, a domain out of reach). Possibly temporary, so not
+	// definite.
 	ErrDPAPIKeyLost = errors.New("Windows (DPAPI) could not use this user's key for the state file")
 	// ErrDPAPIProfile: the user's profile or logon credentials are not
 	// available to DPAPI in this logon (environmental, not definite).
@@ -185,7 +190,11 @@ func checkDPAPIInner(b []byte) (dpapiInfo, error) {
 		return info, bad
 	}
 	copy(info.masterKey[:], mk)
-	if info.flags, ok = u32(); !ok || info.flags&cryptprotectLocalMachine != 0 {
+	// The flags must be exactly what Windows writes for a user-scope
+	// blob made with CRYPTPROTECT_UI_FORBIDDEN: 0 (seen on windows-2025;
+	// the UI flag is not stored). Anything else, machine scope
+	// (CRYPTPROTECT_LOCAL_MACHINE) included, is refused.
+	if info.flags, ok = u32(); !ok || info.flags != dpapiBlobFlags {
 		return info, bad
 	}
 	if d, ok := field(false); !ok || !bytes.Equal(d, dpapiDescriptionBytes()) {
@@ -245,10 +254,13 @@ func dpapiPlaintext(dataKey []byte) []byte {
 }
 
 func dpapiCheck(dataKey []byte) []byte {
-	h := sha256.New()
-	h.Write([]byte(dpapiCheckLabel))
-	h.Write(dataKey)
-	return h.Sum(nil)[:dpapiCheckLen]
+	buf := make([]byte, 0, len(dpapiCheckLabel)+len(dataKey))
+	buf = append(append(buf, dpapiCheckLabel...), dataKey...)
+	sum := sha256.Sum256(buf)
+	clear(buf)
+	out := append([]byte(nil), sum[:dpapiCheckLen]...)
+	clear(sum[:])
+	return out
 }
 
 // dpapiKeyFromPlaintext checks what CryptUnprotectData returned and

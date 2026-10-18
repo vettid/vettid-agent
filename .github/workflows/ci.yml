@@ -36,12 +36,12 @@ jobs:
       - name: go vet
         run: go vet ./...
       - name: go test
-        # On Windows the DPAPI test creates a local user and runs a helper
-        # as that user (internal/protect/dpapi_otheruser_windows_test.go).
-        env:
-          VETTID_AGENT_TEST_OTHER_USER: ${{ runner.os == 'Windows' && '1' || '' }}
         run: go test ${{ matrix.race }} -count=1 ./...
-      - name: DPAPI tests, verbose (the record of what Windows answered)
+      # The DPAPI tests again, verbose, as the record of what Windows
+      # answered. Only this step creates local test users and runs a helper
+      # as them (internal/protect/dpapi_otheruser_windows_test.go), so that
+      # happens once per run.
+      - name: DPAPI tests, verbose, with test users
         if: runner.os == 'Windows'
         env:
           VETTID_AGENT_TEST_OTHER_USER: "1"

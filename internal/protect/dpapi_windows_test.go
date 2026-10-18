@@ -145,6 +145,7 @@ func TestDPAPITamperedRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	dataStart, signStart := locateDataSign(t, blob[1:])
+	const mkStart = 4 + 16 + 4 // in the DPAPI part
 	kinds := map[string]int{}
 	for i := 1; i < len(blob); i++ {
 		b := append([]byte{}, blob...)
@@ -158,6 +159,14 @@ func TestDPAPITamperedRefused(t *testing.T) {
 		}
 		pos := i - 1
 		region := "header"
+		if pos >= mkStart && pos < mkStart+16 {
+			// Windows cannot find the master key: the message must name
+			// alteration, not only another user or computer.
+			if !errors.Is(err, ErrDPAPIKeyLost) || !strings.Contains(err.Error(), "altered or damaged") {
+				t.Errorf("byte %d (master key GUID) changed: %v, want ErrDPAPIKeyLost naming alteration", i, err)
+			}
+			region = "master key GUID"
+		}
 		switch {
 		case pos >= signStart:
 			region = "signature"
@@ -244,13 +253,29 @@ func TestClassifyDPAPI(t *testing.T) {
 			t.Errorf("0x%x: code missing in %q", c.code, err)
 		}
 	}
-	// Only the refusal and the lost key are definite, and only the lost
-	// key's hint mentions another computer, as one possibility.
+	// Only the lost key's hint mentions another computer, as one
+	// possibility next to alteration, and it asks to check before
+	// pairing again.
 	if strings.Contains(classifyDPAPI("x", windows.ERROR_INVALID_DATA, nil).Error(), "computer") {
 		t.Error("ERROR_INVALID_DATA claims another computer")
 	}
 	if s := classifyDPAPI("x", windows.ERROR_FILE_NOT_FOUND, nil).Error(); strings.Contains(s, "another") {
 		t.Errorf("profile error claims another user or computer: %s", s)
+	}
+	s := classifyDPAPI("x", windows.Errno(windows.NTE_BAD_KEY_STATE), nil).Error()
+	if !strings.Contains(s, "altered or damaged") || !strings.Contains(s, "domain reachable") ||
+		strings.Index(s, "check first") > strings.Index(s, "pair again") {
+		t.Errorf("lost key, unknown cause: %s", s)
+	}
+	// Wrap's errors never speak of a state file or another user.
+	for _, code := range []windows.Errno{windows.Errno(windows.NTE_BAD_KEY_STATE), windows.ERROR_INVALID_DATA, windows.ERROR_ACCESS_DENIED} {
+		s := classifyProtect(code).Error()
+		if strings.Contains(s, "state file") || strings.Contains(s, "another") || strings.Contains(s, "altered") {
+			t.Errorf("Wrap error 0x%x: %s", uint32(code), s)
+		}
+	}
+	if !errors.Is(classifyProtect(windows.ERROR_FILE_NOT_FOUND), ErrDPAPIProfile) {
+		t.Error("Wrap without a profile is not ErrDPAPIProfile")
 	}
 }
 
@@ -272,7 +297,7 @@ func TestDPAPIKeyLostHint(t *testing.T) {
 	if masterKeyPresent(info) != 0 {
 		t.Fatal("an unknown master key reported present")
 	}
-	if h := keyLostHint(&info); !strings.Contains(h, "another Windows user") || strings.Contains(h, "administrator") {
+	if h := keyLostHint(&info); !strings.Contains(h, "another Windows user") || !strings.Contains(h, "altered or damaged") || strings.Contains(h, "administrator") {
 		t.Errorf("absent key hint: %s", h)
 	}
 }
@@ -350,7 +375,7 @@ func TestChooseProtectorWindows(t *testing.T) {
 	}
 	orig := dpapiProbe
 	t.Cleanup(func() { dpapiProbe = orig })
-	profileErr := classifyDPAPI("protect the key", windows.ERROR_FILE_NOT_FOUND, nil)
+	profileErr := classifyProtect(windows.ERROR_FILE_NOT_FOUND)
 	for name, f := range map[string]fakeProbe{
 		"wrap fails":   {wrapErr: profileErr},
 		"unwrap fails": {unwrapErr: ErrDPAPIRefused},
