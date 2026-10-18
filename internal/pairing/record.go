@@ -13,17 +13,66 @@ import (
 // (internal/state encrypts it; docs/STATE-FILE.md "What the state holds"):
 // the vault client's saved state, and how far pairing got.
 //
-//	{"v":1,"phase":"started"|"waiting"|"paired","deadline":"<RFC 3339>","device":{…}}
+//	{"v":1,"phase":"started"|"waiting"|"paired","deadline":"<RFC 3339>","device":{…},
+//	 "access":{"state":"unknown"|"none"|"active","session_id":"…","expires_at":"<RFC 3339>"}}
 //
 // deadline is present exactly while pairing is unfinished (started or
 // waiting): the end of the 10 minutes after hs.init (VAULT-MESSAGING
 // §6.7). device is the client's Save output (secret: keys, tokens, the
 // session keyring). Neither the pairing code nor the SAS is ever stored
 // (AGENT-PLAN §4.7).
+//
+// access (paired records only, optional) is the connector's access
+// session (VAULT-MESSAGING §6.8) as of the save: written by
+// internal/vaultconn from device.session.granted and .ended in the same
+// save as the batch that carried them. A record without it (written
+// before access was kept, or right after pairing) reads as unknown.
 type Record struct {
 	Phase    Phase
 	Deadline time.Time // zero once paired
 	Device   json.RawMessage
+	Access   Access // paired only; the zero value is AccessUnknown
+}
+
+// Access is the access session as the connector last knew it.
+type Access struct {
+	State     AccessState
+	SessionID string    // active only
+	ExpiresAt time.Time // active only; zero when the expiry is not known
+}
+
+// AccessState is the kind of access the connector knows of.
+type AccessState string
+
+const (
+	// AccessUnknown: not known (after pairing, whose first session the
+	// connector does not learn, or a record without the member). The
+	// zero value.
+	AccessUnknown AccessState = ""
+	// AccessNone: no access session.
+	AccessNone AccessState = "none"
+	// AccessActive: a session, until ExpiresAt (if known).
+	AccessActive AccessState = "active"
+)
+
+// maxSessionID bounds a session id (chosen; the vault's are short ids).
+const maxSessionID = 128
+
+// Valid reports whether a has a consistent form.
+func (a Access) Valid() bool {
+	switch a.State {
+	case AccessUnknown, AccessNone:
+		return a.SessionID == "" && a.ExpiresAt.IsZero()
+	case AccessActive:
+		return len(a.SessionID) <= maxSessionID && (a.SessionID != "" || a.ExpiresAt.IsZero())
+	}
+	return false
+}
+
+type accessJSON struct {
+	State     string     `json:"state"`
+	SessionID string     `json:"session_id,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 }
 
 // Phase is how far pairing got.
@@ -52,6 +101,7 @@ type recordJSON struct {
 	Phase    Phase           `json:"phase"`
 	Deadline *time.Time      `json:"deadline,omitempty"`
 	Device   json.RawMessage `json:"device"`
+	Access   *accessJSON     `json:"access,omitempty"`
 }
 
 // ErrRecord: the state file's plaintext is not a valid record.
@@ -66,6 +116,13 @@ func (r *Record) Encode() ([]byte, error) {
 	if r.Phase != PhasePaired {
 		d := r.Deadline.UTC()
 		j.Deadline = &d
+	} else if r.Access.State != AccessUnknown {
+		a := &accessJSON{State: string(r.Access.State), SessionID: r.Access.SessionID}
+		if !r.Access.ExpiresAt.IsZero() {
+			e := r.Access.ExpiresAt.UTC()
+			a.ExpiresAt = &e
+		}
+		j.Access = a
 	}
 	return json.Marshal(j)
 }
@@ -90,6 +147,19 @@ func DecodeRecord(b []byte) (*Record, error) {
 		return nil, fmt.Errorf("%w: unknown version", ErrRecord)
 	}
 	r := &Record{Phase: j.Phase, Device: j.Device}
+	if j.Access != nil {
+		if r.Phase != PhasePaired {
+			return nil, fmt.Errorf("%w: access on an unfinished pairing", ErrRecord)
+		}
+		st := AccessState(j.Access.State)
+		if st == AccessUnknown {
+			return nil, fmt.Errorf("%w: invalid access", ErrRecord)
+		}
+		r.Access = Access{State: st, SessionID: j.Access.SessionID}
+		if j.Access.ExpiresAt != nil {
+			r.Access.ExpiresAt = *j.Access.ExpiresAt
+		}
+	}
 	if j.Deadline != nil {
 		r.Deadline = *j.Deadline
 		if r.Phase == PhasePaired {
@@ -110,7 +180,13 @@ func (r *Record) check() error {
 		if r.Deadline.IsZero() {
 			return fmt.Errorf("%w: an unfinished pairing without a deadline", ErrRecord)
 		}
+		if r.Access.State != AccessUnknown {
+			return fmt.Errorf("%w: access on an unfinished pairing", ErrRecord)
+		}
 	case PhasePaired:
+		if !r.Access.Valid() {
+			return fmt.Errorf("%w: invalid access", ErrRecord)
+		}
 	default:
 		return fmt.Errorf("%w: unknown phase", ErrRecord)
 	}

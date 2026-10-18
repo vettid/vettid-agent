@@ -97,6 +97,9 @@ type Vault struct {
 	// FailAcks makes every ack fail (the message stays in the mailbox),
 	// as if the device stopped between saving and acknowledging.
 	FailAcks bool
+	// GrantListError, if set, answers leash.grant.list with this error
+	// code (for example session_required) instead of an empty list.
+	GrantListError string
 	// DepositError, if set, answers the device's deposits to the vault's
 	// mailbox after pairing with this error (for example 403
 	// token_revoked).
@@ -563,6 +566,14 @@ func (v *Vault) toVault(payload []byte) {
 		if v.session != nil {
 			if in, _, err := v.session.Open(env, now); err == nil {
 				v.received = append(v.received, in.Type)
+				if in.Type == "leash.grant.list" && in.Re == "" {
+					resp := &envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK, Body: []byte(`{"grants":[],"suspended":false}`)}
+					if v.GrantListError != "" {
+						resp.Status, resp.Body = envelope.StatusError, nil
+						resp.Error = &envelope.Error{Code: v.GrantListError}
+					}
+					_, _ = v.sealLocked(resp)
+				}
 				if in.Type == "vault.status" && in.Re == "" {
 					_, _ = v.sealLocked(&envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK,
 						Body: []byte(`{"vault_id":"` + VaultID + `","state_seq":1,"header_seq":1,"provisional":false,"devices":[],"connections":[],"owner_check":{"state":"ok"}}`)})

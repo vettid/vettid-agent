@@ -830,3 +830,44 @@ func TestPairPairedSavedBeforeAck(t *testing.T) {
 		t.Errorf("paired written %d times: %v", n, sp.writes)
 	}
 }
+
+// TestRecordAccess: the access member round-trips on a paired record; a
+// record without it (older, or right after pairing) reads as unknown;
+// malformed or misplaced access is refused.
+func TestRecordAccess(t *testing.T) {
+	exp := time.Unix(1790856600, 0).UTC()
+	for _, a := range []Access{
+		{},
+		{State: AccessNone},
+		{State: AccessActive},
+		{State: AccessActive, SessionID: "s1", ExpiresAt: exp},
+	} {
+		b, err := (&Record{Phase: PhasePaired, Device: json.RawMessage(`{}`), Access: a}).Encode()
+		if err != nil {
+			t.Fatalf("%+v: %v", a, err)
+		}
+		r, err := DecodeRecord(b)
+		if err != nil || r.Access != a {
+			t.Errorf("%+v: got %+v, %v (%s)", a, r.Access, err, b)
+		}
+	}
+	old := `{"v":1,"phase":"paired","device":{}}`
+	if r, err := DecodeRecord([]byte(old)); err != nil || r.Access.State != AccessUnknown {
+		t.Errorf("old record: %+v %v", r, err)
+	}
+	for _, bad := range []string{
+		`{"v":1,"phase":"paired","device":{},"access":{"state":""}}`,
+		`{"v":1,"phase":"paired","device":{},"access":{"state":"maybe"}}`,
+		`{"v":1,"phase":"paired","device":{},"access":{"state":"none","session_id":"x"}}`,
+		`{"v":1,"phase":"paired","device":{},"access":{"state":"active","expires_at":"2026-10-01T12:00:00Z"}}`,
+		`{"v":1,"phase":"paired","device":{},"access":{"state":"active","x":1}}`,
+		`{"v":1,"phase":"waiting","deadline":"2026-10-01T12:00:00Z","device":{},"access":{"state":"none"}}`,
+	} {
+		if _, err := DecodeRecord([]byte(bad)); !errors.Is(err, ErrRecord) {
+			t.Errorf("%s: %v", bad, err)
+		}
+	}
+	if _, err := (&Record{Phase: PhaseWaiting, Deadline: exp, Device: json.RawMessage(`{}`), Access: Access{State: AccessNone}}).Encode(); err == nil {
+		t.Error("encoded access on an unfinished pairing")
+	}
+}

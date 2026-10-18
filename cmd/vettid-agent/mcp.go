@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/vettid/vettid-agent/internal/access"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/state"
 	"github.com/vettid/vettid-agent/internal/vaultconn"
@@ -40,6 +41,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	dir := fs.String("state-dir", "", "the state `DIR`ectory of this MCP client's pairing (required)")
+	accessMinutes := fs.Int("access-minutes", 60, "how long an access session to ask your phone for, in `minutes` (1 to 1440)")
 	verbose := fs.Bool("verbose", false, "log each message type and id to standard error")
 	prot := &pairing.Protectors{NoPrompt: true}
 	prot.Source.AddFlags(fs)
@@ -53,7 +55,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		}
 		return 2
 	}
-	if *dir == "" || fs.NArg() != 0 {
+	if *dir == "" || fs.NArg() != 0 || *accessMinutes < 1 || *accessMinutes > 1440 {
 		fs.Usage()
 		return 2
 	}
@@ -102,12 +104,18 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	if *verbose {
 		level = slog.LevelInfo
 	}
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+	// The access policy (AG8) sees each event and vault.status; it is
+	// created once the connection exists (the callbacks run only in Run).
+	var mgr *access.Manager
 	o := vaultconn.Options{
-		Store:   store,
-		Resolve: resolve,
-		Record:  rec,
-		Out:     stderr,
-		Log:     slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level})),
+		Store:    store,
+		Resolve:  resolve,
+		Record:   rec,
+		Out:      stderr,
+		Log:      logger,
+		OnEvent:  func(ev vaultconn.Event) { mgr.OnEvent(ev) },
+		OnStatus: func(oc string) { mgr.OnStatus(oc) },
 	}
 	if mcpOptions != nil {
 		mcpOptions(&o)
@@ -116,6 +124,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(err)
 	}
+	mgr = access.New(conn, *accessMinutes*60, nil)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -128,6 +137,13 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	go func() {
 		_, _ = io.Copy(io.Discard, in)
 		cancel()
+	}()
+	// A saved session that has not expired is checked once at start
+	// (internal/access Start), through Run's goroutine.
+	go func() {
+		if err := mgr.Start(ctx); err != nil && ctx.Err() == nil {
+			logger.Warn("access session check at start failed", "err", err)
+		}
 	}()
 	err = conn.Run(ctx)
 	switch {
