@@ -42,6 +42,7 @@ type Protectors struct {
 
 	choose   func(protect.ChooseOptions) (protect.Choice, error)
 	platform func(string) state.Protector
+	notices  func() []string // DPAPI's reach notices; tests replace it
 
 	cached   state.Protector // the resolver's passphrase protector
 	resolErr error
@@ -59,6 +60,13 @@ func (c *Protectors) platformFn() func(string) state.Protector {
 		return c.platform
 	}
 	return protect.Platform
+}
+
+func (c *Protectors) dpapiNotices() func() []string {
+	if c.notices != nil {
+		return c.notices
+	}
+	return protect.DPAPINotices
 }
 
 // sourceGiven reports whether a passphrase source flag was given.
@@ -95,7 +103,16 @@ func (c *Protectors) New() (state.Protector, string, error) {
 			if p == nil {
 				return nil, "", fmt.Errorf("the protector %q is not available in this build", choice.Protector)
 			}
-			return p, "Keys are bound to this computer: " + choice.Reason + ".", nil
+			notice := "Keys are bound to this computer: " + choice.Reason + "."
+			if choice.Protector == protect.DPAPIName {
+				// How far the account's DPAPI keys reach beyond this
+				// computer (owner decision, 2026-10-18): not refused,
+				// said.
+				for _, n := range c.dpapiNotices()() {
+					notice += "\n" + n
+				}
+			}
+			return p, notice, nil
 		}
 	}
 	pass, err := c.readPass(promptNewPassphrase, true)

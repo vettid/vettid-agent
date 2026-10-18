@@ -110,3 +110,39 @@ func TestProtectorsResolve(t *testing.T) {
 		t.Error("an unreadable passphrase source was not reported")
 	}
 }
+
+// TestProtectorsNewDPAPINotices: when DPAPI is chosen, the notices of
+// how far the account's DPAPI keys reach follow the protector's line
+// (owner decision, 2026-10-18); another protector does not ask.
+func TestProtectorsNewDPAPINotices(t *testing.T) {
+	dpapi := &testProtector{name: protect.DPAPIName}
+	platform := func(name string) state.Protector {
+		if name == protect.DPAPIName {
+			return dpapi
+		}
+		return fakePlatform(name)
+	}
+	chosen := protect.Choice{Protector: protect.DPAPIName, Reason: "Windows DPAPI, for this Windows user", MachineBound: true}
+	for _, tc := range []struct {
+		name    string
+		notices []string
+		want    string
+	}{
+		{"local", nil, "Keys are bound to this computer: Windows DPAPI, for this Windows user."},
+		{"domain and roaming", []string{protect.TextDPAPIDomain, protect.TextDPAPIRoaming},
+			"Keys are bound to this computer: Windows DPAPI, for this Windows user.\n" + protect.TextDPAPIDomain + "\n" + protect.TextDPAPIRoaming},
+	} {
+		c := noFD(&Protectors{choose: fakeChoose(chosen, nil), platform: platform, notices: func() []string { return tc.notices }})
+		p, notice, err := c.New()
+		if err != nil || p != dpapi || notice != tc.want {
+			t.Errorf("%s: %v %v %q", tc.name, p, err, notice)
+		}
+	}
+
+	asked := false
+	works := protect.Choice{Protector: "tpm", Reason: "TPM 2.0 at /dev/tpmrm0", MachineBound: true}
+	c := noFD(&Protectors{choose: fakeChoose(works, nil), platform: platform, notices: func() []string { asked = true; return []string{protect.TextDPAPIDomain} }})
+	if _, notice, err := c.New(); err != nil || asked || strings.Contains(notice, protect.TextDPAPIDomain) {
+		t.Errorf("tpm: %v asked=%v %q", err, asked, notice)
+	}
+}

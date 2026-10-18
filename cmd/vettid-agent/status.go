@@ -17,6 +17,10 @@ import (
 // statusResolve replaces the protector resolver (tests' protector).
 var statusResolve state.Resolver
 
+// statusDPAPINotices says how far this Windows account's DPAPI keys
+// reach beyond this computer; tests replace it.
+var statusDPAPINotices = protect.DPAPINotices
+
 const statusUsage = `Usage: vettid-agent status --state-dir DIR [--passphrase-fd N | --passphrase-file PATH]
 
 Shows the pairing, access and grants saved in DIR. It does not contact your
@@ -107,6 +111,13 @@ func writeStatus(w io.Writer, dir string, v *state.View, rec *pairing.Record, no
 		fmt.Fprintf(w, "Keys: %s\n", protect.NotMachineBound)
 	default:
 		fmt.Fprintf(w, "Keys: protected by %s, bound to this computer\n", protectorLabel(v.Protector))
+		if v.Protector == protect.DPAPIName {
+			// Owner decision, 2026-10-18: a domain account or a roaming
+			// profile is not refused, but said.
+			for _, n := range statusDPAPINotices() {
+				fmt.Fprintf(w, "  %s\n", n)
+			}
+		}
 	}
 	fmt.Fprintln(w, "Read without taking the state directory's lock: if `vettid-agent mcp` runs for it, this is its last saved state.")
 }

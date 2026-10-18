@@ -35,10 +35,13 @@ type toolDef struct {
 }
 
 type annotations struct {
-	Title          string `json:"title"`
-	ReadOnlyHint   bool   `json:"readOnlyHint"`
-	OpenWorldHint  bool   `json:"openWorldHint"`
-	IdempotentHint bool   `json:"idempotentHint"`
+	Title string `json:"title"`
+	// ReadOnlyHint is left out where it is not set: leash.request_secret
+	// hands the member's values to the agent's app, so it carries none
+	// (owner decision, 2026-10-18).
+	ReadOnlyHint   bool `json:"readOnlyHint,omitempty"`
+	OpenWorldHint  bool `json:"openWorldHint"`
+	IdempotentHint bool `json:"idempotentHint"`
 }
 
 type tool struct {
@@ -106,7 +109,7 @@ func (s *Server) toolSet() []*tool {
 					`"fields":{"type":"array","items":` + fieldIDSchema + `,"minItems":1,"maxItems":64,"uniqueItems":true,` +
 					`"description":"Only these fields (field ids from leash.list_available); all fields if absent."}` +
 					`},"required":["item_id"],"additionalProperties":false}`),
-				Annotations: annotations{Title: "Read an item's values", ReadOnlyHint: true},
+				Annotations: annotations{Title: "Read an item's values"},
 			},
 			run: s.requestSecret,
 		},
