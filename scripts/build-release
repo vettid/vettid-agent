@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# Build the release binaries of vettid-agent reproducibly (AGENT-PLAN §2
+# AG4, §6 A5.1): the same commit gives byte-identical binaries on any
+# Linux or macOS machine, whatever its own Go version and architecture.
+#
+#   scripts/build-release [-o OUT_DIR] [REF]     (defaults: dist/, HEAD)
+#
+# Writes OUT_DIR/vettid-agent-<version>-<os>-<arch>[.exe] for
+# linux/amd64, linux/arm64 and windows/amd64, and OUT_DIR/SHA256SUMS
+# (`sha256sum` format, sorted by name). OUT_DIR is emptied first. The
+# binaries are unsigned; the owner signs SHA256SUMS separately (A5.2).
+#
+# How the output is pinned:
+#   - The source is the committed tree of REF (`git archive`), extracted
+#     into a new temporary directory: uncommitted or untracked files in
+#     the checkout never reach a release build.
+#   - The toolchain is exactly go.mod's toolchain line (GOTOOLCHAIN set to
+#     it, so the go command downloads that release from the Go module
+#     proxy, checksum-verified, if the local Go differs); the script
+#     refuses to build if another toolchain answers.
+#   - CGO_ENABLED=0, -trimpath, -buildvcs=false, no build tags,
+#     -ldflags "-s -w -buildid= -X ...", GOAMD64=v1, GOARM64=v8.0, no
+#     GOEXPERIMENT, GOFLAGS=-mod=readonly, GOWORK=off, a fresh build cache.
+#   - The version is the tag on REF matching v<major>.<minor>.<patch>[-pre]
+#     (exactly one such tag), or "untagged"; VERSION=... overrides it. The
+#     version and the full commit hash are embedded with -X; the binary
+#     carries no other VCS stamp, so the checkout's state cannot leak in.
+#   - SOURCE_DATE_EPOCH is REF's commit time; the binaries' modification
+#     times are set to it (Go's output does not depend on the clock).
+#
+# Every binary then passes scripts/check-release-binaries (toolchain,
+# CGO_ENABLED=0, -trimpath, and never the devstack tag).
+#
+# macOS is not built here: its Keychain protector needs cgo, built on a
+# macOS machine (AGENT-PLAN AG4, A5.3).
+#
+# Optional: GO_BUILD_P=N limits the parallelism of each go build.
+set -euo pipefail
+
+usage() { echo "usage: scripts/build-release [-o OUT_DIR] [REF]" >&2; exit 2; }
+log() { echo "build-release: $*" >&2; }
+
+out="dist"
+while getopts "o:" opt; do
+  case "$opt" in
+    o) out="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ "$#" -le 1 ] || usage
+ref="${1:-HEAD}"
+mkdir -p "$out"
+outabs="$(cd "$out" && pwd)"
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$repo"
+git rev-parse --git-dir >/dev/null 2>&1 || { log "FAIL not in a git repository"; exit 1; }
+commit="$(git rev-parse --verify --quiet "${ref}^{commit}")" || { log "FAIL $ref is not a commit"; exit 1; }
+
+if [ -n "${VERSION:-}" ]; then
+  version="$VERSION"
+else
+  tags="$(git tag --points-at "$commit" --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' || true)"
+  case "$(printf '%s' "$tags" | grep -c . || true)" in
+    0) version="untagged" ;;
+    1) version="$tags" ;;
+    *) log "FAIL several version tags on $commit: $(echo $tags); set VERSION"; exit 1 ;;
+  esac
+fi
+if ! [[ "$version" =~ ^(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?|untagged)$ ]]; then
+  log "FAIL version \"$version\" is not v<major>.<minor>.<patch>[-pre] or untagged"
+  exit 1
+fi
+
+SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$commit")"
+export SOURCE_DATE_EPOCH
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-release.XXXXXXXX")"
+trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
+src="$work/src"
+mkdir -p "$src"
+git archive --format=tar "$commit" | tar -x -C "$src"
+
+toolchain="$(awk '$1 == "toolchain" { print $2 }' "$src/go.mod")"
+if ! [[ "$toolchain" =~ ^go[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  log "FAIL go.mod at $commit has no toolchain line naming a release (got \"$toolchain\")"
+  exit 1
+fi
+
+# The build environment. Everything that changes Go's output is set here,
+# not taken from the caller or from `go env -w`.
+export GOTOOLCHAIN="$toolchain"
+export CGO_ENABLED=0
+export GOFLAGS=-mod=readonly
+export GOWORK=off
+export GOAMD64=v1
+export GOARM64=v8.0
+export GOCACHE="$work/gocache"
+unset GOEXPERIMENT GOARM GO386 GOPPC64 GOMIPS GOMIPS64 GORISCV64 GOWASM GODEBUG CC CXX CGO_CFLAGS CGO_LDFLAGS
+
+cd "$src"
+got="$(go env GOVERSION)"
+if [ "$got" != "$toolchain" ]; then
+  log "FAIL the go command reports $got, go.mod names $toolchain"
+  exit 1
+fi
+if [ -n "$(go env GOEXPERIMENT)" ]; then
+  log "FAIL GOEXPERIMENT is set ($(go env GOEXPERIMENT)) by the go environment; unset it"
+  exit 1
+fi
+log "commit $commit, version $version, $toolchain, SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+go mod verify >&2
+
+find "$outabs" -mindepth 1 -maxdepth 1 -name 'vettid-agent-*' -delete
+rm -f "$outabs/SHA256SUMS"
+
+ldflags="-s -w -buildid= -X main.releaseVersion=$version -X main.releaseCommit=$commit"
+par=()
+if [ -n "${GO_BUILD_P:-}" ]; then par=(-p "$GO_BUILD_P"); fi
+
+names=()
+for target in linux/amd64 linux/arm64 windows/amd64; do
+  goos="${target%/*}"; goarch="${target#*/}"
+  ext=""; [ "$goos" = windows ] && ext=".exe"
+  name="vettid-agent-$version-$goos-$goarch$ext"
+  log "building $name"
+  GOOS="$goos" GOARCH="$goarch" go build "${par[@]}" -trimpath -buildvcs=false -tags= \
+    -ldflags="$ldflags" -o "$outabs/$name" ./cmd/vettid-agent
+  touch -d "@$SOURCE_DATE_EPOCH" "$outabs/$name" 2>/dev/null || touch -t "$(date -u -r "$SOURCE_DATE_EPOCH" +%Y%m%d%H%M.%S)" "$outabs/$name"
+  names+=("$name")
+done
+
+cd "$outabs"
+"$src/scripts/check-release-binaries" "${names[@]/#/$outabs/}"
+if command -v sha256sum >/dev/null; then
+  sha256sum "${names[@]}" | LC_ALL=C sort -k2 >SHA256SUMS
+else
+  shasum -a 256 "${names[@]}" | LC_ALL=C sort -k2 >SHA256SUMS
+fi
+log "PASS $outabs"
+cat SHA256SUMS

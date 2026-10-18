@@ -47,7 +47,8 @@ go test -race ./...    # where cgo is available (Linux, macOS)
 ```
 
 CI runs `go vet`, `go test` (with `-race` on Linux and macOS), gitleaks
-and govulncheck on Linux, macOS and Windows runners.
+and govulncheck on Linux, macOS and Windows runners. Release binaries are
+built differently, reproducibly: see [Releases](#releases).
 
 ## Design rules
 
@@ -410,6 +411,72 @@ The connector takes the passphrase from one of:
 The passphrase is read **before** the state directory is opened; a
 descriptor given while the connector already holds its state directory
 is refused.
+
+## Releases
+
+Release binaries are built reproducibly: anyone can rebuild a release
+from its tag and get byte-identical files. They are static
+(`CGO_ENABLED=0`) builds for **Linux amd64 and arm64** and **Windows
+amd64**. macOS binaries come later: the macOS Keychain needs cgo and a
+macOS build machine.
+
+### Building
+
+```sh
+scripts/build-release              # HEAD into dist/
+scripts/build-release -o out v0.1.0
+```
+
+`scripts/build-release` needs git and Go 1.21 or later on Linux or macOS.
+It builds the committed tree of the given commit (never uncommitted
+files) in a new temporary directory, with exactly the toolchain named on
+`go.mod`'s `toolchain` line: if the local Go is a different version, the
+go command downloads that release (checksum-verified), and the script
+refuses to build if any other toolchain answers. It sets everything that
+changes Go's output (`-trimpath`, `-buildvcs=false`, no build tags,
+`-ldflags "-s -w -buildid="`, `GOAMD64=v1`, `GOARM64=v8.0`, no
+`GOEXPERIMENT`, a fresh build cache) and takes `SOURCE_DATE_EPOCH` from
+the commit. The version is the commit's `v*` tag (or `untagged`); it and
+the full commit hash are embedded, and `vettid-agent version` prints
+them. The output is one binary per platform,
+`vettid-agent-<version>-<os>-<arch>`, and `SHA256SUMS`.
+
+Every binary is checked with `scripts/check-release-binaries`, which
+reads Go's embedded build information and fails on another toolchain,
+cgo, a missing `-trimpath`, a VCS stamp, a `GOEXPERIMENT`, or any build
+tag. A build with the `devstack` tag (which accepts a plain-HTTP relay on
+loopback, for vettid-vault's local dev stack) is never a release;
+`vettid-agent version` says so on such a build.
+
+### Verifying a release
+
+```sh
+git clone https://github.com/vettid/vettid-agent && cd vettid-agent
+# download SHA256SUMS from the release, then:
+scripts/verify-reproducible v0.1.0 /path/to/SHA256SUMS
+```
+
+`scripts/verify-reproducible` clones the repository into a new temporary
+directory, checks out the tag, runs that tag's own
+`scripts/build-release` there with a fresh build cache (`-m` also uses a
+fresh module cache, which downloads the toolchain and every module again)
+and compares the result with the given `SHA256SUMS`: the same files and
+the same hashes. It exits non-zero on any difference. Then check the
+downloaded binary against the same file (`sha256sum -c SHA256SUMS
+--ignore-missing`).
+
+**Signatures come later.** The release workflow
+([.github/workflows/release.yml](.github/workflows/release.yml)) builds
+every version tag twice, on an amd64 and an arm64 runner, requires
+identical output and creates a **draft** GitHub release with the
+**unsigned** binaries and `SHA256SUMS`. The owner signs `SHA256SUMS`
+offline with the release key and publishes the release; the signature
+format, the public key's place on vettid.org and how to check the
+signature come with that step (AGENT-PLAN A5.2). No CI system or other
+third party holds a VettID signing key, and the connector does not
+update itself. Until a release is signed, a rebuild that matches is the
+check. Pull requests run the same two builds and comparison as a dry
+run.
 
 ## License
 

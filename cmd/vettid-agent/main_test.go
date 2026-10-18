@@ -20,8 +20,12 @@ func TestVersionPrintsVersionCommitAndGo(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q", code, errOut)
 	}
 	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("want 3 lines, got %q", out)
+	want := 3
+	if readVersion().Devstack {
+		want = 4 // the devstack line (go test -tags devstack)
+	}
+	if len(lines) != want {
+		t.Fatalf("want %d lines, got %q", want, out)
 	}
 	if !strings.HasPrefix(lines[0], "vettid-agent ") || len(lines[0]) <= len("vettid-agent ") {
 		t.Errorf("version line %q", lines[0])
@@ -59,6 +63,38 @@ func TestVersionFrom(t *testing.T) {
 	want := "vettid-agent v0.1.0\ncommit: 0123456789abcdef0123456789abcdef01234567 (modified)\ngo: go1.26.0\n"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestVersionFromDevstackBuild(t *testing.T) {
+	for _, tags := range []string{"devstack", "foo,devstack", "devstack,bar"} {
+		bi := &debug.BuildInfo{
+			GoVersion: "go1.26.9",
+			Settings:  []debug.BuildSetting{{Key: "-tags", Value: tags}},
+		}
+		v := versionFrom(bi)
+		if !v.Devstack {
+			t.Errorf("-tags=%s: not reported as a devstack build", tags)
+		}
+		if !strings.HasSuffix(v.String(), "build: devstack (accepts a plain-HTTP relay on loopback; not a release build)\n") {
+			t.Errorf("-tags=%s: output %q", tags, v.String())
+		}
+	}
+	for _, tags := range []string{"", "devstackx", "nodevstack,foo"} {
+		bi := &debug.BuildInfo{Settings: []debug.BuildSetting{{Key: "-tags", Value: tags}}}
+		if v := versionFrom(bi); v.Devstack || strings.Contains(v.String(), "devstack") {
+			t.Errorf("-tags=%q: reported as a devstack build: %q", tags, v.String())
+		}
+	}
+}
+
+func TestReleaseStampOverridesBuildInfo(t *testing.T) {
+	oldV, oldC := releaseVersion, releaseCommit
+	t.Cleanup(func() { releaseVersion, releaseCommit = oldV, oldC })
+	releaseVersion, releaseCommit = "v0.1.0", "0123456789abcdef0123456789abcdef01234567"
+	v := readVersion()
+	if v.Version != "v0.1.0" || v.Commit != "0123456789abcdef0123456789abcdef01234567" {
+		t.Errorf("got %+v", v)
 	}
 }
 

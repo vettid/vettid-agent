@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Check that binaries are release builds of vettid-agent, from the build
+# information Go embeds (`go version -m`):
+#
+#   - built by exactly the toolchain named in go.mod's toolchain line,
+#   - CGO_ENABLED=0 and -trimpath=true,
+#   - no build tags, and in particular never the devstack tag (a devstack
+#     build accepts a plain-HTTP relay on a loopback address),
+#   - no GOEXPERIMENT, and no VCS stamp (release builds use -buildvcs=false).
+#
+#   scripts/check-release-binaries FILE...
+#
+# Run from the repository (it reads go.mod). Exits non-zero, naming the
+# file and the reason, if any binary fails.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+if [ "$#" -eq 0 ]; then
+  echo "usage: scripts/check-release-binaries FILE..." >&2
+  exit 2
+fi
+toolchain="$(awk '$1 == "toolchain" { print $2 }' go.mod)"
+if [ -z "$toolchain" ]; then
+  echo "check-release-binaries: FAIL go.mod has no toolchain line" >&2
+  exit 1
+fi
+
+fail=0
+for f in "$@"; do
+  if ! info="$(go version -m "$f" 2>&1)"; then
+    echo "check-release-binaries: FAIL $f: no Go build information: $info" >&2
+    fail=1
+    continue
+  fi
+  bad() { echo "check-release-binaries: FAIL $f: $*" >&2; fail=1; }
+  # First line: "<file>: go1.26.9"
+  got_tc="$(printf '%s\n' "$info" | head -n1 | awk '{ print $NF }')"
+  [ "$got_tc" = "$toolchain" ] || bad "built by $got_tc, go.mod names $toolchain"
+  printf '%s\n' "$info" | grep -qxF $'\tpath\tgithub.com/vettid/vettid-agent/cmd/vettid-agent' \
+    || bad "not github.com/vettid/vettid-agent/cmd/vettid-agent"
+  tags="$(printf '%s\n' "$info" | awk -F'\t' '$2 == "build" && $3 ~ /^-tags=/ { sub(/^-tags=/, "", $3); print $3 }')"
+  case ",$tags," in
+    *,devstack,*) bad "built with the devstack tag (-tags=$tags): never a release" ;;
+  esac
+  [ -z "$tags" ] || bad "built with build tags (-tags=$tags); release builds use none"
+  printf '%s\n' "$info" | grep -qxF $'\tbuild\tCGO_ENABLED=0' || bad "not CGO_ENABLED=0"
+  printf '%s\n' "$info" | grep -qxF $'\tbuild\t-trimpath=true' || bad "not -trimpath"
+  if printf '%s\n' "$info" | grep -q $'^\tbuild\tGOEXPERIMENT='; then bad "built with a GOEXPERIMENT"; fi
+  if printf '%s\n' "$info" | grep -q $'^\tbuild\tvcs'; then bad "carries a VCS stamp (not -buildvcs=false)"; fi
+done
+exit "$fail"

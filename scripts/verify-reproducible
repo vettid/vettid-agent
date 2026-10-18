@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Rebuild a release from source and compare it with its SHA256SUMS
+# (AGENT-PLAN §2 AG4, §6 A5.1).
+#
+#   scripts/verify-reproducible [-m] [-k] REF SHA256SUMS
+#
+# REF is the release tag (for example v0.1.0) or a commit; SHA256SUMS is
+# the file published with the release (or written by another build).
+# The script clones this repository into a new temporary directory,
+# checks out REF there, runs REF's own scripts/build-release in that
+# clone with a fresh build cache, and compares the result with
+# SHA256SUMS: the same file names and the same hashes, nothing more and
+# nothing less. It exits 0 only if everything matches, and 1 on any
+# difference (printed as a diff).
+#
+#   -m  also use a fresh Go module cache (downloads the toolchain and
+#       every module again, checksum-verified against go.sum and the Go
+#       checksum database)
+#   -k  keep the temporary directory and say where it is
+#
+# Fetch the release tag first (git fetch --tags). Checking the owner's
+# signature over SHA256SUMS is a separate step (README, "Verifying a
+# release").
+set -euo pipefail
+
+usage() { echo "usage: scripts/verify-reproducible [-m] [-k] REF SHA256SUMS" >&2; exit 2; }
+log() { echo "verify-reproducible: $*" >&2; }
+
+fresh_modcache=0
+keep=0
+while getopts "mk" opt; do
+  case "$opt" in
+    m) fresh_modcache=1 ;;
+    k) keep=1 ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ "$#" -eq 2 ] || usage
+ref="$1"
+sums="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
+[ -f "$sums" ] || { log "FAIL $2 is not a file"; exit 1; }
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+commit="$(git -C "$repo" rev-parse --verify --quiet "${ref}^{commit}")" || { log "FAIL $ref is not a commit here (git fetch --tags?)"; exit 1; }
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-verify.XXXXXXXX")"
+cleanup() {
+  if [ "$keep" = 1 ]; then log "kept $work"; return; fi
+  chmod -R u+w "$work" 2>/dev/null || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+log "cloning into $work/repo"
+git clone --quiet --no-local --no-checkout "$repo" "$work/repo"
+git -C "$work/repo" -c advice.detachedHead=false checkout --quiet "$commit"
+if [ "$fresh_modcache" = 1 ]; then
+  export GOMODCACHE="$work/gomodcache"
+fi
+TMPDIR="$work" "$work/repo/scripts/build-release" -o "$work/out" "$commit"
+
+if diff -u "$sums" "$work/out/SHA256SUMS"; then
+  log "PASS $ref ($commit) rebuilds to the hashes in $2"
+else
+  log "FAIL the rebuild of $ref ($commit) differs from $2 (- given, + rebuilt)"
+  exit 1
+fi
