@@ -466,17 +466,24 @@ scripts/verify-reproducible v0.1.0 /path/to/SHA256SUMS
 ```
 
 `scripts/verify-reproducible` clones the repository into a new temporary
-directory, checks out the tag and runs that tag's own
-`scripts/build-release` there with a fresh build cache (`-m` also uses a
-fresh module cache, which downloads the toolchain and every module
-again). It then uses your checkout's own tools, not the tag's: it hashes
-the rebuilt binaries itself, checks them with your checkout's
-`scripts/check-release-binaries`, and compares the hashes with the given
-`SHA256SUMS`: the same files and the same hashes, nothing more and
-nothing less. It exits non-zero on any difference, and prints how the
-tag's `scripts/` differ from yours so you can read what the tag's build
-script does differently. Then check the downloaded binary against the
-same file:
+directory and checks out the tag. It first prints how the tag's
+`scripts/` differ from yours, so you can read what the tag's build script
+does differently, then runs that tag's own `scripts/build-release` there
+with a fresh build cache (`-m` also uses a fresh module cache, which
+downloads the toolchain and every module again). It then uses your
+checkout's own tools, not the tag's: it hashes the rebuilt binaries
+itself, checks them with your checkout's
+`scripts/check-release-binaries`, on Linux amd64 and arm64 runs the
+binary for your machine and checks that `version` names the tag and its
+commit, and compares the hashes with the given `SHA256SUMS`: the same
+files and the same hashes, nothing more and nothing less. It exits
+non-zero on any difference.
+
+The tag's build script runs as you, with your files within reach. Run
+the verification in a container or a throwaway VM rather than on a
+machine whose data matters.
+
+Then check the downloaded binary against the same file:
 
 ```sh
 sha256sum -c SHA256SUMS --ignore-missing      # Linux
