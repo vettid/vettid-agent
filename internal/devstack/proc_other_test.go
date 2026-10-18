@@ -1,9 +1,15 @@
-//go:build devstack && !linux
+//go:build devstack && unix && !linux
 
 package devstack
 
-import "os/exec"
+import (
+	"os/exec"
+	"syscall"
+)
 
-// setStackAttrs: elsewhere a stack left behind by a killed test process
-// must be stopped by hand.
-func setStackAttrs(*exec.Cmd) {}
+// setStackAttrs starts the stack in a process group of its own, which
+// Close signals as a whole. Without Pdeathsig, a stack left behind by a
+// killed test process must be stopped by hand.
+func setStackAttrs(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+}

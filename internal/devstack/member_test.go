@@ -207,6 +207,27 @@ func (m *Member) putItem(ctx context.Context, sensitivity, tags, content string)
 	return str(m.t, o, "item_id")
 }
 
+// fieldID returns the id of an item's field labelled label (item.get:
+// the fields' ids and labels, without values).
+func (m *Member) fieldID(ctx context.Context, item, label string) string {
+	m.t.Helper()
+	o := m.obj(ctx, "item", "get", "-id", item)
+	var fields []struct {
+		ID    string `json:"field_id"`
+		Label string `json:"label"`
+	}
+	if err := json.Unmarshal(o["fields"], &fields); err != nil {
+		m.t.Fatalf("item get %s: fields: %v", item, err)
+	}
+	for _, f := range fields {
+		if f.Label == label && f.ID != "" {
+			return f.ID
+		}
+	}
+	m.t.Fatalf("item get %s: no field labelled %q", item, label)
+	return ""
+}
+
 func keys(o map[string]json.RawMessage) []string {
 	var ks []string
 	for k := range o {

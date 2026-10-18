@@ -134,6 +134,7 @@ func TestExitA2(t *testing.T) {
 	if st := a.status(ctx); !strings.Contains(st, "Not paired.") {
 		t.Fatalf("status after the unlink:\n%s", st)
 	}
+	a.assertWiped()
 
 	t.Log("a rejected pairing ends with \"Rejected on your phone.\"")
 	b := newAgent(t, s)

@@ -25,6 +25,8 @@ import (
 	"time"
 
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/vettid/vettid-agent/internal/state"
 )
 
 // testPassphrase protects the test connectors' keys (TEST-ONLY; the
@@ -55,7 +57,7 @@ func agentBinary(t *testing.T) string {
 			return
 		}
 		binDir, binPath = dir, filepath.Join(dir, "vettid-agent")
-		out, err := exec.Command("go", "build", "-tags", "devstack", "-o", binPath, "github.com/vettid/vettid-agent/cmd/vettid-agent").CombinedOutput()
+		out, err := exec.Command("go", "build", "-p", "1", "-tags", "devstack", "-o", binPath, "github.com/vettid/vettid-agent/cmd/vettid-agent").CombinedOutput()
 		if err != nil {
 			binErr = fmt.Errorf("building the connector: %v\n%s", err, out)
 		}
@@ -236,6 +238,15 @@ func (a *Agent) status(ctx context.Context) string {
 		a.t.Fatalf("status: %v: %s", err, errb.String())
 	}
 	return out.String()
+}
+
+// assertWiped checks that the state file is gone (after an unlink).
+func (a *Agent) assertWiped() {
+	a.t.Helper()
+	p := filepath.Join(a.Dir, state.StateFileName)
+	if _, err := os.Lstat(p); !errors.Is(err, os.ErrNotExist) {
+		a.t.Errorf("the state file is still there after the unlink (%v)", err)
+	}
 }
 
 // MCP is a running `vettid-agent mcp` with the SDK's client session.

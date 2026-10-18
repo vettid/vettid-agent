@@ -45,6 +45,7 @@ const (
 	minAvailableGB = 8
 	startTimeout   = 20 * time.Minute // the first start builds the stack's binaries
 	stopTimeout    = 90 * time.Second
+	killGrace      = 10 * time.Second // between the group's SIGTERM and SIGKILL
 )
 
 // Stack is a running dev stack, as its ready.json describes it.
@@ -241,13 +242,25 @@ func startStack(ctx context.Context, data, src string) (*Stack, error) {
 	cmd.Stdout, cmd.Stderr = logf, logf
 	setStackAttrs(cmd)
 	fmt.Fprintf(os.Stderr, "devstack: starting the dev stack (log %s)\n", logf.Name())
-	if err := cmd.Start(); err != nil {
+	// The stack is started and waited for on one goroutine locked to its
+	// thread, never unlocked: on Linux the stack's Pdeathsig fires when
+	// the thread that started it exits (setStackAttrs), so that thread
+	// must outlive the stack.
+	started, done := make(chan error, 1), make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		if err := cmd.Start(); err != nil {
+			started <- err
+			return
+		}
+		started <- nil
+		done <- cmd.Wait()
+	}()
+	if err := <-started; err != nil {
 		logf.Close()
 		return nil, err
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	started := &Stack{Data: data, proc: cmd, done: done, log: logf}
+	own := &Stack{Data: data, proc: cmd, done: done, log: logf}
 	deadline := time.Now().Add(startTimeout)
 	for {
 		select {
@@ -264,7 +277,7 @@ func startStack(ctx context.Context, data, src string) (*Stack, error) {
 			}
 		}
 		if time.Now().After(deadline) {
-			_ = started.Close()
+			_ = own.Close()
 			return nil, fmt.Errorf("the dev stack did not get ready within %v; see %s", startTimeout, logf.Name())
 		}
 	}
@@ -272,18 +285,31 @@ func startStack(ctx context.Context, data, src string) (*Stack, error) {
 
 // Close stops the stack if this process started it (SIGTERM: the stack
 // tears its processes and LocalStack down) and waits until it is gone.
+// If it does not stop within stopTimeout, or processes of its group
+// outlive it, the whole group gets SIGTERM and, killGrace later, SIGKILL.
 func (s *Stack) Close() error {
 	if s.proc == nil {
 		return nil
 	}
 	defer s.log.Close()
 	_ = s.proc.Process.Signal(syscall.SIGTERM)
+	timedOut := false
 	select {
 	case <-s.done:
 	case <-time.After(stopTimeout):
-		_ = s.proc.Process.Kill()
-		<-s.done
-		return fmt.Errorf("the dev stack did not stop within %v and was killed; check for its processes and LocalStack", stopTimeout)
+		timedOut = true
+	}
+	if timedOut || groupAlive(s.proc) {
+		_ = signalGroup(s.proc, syscall.SIGTERM)
+		for end := time.Now().Add(killGrace); groupAlive(s.proc) && time.Now().Before(end); {
+			time.Sleep(200 * time.Millisecond)
+		}
+		_ = signalGroup(s.proc, syscall.SIGKILL)
+		if timedOut {
+			<-s.done
+			return fmt.Errorf("the dev stack did not stop within %v and its process group was killed; check for its processes and LocalStack", stopTimeout)
+		}
+		return errors.New("processes of the dev stack's group outlived it and were killed; check for its processes and LocalStack")
 	}
 	if s.Ctl != "" && s.health(context.Background()) == nil {
 		return errors.New("the dev stack's control port still answers after it stopped")

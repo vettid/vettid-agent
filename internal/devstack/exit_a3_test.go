@@ -199,7 +199,9 @@ func TestExitA3(t *testing.T) {
 		t.Fatalf("request_secret (critical): %v", out)
 	}
 	pastCooldown()
-	out, isErr = c.call(ctx, "leash.execute_action", map[string]any{"item_id": crit, "field_id": fid, "data": data})
+	// The critical item's own field: forbidden comes from the critical
+	// rule, not from a field of another item.
+	out, isErr = c.call(ctx, "leash.execute_action", map[string]any{"item_id": crit, "field_id": m.fieldID(ctx, crit, "Key"), "data": data})
 	if !isErr || code(out) != "forbidden" {
 		t.Fatalf("execute_action (critical): %v", out)
 	}
@@ -251,6 +253,7 @@ func TestExitA3(t *testing.T) {
 	if code := waitExit(t, c); code != 1 {
 		t.Errorf("mcp exit code after the unlink: %d, want 1", code)
 	}
+	x.a.assertWiped()
 }
 
 // waitExit waits for the connector to stop after an unlink and returns
