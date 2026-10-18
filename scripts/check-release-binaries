@@ -1,51 +1,98 @@
 #!/usr/bin/env bash
 # Check that binaries are release builds of vettid-agent, from the build
-# information Go embeds (`go version -m`):
+# information Go embeds (`go version -m`) and the release stamp:
 #
-#   - built by exactly the toolchain named in go.mod's toolchain line,
-#   - CGO_ENABLED=0 and -trimpath=true,
+#   - built by exactly the expected toolchain (-t, default: go.mod's
+#     toolchain line in this checkout),
+#   - CGO_ENABLED=0, -trimpath=true, and the target's baseline level
+#     (GOAMD64=v1 on amd64, GOARM64=v8.0 on arm64),
 #   - no build tags, and in particular never the devstack tag (a devstack
 #     build accepts a plain-HTTP relay on a loopback address),
-#   - no GOEXPERIMENT, and no VCS stamp (release builds use -buildvcs=false).
+#   - no -gcflags, -asmflags, GOEXPERIMENT or GOFIPS140, and no VCS stamp
+#     (release builds use -buildvcs=false),
+#   - exactly one release stamp, vettid-agent-release/<version>/<commit>,
+#     matching -v and -c when given.
 #
-#   scripts/check-release-binaries FILE...
+#   scripts/check-release-binaries [-t TOOLCHAIN] [-v VERSION] [-c COMMIT] FILE...
 #
-# Run from the repository (it reads go.mod). Exits non-zero, naming the
-# file and the reason, if any binary fails.
+# Exits non-zero, naming the file and the reason, if any binary fails.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
-if [ "$#" -eq 0 ]; then
-  echo "usage: scripts/check-release-binaries FILE..." >&2
-  exit 2
-fi
-toolchain="$(awk '$1 == "toolchain" { print $2 }' go.mod)"
+usage() { echo "usage: scripts/check-release-binaries [-t TOOLCHAIN] [-v VERSION] [-c COMMIT] FILE..." >&2; exit 2; }
+
+toolchain=""
+want_version=""
+want_commit=""
+while getopts "t:v:c:" opt; do
+  case "$opt" in
+    t) toolchain="$OPTARG" ;;
+    v) want_version="$OPTARG" ;;
+    c) want_commit="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+[ "$#" -gt 0 ] || usage
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -z "$toolchain" ]; then
-  echo "check-release-binaries: FAIL go.mod has no toolchain line" >&2
+  toolchain="$(awk '$1 == "toolchain" { print $2 }' "$repo/go.mod")"
+fi
+if [ -z "$toolchain" ]; then
+  echo "check-release-binaries: FAIL no toolchain (go.mod has no toolchain line; use -t)" >&2
   exit 1
 fi
 
+files=()
+for f in "$@"; do files+=("$(cd "$(dirname "$f")" && pwd)/$(basename "$f")"); done
+# Away from any go.mod: `go version -m` needs no module, and this way no
+# go.mod can make the go command switch toolchains or refuse to run.
+cd /
+
+stampre='vettid-agent-release/(v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?|untagged)/[0-9a-f]{40}'
 fail=0
-for f in "$@"; do
+for f in "${files[@]}"; do
   if ! info="$(go version -m "$f" 2>&1)"; then
     echo "check-release-binaries: FAIL $f: no Go build information: $info" >&2
     fail=1
     continue
   fi
   bad() { echo "check-release-binaries: FAIL $f: $*" >&2; fail=1; }
+  has() { printf '%s\n' "$info" | grep -qxF "$1"; }
+  setting() { printf '%s\n' "$info" | awk -F'\t' -v k="$1" '$2 == "build" && index($3, k "=") == 1 { print substr($3, length(k) + 2) }'; }
+
   # First line: "<file>: go1.26.9"
   got_tc="$(printf '%s\n' "$info" | head -n1 | awk '{ print $NF }')"
-  [ "$got_tc" = "$toolchain" ] || bad "built by $got_tc, go.mod names $toolchain"
-  printf '%s\n' "$info" | grep -qxF $'\tpath\tgithub.com/vettid/vettid-agent/cmd/vettid-agent' \
-    || bad "not github.com/vettid/vettid-agent/cmd/vettid-agent"
-  tags="$(printf '%s\n' "$info" | awk -F'\t' '$2 == "build" && $3 ~ /^-tags=/ { sub(/^-tags=/, "", $3); print $3 }')"
+  [ "$got_tc" = "$toolchain" ] || bad "built by $got_tc, expected $toolchain"
+  has $'\tpath\tgithub.com/vettid/vettid-agent/cmd/vettid-agent' || bad "not github.com/vettid/vettid-agent/cmd/vettid-agent"
+
+  tags="$(setting -tags)"
   case ",$tags," in
     *,devstack,*) bad "built with the devstack tag (-tags=$tags): never a release" ;;
   esac
   [ -z "$tags" ] || bad "built with build tags (-tags=$tags); release builds use none"
-  printf '%s\n' "$info" | grep -qxF $'\tbuild\tCGO_ENABLED=0' || bad "not CGO_ENABLED=0"
-  printf '%s\n' "$info" | grep -qxF $'\tbuild\t-trimpath=true' || bad "not -trimpath"
-  if printf '%s\n' "$info" | grep -q $'^\tbuild\tGOEXPERIMENT='; then bad "built with a GOEXPERIMENT"; fi
+  has $'\tbuild\tCGO_ENABLED=0' || bad "not CGO_ENABLED=0"
+  has $'\tbuild\t-trimpath=true' || bad "not -trimpath"
+  case "$(setting GOARCH)" in
+    amd64) [ "$(setting GOAMD64)" = v1 ] || bad "GOAMD64=$(setting GOAMD64), release builds use v1" ;;
+    arm64) [ "$(setting GOARM64)" = v8.0 ] || bad "GOARM64=$(setting GOARM64), release builds use v8.0" ;;
+    *) bad "GOARCH=$(setting GOARCH) is not a release target" ;;
+  esac
+  for k in -gcflags -asmflags GOEXPERIMENT GOFIPS140; do
+    if printf '%s\n' "$info" | grep -q "^"$'\tbuild\t'"$k="; then bad "built with $k=$(setting "$k")"; fi
+  done
   if printf '%s\n' "$info" | grep -q $'^\tbuild\tvcs'; then bad "carries a VCS stamp (not -buildvcs=false)"; fi
+
+  stamps="$(LC_ALL=C grep -aoE "$stampre" "$f" | LC_ALL=C sort -u || true)"
+  case "$(printf '%s' "$stamps" | grep -c . || true)" in
+    0) bad "no release stamp (not built by scripts/build-release)" ;;
+    1)
+      v="$(printf '%s' "$stamps" | cut -d/ -f2)"
+      c="$(printf '%s' "$stamps" | cut -d/ -f3)"
+      [ -z "$want_version" ] || [ "$v" = "$want_version" ] || bad "stamped version $v, expected $want_version"
+      [ -z "$want_commit" ] || [ "$c" = "$want_commit" ] || bad "stamped commit $c, expected $want_commit"
+      ;;
+    *) bad "several release stamps: $(echo "$stamps" | tr '\n' ' ')" ;;
+  esac
 done
 exit "$fail"

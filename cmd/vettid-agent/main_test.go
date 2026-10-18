@@ -89,12 +89,19 @@ func TestVersionFromDevstackBuild(t *testing.T) {
 }
 
 func TestReleaseStampOverridesBuildInfo(t *testing.T) {
-	oldV, oldC := releaseVersion, releaseCommit
-	t.Cleanup(func() { releaseVersion, releaseCommit = oldV, oldC })
-	releaseVersion, releaseCommit = "v0.1.0", "0123456789abcdef0123456789abcdef01234567"
+	old := releaseStamp
+	t.Cleanup(func() { releaseStamp = old })
+	releaseStamp = "vettid-agent-release/v0.1.0/0123456789abcdef0123456789abcdef01234567"
 	v := readVersion()
 	if v.Version != "v0.1.0" || v.Commit != "0123456789abcdef0123456789abcdef01234567" {
 		t.Errorf("got %+v", v)
+	}
+	for _, bad := range []string{"", "v0.1.0", "vettid-agent-release/v0.1.0/0123", "other/v0.1.0/0123456789abcdef0123456789abcdef01234567",
+		"vettid-agent-release//0123456789abcdef0123456789abcdef01234567", "vettid-agent-release/a/b/0123456789abcdef0123456789abcdef01234567"} {
+		releaseStamp = bad
+		if v := readVersion(); v.Version == "v0.1.0" || v.Commit == "0123456789abcdef0123456789abcdef01234567" {
+			t.Errorf("stamp %q accepted: %+v", bad, v)
+		}
 	}
 }
 

@@ -7,14 +7,23 @@ import (
 	"strings"
 )
 
-// Set by scripts/build-release through -ldflags -X: the release tag (or
-// "untagged") and the full commit hash. Release builds use -buildvcs=false
-// so that the binary does not depend on the state of a checkout; these
-// two strings take the place of the VCS stamp.
-var (
-	releaseVersion string
-	releaseCommit  string
-)
+// Set by scripts/build-release through -ldflags -X to
+// "vettid-agent-release/<version>/<commit>": the release tag (or
+// "untagged") and the full commit hash, in one string that
+// scripts/check-release-binaries finds in the binary. Release builds use
+// -buildvcs=false so that the binary does not depend on the state of a
+// checkout; this stamp takes the place of the VCS stamp.
+var releaseStamp string
+
+// parseReleaseStamp splits releaseStamp; ok is false for an empty or
+// malformed stamp, which is then ignored.
+func parseReleaseStamp(stamp string) (version, commit string, ok bool) {
+	parts := strings.Split(stamp, "/")
+	if len(parts) != 3 || parts[0] != "vettid-agent-release" || parts[1] == "" || len(parts[2]) != 40 {
+		return "", "", false
+	}
+	return parts[1], parts[2], true
+}
 
 // versionInfo is what `vettid-agent version` prints.
 type versionInfo struct {
@@ -29,11 +38,8 @@ type versionInfo struct {
 func readVersion() versionInfo {
 	bi, _ := debug.ReadBuildInfo() // nil when not ok
 	v := versionFrom(bi)
-	if releaseVersion != "" {
-		v.Version = releaseVersion
-	}
-	if releaseCommit != "" {
-		v.Commit = releaseCommit
+	if version, commit, ok := parseReleaseStamp(releaseStamp); ok {
+		v.Version, v.Commit = version, commit
 	}
 	return v
 }

@@ -7,11 +7,17 @@
 # REF is the release tag (for example v0.1.0) or a commit; SHA256SUMS is
 # the file published with the release (or written by another build).
 # The script clones this repository into a new temporary directory,
-# checks out REF there, runs REF's own scripts/build-release in that
-# clone with a fresh build cache, and compares the result with
-# SHA256SUMS: the same file names and the same hashes, nothing more and
-# nothing less. It exits 0 only if everything matches, and 1 on any
-# difference (printed as a diff).
+# checks out REF there, and runs REF's own scripts/build-release in that
+# clone with a fresh build cache (REF is passed through, so a version
+# tag builds as that version even if its commit carries other tags).
+# Then, with this checkout's own tools rather than REF's, it hashes the
+# rebuilt binaries, checks them with this checkout's
+# scripts/check-release-binaries (toolchain from REF's go.mod, version
+# and commit from REF), and compares the hashes with SHA256SUMS: the same
+# file names and the same hashes, nothing more and nothing less. It
+# exits 0 only if everything matches, and 1 on any difference (printed
+# as a diff). It also prints how REF's scripts/ differ from this
+# checkout's, for the reader to judge.
 #
 #   -m  also use a fresh Go module cache (downloads the toolchain and
 #       every module again, checksum-verified against go.sum and the Go
@@ -42,10 +48,20 @@ sums="$(cd "$(dirname "$2")" && pwd)/$(basename "$2")"
 [ -f "$sums" ] || { log "FAIL $2 is not a file"; exit 1; }
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
-commit="$(git -C "$repo" rev-parse --verify --quiet "${ref}^{commit}")" || { log "FAIL $ref is not a commit here (git fetch --tags?)"; exit 1; }
+verre='^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
+if [[ "$ref" =~ $verre ]] && git -C "$repo" rev-parse --verify --quiet --end-of-options "refs/tags/$ref" >/dev/null; then
+  commit="$(git -C "$repo" rev-parse --verify --quiet --end-of-options "refs/tags/$ref^{commit}")" || { log "FAIL tag $ref is not a commit"; exit 1; }
+  build_ref="$ref"
+  version="$ref"
+else
+  commit="$(git -C "$repo" rev-parse --verify --quiet --end-of-options "${ref}^{commit}")" || { log "FAIL $ref is not a commit here (git fetch --tags?)"; exit 1; }
+  build_ref="$commit"
+  version="untagged"
+fi
 
 work="$(mktemp -d "${TMPDIR:-/tmp}/vettid-agent-verify.XXXXXXXX")"
 cleanup() {
+  cd /
   if [ "$keep" = 1 ]; then log "kept $work"; return; fi
   chmod -R u+w "$work" 2>/dev/null || true
   rm -rf "$work"
@@ -58,9 +74,33 @@ git -C "$work/repo" -c advice.detachedHead=false checkout --quiet "$commit"
 if [ "$fresh_modcache" = 1 ]; then
   export GOMODCACHE="$work/gomodcache"
 fi
-TMPDIR="$work" "$work/repo/scripts/build-release" -o "$work/out" "$commit"
+# REF's own build script, in the clone; nothing from the caller's
+# environment selects the version.
+(unset VETTID_RELEASE_VERSION; TMPDIR="$work" "$work/repo/scripts/build-release" -o "$work/out" "$build_ref")
 
-if diff -u "$sums" "$work/out/SHA256SUMS"; then
+log "REF's scripts/ compared with this checkout's (informational; - REF, + this checkout):"
+diff -ru "$work/repo/scripts" "$repo/scripts" >&2 || true
+
+# From here on, this checkout's tools only.
+cd "$work/out"
+bins=()
+for f in vettid-agent-*; do [ -f "$f" ] && bins+=("$f"); done
+[ "${#bins[@]}" -gt 0 ] || { log "FAIL the rebuild produced no binaries"; exit 1; }
+toolchain="$(awk '$1 == "toolchain" { print $2 }' "$work/repo/go.mod")"
+if ! "$repo/scripts/check-release-binaries" -t "$toolchain" -v "$version" -c "$commit" "${bins[@]}"; then
+  log "FAIL the rebuilt binaries are not release builds of $ref ($commit)"
+  exit 1
+fi
+if command -v sha256sum >/dev/null; then
+  sha256sum "${bins[@]}" | LC_ALL=C sort -k2 >"$work/rehashed"
+else
+  shasum -a 256 "${bins[@]}" | LC_ALL=C sort -k2 >"$work/rehashed"
+fi
+if ! cmp -s "$work/rehashed" "$work/out/SHA256SUMS"; then
+  log "note: REF's build-release wrote a SHA256SUMS that differs from the hashes of its files; comparing the hashes computed here"
+fi
+
+if diff -u "$sums" "$work/rehashed"; then
   log "PASS $ref ($commit) rebuilds to the hashes in $2"
 else
   log "FAIL the rebuild of $ref ($commit) differs from $2 (- given, + rebuilt)"

@@ -12,7 +12,13 @@ name: release
 #
 # Every run builds twice from clean, on an amd64 and on an arm64 runner,
 # from two checkout paths, with scripts/build-release (go.mod's toolchain,
-# fresh build cache), and requires byte-identical binaries. Nothing here
+# fresh build cache), and requires byte-identical binaries. Builder a
+# gets go.mod's Go from actions/setup-go; builder b does not use
+# setup-go: it uses the runner image's Go only to download go.mod's
+# toolchain module (golang.org/toolchain) from the Go module proxy, verified
+# against the Go checksum database, into an empty module cache (the
+# module the go command itself fetches when it switches toolchains). The
+# two toolchains reach the runners by different paths. Nothing here
 # signs anything or holds a signing key; no secrets are used.
 
 on:
@@ -38,9 +44,11 @@ jobs:
           - builder: a
             runner: ubuntu-26.04
             path: vettid-agent
+            setup-go: true
           - builder: b
             runner: ubuntu-26.04-arm
             path: elsewhere/build-b/vettid-agent
+            setup-go: false
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
@@ -51,15 +59,43 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: matrix.setup-go
         with:
           go-version-file: ${{ matrix.path }}/go.mod
           cache: false
-      - name: build-release
+      - name: go.mod's toolchain from the Go module proxy, checksum-verified
+        if: ${{ !matrix.setup-go }}
         working-directory: ${{ matrix.path }}
         run: |
+          if ! command -v go >/dev/null; then
+            # The image's preinstalled Go, newest first; it only fetches the toolchain.
+            gobin="$(ls -d /opt/hostedtoolcache/go/*/*/bin 2>/dev/null | sort -V | tail -n1)"
+            [ -n "$gobin" ] || { echo "::error::no Go on this runner image"; exit 1; }
+            export PATH="$gobin:$PATH"
+          fi
+          tc="$(awk '$1 == "toolchain" { print $2 }' go.mod)"
+          mod="golang.org/toolchain@v0.0.1-$tc.linux-$(cd / && GOTOOLCHAIN=local go env GOHOSTARCH)"
+          # The same module the go command fetches when it switches
+          # toolchains, into an empty module cache; `go mod download`
+          # checks it against the Go checksum database (GOSUMDB).
+          export GOMODCACHE="$RUNNER_TEMP/gomodcache" GOFLAGS=-modcacherw
+          dir="$(cd / && GOTOOLCHAIN=local GOSUMDB=sum.golang.org go mod download -json "$mod" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("Error") or ""); print(d["Dir"])' | { read -r err; read -r d; [ -z "$err" ] || { echo "::error::$err" >&2; exit 1; }; echo "$d"; })"
+          # Module zips carry no execute bits; the go command sets them
+          # on bin/ and pkg/tool/ when it switches, and so does this step.
+          chmod +x "$dir"/bin/* "$dir"/pkg/tool/*/*
+          echo "$dir/bin" >>"$GITHUB_PATH"
+          echo "GOMODCACHE=$GOMODCACHE" >>"$GITHUB_ENV"
+          "$dir/bin/go" version
+      - name: build-release
+        working-directory: ${{ matrix.path }}
+        env:
+          # A version tag builds as that tag; everything else as "untagged".
+          REF: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'HEAD' }}
+        run: |
           uname -m
-          go version
-          scripts/build-release -o "$RUNNER_TEMP/out"
+          command -v go
+          (cd / && GOTOOLCHAIN=local go version)
+          scripts/build-release -o "$RUNNER_TEMP/out" "$REF"
       - name: the devstack guard refuses a devstack build
         working-directory: ${{ matrix.path }}
         run: |
@@ -81,6 +117,7 @@ jobs:
   compare:
     needs: build
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -120,6 +157,7 @@ jobs:
     needs: compare
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     permissions:
       contents: write
     steps:
@@ -133,8 +171,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           REPO: ${{ github.repository }}
         run: |
-          # build-release named the files after the tag it found on the
-          # commit; they must carry this tag.
+          # build-release was given this tag and named the files after it.
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "::error::tag $TAG is not v<major>.<minor>.<patch>[-pre]"; exit 1
           fi
