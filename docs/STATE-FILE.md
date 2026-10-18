@@ -57,7 +57,8 @@ The plaintext under the data key is the connector's record
 
 ```
 {"v":1,"phase":"started"|"waiting"|"paired","deadline":"<RFC 3339>","device":{…},
- "access":{"state":"none"|"active","session_id":"…","expires_at":"<RFC 3339>"}}
+ "access":{"state":"none"|"active","session_id":"…","expires_at":"<RFC 3339>"},
+ "leash":{"v":1,"as_of":"<RFC 3339>","suspended":false,"grants":[…]}}
 ```
 
 | Member | What |
@@ -67,6 +68,7 @@ The plaintext under the data key is the connector's record
 | `deadline` | present exactly while `phase` is `started` or `waiting`: the end of the 10 minutes after `hs.init` (VAULT-MESSAGING §6.7), measured from just before the keys were created |
 | `device` | the vault client's `Save()` output: the `ik`, `kem` and relay-key seeds, the vault record with tokens, the session keyring |
 | `access` | optional, `paired` only: the access session (VAULT-MESSAGING §6.8) as of this save. `state` is `none` or `active`. An `active` one has `session_id` and `expires_at` (from `device.session.granted`), `expires_at` only (the first session, from `device.paired`'s `session_expires_at`, which comes with no session id), or neither (a session found by a check whose end is not known). Absent means not known: after a pairing whose `device.paired` gave no usable `session_expires_at`, and in records paired by a build before the first session was recorded. `unknown` is never written |
+| `leash` | optional, `paired` only: the LEASH grants (VAULT-MESSAGING §10.11) as the vault last sent them, kept by `internal/leash`: `v` 1; `as_of`, when the vault sent them; `suspended`, the vault's flag; `grants`, each grant in its wire form (`grant_id`, `agent_id`, `version`, `scope`, `approval`, `connections`, `tags`, `match`, `access`, `uses`, `per_hour`, `per_day`, `expires_at`, `status_ttl`, `issued_at`, `delegation`, `sig`) without its status statement. Absent until the first grant set arrives |
 
 It is parsed strictly (no unknown members, nothing after it). The
 pairing code and the SAS are never stored.
@@ -87,6 +89,23 @@ compare-and-set, so a grant or an end saved in between is never
 overwritten), and saved with the next batch. The version stays 1: the member is optional, and a record
 without it reads as before. A build older than this member refuses a
 record that has it (strict parsing); no such build was released.
+
+`leash` is written the same way: `leash.grant.updated` and the answer
+to `leash.grant.list` are applied in the save of their batch, before it
+is acknowledged. Their order is not relied on (VAULT-MESSAGING §8.4 gives
+none, and §8.3 sends a failed deposit again later): a set replaces the
+grants only if it is the answer to a list this process sent with nothing
+learned since; anything else (every `leash.grant.updated` included) may
+only remove grants or suspend, and a fresh list is asked for. A
+status statement (`leash.status.get`) and what a refused one teaches
+(`not_found`, a suspension) are kept in memory and saved with the next
+batch; statements are never saved, since a grant is presented only
+after the grants were listed again in the current access session, and
+that list carries fresh ones. The member is parsed strictly and each
+grant is checked as when it arrived (its device id, its delegation's
+signature and members); a member that fails is ignored and replaced by
+the next grant set. A build older than this member refuses a record
+that has it; no such build was released.
 
 ### Pairing's last batch
 

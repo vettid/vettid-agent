@@ -17,6 +17,7 @@ package vaultconn
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -94,6 +95,10 @@ type Options struct {
 	// StatusEvery is how often Run sends vault.status after the one at
 	// start; default 6 hours.
 	StatusEvery time.Duration
+	// Grants, if set, keeps the record's `leash` member (internal/leash):
+	// it sees each batch inside its save and gives the member saved with
+	// it. Without it the member loaded from Record is kept as it was.
+	Grants Part
 
 	// HTTP, Now and PollWait go to the client (nil and zero: its
 	// defaults; PollWait bounds how long a Request waits before it is
@@ -101,6 +106,34 @@ type Options struct {
 	HTTP     *http.Client
 	Now      func() time.Time
 	PollWait time.Duration
+}
+
+// Part is a member of the record kept by another package
+// (internal/leash's grants), saved with each batch like the access
+// session.
+type Part interface {
+	// Apply is called inside the save of a batch (in Run's goroutine,
+	// before the record is written and the batch acknowledged) with the
+	// batch's messages, responses included, as collected (VAULT-MESSAGING
+	// §8.4 guarantees no order between them; a Part must not rely on
+	// one). It
+	// must not block or call Conn. Idempotent handling is required: a
+	// batch may be applied again by the next process after a crash
+	// between the save and the acknowledgement.
+	Apply(batch []Message)
+	// Snapshot returns the member's JSON for the record (nil: absent).
+	Snapshot() json.RawMessage
+}
+
+// Message is a collected vault message as Part.Apply sees it: an event
+// (Re empty) or a response.
+type Message struct {
+	ID        string
+	Type      string
+	Re        string
+	OK        bool
+	ErrorCode string
+	Body      json.RawMessage
 }
 
 // Event is a vault message that is not a response.
@@ -124,7 +157,7 @@ type result struct {
 }
 
 type call struct {
-	id   string // "": a new inner id
+	id   string // caller-chosen inner id (a ULID); "": a new one from the client
 	typ  string
 	body json.RawMessage
 	done chan result // buffered, 1
@@ -166,6 +199,11 @@ type Conn struct {
 	// goroutines.
 	accMu  sync.Mutex
 	access pairing.Access
+
+	ik ed25519.PublicKey
+	// lastContact: when a batch from the vault was last collected.
+	contactMu   sync.Mutex
+	lastContact time.Time
 }
 
 // New restores the device from the record, with Persist writing the
@@ -197,7 +235,23 @@ func New(o Options) (*Conn, error) {
 	}
 	c.dev = d
 	c.access = o.Record.Access
+	c.ik = d.IdentityKey()
 	return c, nil
+}
+
+// DeviceID returns this agent's device id (from the client's state).
+func (c *Conn) DeviceID() string { return c.dev.DeviceID() }
+
+// IdentityKey returns this agent's identity public key (its `ik`, the
+// `sub` of its LEASH delegations).
+func (c *Conn) IdentityKey() ed25519.PublicKey { return bytes.Clone(c.ik) }
+
+// LastContact returns when a message from the vault was last collected
+// in this process (zero: none yet).
+func (c *Conn) LastContact() time.Time {
+	c.contactMu.Lock()
+	defer c.contactMu.Unlock()
+	return c.lastContact
 }
 
 // Access returns the access session as last known: from the record at
@@ -284,6 +338,11 @@ func (c *Conn) persist(st []byte) error {
 	c.collected = true
 	evs := c.dev.Events()
 	c.events = append(c.events, evs...)
+	if len(evs) > 0 {
+		c.contactMu.Lock()
+		c.lastContact = c.o.Now()
+		c.contactMu.Unlock()
+	}
 	for _, ev := range evs {
 		if ev.Re == "" && ev.Type == "device.unlinked" {
 			c.unlinked = true
@@ -301,7 +360,20 @@ func (c *Conn) persist(st []byte) error {
 	// The batch's access events are applied before the save, so they are
 	// in the state file before the relay drops them.
 	c.applyAccess(evs)
-	rec := pairing.Record{Phase: pairing.PhasePaired, Device: bytes.Clone(st), Access: c.Access()}
+	leash := c.o.Record.Leash
+	if c.o.Grants != nil {
+		msgs := make([]Message, 0, len(evs))
+		for _, in := range evs {
+			m := Message{ID: in.ID, Type: in.Type, Re: in.Re, OK: in.Status == envelope.StatusOK, Body: in.Body}
+			if in.Error != nil {
+				m.ErrorCode = in.Error.Code
+			}
+			msgs = append(msgs, m)
+		}
+		c.o.Grants.Apply(msgs)
+		leash = c.o.Grants.Snapshot()
+	}
+	rec := pairing.Record{Phase: pairing.PhasePaired, Device: bytes.Clone(st), Access: c.Access(), Leash: leash}
 	b, err := rec.Encode()
 	clear(rec.Device)
 	if err != nil {
@@ -566,17 +638,19 @@ func (c *Conn) readStatus(r *Response) {
 // Request sends a request to the vault through Run's goroutine and
 // waits for its response, ctx's end or Run's end.
 func (c *Conn) Request(ctx context.Context, typ string, body json.RawMessage) (*Response, error) {
-	return c.request(ctx, "", typ, body)
+	return c.RequestWithID(ctx, "", typ, body)
 }
 
 // RequestWithID is Request with a caller-chosen inner id (a ULID, see
-// NewID). An application retry passes the id of the request it repeats,
-// so that the vault answers it from its dedupe (VAULT-MESSAGING §8.2,
-// §8.6) instead of executing it again, and a request the vault holds for
-// approval (§6.8) is not held twice. A call still waiting under the same
-// id ends with ErrSuperseded: only the latest one is answered.
+// NewID; "": a new one chosen by the client). An application retry
+// passes the id of the request it repeats, so that the vault answers it
+// from its dedupe (VAULT-MESSAGING §8.2, §8.6) instead of executing it
+// again, and a request the vault holds for approval (§6.8) is not held
+// twice; a Part recognises the response to its own request by its `re`.
+// A call still waiting under the same id ends with ErrSuperseded: only
+// the latest one is answered.
 func (c *Conn) RequestWithID(ctx context.Context, id, typ string, body json.RawMessage) (*Response, error) {
-	if !envelope.ValidULID(id) {
+	if id != "" && !envelope.ValidULID(id) {
 		return nil, errors.New("vaultconn: the inner id is not a ULID")
 	}
 	return c.request(ctx, id, typ, body)

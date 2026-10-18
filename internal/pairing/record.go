@@ -14,7 +14,8 @@ import (
 // the vault client's saved state, and how far pairing got.
 //
 //	{"v":1,"phase":"started"|"waiting"|"paired","deadline":"<RFC 3339>","device":{…},
-//	 "access":{"state":"none"|"active","session_id":"…","expires_at":"<RFC 3339>"}}
+//	 "access":{"state":"none"|"active","session_id":"…","expires_at":"<RFC 3339>"},
+//	 "leash":{…}}
 //
 // deadline is present exactly while pairing is unfinished (started or
 // waiting): the end of the 10 minutes after hs.init (VAULT-MESSAGING
@@ -33,11 +34,18 @@ import (
 // what internal/access learns by a check. A record without it (paired by
 // a build before the first session was recorded) reads as unknown;
 // "unknown" is never written.
+//
+// leash (paired records only, optional) is the connector's LEASH grants
+// as of the save (internal/leash; docs/STATE-FILE.md), saved by
+// internal/vaultconn with the batch that carried them.
 type Record struct {
 	Phase    Phase
 	Deadline time.Time // zero once paired
 	Device   json.RawMessage
 	Access   Access // paired only; the zero value is AccessUnknown
+	// Leash (paired only, optional) is internal/leash's saved grants, a
+	// JSON object that package reads and checks; nil when absent.
+	Leash json.RawMessage
 }
 
 // Access is the access session as the connector last knew it.
@@ -107,6 +115,7 @@ type recordJSON struct {
 	Deadline *time.Time      `json:"deadline,omitempty"`
 	Device   json.RawMessage `json:"device"`
 	Access   *accessJSON     `json:"access,omitempty"`
+	Leash    json.RawMessage `json:"leash,omitempty"`
 }
 
 // ErrRecord: the state file's plaintext is not a valid record.
@@ -128,6 +137,9 @@ func (r *Record) Encode() ([]byte, error) {
 			a.ExpiresAt = &e
 		}
 		j.Access = a
+	}
+	if r.Phase == PhasePaired && r.Leash != nil {
+		j.Leash = r.Leash
 	}
 	return json.Marshal(j)
 }
@@ -151,7 +163,7 @@ func DecodeRecord(b []byte) (*Record, error) {
 	if j.V != recordVersion {
 		return nil, fmt.Errorf("%w: unknown version", ErrRecord)
 	}
-	r := &Record{Phase: j.Phase, Device: j.Device}
+	r := &Record{Phase: j.Phase, Device: j.Device, Leash: j.Leash}
 	if j.Access != nil {
 		if r.Phase != PhasePaired {
 			return nil, fmt.Errorf("%w: access on an unfinished pairing", ErrRecord)
@@ -198,6 +210,12 @@ func (r *Record) check() error {
 	d := bytes.TrimSpace(r.Device)
 	if len(d) < 2 || d[0] != '{' || !json.Valid(d) {
 		return fmt.Errorf("%w: no device state", ErrRecord)
+	}
+	if r.Leash != nil {
+		l := bytes.TrimSpace(r.Leash)
+		if r.Phase != PhasePaired || len(l) < 2 || l[0] != '{' || !json.Valid(l) {
+			return fmt.Errorf("%w: invalid leash", ErrRecord)
+		}
 	}
 	return nil
 }
