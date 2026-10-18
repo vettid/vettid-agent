@@ -83,19 +83,21 @@ const (
 
 // Texts (AGENT-PLAN §11 where it drafts one; the others are chosen).
 const (
-	TextWaiting   = "Waiting for your approval on your phone. Check again with leash.check_status."
-	TextInFlight  = "Your vault has not answered yet. Check again with leash.check_status."
-	TextDenied    = "Declined on your phone."
-	TextForbidden = "Your vault does not allow this agent to do that. You can change its permissions on your phone."
-	TextSuspended = "Your vault paused this agent after repeated refused requests. You can resume it on your phone."
-	TextTimeout   = "Your phone did not answer in time, and the request was dropped. Make it again if you still need it."
-	TextExpired   = "No result is kept for this request: a result is returned once and kept at most 10 minutes, and none survives a restart of the connector. Make the request again."
-	TextSession   = "Your access session ended before your vault ran this request. Try again."
-	TextNotFound  = "That item has no such field, or the field cannot be used this way."
-	TextLimit     = "Too many requests are waiting for approval on your phone. Try again after you answer them."
-	TextTooMany   = "Too many requests are waiting for your vault. Check their status, or try again later."
-	TextProtocol  = "Your vault's answer could not be read."
-	TextStopped   = "The connection to your vault has stopped."
+	TextWaiting        = "Waiting for your approval on your phone. Check again with leash.check_status."
+	TextInFlight       = "Your vault has not answered yet. Check again with leash.check_status."
+	TextDenied         = "Declined on your phone."
+	TextForbidden      = "Your vault does not allow this agent to do that. You can change its permissions on your phone."
+	TextSuspended      = "Your vault paused this agent after repeated refused requests. You can resume it on your phone."
+	TextTimeout        = "Your phone did not answer in time, and the request was dropped. Make it again if you still need it."
+	TextExpired        = "No result is kept for this request: a result is returned once and kept at most 10 minutes, and none survives a restart of the connector. Make the request again."
+	TextSession        = "Your access session ended before your vault ran this request. Try again."
+	TextNotFound       = "That item has no such field, or the field cannot be used this way."
+	TextLimit          = "Too many requests are waiting for approval on your phone. Try again after you answer them."
+	TextTooMany        = "Too many requests are waiting for your vault. Check their status, or try again later."
+	TextProtocol       = "Your vault's answer could not be read."
+	TextStopped        = "The connection to your vault has stopped."
+	TextSuperseded     = "Another copy of this request took its place, so its answer cannot be returned here. Make the request again if you still need it."
+	TextApprovalPassed = "The time to approve this request on your phone has passed; waiting for your vault's final answer. Check again with leash.check_status."
 )
 
 // Error is a request's outcome other than a result, with a stable code
@@ -134,6 +136,7 @@ var (
 	ErrProtocol    = &Error{Code: "protocol_error", Text: TextProtocol}
 	ErrStopped     = &Error{Code: "vault_unreachable", Text: TextStopped}
 	ErrRefused     = &Error{Code: "refused", Text: vaultconn.TextRefused}
+	ErrSuperseded  = &Error{Code: "superseded", Text: TextSuperseded}
 )
 
 // Conn is what this package uses of *vaultconn.Conn.
@@ -472,7 +475,10 @@ func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
 // pending (Waiting when the vault holds it for approval), its result
 // (once), or its error. After Options.Unanswered without any sign from
 // the vault it answers ErrUnreachable with RequestID set (the request
-// stays in flight, AGENT-PLAN §4.4). An id that is not known, whose
+// stays in flight, AGENT-PLAN §4.4). Once a held request's approval
+// window (its exp) has passed it is still pending, but no longer
+// Waiting, with TextApprovalPassed: the vault may still run it and
+// answer under the same id. An id that is not known, whose
 // result was already returned or dropped, gives ErrExpired.
 func (c *Client) Status(ctx context.Context, requestID string) (*Outcome, error) {
 	c.mu.Lock()
@@ -514,7 +520,14 @@ func (c *Client) heldLocked() int {
 
 func pendingLocked(e *entry) *Outcome {
 	o := &Outcome{Pending: true, RequestID: e.id, Waiting: e.waiting, Text: TextInFlight}
-	if e.waiting {
+	switch {
+	case e.waiting && !time.Now().Before(e.exp):
+		// The approval's window has passed: the member can no longer
+		// answer it, so it no longer waits for the member; the vault's
+		// answer (normally approval_timeout, or an approval given just
+		// in time) is still collected under the same id.
+		o.Waiting, o.Text = false, TextApprovalPassed
+	case e.waiting:
 		o.Text = TextWaiting
 	}
 	return o
@@ -638,6 +651,15 @@ func (c *Client) run(e *entry) {
 			return
 		case errors.Is(err, vaultconn.ErrStopped):
 			c.finish(e, nil, ErrStopped)
+			return
+		case errors.Is(err, vaultconn.ErrSuperseded):
+			// Another send under this inner id now waits for the answer,
+			// so this copy will never get it; and it was sent, so sending
+			// it again would only supersede that one in turn. This
+			// package never has two copies of one request in flight, so
+			// this is not expected; the request ends.
+			c.log.Warn("agent.request superseded", "op", e.op, "id", e.id)
+			c.finish(e, nil, ErrSuperseded)
 			return
 		case errors.Is(err, errAttemptTimeout):
 		default:

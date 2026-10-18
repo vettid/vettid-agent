@@ -950,3 +950,52 @@ func TestCloseWhileSending(t *testing.T) {
 		t.Error("the request's body was not zeroed")
 	}
 }
+
+// TestSuperseded: a copy that the connection reports superseded (another
+// send under the same inner id took its place) ends the request: it is
+// not taken for a failed send and sent again.
+func TestSuperseded(t *testing.T) {
+	e := newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		if n == 1 {
+			return nil, vaultconn.ErrSuperseded
+		}
+		return ok(itemBody), nil
+	}, nil)
+	if _, err := e.c.Get(context.Background(), itemID, nil); !errors.Is(err, ErrSuperseded) || err.Error() != TextSuperseded {
+		t.Fatalf("Get: %v", err)
+	}
+	time.Sleep(50 * time.Millisecond) // more than RetryPause
+	if n := len(e.conn.copies()); n != 1 {
+		t.Errorf("%d copies sent", n)
+	}
+}
+
+// TestStatusAfterApprovalWindow: once a held request's exp has passed,
+// Status no longer says it waits for the member's approval: it is still
+// pending (the vault may still run it and answer under the same id),
+// with its own text, and the vault's answer is still collected.
+func TestStatusAfterApprovalWindow(t *testing.T) {
+	answer := make(chan struct{})
+	var e *env
+	e = newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		waiting(e, id, time.Now().Add(150*time.Millisecond))
+		<-answer
+		return refused("approval_timeout"), nil
+	}, func(o *Options) { o.Grace = time.Minute })
+	out, err := e.c.Get(context.Background(), itemID, nil)
+	if err != nil || !out.Waiting || out.Text != TextWaiting {
+		t.Fatalf("Get: %+v, %v", out, err)
+	}
+	time.Sleep(200 * time.Millisecond) // past exp, within Grace
+	o, err := e.c.Status(context.Background(), out.RequestID)
+	if err != nil || !o.Pending || o.Waiting || o.Text != TextApprovalPassed || o.RequestID != out.RequestID {
+		t.Fatalf("Status after exp: %+v, %v", o, err)
+	}
+	close(answer)
+	if _, err := status(t, e, out.RequestID); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("final Status: %v", err)
+	}
+	if n := len(e.conn.copies()); n != 1 {
+		t.Errorf("%d copies sent", n)
+	}
+}

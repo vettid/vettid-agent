@@ -435,9 +435,10 @@ func TestStatementChecks(t *testing.T) {
 	}
 }
 
-// TestHeld: owner_check_required stops refreshing until vault.status
-// shows the hold ended (a grant update does not end it); internal/access
-// is told; the background loop is woken when the hold ends.
+// TestHeld: owner_check_required stops refreshing until a vault.status
+// that is not held shows the hold ended (neither a grant update nor a
+// list answer ends it); internal/access is told; the background loop is
+// woken when the hold ends.
 func TestHeld(t *testing.T) {
 	e := newEnv(t)
 	var answered []string
@@ -468,7 +469,21 @@ func TestHeld(t *testing.T) {
 	if !e.m.Held() || e.f.count("leash.status.get") != n || e.f.count("leash.grant.list") != 1 {
 		t.Errorf("a grant update ended the hold: held %v, %d refreshes, %d lists", e.m.Held(), e.f.count("leash.status.get"), e.f.count("leash.grant.list"))
 	}
-	// Drain a wake-up left by the update.
+	// Nor does the answer to a list (one sent before the hold can be
+	// answered after it): the set is applied, the hold stays.
+	e.listing(t, false, g1)
+	if err := e.m.List(ctx); err != nil {
+		t.Fatalf("List while held: %v", err)
+	}
+	if !e.m.Held() {
+		t.Error("a list answer ended the hold")
+	}
+	e.c.Add(10 * time.Minute)
+	e.m.step(ctx)
+	if e.f.count("leash.status.get") != n || e.f.count("leash.grant.list") != 2 {
+		t.Errorf("worked while held after a list: %d refreshes, %d lists", e.f.count("leash.status.get"), e.f.count("leash.grant.list"))
+	}
+	// Drain a wake-up left by the update or the list.
 	select {
 	case <-e.m.wake:
 	default:
@@ -489,9 +504,6 @@ func TestHeld(t *testing.T) {
 	e.listing(t, false, g1)
 	e.f.statusGet = statusAnswer(t, e.c, map[string]json.RawMessage{gid(1): g1})
 	e.m.step(ctx)
-	if e.f.count("leash.grant.list") != 2 {
-		t.Errorf("not listed after the hold: %d lists", e.f.count("leash.grant.list"))
-	}
 	mustPresent(t, e, gid(1))
 }
 

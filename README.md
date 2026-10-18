@@ -219,7 +219,8 @@ JSON in text, with `status` `ok`, `pending` (with a `request_id`) or
 The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
 `not_found`, `limit`, …) or the connector's own: `access_requested`,
 `access_denied`, `vault_unreachable`, `owner_check_required`,
-`suspended`, `expired`, `bad_request` and `rate_limited_local`.
+`suspended`, `expired`, `bad_request`, `rate_limited_local` and
+`superseded` (not expected: another copy of the request took its place).
 
 The connector answers up to 120 tool calls in a burst and then 2 a
 second; calls beyond that get `rate_limited_local` before anything
@@ -242,6 +243,13 @@ package's decryption buffers, copies Go's runtime makes, and the pipe
 to the client. What the client does with a value (its context, its
 logs) is up to the client.
 
+> **Shared values may stay on disk.** `leash.request_secret` hands an
+> item's values to the agent's app. Many apps keep tool results in their
+> chat history or logs on disk, so a value may stay there after the task.
+> The connector wipes only its own copies. Share with an agent only the
+> items you accept being stored that way. Safer ways for an agent to use
+> a secret are planned.
+
 The connector runs at most 64 tool calls at once. A client that stops
 reading standard output stops the connector reading standard input,
 so it does not grow without bound; until the client reads again, a
@@ -258,7 +266,8 @@ none, the connector asks your vault for access (one hour, or what
 `--access-minutes` of `vettid-agent mcp` sets) and the tool
 answers "This agent needs access to your vault. Allow it on your phone,
 then try again." It never asks more than once at a time, waits 10
-minutes after you decline or leave a request unanswered, asks at most 6
+minutes after you decline or leave a request unanswered or end its
+access on your phone, asks at most 6
 times an hour, and waits as long as your vault says when it answers that
 the last request was too recent. While your vault waits for your daily
 check, it asks for no access (it only asks your vault whether the check
@@ -305,6 +314,10 @@ asks you on your phone first.
 - If your vault does not answer within 30 seconds, `leash.check_status`
   says "Your vault did not answer. It may be locked; unlock it on your
   phone." and the request stays open.
+- While your vault waits for your approval, `leash.check_status` says
+  so. Once the time for it has passed, it says that instead and the
+  request stays pending until your vault's own answer comes (normally
+  `approval_timeout`).
 - If your vault starts asking for your approval only after every copy
   of a request went unanswered (for example, it was locked for longer
   than the copies wait, and is unlocked later), the connector has
@@ -483,6 +496,17 @@ Exceptions that come with Windows itself:
   changing it), Windows can no longer open keys made before, and the
   connector says so; set the old password back if you can, or pair
   again.
+
+The connector does not refuse a domain account or a roaming profile,
+but says so where it can tell: `pair` (when it chooses DPAPI) and
+`status` add "This Windows account is a domain account: your
+organization can recover keys protected for it." or "This Windows
+account has a roaming profile: keys protected for it also open on the
+other computers where your profile is loaded." It checks whether the
+computer is joined to an Active Directory domain and your account is not
+a local one, and whether Windows reports your profile as roaming or
+names a server copy of it. If it cannot tell, it says nothing, so the
+absence of these lines is not a guarantee.
 
 When Windows cannot use the key it needs, the connector first asks you
 to check that you are signed in as the user who paired it, with your

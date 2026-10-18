@@ -172,11 +172,12 @@ type Manager struct {
 	listFails int
 	nextList  time.Time
 	// held: the vault answered owner_check_required; the background loop
-	// lists and refreshes nothing until a vault.status (OnStatus) or a
-	// list applied in full shows the hold ended, and then resumes at
-	// once (OnStatus wakes it). A leash.grant.updated does not end it:
-	// it is applied only as a narrowing, and nothing in it says the hold
-	// ended. While held, a tool call has internal/access send vault.status
+	// lists and refreshes nothing until a vault.status that is not held
+	// (OnStatus) shows the hold ended, and then resumes at once (OnStatus
+	// wakes it). Neither a leash.grant.updated nor the answer to a list
+	// ends it: either can have been sent before the hold and arrive after
+	// it (VAULT-MESSAGING §8.4), and nothing in it says the hold ended.
+	// While held, a tool call has internal/access send vault.status
 	// at most once a minute (access.CheckHold), whose answer reaches
 	// OnStatus.
 	held bool
@@ -410,7 +411,6 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 	m.grants, m.suspended, m.asOf, m.saved = gs, suspended, now, true
 	m.statements = stmts
 	m.fails = map[string]int{}
-	m.held = false
 	m.dead = map[string]bool{}
 	m.listed = true
 	if !m.needList {
@@ -446,7 +446,7 @@ func (m *Manager) OnStatus(ownerCheck string) {
 }
 
 // Held reports whether the vault answered owner_check_required and no
-// vault.status or list has shown the hold ended since.
+// vault.status has shown the hold ended since.
 func (m *Manager) Held() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

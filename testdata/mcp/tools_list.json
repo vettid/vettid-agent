@@ -49,7 +49,6 @@
         },
         "annotations": {
           "title": "Read an item's values",
-          "readOnlyHint": true,
           "openWorldHint": false,
           "idempotentHint": false
         }

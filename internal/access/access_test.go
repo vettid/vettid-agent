@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -291,7 +292,9 @@ func TestTooSoon(t *testing.T) {
 }
 
 // TestOwnerCheck: owner_check_required stops requests until a
-// vault.status says the hold ended, or a grant update arrives.
+// vault.status says the hold ended; a grant update or a session grant
+// does not end it (it may have been sent before the hold, or delivered
+// again), as in internal/leash.
 func TestOwnerCheck(t *testing.T) {
 	f, _, m := setup(none)
 	f.answer("device.session.request", fail("owner_check_required", `{}`))
@@ -315,8 +318,18 @@ func TestOwnerCheck(t *testing.T) {
 		t.Fatal("answer owner_check_required")
 	}
 	m.OnEvent(vaultconn.Event{Type: "leash.grant.updated"})
-	if err := ensure(t, m); errors.Is(err, ErrOwnerCheck) {
-		t.Fatal("grant update did not end the hold")
+	if err := ensure(t, m); !errors.Is(err, ErrOwnerCheck) || !m.Held() {
+		t.Fatalf("a grant update ended the hold: %v", err)
+	}
+	// A device.session.granted (for example one delivered again after a
+	// crash) does not end it either.
+	m.OnEvent(vaultconn.Event{Type: "device.session.granted"})
+	if err := ensure(t, m); !errors.Is(err, ErrOwnerCheck) || !m.Held() {
+		t.Fatalf("a session grant ended the hold: %v", err)
+	}
+	m.OnStatus("ok")
+	if err := ensure(t, m); errors.Is(err, ErrOwnerCheck) || m.Held() {
+		t.Fatalf("vault.status did not end the hold: %v", err)
 	}
 }
 
@@ -419,12 +432,53 @@ func TestDenialWithoutOutstanding(t *testing.T) {
 	if err := ensure(t, m); !errors.Is(err, ErrAccessDenied) || f.count("device.session.request") != 0 {
 		t.Fatalf("got %v", err)
 	}
-	// An app ending the session starts no quiet period (AG8 names only
-	// denials and unanswered requests).
-	f2, _, m2 := setup(none)
-	m2.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
-	if err := ensure(t, m2); !errors.Is(err, ErrAccessRequested) || f2.count("device.session.request") != 1 {
-		t.Fatalf("ended: %v", err)
+}
+
+// TestQuietAfterEnded: a session the member ended in the app starts the
+// quiet period, as a denial does (owner decision, 2026-10-18), also
+// without a request outstanding; it answers access_denied with its own
+// text. A session that simply expired starts none.
+func TestQuietAfterEnded(t *testing.T) {
+	f, c, m := setup(pairing.Access{State: pairing.AccessActive, ExpiresAt: t0.Add(time.Hour)})
+	if err := ensure(t, m); err != nil {
+		t.Fatal(err)
+	}
+	c.add(5 * time.Minute)
+	f.SetAccess(none) // vaultconn applied the event in the batch's save
+	m.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
+	endedAt := c.now()
+	for _, d := range []time.Duration{0, 5 * time.Minute, 10*time.Minute - time.Second} {
+		c.t = endedAt.Add(d)
+		err := ensure(t, m)
+		var e *Error
+		if !errors.As(err, &e) || !errors.Is(err, ErrAccessDenied) || !e.Until.Equal(endedAt.Add(10*time.Minute)) ||
+			!strings.HasPrefix(e.Text, "Access was ended on your phone. No new request is sent before ") {
+			t.Fatalf("at +%v: %v", d, err)
+		}
+	}
+	if n := f.count("device.session.request"); n != 0 {
+		t.Fatalf("%d requests during the quiet period", n)
+	}
+	c.t = endedAt.Add(10 * time.Minute)
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) || f.count("device.session.request") != 1 {
+		t.Fatalf("after the quiet period: %v", err)
+	}
+
+	// Ended while a request was outstanding: the vault dropped it, and
+	// the quiet period applies.
+	f, c, m = setup(none)
+	_ = ensure(t, m)
+	c.add(time.Minute)
+	m.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: json.RawMessage(`{"reason":"ended"}`)})
+	if err := ensure(t, m); !errors.Is(err, ErrAccessDenied) || f.count("device.session.request") != 1 {
+		t.Fatalf("ended with one outstanding: %v", err)
+	}
+
+	// Expired: no event, no quiet period; the next call asks.
+	f, c, m = setup(pairing.Access{State: pairing.AccessActive, ExpiresAt: t0.Add(time.Hour)})
+	c.t = t0.Add(time.Hour)
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) || f.count("device.session.request") != 1 {
+		t.Fatalf("expired: %v", err)
 	}
 }
 
