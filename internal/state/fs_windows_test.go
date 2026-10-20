@@ -266,3 +266,31 @@ func TestProbeSetupErrorsAreErrors(t *testing.T) {
 		t.Error("the old key was wiped")
 	}
 }
+
+// makeReadableByOthers grants Everyone read access to path.
+func makeReadableByOthers(t *testing.T, path string) {
+	t.Helper()
+	icacls(t, path, "/grant", "*"+sidEveryone+":(R)")
+}
+
+// A deleted file reached through an inherited handle is refused with
+// wording that fits it, and without the owner-only hint's sentinel.
+func TestCheckOwnerOnlyHandleDeletedFile(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	f, err := openPrivate(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := s.Save([]byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	err = CheckOwnerOnlyHandle(windows.Handle(f.Fd()), "passphrase file")
+	if err == nil || errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrReplaced) || !strings.Contains(err.Error(), "the file was deleted") {
+		t.Fatalf("CheckOwnerOnlyHandle of a deleted file = %v", err)
+	}
+}

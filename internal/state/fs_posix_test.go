@@ -166,3 +166,11 @@ func TestLoadRefusesFIFO(t *testing.T) {
 		t.Fatalf("Load of a FIFO = %v, want ErrNotOwnerOnly", err)
 	}
 }
+
+// makeReadableByOthers gives group and others read access to path.
+func makeReadableByOthers(t *testing.T, path string) {
+	t.Helper()
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

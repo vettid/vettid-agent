@@ -96,6 +96,14 @@ var (
 	// ErrNotOwnerOnly: the state directory or file is accessible to
 	// someone other than the current user, or owned by someone else.
 	ErrNotOwnerOnly = errors.New("state is not private to the current user")
+	// ErrReplaced: the state file, once open, passed the owner-only
+	// checks but had no link left: a rename replaced it (or it was
+	// deleted) between the open and the check. Its bytes are never used.
+	// ReadOnly opens the path again, a bounded number of times; Load,
+	// which holds the lock, refuses it. It is not ErrNotOwnerOnly: no
+	// other link or access was found (a file that fails the owner-only
+	// checks is ErrNotOwnerOnly whatever its link count).
+	ErrReplaced = errors.New("the state file was replaced while it was being read (no link left once open)")
 	// ErrExists: Create found a state file; replacing one is
 	// CreateReplace.
 	ErrExists = errors.New("a state file already exists (this connector is paired); replacing it must be explicit")
@@ -775,6 +783,9 @@ func readNoFollow(path string, max int64, check bool) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
+	if testHookAfterOpen != nil {
+		testHookAfterOpen(path)
+	}
 	if check {
 		if err := checkFile(f); err != nil {
 			return nil, err
@@ -790,14 +801,48 @@ func readNoFollow(path string, max int64, check bool) ([]byte, error) {
 	return raw, nil
 }
 
+// testHookAfterOpen, when set (tests only), runs in readNoFollow after
+// the file is opened and before it is checked.
+var testHookAfterOpen func(path string)
+
 // notPrivate builds an ErrNotOwnerOnly naming what failed.
 func notPrivate(what, check string) error {
 	return fmt.Errorf("%w: %s %s", ErrNotOwnerOnly, what, check)
 }
 
+// checkLinks is the one-link rule on an open file's link count. One link
+// passes. More than one is refused (ErrNotOwnerOnly): the file can be
+// reached by another name. None means the file was replaced by a rename
+// (or deleted) after it was opened (ErrReplaced): nothing about the file
+// at the path is known, and the caller may open the path again. The
+// count is in both errors. Callers run it after the owner-only checks,
+// so that a file failing those is never classed as merely replaced.
+func checkLinks(what string, n uint64) error {
+	switch {
+	case n == 1:
+		return nil
+	case n == 0:
+		return fmt.Errorf("%w: %s has 0 links", ErrReplaced, what)
+	default:
+		return notPrivate(what, fmt.Sprintf("has %d links, not 1 (another hard link to it exists)", n))
+	}
+}
+
 // readOnlyAttempts bounds ReadOnly's reads of a file replaced while it
-// was opened.
-const readOnlyAttempts = 5
+// was opened. With readOnlyDelay the attempts span about 1.4 s, several
+// times longer than any one save, also where an antivirus filter scans
+// each new state file as it is opened.
+const readOnlyAttempts = 20
+
+// readOnlyDelay is the pause before attempt n (n >= 1): 1 ms, doubling,
+// at most 100 ms.
+func readOnlyDelay(n int) time.Duration {
+	d := time.Millisecond << min(n-1, 7)
+	return min(d, 100*time.Millisecond)
+}
+
+// readOnlySleep pauses between ReadOnly's attempts; tests replace it.
+var readOnlySleep = time.Sleep
 
 // View is a read-only look at a state directory (ReadOnly).
 type View struct {
@@ -829,16 +874,23 @@ func ReadOnly(dir string, resolve Resolver) (*View, error) {
 		return nil, err
 	}
 	// A save by the lock holder can rename a new file over the one just
-	// opened, which then has no link left and fails the one-link check;
-	// read again. A file that keeps failing (another link) is refused.
+	// opened, which then has no link left (ErrReplaced); its bytes are
+	// dropped and the path is opened and checked again. Only that is
+	// retried: any other refusal (another hard link, access for someone
+	// else) is returned at once.
 	var raw []byte
 	var err error
-	for attempt := 0; ; attempt++ {
+	for attempt := 0; attempt < readOnlyAttempts; attempt++ {
+		if attempt > 0 {
+			readOnlySleep(readOnlyDelay(attempt))
+		}
 		raw, err = readNoFollow(filepath.Join(dir, StateFileName), maxFileLen, true)
-		if err == nil || !errors.Is(err, ErrNotOwnerOnly) || attempt == readOnlyAttempts-1 {
+		if !errors.Is(err, ErrReplaced) {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+	}
+	if errors.Is(err, ErrReplaced) {
+		return nil, fmt.Errorf("state: the state file was replaced during each of %d reads (the running agent app keeps saving it); try again: %w", readOnlyAttempts, err)
 	}
 	if err != nil {
 		return nil, err
