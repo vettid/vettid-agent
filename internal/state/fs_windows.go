@@ -166,6 +166,8 @@ func checkFile(f *os.File) error { return checkHandle(windows.Handle(f.Fd()), "s
 // open file handle (what names it in errors): a regular file with one
 // link, owned by the current user, with no access-allowed entry for
 // anyone else. The handle needs READ_CONTROL (GENERIC_READ includes it).
+// A file with more than one link is ErrNotOwnerOnly; one with no link
+// left (replaced or deleted since it was opened) is ErrUnlinked.
 // internal/protect uses it for passphrase files and handles.
 func CheckOwnerOnlyHandle(h windows.Handle, what string) error { return checkHandle(h, what) }
 
@@ -177,8 +179,8 @@ func checkHandle(h windows.Handle, what string) error {
 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
 		return notPrivate(what, "is not a regular file")
 	}
-	if info.NumberOfLinks != 1 {
-		return notPrivate(what, "has more than one link")
+	if err := checkLinks(what, uint64(info.NumberOfLinks)); err != nil {
+		return err
 	}
 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)

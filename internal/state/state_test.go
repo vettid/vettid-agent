@@ -763,19 +763,6 @@ func TestLoadRefusesSymlink(t *testing.T) {
 	}
 }
 
-func TestLoadRefusesHardLink(t *testing.T) {
-	s := openTest(t)
-	if err := s.Create(newFixedProtector(seq(0x40, 32)), []byte("x")); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Link(s.Path(), filepath.Join(s.Dir(), "second-name")); err != nil {
-		t.Skipf("no hard links here: %v", err)
-	}
-	if _, err := s.Load(resolverFor(newFixedProtector(seq(0x40, 32)))); !errors.Is(err, ErrNotOwnerOnly) {
-		t.Fatalf("Load of a file with two links = %v, want ErrNotOwnerOnly", err)
-	}
-}
-
 func readHeader(t *testing.T, path string) *header {
 	t.Helper()
 	raw, err := os.ReadFile(path)

@@ -113,8 +113,8 @@ func checkFile(f *os.File) error {
 	if !ok {
 		return notPrivate("state file", "has no readable owner")
 	}
-	if st.Nlink != 1 {
-		return notPrivate("state file", "has more than one link")
+	if err := checkLinks("state file", uint64(st.Nlink)); err != nil {
+		return err
 	}
 	return checkOwnerMode("state file", fi.Mode(), st.Uid, uint32(os.Geteuid()))
 }
