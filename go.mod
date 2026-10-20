@@ -2,7 +2,7 @@ module github.com/vettid/vettid-agent
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/google/go-tpm v0.9.8
