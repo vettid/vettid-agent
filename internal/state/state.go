@@ -96,12 +96,14 @@ var (
 	// ErrNotOwnerOnly: the state directory or file is accessible to
 	// someone other than the current user, or owned by someone else.
 	ErrNotOwnerOnly = errors.New("state is not private to the current user")
-	// ErrUnlinked: the file, once open, had no link left: a rename
-	// replaced it (or it was deleted) between the open and the check.
-	// Its bytes are never used. ReadOnly opens the path again, a bounded
-	// number of times; Load, which holds the lock, refuses it. It is not
-	// ErrNotOwnerOnly: no other link or access was found.
-	ErrUnlinked = errors.New("the file has no link left (it was replaced or deleted while it was being opened)")
+	// ErrReplaced: the state file, once open, passed the owner-only
+	// checks but had no link left: a rename replaced it (or it was
+	// deleted) between the open and the check. Its bytes are never used.
+	// ReadOnly opens the path again, a bounded number of times; Load,
+	// which holds the lock, refuses it. It is not ErrNotOwnerOnly: no
+	// other link or access was found (a file that fails the owner-only
+	// checks is ErrNotOwnerOnly whatever its link count).
+	ErrReplaced = errors.New("the state file was replaced while it was being read (no link left once open)")
 	// ErrExists: Create found a state file; replacing one is
 	// CreateReplace.
 	ErrExists = errors.New("a state file already exists (this connector is paired); replacing it must be explicit")
@@ -811,15 +813,16 @@ func notPrivate(what, check string) error {
 // checkLinks is the one-link rule on an open file's link count. One link
 // passes. More than one is refused (ErrNotOwnerOnly): the file can be
 // reached by another name. None means the file was replaced by a rename
-// (or deleted) after it was opened (ErrUnlinked): nothing about the file
+// (or deleted) after it was opened (ErrReplaced): nothing about the file
 // at the path is known, and the caller may open the path again. The
-// count is in both errors.
+// count is in both errors. Callers run it after the owner-only checks,
+// so that a file failing those is never classed as merely replaced.
 func checkLinks(what string, n uint64) error {
 	switch {
 	case n == 1:
 		return nil
 	case n == 0:
-		return fmt.Errorf("%w: %s has 0 links", ErrUnlinked, what)
+		return fmt.Errorf("%w: %s has 0 links", ErrReplaced, what)
 	default:
 		return notPrivate(what, fmt.Sprintf("has %d links, not 1 (another hard link to it exists)", n))
 	}
@@ -871,7 +874,7 @@ func ReadOnly(dir string, resolve Resolver) (*View, error) {
 		return nil, err
 	}
 	// A save by the lock holder can rename a new file over the one just
-	// opened, which then has no link left (ErrUnlinked); its bytes are
+	// opened, which then has no link left (ErrReplaced); its bytes are
 	// dropped and the path is opened and checked again. Only that is
 	// retried: any other refusal (another hard link, access for someone
 	// else) is returned at once.
@@ -882,11 +885,11 @@ func ReadOnly(dir string, resolve Resolver) (*View, error) {
 			readOnlySleep(readOnlyDelay(attempt))
 		}
 		raw, err = readNoFollow(filepath.Join(dir, StateFileName), maxFileLen, true)
-		if !errors.Is(err, ErrUnlinked) {
+		if !errors.Is(err, ErrReplaced) {
 			break
 		}
 	}
-	if errors.Is(err, ErrUnlinked) {
+	if errors.Is(err, ErrReplaced) {
 		return nil, fmt.Errorf("state: the state file was replaced during each of %d reads (the running agent app keeps saving it); try again: %w", readOnlyAttempts, err)
 	}
 	if err != nil {

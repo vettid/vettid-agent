@@ -166,10 +166,18 @@ func checkFile(f *os.File) error { return checkHandle(windows.Handle(f.Fd()), "s
 // open file handle (what names it in errors): a regular file with one
 // link, owned by the current user, with no access-allowed entry for
 // anyone else. The handle needs READ_CONTROL (GENERIC_READ includes it).
-// A file with more than one link is ErrNotOwnerOnly; one with no link
-// left (replaced or deleted since it was opened) is ErrUnlinked.
-// internal/protect uses it for passphrase files and handles.
-func CheckOwnerOnlyHandle(h windows.Handle, what string) error { return checkHandle(h, what) }
+// A file with more than one link is ErrNotOwnerOnly. A file with no
+// link left (deleted, possibly before the handle was inherited) is
+// refused with a plain error that says so; it is neither ErrNotOwnerOnly
+// nor ErrReplaced. internal/protect uses it for passphrase files and
+// handles.
+func CheckOwnerOnlyHandle(h windows.Handle, what string) error {
+	err := checkHandle(h, what)
+	if errors.Is(err, ErrReplaced) {
+		return fmt.Errorf("state: %s has 0 links: the file was deleted", what)
+	}
+	return err
+}
 
 func checkHandle(h windows.Handle, what string) error {
 	var info windows.ByHandleFileInformation
@@ -179,15 +187,17 @@ func checkHandle(h windows.Handle, what string) error {
 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_DIRECTORY|windows.FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
 		return notPrivate(what, "is not a regular file")
 	}
-	if err := checkLinks(what, uint64(info.NumberOfLinks)); err != nil {
-		return err
-	}
 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return notPrivate(what, "security is unreadable")
 	}
-	return checkSecurity(what, sd)
+	// Owner and DACL first: a file that fails them is refused as not
+	// private whatever its link count, never retried as replaced.
+	if err := checkSecurity(what, sd); err != nil {
+		return err
+	}
+	return checkLinks(what, uint64(info.NumberOfLinks))
 }
 
 // openNoFollow opens path with FILE_FLAG_OPEN_REPARSE_POINT, so that a

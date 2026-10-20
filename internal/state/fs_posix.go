@@ -113,10 +113,12 @@ func checkFile(f *os.File) error {
 	if !ok {
 		return notPrivate("state file", "has no readable owner")
 	}
-	if err := checkLinks("state file", uint64(st.Nlink)); err != nil {
+	// Owner and mode first: a file that fails them is refused as not
+	// private whatever its link count, never retried as replaced.
+	if err := checkOwnerMode("state file", fi.Mode(), st.Uid, uint32(os.Geteuid())); err != nil {
 		return err
 	}
-	return checkOwnerMode("state file", fi.Mode(), st.Uid, uint32(os.Geteuid()))
+	return checkLinks("state file", uint64(st.Nlink))
 }
 
 func openPrivate(path string) (*os.File, error) {

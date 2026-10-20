@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -61,7 +62,7 @@ func TestReadOnly(t *testing.T) {
 // TestReadOnlyDuringWrites: reads while the lock holder keeps saving
 // (each save a rename over the file) see one whole state, never a torn
 // or missing one, and are never refused as not private. A read whose
-// every attempt loses the race to a save fails with ErrUnlinked, which
+// every attempt loses the race to a save fails with ErrReplaced, which
 // is safe (nothing was read); where every open is slow (an antivirus
 // filter scanning each new file) that can happen while the writer
 // runs, so it is allowed then, and a read after the writes must work.
@@ -97,6 +98,11 @@ func TestReadOnlyDuringWrites(t *testing.T) {
 				t.Fatalf("read after the writes: %v", err)
 			}
 			t.Logf("%d reads during the writes: %d whole, %d lost every attempt to a save", reads, ok, lost)
+			// Without an antivirus filter slowing every open, some reads
+			// during the writes must win.
+			if ok == 0 && runtime.GOOS != "windows" {
+				t.Fatal("no read during the writes succeeded")
+			}
 			return
 		default:
 		}
@@ -108,7 +114,7 @@ func TestReadOnlyDuringWrites(t *testing.T) {
 				t.Fatalf("read %d: %q", reads, v.State)
 			}
 			ok++
-		case errors.Is(err, ErrUnlinked) && !errors.Is(err, ErrNotOwnerOnly):
+		case errors.Is(err, ErrReplaced) && !errors.Is(err, ErrNotOwnerOnly):
 			lost++
 		default:
 			t.Fatalf("read %d during writes: %v", reads, err)
@@ -144,7 +150,7 @@ func countSleeps(t *testing.T) *[]time.Duration {
 }
 
 // An open file that a rename then replaces has 0 links. checkFile
-// reports that as ErrUnlinked with the count, not as a privacy refusal.
+// reports that as ErrReplaced with the count, not as a privacy refusal.
 func TestCheckFileReplacedWhileOpen(t *testing.T) {
 	s := openTest(t)
 	p := newFixedProtector(bytes.Repeat([]byte{7}, 32))
@@ -163,11 +169,52 @@ func TestCheckFileReplacedWhileOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = checkFile(f)
-	if !errors.Is(err, ErrUnlinked) || errors.Is(err, ErrNotOwnerOnly) {
-		t.Fatalf("checkFile of the replaced file = %v, want ErrUnlinked", err)
+	if !errors.Is(err, ErrReplaced) || errors.Is(err, ErrNotOwnerOnly) {
+		t.Fatalf("checkFile of the replaced file = %v, want ErrReplaced", err)
 	}
 	if !strings.Contains(err.Error(), "0 links") {
 		t.Errorf("error %q does not give the link count", err)
+	}
+}
+
+// A replaced file that is also not private (here, readable by others)
+// is refused as not private, not classed as replaced: Load and ReadOnly
+// return ErrNotOwnerOnly, and ReadOnly does not retry.
+func TestReplacedFileNotPrivateIsRefused(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(bytes.Repeat([]byte{7}, 32))
+	if err := s.Create(p, []byte(`{"n":0}`)); err != nil {
+		t.Fatal(err)
+	}
+	f, err := openPrivate(s.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	makeReadableByOthers(t, s.Path())
+	if err := s.Save([]byte(`{"n":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	err = checkFile(f)
+	if !errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrReplaced) {
+		t.Fatalf("checkFile of a replaced, readable-by-others file = %v, want ErrNotOwnerOnly", err)
+	}
+
+	sleeps := countSleeps(t)
+	testHookAfterOpen = func(path string) {
+		testHookAfterOpen = nil
+		makeReadableByOthers(t, path)
+		if err := s.Save([]byte(`{"n":2}`)); err != nil {
+			t.Errorf("save: %v", err)
+		}
+	}
+	t.Cleanup(func() { testHookAfterOpen = nil })
+	_, err = ReadOnly(s.Dir(), func(string) Protector { return p })
+	if !errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrReplaced) {
+		t.Fatalf("ReadOnly = %v, want ErrNotOwnerOnly", err)
+	}
+	if len(*sleeps) != 0 {
+		t.Errorf("ReadOnly retried a file that is not private %d times", len(*sleeps))
 	}
 }
 
@@ -195,7 +242,7 @@ func TestReadOnlyRetriesReplacedFile(t *testing.T) {
 }
 
 // A file replaced on every attempt: ReadOnly stops after
-// readOnlyAttempts with ErrUnlinked, having read nothing.
+// readOnlyAttempts with ErrReplaced, having read nothing.
 func TestReadOnlyGivesUpOnEndlessReplacement(t *testing.T) {
 	s := openTest(t)
 	p := newFixedProtector(bytes.Repeat([]byte{7}, 32))
@@ -205,8 +252,8 @@ func TestReadOnlyGivesUpOnEndlessReplacement(t *testing.T) {
 	sleeps := countSleeps(t)
 	saves := replaceAfterOpen(t, s, 1<<30)
 	v, err := ReadOnly(s.Dir(), func(string) Protector { return p })
-	if v != nil || !errors.Is(err, ErrUnlinked) || errors.Is(err, ErrNotOwnerOnly) {
-		t.Fatalf("ReadOnly = %v, %v; want ErrUnlinked", v, err)
+	if v != nil || !errors.Is(err, ErrReplaced) || errors.Is(err, ErrNotOwnerOnly) {
+		t.Fatalf("ReadOnly = %v, %v; want ErrReplaced", v, err)
 	}
 	if *saves != readOnlyAttempts || len(*sleeps) != readOnlyAttempts-1 {
 		t.Errorf("%d attempts, %d pauses; want %d attempts", *saves, len(*sleeps), readOnlyAttempts)
@@ -236,7 +283,7 @@ func TestRefusesHardLinkedStateFile(t *testing.T) {
 	}
 	check := func(what string, err error) {
 		t.Helper()
-		if !errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrUnlinked) {
+		if !errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrReplaced) {
 			t.Fatalf("%s = %v, want ErrNotOwnerOnly", what, err)
 		}
 		if !strings.Contains(err.Error(), "has 2 links") {
@@ -257,12 +304,12 @@ func TestCheckLinks(t *testing.T) {
 	if err := checkLinks("x", 1); err != nil {
 		t.Errorf("1 link: %v", err)
 	}
-	if err := checkLinks("x", 0); !errors.Is(err, ErrUnlinked) || errors.Is(err, ErrNotOwnerOnly) {
+	if err := checkLinks("x", 0); !errors.Is(err, ErrReplaced) || errors.Is(err, ErrNotOwnerOnly) {
 		t.Errorf("0 links: %v", err)
 	}
 	for _, n := range []uint64{2, 3, 1 << 32} {
 		err := checkLinks("x", n)
-		if !errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrUnlinked) || !strings.Contains(err.Error(), fmt.Sprintf("has %d links", n)) {
+		if !errors.Is(err, ErrNotOwnerOnly) || errors.Is(err, ErrReplaced) || !strings.Contains(err.Error(), fmt.Sprintf("has %d links", n)) {
 			t.Errorf("%d links: %v", n, err)
 		}
 	}
