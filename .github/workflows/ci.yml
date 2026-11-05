@@ -96,7 +96,7 @@ jobs:
               $failed = "TestAccessCheckIsReal did not pass"
             }
           } finally {
-            try { Remove-LocalUser -Name $name } catch { Write-Warning "removing $name: $_" }
+            try { Remove-LocalUser -Name $name } catch { Write-Warning "removing ${name}: $_" }
           }
           if ($failed) { Write-Error $failed }
           exit 0
