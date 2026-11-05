@@ -107,13 +107,17 @@ func shorten(s string) string {
 // own). The phone doesn't show `env`, so a request can't set them, for the
 // same reason as LD_ (AGENT-PLAN §4.9; the code-loading ones beyond LD_ and
 // DYLD_ are the lead's ruling, 2026-11-05). Names are upper case, as the
-// name rule requires.
-var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_CONFIG_", "COR_PROFILER", "CORECLR_", "DOTNET_"}
+// name rule requires. A list like this can't be complete; the whole GIT_
+// family is refused because git reads many of them as commands. The same
+// rule holds for --run-env, so an operator can't pass these through either.
+var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_", "COR_PROFILER", "CORECLR_", "DOTNET_"}
 
 var loaderNames = []string{
-	"NODE_OPTIONS", "BASH_ENV", "ENV", "PERL5OPT", "PERL5LIB",
-	"PYTHONSTARTUP", "PYTHONPATH", "RUBYOPT", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
-	"GIT_SSH_COMMAND", "GIT_EXEC_PATH",
+	"NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV",
+	"PERL5OPT", "PERL5LIB", "PERLLIB", "PERL5DB",
+	"PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "RUBYOPT", "RUBYLIB",
+	"JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
+	"LESSOPEN", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS", "SUDO_ASKPASS",
 }
 
 func forbiddenNames() []string {

@@ -40,21 +40,39 @@ func TestAccessCheckIsReal(t *testing.T) {
 
 // A junction to a protected directory is refused: it's resolved by
 // nothing before the check, and its owner could repoint it later.
+// (Junctions need no privilege, so making one failing is a test failure.)
 func TestJunctionRunPathRefused(t *testing.T) {
 	link := filepath.Join(t.TempDir(), "j")
-	target := filepath.Join(os.Getenv("SystemRoot"), "System32")
+	target := os.Getenv("SystemRoot")
 	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput(); err != nil {
-		t.Skipf("can't make a junction here: %v %s", err, out)
+		t.Fatalf("can't make a junction: %v %s", err, out)
 	}
-	_, err := CheckRunPaths([]string{link})
-	if err == nil || !strings.Contains(err.Error(), "junction") {
-		t.Fatalf("junction to System32: %v", err)
+	// At the leaf: the check names it.
+	if _, err := CheckRunPaths([]string{link}); err == nil || !strings.Contains(err.Error(), "junction") {
+		t.Errorf("junction at the leaf: %v", err)
+	}
+	// Under a junction (it as a parent): refused too, already when links
+	// are resolved, which fails on a path through a junction.
+	if _, err := CheckRunPaths([]string{filepath.Join(link, "System32")}); err == nil {
+		t.Error("a path under a junction accepted")
 	}
 }
 
 // A program extension after a stream name doesn't make a program.
+// The stream exists, so it's the ":" rule that refuses it.
 func TestStreamNameIsNotAProgram(t *testing.T) {
-	if _, err := Resolve(filepath.Join(t.TempDir(), "x.txt:s.exe"), nil); err == nil {
+	file := filepath.Join(t.TempDir(), "x.txt")
+	if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stream := file + ":s.exe"
+	if err := os.WriteFile(stream, []byte("MZ"), 0o600); err != nil {
+		t.Fatalf("can't write a stream: %v", err)
+	}
+	if _, err := os.Stat(stream); err != nil {
+		t.Fatalf("stream not there: %v", err)
+	}
+	if _, err := Resolve(stream, nil); err == nil {
 		t.Fatal("x.txt:s.exe accepted")
 	}
 }

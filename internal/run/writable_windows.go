@@ -51,7 +51,7 @@ func writable(dir string, parent bool) (bool, error) {
 		return false, fmt.Errorf("can't be checked: %w", err)
 	}
 	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return false, fmt.Errorf("is a junction or link; use the directory it points to")
+		return false, fmt.Errorf("is a junction, link or other reparse point (a OneDrive or deduplicated folder, for example); use a plain local directory")
 	}
 	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)

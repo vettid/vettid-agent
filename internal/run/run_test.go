@@ -161,6 +161,11 @@ func TestEnvRefusals(t *testing.T) {
 		{"cor profiler family", Var{"COR_PROFILER_PATH", "x"}},
 		{"coreclr family", Var{"CORECLR_ENABLE_PROFILING", "x"}},
 		{"dotnet family", Var{"DOTNET_STARTUP_HOOKS", "x"}},
+		{"git family", Var{"GIT_PAGER", "x"}},
+		{"askpass", Var{"SSH_ASKPASS", "x"}},
+		{"pager", Var{"PAGER", "x"}},
+		{"python home", Var{"PYTHONHOME", "x"}},
+		{"node path", Var{"NODE_PATH", "x"}},
 	}
 	for _, n := range wantMinimal() {
 		cases = append(cases, struct {
