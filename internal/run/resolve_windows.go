@@ -3,6 +3,7 @@
 package run
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,9 +11,32 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// The minimal environment copied from the connector (AGENT-PLAN §4.9).
-var minimalNames = []string{"SystemRoot", "SystemDrive", "windir", "PATHEXT", "USERPROFILE",
-	"USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"}
+// The minimal environment (AGENT-PLAN §4.9): copiedNames are copied from
+// the connector's environment; the others are set by the connector from
+// the system (systemVars), never inherited.
+var minimalNames = append([]string{"SystemRoot", "SystemDrive", "windir", "PATHEXT"}, copiedNames...)
+
+var copiedNames = []string{"USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA"}
+
+// systemVars: SystemRoot and windir from the system's Windows directory
+// (GetSystemWindowsDirectory), SystemDrive from its volume, and PATHEXT
+// as the program extensions the connector itself accepts, so a program
+// that looks things up sees what the connector checked, not what its
+// starter set. (chosen; not in the spec) Without the Windows directory no
+// run starts.
+func systemVars() ([]Var, error) {
+	root, err := windows.GetSystemWindowsDirectory()
+	if err != nil || root == "" || !filepath.IsAbs(root) {
+		return nil, errors.New("the Windows directory can't be found")
+	}
+	root = filepath.Clean(root)
+	return []Var{
+		{"SystemRoot", root},
+		{"windir", root},
+		{"SystemDrive", filepath.VolumeName(root)},
+		{"PATHEXT", ".COM;.EXE"},
+	}, nil
+}
 
 // tempNames are set to the run's tmp directory.
 var tempNames = []string{"TEMP", "TMP"}

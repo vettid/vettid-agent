@@ -7,9 +7,9 @@ import (
 )
 
 // checkProgram is the rule a resolved program must pass at every run:
-// it and the folders above it can't be changed by the connector's user
-// (owner decision, 2026-11-05). Tests of the lookup order alone replace it.
-var checkProgram = unchangeable
+// it, its own folder and the folders above it can't be changed by the
+// connector's user (owner decision, 2026-11-05; programUnchangeable). Tests of the lookup order alone replace it.
+var checkProgram = programUnchangeable
 
 // fixedPath is FixedPath, replaced by tests (the Homebrew case).
 var fixedPath = FixedPath

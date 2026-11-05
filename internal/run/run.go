@@ -115,7 +115,8 @@ var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_", "COR_PROFILER", "CORECLR_"
 var loaderNames = []string{
 	"NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV",
 	"PERL5OPT", "PERL5LIB", "PERLLIB", "PERL5DB",
-	"PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "RUBYOPT", "RUBYLIB",
+	"PYTHONSTARTUP", "PYTHONPATH", "PYTHONHOME", "PYTHONUSERBASE", "RUBYOPT", "RUBYLIB",
+	"XDG_CONFIG_HOME", "GCONV_PATH", "AWS_CONFIG_FILE", "KUBECONFIG", "COMSPEC", "PSMODULEPATH", "SHELL",
 	"JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
 	"LESSOPEN", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS", "SUDO_ASKPASS",
 }
@@ -192,10 +193,17 @@ func Env(spec Spec, lookup func(string) (string, bool)) ([]string, error) {
 		}
 		out = append(out, Var{name, value})
 	}
-	for _, n := range minimalNames {
+	for _, n := range copiedNames {
 		if v, ok := lookup(n); ok {
 			set(n, v)
 		}
+	}
+	sys, err := systemVars()
+	if err != nil {
+		return nil, err
+	}
+	for _, v := range sys {
+		set(v.Name, v.Value)
 	}
 	set("PATH", SearchPath(spec.RunPath))
 	for _, n := range tempNames {
@@ -261,7 +269,7 @@ func checkNotWritable(p string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("can't be resolved: %w", err)
 	}
-	if err := unchangeable(real); err != nil {
+	if err := unchangeable(real, 1); err != nil {
 		return "", err
 	}
 	return real, nil
@@ -272,14 +280,21 @@ func checkNotWritable(p string) (string, error) {
 // user (owner, write access, ACLs, reparse points; see writable). Owner
 // decisions of 2026-11-05: for --run-path directories, and at every run for
 // the program itself and the folders above it, on the fixed path too.
-func unchangeable(real string) error {
-	for p, parent := real, false; ; p, parent = filepath.Dir(p), true {
+//
+// The first own entries (the --run-path directory: 1; a program and its
+// folder: 2) must refuse every changing right, adding files included: a
+// file added to a program's own folder is loaded by it (a DLL found in the
+// application's folder first, on Windows). Folders above those need only
+// refuse what replaces them (renaming, deleting, changing access).
+func unchangeable(real string, own int) error {
+	for p, i := real, 0; ; p, i = filepath.Dir(p), i+1 {
+		parent := i >= own
 		w, err := writable(p, parent)
 		if err != nil {
 			return fmt.Errorf("%s %w", p, err)
 		}
 		if w {
-			if parent {
+			if i > 0 {
 				return fmt.Errorf("its folder %s can be changed by this connector's user, or by others; it must be one only an administrator can change", p)
 			}
 			return fmt.Errorf("%s can be changed by this connector's user, or by others; it must be one only an administrator can change", p)
@@ -289,6 +304,10 @@ func unchangeable(real string) error {
 		}
 	}
 }
+
+// programUnchangeable is unchangeable for a resolved program: the file and
+// its own folder get the full rule.
+func programUnchangeable(real string) error { return unchangeable(real, 2) }
 
 // CheckRunEnv checks the operator's --run-env names: at most 32, each
 // valid by the same rule as a request's env names.

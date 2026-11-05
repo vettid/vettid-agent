@@ -14,6 +14,12 @@ import (
 // The minimal environment copied from the connector (AGENT-PLAN §4.9).
 var minimalNames = []string{"HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ"}
 
+// copiedNames: on POSIX the whole minimal set is copied.
+var copiedNames = minimalNames
+
+// systemVars: none on POSIX.
+func systemVars() ([]Var, error) { return nil, nil }
+
 // tempNames are set to the run's tmp directory.
 var tempNames = []string{"TMPDIR"}
 

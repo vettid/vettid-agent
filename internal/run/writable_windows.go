@@ -4,7 +4,9 @@ package run
 
 import (
 	"fmt"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -53,11 +55,23 @@ func writable(dir string, parent bool) (bool, error) {
 	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		return false, fmt.Errorf("is a junction, link or other reparse point (a OneDrive or deduplicated folder, for example); use a plain local directory")
 	}
+	if filepath.Dir(dir) == dir {
+		if err := fixedLocalDrive(dir); err != nil {
+			return false, err
+		}
+	}
 	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return false, fmt.Errorf("its access can't be read: %w", err)
 	}
+	return changes(sd, parent)
+}
+
+// changes reports whether the current user holds, over an object of sd, a
+// right that changes it: any of dirRights, or for a folder above the
+// checked ones (parent) any of parentRights.
+func changes(sd *windows.SECURITY_DESCRIPTOR, parent bool) (bool, error) {
 	granted, err := maxAllowed(sd)
 	if err != nil {
 		return false, err
@@ -107,4 +121,37 @@ func maxAllowed(sd *windows.SECURITY_DESCRIPTOR) (uint32, error) {
 		return 0, nil
 	}
 	return granted, nil
+}
+
+// fixedLocalDrive refuses a drive that is not a fixed local disk (a network,
+// removable or optical drive, a RAM disk), and a drive letter mapped to a
+// folder (subst, or DefineDosDevice in the user's own session), which its
+// user can point elsewhere after the check. A standard user can't redefine
+// an existing letter such as C: (Windows refuses it), only add new ones.
+// (chosen; not in the spec)
+func fixedLocalDrive(root string) error {
+	p, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		return fmt.Errorf("is not a valid path")
+	}
+	if t := windows.GetDriveType(p); t != windows.DRIVE_FIXED {
+		return fmt.Errorf("is not on a fixed local drive; use a folder on a local disk")
+	}
+	vol := filepath.VolumeName(root)
+	name, err := windows.UTF16PtrFromString(vol)
+	if err != nil || vol == "" {
+		return fmt.Errorf("is not on a drive letter; use a folder on a local disk")
+	}
+	buf := make([]uint16, 1024)
+	n, err := windows.QueryDosDevice(name, &buf[0], uint32(len(buf)))
+	if err != nil {
+		return fmt.Errorf("its drive can't be checked: %w", err)
+	}
+	// The first target is what the letter maps to: a device for a disk,
+	// \??\<path> for a letter mapped to a folder.
+	target := windows.UTF16ToString(buf[:n])
+	if !strings.HasPrefix(target, `\Device\`) {
+		return fmt.Errorf("is on a drive letter mapped to a folder (subst); use the folder's own path on a local disk")
+	}
+	return nil
 }

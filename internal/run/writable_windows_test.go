@@ -39,6 +39,113 @@ func TestAccessCheckIsReal(t *testing.T) {
 	}
 }
 
+// The rights rule against fixed security descriptors, so it holds whatever
+// the test's user may do (CI's runner is an administrator, which the
+// on-disk tests skip). The owner is SYSTEM, so the test's user has no
+// owner's rights; each case grants it, by its own SID, exactly the
+// rights named.
+func TestChangesRule(t *testing.T) {
+	me := currentUserSID(t)
+	read := "(A;;0x1200a9;;;WD)" // read and execute for everyone
+	cases := []struct {
+		name        string
+		dacl        string
+		own, parent bool // changes, as an own entry and as a folder above
+	}{
+		{"read only", read, false, false},
+		{"add file only", read + "(A;;0x2;;;" + me + ")", true, false},
+		{"add folder only", read + "(A;;0x4;;;" + me + ")", true, false},
+		{"delete child", read + "(A;;0x40;;;" + me + ")", true, true},
+		{"delete", read + "(A;;SD;;;" + me + ")", true, true},
+		{"write access list", read + "(A;;WD;;;" + me + ")", true, true},
+		{"write owner", read + "(A;;WO;;;" + me + ")", true, true},
+		{"full", "(A;;FA;;;" + me + ")", true, true},
+		{"denied", "(D;;FA;;;" + me + ")" + read, false, false},
+	}
+	for _, c := range cases {
+		sd, err := windows.SecurityDescriptorFromString("O:SYG:SYD:P" + c.dacl)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		for _, parent := range []bool{false, true} {
+			got, err := changes(sd, parent)
+			if err != nil {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+			want := c.own
+			if parent {
+				want = c.parent
+			}
+			if got != want {
+				t.Errorf("%s, parent %v: changes %v, want %v", c.name, parent, got, want)
+			}
+		}
+	}
+	// The owner may change the access list, whatever the list says.
+	sd, err := windows.SecurityDescriptorFromString("O:" + me + "G:SYD:P" + read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := changes(sd, true); err != nil || !got {
+		t.Errorf("owned by the user: changes %v, %v", got, err)
+	}
+}
+
+func currentUserSID(t *testing.T) string {
+	t.Helper()
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.User.Sid.String()
+}
+
+// SystemRoot, windir, SystemDrive and PATHEXT come from the system, not
+// from the connector's environment, whatever its starter set.
+func TestEnvWindowsSystemVars(t *testing.T) {
+	root, err := windows.GetSystemWindowsDirectory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoy := map[string]string{"SystemRoot": `C:\decoy`, "windir": `C:\decoy`, "SystemDrive": "Z:", "PATHEXT": ".BAT;.CMD;.EXE"}
+	env, err := Env(Spec{Tmp: t.TempDir()}, mapLookup(decoy))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := envMap(t, env)
+	want := map[string]string{"SystemRoot": filepath.Clean(root), "windir": filepath.Clean(root),
+		"SystemDrive": filepath.VolumeName(root), "PATHEXT": ".COM;.EXE"}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("%s = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// A drive letter mapped to a folder (subst) is refused: its user can point
+// it elsewhere after the check.
+func TestSubstDriveRefused(t *testing.T) {
+	dir := t.TempDir()
+	letter := ""
+	for c := 'Z'; c >= 'M'; c-- {
+		if _, err := os.Stat(string(c) + `:\`); err != nil {
+			letter = string(c) + ":"
+			break
+		}
+	}
+	if letter == "" {
+		t.Skip("no free drive letter")
+	}
+	if out, err := exec.Command("subst", letter, dir).CombinedOutput(); err != nil {
+		t.Fatalf("subst: %v %s", err, out)
+	}
+	t.Cleanup(func() { exec.Command("subst", letter, "/d").Run() })
+	_, err := CheckRunPaths([]string{letter + `\`})
+	if err == nil || !strings.Contains(err.Error(), "subst") {
+		t.Fatalf("subst drive: %v", err)
+	}
+}
+
 // A junction to a protected directory is refused: it's resolved by
 // nothing before the check, and its owner could repoint it later.
 // (Junctions need no privilege, so making one failing is a test failure.)

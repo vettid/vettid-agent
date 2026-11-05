@@ -50,6 +50,44 @@ jobs:
         env:
           VETTID_AGENT_TEST_OTHER_USER: "1"
         run: go test -count=1 -v -run "TestDPAPI|TestChooseProtectorWindows|TestClassifyDPAPI" ./internal/protect
+      # The runner's user is an administrator, for whom every folder can be
+      # changed, so internal/run's on-disk access checks skip in "go test"
+      # above. Here the package's tests run again as a new standard user,
+      # and the step fails if any of them skipped as elevated.
+      - name: internal/run as a standard user
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'runtest'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          go test -c -o (Join-Path $dir 'run.test.exe') ./internal/run
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $name = 'vettidrunci'
+          $pw = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(18)) + 'aA1!'
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+          New-LocalUser -Name $name -Password $sec -AccountNeverExpires | Out-Null
+          try {
+            icacls $dir /grant "${name}:(OI)(CI)RX" | Out-Null
+            sc.exe config seclogon start= demand | Out-Null
+            sc.exe start seclogon | Out-Null
+            $cred = New-Object Management.Automation.PSCredential($name, $sec)
+            $out = Join-Path $env:RUNNER_TEMP 'runtest-out.txt'
+            $err = Join-Path $env:RUNNER_TEMP 'runtest-err.txt'
+            $p = Start-Process -FilePath (Join-Path $dir 'run.test.exe') -ArgumentList '-test.v', '-test.count=1' `
+              -Credential $cred -LoadUserProfile -WorkingDirectory $dir `
+              -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
+            Get-Content $out, $err
+            if ($p.ExitCode -ne 0) { Write-Error "internal/run failed as a standard user" }
+            if (Select-String -Path $out -Pattern 'running as an administrator' -Quiet) {
+              Write-Error "a test skipped as elevated under the standard user"
+            }
+            if (-not (Select-String -Path $out -Pattern '--- PASS: TestAccessCheckIsReal' -Quiet)) {
+              Write-Error "TestAccessCheckIsReal did not pass"
+            }
+          } finally {
+            Remove-LocalUser -Name $name
+          }
       # The Keychain tests again, verbose, as the record of what macOS
       # answers a binary without the keychain-access-groups entitlement
       # (a test binary is one); the round trip needs the signed app (A5).

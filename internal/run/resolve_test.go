@@ -73,7 +73,7 @@ func TestResolveBareNameFixedPathOnly(t *testing.T) {
 			inFixed = true
 		}
 	}
-	if !inFixed && runtime.GOOS == "windows" {
+	if !inFixed {
 		t.Errorf("%s resolved to %s, outside the fixed path", sys, p)
 	}
 }

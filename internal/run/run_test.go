@@ -78,6 +78,14 @@ func TestEnvExactSet(t *testing.T) {
 	for _, n := range wantMinimal() {
 		want[n] = "min-" + n
 	}
+	// On Windows the system's own values replace the connector's.
+	sys, err := systemVars()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range sys {
+		want[v.Name] = v.Value
+	}
 	for _, n := range wantTemp() {
 		want[n] = tmp
 	}
@@ -283,16 +291,14 @@ func systemDir(t *testing.T) string {
 	return "/usr/bin"
 }
 
-func TestCheckRunPaths(t *testing.T) {
+// Bad values are refused whatever the test's user may change, so these
+// run everywhere, as an administrator or root too.
+func TestCheckRunPathsRefusesBadValues(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "f")
 	os.WriteFile(file, nil, 0o600)
-	good := systemDir(t)
 	if _, err := CheckRunPaths(nil); err != nil {
 		t.Errorf("none: %v", err)
-	}
-	if _, err := CheckRunPaths([]string{good}); err != nil {
-		t.Errorf("good: %v", err)
 	}
 	bad := map[string][]string{
 		"relative":    {"rel/dir"},
@@ -308,15 +314,26 @@ func TestCheckRunPaths(t *testing.T) {
 			t.Errorf("%s accepted", name)
 		}
 	}
+	seventeen := make([]string, MaxRunPathDirs+1)
+	for i := range seventeen {
+		seventeen[i] = dir
+	}
+	if _, err := CheckRunPaths(seventeen); err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Errorf("17: %v", err)
+	}
+}
+
+func TestCheckRunPaths(t *testing.T) {
+	good := systemDir(t)
+	if _, err := CheckRunPaths([]string{good}); err != nil {
+		t.Errorf("good: %v", err)
+	}
 	sixteen := make([]string, MaxRunPathDirs)
 	for i := range sixteen {
 		sixteen[i] = good
 	}
 	if _, err := CheckRunPaths(sixteen); err != nil {
 		t.Errorf("16: %v", err)
-	}
-	if _, err := CheckRunPaths(append(sixteen, good)); err == nil {
-		t.Error("17 accepted")
 	}
 }
 
