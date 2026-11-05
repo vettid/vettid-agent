@@ -1,0 +1,6 @@
+# Allow-list for scripts/check-spelling: British forms that are not
+# user-facing text and must not change.
+# One entry per line: PATH-ERE TOKEN-ERE  # why (the reason is required).
+# The token is removed from matching lines of files whose path matches,
+# before the check looks again. Tokens are case-sensitive.
+^internal/mcp/server\.go$ "notifications/cancelled"  # the MCP method name (wire string)
