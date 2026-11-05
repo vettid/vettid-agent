@@ -463,7 +463,7 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 		defer out.wipe()
 		if cctx.Err() != nil {
 			// Cancelled by the client, or the session ended: no answer.
-			s.log.Info("tool call cancelled", "tool", t.def.Name)
+			s.log.Info("tool call canceled", "tool", t.def.Name)
 			return
 		}
 		s.log.Info("tool call", "tool", t.def.Name, "outcome", out.logCode, "request_id", out.requestID)

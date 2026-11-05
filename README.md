@@ -71,7 +71,7 @@ because the dev stack has no clock to move for it; it runs only with
 
 A `devstack` build reaches a dev stack when `VETTID_AGENT_DEVSTACK` names
 the stack's control port (`ctl` in its `ready.json`): relay requests for
-the stack's relay origin (`https://relay.vettid.test`) are dialled at its
+the stack's relay origin (`https://relay.vettid.test`) are dialed at its
 TLS front on the loopback interface, trusting only the TEST TLS root its
 `GET /dev/trust` serves, and any other host is refused. The tag is never
 in a release build.

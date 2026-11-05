@@ -31,6 +31,10 @@ jobs:
       - name: gofmt
         if: runner.os == 'Linux'
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      # User-facing text is American English (owner decision, 2026-11-05).
+      - name: spelling (American English in user-facing text)
+        if: runner.os == 'Linux'
+        run: sh scripts/check-spelling
       - name: go mod verify
         run: go mod verify
       - name: go vet

@@ -141,7 +141,7 @@ start (AGENT-PLAN §4.5), and the vault client applies its own messages
     file system lacks it; then `FlushFileBuffers` on the renamed file and
     on the directory (opened with `FILE_FLAG_BACKUP_SEMANTICS`). Where a
     file system refuses to flush a directory, what remains is its own
-    behaviour: NTFS journaling keeps the directory consistent after a
+    behavior: NTFS journaling keeps the directory consistent after a
     crash (the old entry or the new one), but that alone does not make
     the new entry durable.
 - **Owner-only**: on Linux and macOS the directory is mode `0700` and the

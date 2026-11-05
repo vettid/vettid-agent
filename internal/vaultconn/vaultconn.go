@@ -691,7 +691,7 @@ func errCode(err error) string {
 		return fmt.Sprintf("relay HTTP %d %s", re.Status, sanitizeCode(re.Code))
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return "cancelled"
+		return "canceled"
 	}
 	if errors.Is(err, client.ErrNotPaired) {
 		return "not paired"

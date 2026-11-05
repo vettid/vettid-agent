@@ -21,7 +21,7 @@ changes should fit one of its phases.
 
 - Standard Go conventions (`gofmt`, `go vet`); the standard library
   where it suffices.
-- Keep functions focused and small; write tests for new behaviour.
+- Keep functions focused and small; write tests for new behavior.
 - Specification references cite the document and section, for example
   "VAULT-MESSAGING §6.7".
 
