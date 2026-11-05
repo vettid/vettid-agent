@@ -8,8 +8,8 @@
 # /* or * (then a space or the line's end), so "*p = ..." is scanned. A
 # line of a raw (backquoted) string that starts with // is skipped too.
 # Real exceptions (identifiers, wire strings) are in
-# .github/spelling-allow.txt (not in scripts/, where every file is
-# shellchecked).
+# .github/spelling-allow.txt, not in scripts/: CI runs a shell linter on
+# every file there.
 #
 # POSIX sh, find, grep -E and awk. Run from anywhere:
 #   sh scripts/check-spelling
