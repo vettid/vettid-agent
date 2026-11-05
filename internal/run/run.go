@@ -70,19 +70,40 @@ const (
 
 var nameRE = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,63}$`)
 
-// ValidName reports whether name may be used for a request env variable,
-// the secret's variable or a --run-env name: it matches
-// ^[A-Z_][A-Z0-9_]{0,63}$, is not in the minimal set, PATH, TMPDIR, TEMP
-// or TMP or a code-loading variable, and does not start with a loader
-// prefix (LD_, DYLD_, ...; see loaderPrefixes). On Windows the forbidden
-// checks ignore case.
+// ValidName reports whether name may be used for a request env variable
+// or the secret's variable: it passes the base rule (checkBaseName) and is
+// none of the variables that make a program load other code or send its
+// traffic elsewhere (loaderPrefixes, loaderNames). On Windows the
+// forbidden checks ignore case.
 func ValidName(name string) bool { return checkName(name) == nil }
 
 func checkName(name string) error {
+	if err := checkBaseName(name); err != nil {
+		return err
+	}
+	for _, p := range loaderPrefixes {
+		if strings.HasPrefix(name, p) {
+			return badRequest("variable name %q is not allowed", name)
+		}
+	}
+	for _, f := range loaderNames {
+		if sameName(f, name) {
+			return badRequest("variable name %q is not allowed", name)
+		}
+	}
+	return nil
+}
+
+// checkBaseName is the name rule of AGENT-PLAN §4.9 alone: it matches
+// ^[A-Z_][A-Z0-9_]{0,63}$, is not in the minimal set, PATH, TMPDIR, TEMP
+// or TMP, and does not start with LD_ or DYLD_. The operator's --run-env
+// names get this rule only, not the longer lists (owner decision,
+// 2026-11-05).
+func checkBaseName(name string) error {
 	if len(name) > maxNameLen || !nameRE.MatchString(name) {
 		return badRequest("variable name %q is not allowed", shorten(name))
 	}
-	for _, p := range loaderPrefixes {
+	for _, p := range []string{"LD_", "DYLD_"} {
 		if strings.HasPrefix(name, p) {
 			return badRequest("variable name %q is not allowed", name)
 		}
@@ -104,12 +125,14 @@ func shorten(s string) string {
 
 // loaderPrefixes and loaderNames: variables that make a program load or
 // run other code (the dynamic loader's, and language runtimes' and tools'
-// own). The phone doesn't show `env`, so a request can't set them, for the
-// same reason as LD_ (AGENT-PLAN §4.9; the code-loading ones beyond LD_ and
-// DYLD_ are the lead's ruling, 2026-11-05). Names are upper case, as the
-// name rule requires. A list like this can't be complete; the whole GIT_
-// family is refused because git reads many of them as commands. The same
-// rule holds for --run-env, so an operator can't pass these through either.
+// own), or send its traffic elsewhere or make it trust another
+// certificate. A request can't set them, even when the item's binding
+// lists them: a backstop under that allowlist, since a list like this
+// can't be complete (VAULT-MESSAGING §10.11; owner decisions,
+// 2026-11-05). Names are upper case, as the name rule requires. The whole
+// GIT_ family is refused because git reads many of them as commands. The
+// operator's --run-env names are not checked against these lists (owner
+// decision, 2026-11-05).
 var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_", "COR_PROFILER", "CORECLR_", "DOTNET_"}
 
 var loaderNames = []string{
@@ -119,11 +142,15 @@ var loaderNames = []string{
 	"XDG_CONFIG_HOME", "GCONV_PATH", "AWS_CONFIG_FILE", "KUBECONFIG", "COMSPEC", "PSMODULEPATH", "SHELL",
 	"JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS", "JDK_JAVA_OPTIONS",
 	"LESSOPEN", "PAGER", "EDITOR", "VISUAL", "SSH_ASKPASS", "SUDO_ASKPASS",
+	"GOFLAGS", "RUSTC_WRAPPER",
+	// Names that send a program's traffic elsewhere or make it trust
+	// another certificate.
+	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+	"NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
 }
 
 func forbiddenNames() []string {
 	out := append([]string{}, minimalNames...)
-	out = append(out, loaderNames...)
 	return append(out, "PATH", "TMPDIR", "TEMP", "TMP")
 }
 
@@ -319,7 +346,7 @@ func CheckRunEnv(names []string) error {
 		return fmt.Errorf("--run-env: %d names, at most %d", len(names), MaxRunEnvNames)
 	}
 	for _, n := range names {
-		if err := checkName(n); err != nil {
+		if err := checkBaseName(n); err != nil {
 			return fmt.Errorf("--run-env %q: not an allowed variable name", shorten(n))
 		}
 	}

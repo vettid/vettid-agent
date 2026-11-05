@@ -168,6 +168,16 @@ func TestEnvRefusals(t *testing.T) {
 		{"git config family", Var{"GIT_CONFIG_COUNT", "x"}},
 		{"cor profiler family", Var{"COR_PROFILER_PATH", "x"}},
 		{"coreclr family", Var{"CORECLR_ENABLE_PROFILING", "x"}},
+		// Traffic elsewhere, another certificate, other code (owner
+		// decisions, 2026-11-05).
+		{"https proxy", Var{"HTTPS_PROXY", "x"}},
+		{"all proxy", Var{"ALL_PROXY", "x"}},
+		{"cert file", Var{"SSL_CERT_FILE", "x"}},
+		{"node ca", Var{"NODE_EXTRA_CA_CERTS", "x"}},
+		{"requests ca", Var{"REQUESTS_CA_BUNDLE", "x"}},
+		{"go flags", Var{"GOFLAGS", "x"}},
+		{"rustc wrapper", Var{"RUSTC_WRAPPER", "x"}},
+		{"git config home", Var{"XDG_CONFIG_HOME", "x"}},
 		{"dotnet family", Var{"DOTNET_STARTUP_HOOKS", "x"}},
 		{"git family", Var{"GIT_PAGER", "x"}},
 		{"askpass", Var{"SSH_ASKPASS", "x"}},
@@ -225,6 +235,12 @@ func TestEnvRefusals(t *testing.T) {
 	// A bad --run-env name is refused as well.
 	if _, err := Env(Spec{Tmp: t.TempDir(), RunEnv: []string{"LD_PRELOAD"}}, mapLookup(nil)); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("run-env LD_PRELOAD: %v", err)
+	}
+	// The operator may pass a name a request may not (owner decision,
+	// 2026-11-05): --run-env gets the base rule only.
+	env, err := Env(Spec{Tmp: t.TempDir(), RunEnv: []string{"HTTPS_PROXY"}}, mapLookup(map[string]string{"HTTPS_PROXY": "http://proxy"}))
+	if err != nil || envMap(t, env)["HTTPS_PROXY"] != "http://proxy" {
+		t.Errorf("run-env HTTPS_PROXY: %v %v", err, env)
 	}
 }
 
@@ -338,7 +354,7 @@ func TestCheckRunPaths(t *testing.T) {
 }
 
 func TestCheckRunEnv(t *testing.T) {
-	if err := CheckRunEnv([]string{"MY_VAR", "_X", "A1"}); err != nil {
+	if err := CheckRunEnv([]string{"MY_VAR", "_X", "A1", "HTTPS_PROXY", "NODE_OPTIONS"}); err != nil {
 		t.Errorf("good: %v", err)
 	}
 	for _, bad := range []string{"lower", "LD_PRELOAD", "PATH", "TMP", "TEMP", "TMPDIR", "1X", "A-B", "", "DYLD_X"} {
