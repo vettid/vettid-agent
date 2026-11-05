@@ -11,6 +11,9 @@ import (
 // connector's user (owner decision, 2026-11-05; programUnchangeable). Tests of the lookup order alone replace it.
 var checkProgram = programUnchangeable
 
+// checkPlain is plainPath, replaced by tests of the pin alone.
+var checkPlain = plainPath
+
 // fixedPath is FixedPath, replaced by tests (the Homebrew case).
 var fixedPath = FixedPath
 
@@ -24,6 +27,20 @@ var fixedPath = FixedPath
 // the inherited PATH. Any other argv0 with a separator (on Windows also
 // a backslash or a volume name) is program_not_found.
 func Resolve(argv0 string, runPath []string) (string, error) {
+	return ResolvePinned(argv0, runPath, "")
+}
+
+// ResolvePinned is Resolve for a program whose catalog entry may hold a
+// pinned path (VAULT-MESSAGING §10.11, the catalog's `path`; AGENT-PLAN
+// §4.9, "The program's content"). The check of a program only an
+// administrator can change (checkProgram) runs for every resolved program
+// except one exactly equal to pinned (without case on Windows); the vault
+// pins that file by its SHA-256, so a changed file there is referred to
+// the phone. A pinned program moved elsewhere gets the check again. An
+// empty pinned matches nothing. The other refusals still apply to the
+// pinned path: a junction or other reparse point in it, and on Windows a
+// drive that is not a fixed local disk (plainPath).
+func ResolvePinned(argv0 string, runPath []string, pinned string) (string, error) {
 	if argv0 == "" || strings.IndexByte(argv0, 0) >= 0 {
 		return "", notFound("the program name is empty or invalid")
 	}
@@ -37,7 +54,7 @@ func Resolve(argv0 string, runPath []string) (string, error) {
 		if !ok {
 			return "", notFound("%s is not an executable file", argv0)
 		}
-		return checked(p)
+		return checked(p, pinned)
 	}
 	if hasSeparator(argv0) {
 		return "", notFound("%s is neither an absolute path nor a bare name", argv0)
@@ -51,15 +68,22 @@ func Resolve(argv0 string, runPath []string) (string, error) {
 			// The first program found is the one: a refused one isn't
 			// skipped for another of the same name further on.
 			if p, ok := executable(cand); ok {
-				return checked(p)
+				return checked(p, pinned)
 			}
 		}
 	}
 	return "", notFound("%s was not found on the connector's search path", argv0)
 }
 
-// checked applies checkProgram to a resolved program.
-func checked(p string) (string, error) {
+// checked applies checkProgram to a resolved program, or for the pinned
+// path the path rules alone (checkPlain).
+func checked(p, pinned string) (string, error) {
+	if pinned != "" && samePath(p, pinned) {
+		if err := checkPlain(p); err != nil {
+			return "", notFound("the program isn't run: %v", err)
+		}
+		return p, nil
+	}
 	if err := checkProgram(p); err != nil {
 		return "", notFound("the program isn't run: %v", err)
 	}

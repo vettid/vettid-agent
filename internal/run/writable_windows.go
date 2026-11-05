@@ -40,25 +40,8 @@ const (
 // groups) holds a right over dir that lets it change what dir holds: as the
 // directory itself (parent false) or as one of a --run-path's parents.
 func writable(dir string, parent bool) (bool, error) {
-	// A junction or other reparse point is refused outright: links were
-	// resolved before this, but junctions aren't (Go 1.23+), and the
-	// security read below would describe its target, which its owner can
-	// change later.
-	p, err := windows.UTF16PtrFromString(dir)
-	if err != nil {
-		return false, fmt.Errorf("is not a valid path")
-	}
-	attrs, err := windows.GetFileAttributes(p)
-	if err != nil {
-		return false, fmt.Errorf("can't be checked: %w", err)
-	}
-	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-		return false, fmt.Errorf("is a junction, link or other reparse point (a OneDrive or deduplicated folder, for example); use a plain local directory")
-	}
-	if filepath.Dir(dir) == dir {
-		if err := fixedLocalDrive(dir); err != nil {
-			return false, err
-		}
+	if err := plainEntry(dir); err != nil {
+		return false, err
 	}
 	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
@@ -67,6 +50,47 @@ func writable(dir string, parent bool) (bool, error) {
 	}
 	return changes(sd, parent)
 }
+
+// plainEntry refuses a junction or other reparse point outright: links
+// were resolved before this, but junctions aren't (Go 1.23+), and the
+// security read of writable would describe its target, which its owner
+// can change later. At the root it refuses a drive that is not a fixed
+// local disk (fixedLocalDrive).
+func plainEntry(dir string) error {
+	p, err := windows.UTF16PtrFromString(dir)
+	if err != nil {
+		return fmt.Errorf("is not a valid path")
+	}
+	attrs, err := windows.GetFileAttributes(p)
+	if err != nil {
+		return fmt.Errorf("can't be checked: %w", err)
+	}
+	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return fmt.Errorf("is a junction, link or other reparse point (a OneDrive or deduplicated folder, for example); use a plain local directory")
+	}
+	if filepath.Dir(dir) == dir {
+		if err := fixedLocalDrive(dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// plainPath applies plainEntry to a resolved program and every folder
+// above it: the rules a pinned program still gets (ResolvePinned).
+func plainPath(real string) error {
+	for p := real; ; p = filepath.Dir(p) {
+		if err := plainEntry(p); err != nil {
+			return fmt.Errorf("%s %w", p, err)
+		}
+		if filepath.Dir(p) == p {
+			return nil
+		}
+	}
+}
+
+// samePath compares two resolved paths without case, as Windows does.
+func samePath(a, b string) bool { return strings.EqualFold(a, b) }
 
 // changes reports whether the current user holds, over an object of sd, a
 // right that changes it: any of dirRights, or for a folder above the

@@ -18,12 +18,16 @@ import (
 const (
 	CodeProgramNotFound = "program_not_found"
 	CodeBadRequest      = "bad_request"
+	CodeEnvNotAllowed   = "env_not_allowed"
+	CodeRunFailed       = "run_failed"
 )
 
 // Error carries a wire code and a message that holds no secret value.
+// Names is the body of env_not_allowed ({names}).
 type Error struct {
-	Code string
-	Msg  string
+	Code  string
+	Msg   string
+	Names []string
 }
 
 func (e *Error) Error() string { return e.Code + ": " + e.Msg }
@@ -39,6 +43,8 @@ func (e *Error) Is(target error) bool {
 var (
 	ErrProgramNotFound error = &Error{Code: CodeProgramNotFound}
 	ErrBadRequest      error = &Error{Code: CodeBadRequest}
+	ErrEnvNotAllowed   error = &Error{Code: CodeEnvNotAllowed}
+	ErrRunFailed       error = &Error{Code: CodeRunFailed}
 )
 
 // Code returns the wire code of err, or "" if it is not an *Error.
@@ -52,6 +58,10 @@ func Code(err error) string {
 
 func notFound(format string, a ...any) error {
 	return &Error{Code: CodeProgramNotFound, Msg: fmt.Sprintf(format, a...)}
+}
+
+func runFailed(format string, a ...any) error {
+	return &Error{Code: CodeRunFailed, Msg: fmt.Sprintf(format, a...)}
 }
 
 func badRequest(format string, a ...any) error {
@@ -152,6 +162,48 @@ var loaderNames = []string{
 func forbiddenNames() []string {
 	out := append([]string{}, minimalNames...)
 	return append(out, "PATH", "TMPDIR", "TEMP", "TMP")
+}
+
+// UnlistedEnv returns the names of the request's env that the bound
+// program's entry does not list (the catalog's `env`; VAULT-MESSAGING
+// §10.11, AGENT-PLAN §4.9 "An allowlist for the request's env"), each
+// once, in the request's order. With no listed names (an unbound item, or
+// an entry with an empty list) every name is unlisted.
+func UnlistedEnv(listed []string, request []Var) []string {
+	var out []string
+	for _, v := range request {
+		if !contains(listed, v.Name) && !contains(out, v.Name) {
+			out = append(out, v.Name)
+		}
+	}
+	return out
+}
+
+// CheckEnvAllowed is the connector's check before it sends item.run, in
+// the vault's order: the name rule first (bad_request; the code-loading
+// names are refused there even when listed), then the allowlist
+// (env_not_allowed, with the unlisted names as {names}). Names are not
+// values: they may be shown and logged.
+func CheckEnvAllowed(listed []string, request []Var) error {
+	for _, v := range request {
+		if err := checkName(v.Name); err != nil {
+			return err
+		}
+	}
+	if names := UnlistedEnv(listed, request); len(names) > 0 {
+		return &Error{Code: CodeEnvNotAllowed, Names: names,
+			Msg: "the program's binding does not allow the variables " + strings.Join(names, ", ")}
+	}
+	return nil
+}
+
+func contains(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // Var is one environment variable.

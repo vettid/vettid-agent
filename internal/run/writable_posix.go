@@ -28,3 +28,9 @@ func writable(dir string, _ bool) (bool, error) {
 	}
 	return unix.Access(dir, unix.W_OK) == nil, nil
 }
+
+// plainPath: no reparse points on POSIX; links were resolved by Resolve.
+func plainPath(string) error { return nil }
+
+// samePath compares two resolved paths exactly.
+func samePath(a, b string) bool { return a == b }
