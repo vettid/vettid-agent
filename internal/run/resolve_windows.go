@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/sys/windows"
 )
 
 // The minimal environment copied from the connector (AGENT-PLAN §4.9).
@@ -19,14 +21,13 @@ var tempNames = []string{"TEMP", "TMP"}
 func sameName(a, b string) bool { return strings.EqualFold(a, b) }
 
 // FixedPath is the connector's fixed search path for bare program names:
-// %SystemRoot%\System32 and %SystemRoot%. Without SystemRoot (or windir)
-// it is empty, and no bare name is found.
+// the system's Windows directory's System32, then the directory itself.
+// It comes from the system (GetSystemWindowsDirectory), never from an
+// inherited SystemRoot or windir, which the connector's starter could set.
+// Without it no bare name is found.
 func FixedPath() []string {
-	root := os.Getenv("SystemRoot")
-	if root == "" {
-		root = os.Getenv("windir")
-	}
-	if root == "" || !filepath.IsAbs(root) {
+	root, err := windows.GetSystemWindowsDirectory()
+	if err != nil || root == "" || !filepath.IsAbs(root) {
 		return nil
 	}
 	return []string{filepath.Join(root, "System32"), filepath.Clean(root)}
@@ -35,19 +36,11 @@ func FixedPath() []string {
 // hasSeparator: a slash, a backslash or a volume name (a colon).
 func hasSeparator(s string) bool { return strings.ContainsAny(s, `/\:`) }
 
-func pathExt() []string {
-	v := os.Getenv("PATHEXT")
-	if v == "" {
-		v = ".COM;.EXE;.BAT;.CMD"
-	}
-	var out []string
-	for _, e := range strings.Split(v, ";") {
-		if strings.HasPrefix(e, ".") && len(e) > 1 {
-			out = append(out, strings.ToLower(e))
-		}
-	}
-	return out
-}
+// pathExt: the program extensions, fixed, never an inherited PATHEXT.
+// .bat and .cmd are left out: their arguments go through cmd.exe, which
+// Go can't quote safely, so an agent's argument could run a command.
+// (chosen; not in the spec)
+func pathExt() []string { return []string{".exe", ".com"} }
 
 func hasExt(name string, exts []string) bool {
 	e := strings.ToLower(filepath.Ext(name))
@@ -73,8 +66,14 @@ func candidates(dir, name string) []string {
 	return out
 }
 
-// canExecute: a regular file whose extension is in PATHEXT.
-func canExecute(path string, _ os.FileInfo) bool { return hasExt(path, pathExt()) }
+// canExecute: a regular file with a program extension, and no stream
+// name (x.txt:s.exe names an alternate data stream).
+func canExecute(path string, _ os.FileInfo) bool {
+	if strings.Contains(path[len(filepath.VolumeName(path)):], ":") {
+		return false
+	}
+	return hasExt(path, pathExt())
+}
 
 // isUNC: a network path, \\host\share\... or //host/share/... (the
 // \\?\UNC\ form included). (chosen; not in the spec)

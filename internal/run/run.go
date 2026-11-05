@@ -73,7 +73,8 @@ var nameRE = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,63}$`)
 // ValidName reports whether name may be used for a request env variable,
 // the secret's variable or a --run-env name: it matches
 // ^[A-Z_][A-Z0-9_]{0,63}$, is not in the minimal set, PATH, TMPDIR, TEMP
-// or TMP, and does not start with LD_ or DYLD_. On Windows the forbidden
+// or TMP or a code-loading variable, and does not start with a loader
+// prefix (LD_, DYLD_, ...; see loaderPrefixes). On Windows the forbidden
 // checks ignore case.
 func ValidName(name string) bool { return checkName(name) == nil }
 
@@ -81,8 +82,10 @@ func checkName(name string) error {
 	if len(name) > maxNameLen || !nameRE.MatchString(name) {
 		return badRequest("variable name %q is not allowed", shorten(name))
 	}
-	if strings.HasPrefix(name, "LD_") || strings.HasPrefix(name, "DYLD_") {
-		return badRequest("variable name %q is not allowed", name)
+	for _, p := range loaderPrefixes {
+		if strings.HasPrefix(name, p) {
+			return badRequest("variable name %q is not allowed", name)
+		}
 	}
 	for _, f := range forbiddenNames() {
 		if sameName(f, name) {
@@ -99,8 +102,23 @@ func shorten(s string) string {
 	return s
 }
 
+// loaderPrefixes and loaderNames: variables that make a program load or
+// run other code (the dynamic loader's, and language runtimes' and tools'
+// own). The phone doesn't show `env`, so a request can't set them, for the
+// same reason as LD_ (AGENT-PLAN §4.9; the code-loading ones beyond LD_ and
+// DYLD_ are the lead's ruling, 2026-11-05). Names are upper case, as the
+// name rule requires.
+var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_CONFIG_", "COR_PROFILER", "CORECLR_", "DOTNET_"}
+
+var loaderNames = []string{
+	"NODE_OPTIONS", "BASH_ENV", "ENV", "PERL5OPT", "PERL5LIB",
+	"PYTHONSTARTUP", "PYTHONPATH", "RUBYOPT", "JAVA_TOOL_OPTIONS", "_JAVA_OPTIONS",
+	"GIT_SSH_COMMAND", "GIT_EXEC_PATH",
+}
+
 func forbiddenNames() []string {
 	out := append([]string{}, minimalNames...)
+	out = append(out, loaderNames...)
 	return append(out, "PATH", "TMPDIR", "TEMP", "TMP")
 }
 
@@ -207,19 +225,26 @@ func SearchPath(runPath []string) string {
 // CheckRunPaths checks the operator's --run-path values: at most 16,
 // each an absolute path of an existing directory, with no path list
 // separator in it.
-func CheckRunPaths(paths []string) error {
+//
+// It returns the directories with links resolved: those, not the values as
+// given, are what Resolve and the run's PATH use, so a link repointed after
+// the check changes nothing.
+func CheckRunPaths(paths []string) ([]string, error) {
 	if len(paths) > MaxRunPathDirs {
-		return fmt.Errorf("--run-path: %d directories, at most %d", len(paths), MaxRunPathDirs)
+		return nil, fmt.Errorf("--run-path: %d directories, at most %d", len(paths), MaxRunPathDirs)
 	}
+	out := make([]string, 0, len(paths))
 	for _, p := range paths {
 		if err := checkAbsDir(p); err != nil {
-			return fmt.Errorf("--run-path %q: %w", p, err)
+			return nil, fmt.Errorf("--run-path %q: %w", p, err)
 		}
-		if err := checkNotWritable(p); err != nil {
-			return fmt.Errorf("--run-path %q: %w", p, err)
+		real, err := checkNotWritable(p)
+		if err != nil {
+			return nil, fmt.Errorf("--run-path %q: %w", p, err)
 		}
+		out = append(out, real)
 	}
-	return nil
+	return out, nil
 }
 
 // checkNotWritable refuses a --run-path directory that the connector's own
@@ -227,24 +252,24 @@ func CheckRunPaths(paths []string) error {
 // root (owner decision, 2026-11-05): an agent running as that user could
 // otherwise swap a bound program and receive the secret without a prompt.
 // Links are resolved first, so the real directories are the ones checked.
-func checkNotWritable(p string) error {
+func checkNotWritable(p string) (string, error) {
 	real, err := filepath.EvalSymlinks(p)
 	if err != nil {
-		return fmt.Errorf("can't be resolved: %w", err)
+		return "", fmt.Errorf("can't be resolved: %w", err)
 	}
 	for dir, parent := real, false; ; dir, parent = filepath.Dir(dir), true {
 		w, err := writable(dir, parent)
 		if err != nil {
-			return fmt.Errorf("%s %w", dir, err)
+			return "", fmt.Errorf("%s %w", dir, err)
 		}
 		if w {
 			if parent {
-				return fmt.Errorf("its parent %s can be changed by this connector's user, or by others; choose a directory only an administrator can change", dir)
+				return "", fmt.Errorf("its parent %s can be changed by this connector's user, or by others; choose a directory only an administrator can change", dir)
 			}
-			return errors.New("can be changed by this connector's user, or by others; choose a directory only an administrator can change")
+			return "", errors.New("can be changed by this connector's user, or by others; choose a directory only an administrator can change")
 		}
 		if filepath.Dir(dir) == dir {
-			return nil
+			return real, nil
 		}
 	}
 }

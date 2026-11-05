@@ -5,6 +5,7 @@ package run
 import (
 	"fmt"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -19,6 +20,10 @@ func writable(dir string, _ bool) (bool, error) {
 		return false, fmt.Errorf("can't be checked: %w", err)
 	}
 	if fi.Mode().Perm()&0o022 != 0 {
+		return true, nil
+	}
+	// Owned by this user: it can chmod it writable, whatever the mode.
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Geteuid() {
 		return true, nil
 	}
 	return unix.Access(dir, unix.W_OK) == nil, nil

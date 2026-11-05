@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // Per-run directories (AGENT-PLAN §4.9, "Run"). Each run gets
@@ -40,7 +41,7 @@ type RunDirs struct {
 var ErrBadRunID = errors.New("state: invalid run id")
 
 func validRunID(id string) bool {
-	if id == "" || len(id) > MaxRunIDLen {
+	if id == "" || len(id) > MaxRunIDLen || reservedName(id) {
 		return false
 	}
 	for i := 0; i < len(id); i++ {
@@ -202,4 +203,19 @@ func (s *Store) removeRunDir(dir string) error {
 		return fmt.Errorf("state: remove run directory: %w", errors.Join(errs...))
 	}
 	return nil
+}
+
+// reservedName: a Windows device name (CON, NUL, COM1, ...), which can't
+// be a directory there; refused everywhere, so ids behave the same on
+// every system.
+func reservedName(id string) bool {
+	u := strings.ToUpper(id)
+	switch u {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(u) == 4 && (strings.HasPrefix(u, "COM") || strings.HasPrefix(u, "LPT")) && u[3] >= '1' && u[3] <= '9' {
+		return true
+	}
+	return false
 }

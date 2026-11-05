@@ -11,7 +11,8 @@ import (
 
 func TestRunIDValidation(t *testing.T) {
 	s := openTest(t)
-	bad := []string{"", ".", "..", "a/b", `a\b`, "a b", "a.b", "../x", "a:b", "é", "a\x00b", strings.Repeat("a", MaxRunIDLen+1)}
+	bad := []string{"", ".", "..", "a/b", `a\b`, "a b", "a.b", "../x", "a:b", "é", "a\x00b", strings.Repeat("a", MaxRunIDLen+1),
+		"CON", "nul", "Com1", "LPT9"} // Windows device names, refused everywhere
 	for _, id := range bad {
 		if _, err := s.PrepareRun(id); !errors.Is(err, ErrBadRunID) {
 			t.Errorf("PrepareRun(%q) = %v, want ErrBadRunID", id, err)
