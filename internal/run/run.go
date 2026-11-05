@@ -261,19 +261,31 @@ func checkNotWritable(p string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("can't be resolved: %w", err)
 	}
-	for dir, parent := real, false; ; dir, parent = filepath.Dir(dir), true {
-		w, err := writable(dir, parent)
+	if err := unchangeable(real); err != nil {
+		return "", err
+	}
+	return real, nil
+}
+
+// unchangeable checks a resolved path (links followed) and every directory
+// above it, up to the root: none may be changeable by the connector's own
+// user (owner, write access, ACLs, reparse points; see writable). Owner
+// decisions of 2026-11-05: for --run-path directories, and at every run for
+// the program itself and the folders above it, on the fixed path too.
+func unchangeable(real string) error {
+	for p, parent := real, false; ; p, parent = filepath.Dir(p), true {
+		w, err := writable(p, parent)
 		if err != nil {
-			return "", fmt.Errorf("%s %w", dir, err)
+			return fmt.Errorf("%s %w", p, err)
 		}
 		if w {
 			if parent {
-				return "", fmt.Errorf("its parent %s can be changed by this connector's user, or by others; choose a directory only an administrator can change", dir)
+				return fmt.Errorf("its folder %s can be changed by this connector's user, or by others; it must be one only an administrator can change", p)
 			}
-			return "", errors.New("can be changed by this connector's user, or by others; choose a directory only an administrator can change")
+			return fmt.Errorf("%s can be changed by this connector's user, or by others; it must be one only an administrator can change", p)
 		}
-		if filepath.Dir(dir) == dir {
-			return real, nil
+		if filepath.Dir(p) == p {
+			return nil
 		}
 	}
 }

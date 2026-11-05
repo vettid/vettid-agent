@@ -6,6 +6,14 @@ import (
 	"strings"
 )
 
+// checkProgram is the rule a resolved program must pass at every run:
+// it and the folders above it can't be changed by the connector's user
+// (owner decision, 2026-11-05). Tests of the lookup order alone replace it.
+var checkProgram = unchangeable
+
+// fixedPath is FixedPath, replaced by tests (the Homebrew case).
+var fixedPath = FixedPath
+
 // Resolve finds the program for argv0 (AGENT-PLAN §4.9, "Run") and
 // returns its path with symbolic links resolved: the `program` the vault
 // checks against the item's programs.
@@ -29,23 +37,33 @@ func Resolve(argv0 string, runPath []string) (string, error) {
 		if !ok {
 			return "", notFound("%s is not an executable file", argv0)
 		}
-		return p, nil
+		return checked(p)
 	}
 	if hasSeparator(argv0) {
 		return "", notFound("%s is neither an absolute path nor a bare name", argv0)
 	}
-	dirs := append(FixedPath(), runPath...)
+	dirs := append(fixedPath(), runPath...)
 	for _, dir := range dirs {
 		if dir == "" || !filepath.IsAbs(dir) {
 			continue
 		}
 		for _, cand := range candidates(dir, argv0) {
+			// The first program found is the one: a refused one isn't
+			// skipped for another of the same name further on.
 			if p, ok := executable(cand); ok {
-				return p, nil
+				return checked(p)
 			}
 		}
 	}
 	return "", notFound("%s was not found on the connector's search path", argv0)
+}
+
+// checked applies checkProgram to a resolved program.
+func checked(p string) (string, error) {
+	if err := checkProgram(p); err != nil {
+		return "", notFound("the program isn't run: %v", err)
+	}
+	return p, nil
 }
 
 // executable resolves links in path and reports whether the result is a

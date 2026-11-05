@@ -23,6 +23,15 @@ func makeExec(t *testing.T, dir, name string) string {
 	return p
 }
 
+// lookupOnly lets a test check the lookup order with programs in its own
+// temporary directories, which the at-every-run rule would refuse.
+func lookupOnly(t *testing.T) {
+	t.Helper()
+	old := checkProgram
+	checkProgram = func(string) error { return nil }
+	t.Cleanup(func() { checkProgram = old })
+}
+
 func evalAbs(t *testing.T, p string) string {
 	t.Helper()
 	r, err := filepath.EvalSymlinks(p)
@@ -33,6 +42,7 @@ func evalAbs(t *testing.T, p string) string {
 }
 
 func TestResolveBareNameFixedPathOnly(t *testing.T) {
+	lookupOnly(t)
 	decoyDir := t.TempDir()
 	makeExec(t, decoyDir, "vettiddecoyprog")
 	// The inherited PATH names the decoy directory; it must not be used.
@@ -69,6 +79,7 @@ func TestResolveBareNameFixedPathOnly(t *testing.T) {
 }
 
 func TestResolveFixedBeforeRunPath(t *testing.T) {
+	lookupOnly(t)
 	// A run-path directory cannot shadow a fixed-path program.
 	shadow := t.TempDir()
 	name := "sh"
@@ -101,6 +112,7 @@ func TestResolveRefusesPathsWithSeparators(t *testing.T) {
 }
 
 func TestResolveAbsolute(t *testing.T) {
+	lookupOnly(t)
 	dir := t.TempDir()
 	good := makeExec(t, dir, "tool")
 	got, err := Resolve(good, nil)
@@ -128,6 +140,7 @@ func TestResolveAbsolute(t *testing.T) {
 }
 
 func TestResolveSymlinkIsResolved(t *testing.T) {
+	lookupOnly(t)
 	dir := t.TempDir()
 	target := makeExec(t, dir, "real")
 	link := filepath.Join(dir, "link"+filepath.Ext(target))
@@ -155,5 +168,59 @@ func TestResolveSymlinkIsResolved(t *testing.T) {
 		if _, err := Resolve(dl, nil); !errors.Is(err, ErrProgramNotFound) {
 			t.Errorf("link to directory: %v", err)
 		}
+	}
+}
+
+// The owner's rule at every run (2026-11-05): a program the connector's
+// user can change, or under a folder it can change, isn't run.
+func TestResolveRefusesAChangeableProgram(t *testing.T) {
+	own := makeExec(t, t.TempDir(), "tool") // the user's own file and folder
+	if _, err := Resolve(own, nil); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "can be changed") {
+		t.Fatalf("user-owned program: %v", err)
+	}
+	// A link from elsewhere to it: the target is what's checked.
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(own, link); err == nil {
+		if _, err := Resolve(link, nil); !errors.Is(err, ErrProgramNotFound) {
+			t.Errorf("link to a user-owned program: %v", err)
+		}
+	}
+	// A system program is run.
+	sys := "/bin/sh"
+	if runtime.GOOS == "windows" {
+		sys = filepath.Join(FixedPath()[0], "cmd.exe")
+	}
+	if _, err := Resolve(sys, nil); err != nil {
+		t.Errorf("%s: %v", sys, err)
+	}
+}
+
+// The fixed path itself gets the rule: a user-owned directory on it (as
+// Homebrew's /opt/homebrew/bin is) doesn't supply programs.
+func TestResolveRefusesAUserOwnedFixedPathDirectory(t *testing.T) {
+	dir := t.TempDir()
+	makeExec(t, dir, "brewtool")
+	old := fixedPath
+	fixedPath = func() []string { return []string{dir} }
+	t.Cleanup(func() { fixedPath = old })
+	if _, err := Resolve("brewtool", nil); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "can be changed") {
+		t.Fatalf("user-owned fixed-path directory: %v", err)
+	}
+}
+
+// A protected file under a folder the user can change is refused for the
+// folder (POSIX: a read-only program in the user's own directory).
+func TestResolveRefusesAChangeableFolder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("on Windows the user's own file is already refused for itself")
+	}
+	dir := t.TempDir()
+	p := makeExec(t, dir, "tool")
+	if err := os.Chmod(p, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Resolve(p, nil)
+	if !errors.Is(err, ErrProgramNotFound) {
+		t.Fatalf("program under a user-owned folder: %v", err)
 	}
 }
