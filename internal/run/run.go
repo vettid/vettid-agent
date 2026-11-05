@@ -289,7 +289,7 @@ func checkNotWritable(p string) (string, error) {
 func unchangeable(real string, own int) error {
 	for p, i := real, 0; ; p, i = filepath.Dir(p), i+1 {
 		parent := i >= own
-		w, err := writable(p, parent)
+		w, err := writableAt(p, parent)
 		if err != nil {
 			return fmt.Errorf("%s %w", p, err)
 		}
@@ -304,6 +304,9 @@ func unchangeable(real string, own int) error {
 		}
 	}
 }
+
+// writableAt is writable, replaced by tests of the levels.
+var writableAt = writable
 
 // programUnchangeable is unchangeable for a resolved program: the file and
 // its own folder get the full rule.

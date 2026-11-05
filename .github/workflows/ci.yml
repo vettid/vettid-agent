@@ -60,34 +60,46 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $dir = Join-Path $env:RUNNER_TEMP 'runtest'
-          New-Item -ItemType Directory -Force $dir | Out-Null
+          $tmp = Join-Path $env:RUNNER_TEMP 'runtest-tmp'
+          New-Item -ItemType Directory -Force $dir, $tmp | Out-Null
           go test -c -o (Join-Path $dir 'run.test.exe') ./internal/run
           if ($LASTEXITCODE -ne 0) { exit 1 }
           $name = 'vettidrunci'
           $pw = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(18)) + 'aA1!'
           $sec = ConvertTo-SecureString $pw -AsPlainText -Force
           New-LocalUser -Name $name -Password $sec -AccountNeverExpires | Out-Null
+          $failed = $null
           try {
+            # The test binary's folder readable, and a temporary folder of
+            # the user's own: Start-Process -Credential passes this
+            # environment, whose TEMP the user can't write.
             icacls $dir /grant "${name}:(OI)(CI)RX" | Out-Null
+            icacls $tmp /grant "${name}:(OI)(CI)M" | Out-Null
             sc.exe config seclogon start= demand | Out-Null
             sc.exe start seclogon | Out-Null
             $cred = New-Object Management.Automation.PSCredential($name, $sec)
             $out = Join-Path $env:RUNNER_TEMP 'runtest-out.txt'
             $err = Join-Path $env:RUNNER_TEMP 'runtest-err.txt'
-            $p = Start-Process -FilePath (Join-Path $dir 'run.test.exe') -ArgumentList '-test.v', '-test.count=1' `
+            $exe = Join-Path $dir 'run.test.exe'
+            $cmdline = "/c set TMP=$tmp&& set TEMP=$tmp&& `"$exe`" -test.v -test.count=1"
+            $p = Start-Process -FilePath "$env:SystemRoot\System32\cmd.exe" -ArgumentList $cmdline `
               -Credential $cred -LoadUserProfile -WorkingDirectory $dir `
-              -RedirectStandardOutput $out -RedirectStandardError $err -Wait -PassThru
+              -RedirectStandardOutput $out -RedirectStandardError $err -PassThru
+            $null = $p.Handle # kept, so ExitCode is readable after the exit
+            $p.WaitForExit()
             Get-Content $out, $err
-            if ($p.ExitCode -ne 0) { Write-Error "internal/run failed as a standard user" }
-            if (Select-String -Path $out -Pattern 'running as an administrator' -Quiet) {
-              Write-Error "a test skipped as elevated under the standard user"
+            if ($p.ExitCode -ne 0) { $failed = "internal/run failed as a standard user (exit $($p.ExitCode))" }
+            elseif (Select-String -Path $out -Pattern 'running as an administrator' -Quiet) {
+              $failed = "a test skipped as elevated under the standard user"
             }
-            if (-not (Select-String -Path $out -Pattern '--- PASS: TestAccessCheckIsReal' -Quiet)) {
-              Write-Error "TestAccessCheckIsReal did not pass"
+            elseif (-not (Select-String -Path $out -Pattern '--- PASS: TestAccessCheckIsReal' -Quiet)) {
+              $failed = "TestAccessCheckIsReal did not pass"
             }
           } finally {
-            Remove-LocalUser -Name $name
+            try { Remove-LocalUser -Name $name } catch { Write-Warning "removing $name: $_" }
           }
+          if ($failed) { Write-Error $failed }
+          exit 0
       # The Keychain tests again, verbose, as the record of what macOS
       # answers a binary without the keychain-access-groups entitlement
       # (a test binary is one); the round trip needs the signed app (A5).

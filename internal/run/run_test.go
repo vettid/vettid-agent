@@ -382,3 +382,24 @@ func TestCheckRunPathsRefusesWritable(t *testing.T) {
 		}
 	}
 }
+
+// The levels of unchangeable: a program's own folder gets the full rule
+// (adding a file there is enough to refuse it), a --run-path's parent
+// only the rule for folders above. The fake says a folder can be changed
+// only under the full rule, as one that grants adding files alone does.
+func TestUnchangeableLevels(t *testing.T) {
+	folder := filepath.Join(t.TempDir(), "tools")
+	prog := filepath.Join(folder, "tool")
+	old := writableAt
+	writableAt = func(p string, parent bool) (bool, error) { return p == folder && !parent, nil }
+	t.Cleanup(func() { writableAt = old })
+	if err := programUnchangeable(prog); err == nil || !strings.Contains(err.Error(), "its folder") {
+		t.Errorf("program in an add-file folder: %v", err)
+	}
+	if err := unchangeable(filepath.Join(folder, "sub"), 1); err != nil {
+		t.Errorf("--run-path below that folder: %v", err)
+	}
+	if err := unchangeable(folder, 1); err == nil {
+		t.Error("that folder as a --run-path accepted")
+	}
+}

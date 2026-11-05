@@ -139,8 +139,8 @@ func fixedLocalDrive(root string) error {
 	}
 	vol := filepath.VolumeName(root)
 	name, err := windows.UTF16PtrFromString(vol)
-	if err != nil || vol == "" {
-		return fmt.Errorf("is not on a drive letter; use a folder on a local disk")
+	if err != nil || len(vol) != 2 || vol[1] != ':' {
+		return fmt.Errorf("is not on a plain drive letter (such as C:); use a folder on a local disk")
 	}
 	buf := make([]uint16, 1024)
 	n, err := windows.QueryDosDevice(name, &buf[0], uint32(len(buf)))
@@ -149,8 +149,11 @@ func fixedLocalDrive(root string) error {
 	}
 	// The first target is what the letter maps to: a device for a disk,
 	// \??\<path> for a letter mapped to a folder.
+	// A disk is \Device\<name> alone; a raw target with a path after
+	// the device's name maps the letter to a folder just as subst does.
 	target := windows.UTF16ToString(buf[:n])
-	if !strings.HasPrefix(target, `\Device\`) {
+	rest, ok := strings.CutPrefix(target, `\Device\`)
+	if !ok || rest == "" || strings.Contains(rest, `\`) {
 		return fmt.Errorf("is on a drive letter mapped to a folder (subst); use the folder's own path on a local disk")
 	}
 	return nil

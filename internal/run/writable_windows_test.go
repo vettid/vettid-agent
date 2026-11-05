@@ -61,6 +61,8 @@ func TestChangesRule(t *testing.T) {
 		{"write owner", read + "(A;;WO;;;" + me + ")", true, true},
 		{"full", "(A;;FA;;;" + me + ")", true, true},
 		{"denied", "(D;;FA;;;" + me + ")" + read, false, false},
+		{"through a group (Users)", read + "(A;;0x2;;;BU)", true, false},
+		{"inherit-only, not on this folder", read + "(A;OICIIO;FA;;;" + me + ")", false, false},
 	}
 	for _, c := range cases {
 		sd, err := windows.SecurityDescriptorFromString("O:SYG:SYD:P" + c.dacl)
@@ -143,6 +145,42 @@ func TestSubstDriveRefused(t *testing.T) {
 	_, err := CheckRunPaths([]string{letter + `\`})
 	if err == nil || !strings.Contains(err.Error(), "subst") {
 		t.Fatalf("subst drive: %v", err)
+	}
+}
+
+// A drive letter defined with a raw target that names a folder on a disk
+// device acts as subst does, and is refused the same way.
+func TestRawTargetDriveRefused(t *testing.T) {
+	dir := t.TempDir()
+	vol := filepath.VolumeName(dir)
+	vp, _ := windows.UTF16PtrFromString(vol)
+	buf := make([]uint16, 1024)
+	n, err := windows.QueryDosDevice(vp, &buf[0], uint32(len(buf)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := windows.UTF16ToString(buf[:n])
+	letter := ""
+	for c := 'Z'; c >= 'M'; c-- {
+		if _, err := os.Stat(string(c) + ":" + string(os.PathSeparator)); err != nil {
+			letter = string(c) + ":"
+			break
+		}
+	}
+	if letter == "" {
+		t.Skip("no free drive letter")
+	}
+	lp, _ := windows.UTF16PtrFromString(letter)
+	tp, _ := windows.UTF16PtrFromString(device + dir[len(vol):])
+	if err := windows.DefineDosDevice(windows.DDD_RAW_TARGET_PATH, lp, tp); err != nil {
+		t.Fatalf("DefineDosDevice: %v", err)
+	}
+	t.Cleanup(func() {
+		windows.DefineDosDevice(windows.DDD_RAW_TARGET_PATH|windows.DDD_REMOVE_DEFINITION|windows.DDD_EXACT_MATCH_ON_REMOVE, lp, tp)
+	})
+	_, err = CheckRunPaths([]string{letter + string(os.PathSeparator)})
+	if err == nil || !strings.Contains(err.Error(), "subst") {
+		t.Fatalf("raw-target drive: %v", err)
 	}
 }
 
