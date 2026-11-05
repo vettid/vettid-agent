@@ -273,6 +273,7 @@ func TestSubstituteSecretFile(t *testing.T) {
 // --run-path looks like.
 func systemDir(t *testing.T) string {
 	t.Helper()
+	skipIfElevated(t)
 	if runtime.GOOS == "windows" {
 		return filepath.Join(os.Getenv("SystemRoot"), "System32")
 	}
@@ -355,10 +356,12 @@ func TestCheckRunPathsRefusesWritable(t *testing.T) {
 	if err := os.Mkdir(sub, 0o555); err != nil {
 		t.Fatal(err)
 	}
+	// Owned by this user, so refused for itself even at 0555 (its owner
+	// can chmod it).
 	if runtime.GOOS != "windows" {
 		_, err = CheckRunPaths([]string{sub})
-		if err == nil || !strings.Contains(err.Error(), "its parent") {
-			t.Fatalf("writable parent: %v", err)
+		if err == nil || !strings.Contains(err.Error(), "can be changed") {
+			t.Fatalf("own read-only directory: %v", err)
 		}
 	}
 }

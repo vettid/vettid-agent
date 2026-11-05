@@ -143,7 +143,8 @@ func TestResolveSymlinkIsResolved(t *testing.T) {
 	lookupOnly(t)
 	dir := t.TempDir()
 	target := makeExec(t, dir, "real")
-	link := filepath.Join(dir, "link"+filepath.Ext(target))
+	// A name no system has on its fixed path.
+	link := filepath.Join(dir, "vettidtestlink"+filepath.Ext(target))
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symbolic links not permitted here: %v", err)
 	}
@@ -155,7 +156,7 @@ func TestResolveSymlinkIsResolved(t *testing.T) {
 		t.Errorf("got %s, want %s", got, evalAbs(t, target))
 	}
 	// Bare name through a run-path link resolves too.
-	got, err = Resolve("link", []string{dir})
+	got, err = Resolve("vettidtestlink", []string{dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +186,9 @@ func TestResolveRefusesAChangeableProgram(t *testing.T) {
 			t.Errorf("link to a user-owned program: %v", err)
 		}
 	}
-	// A system program is run.
+	// A system program is run (not as an administrator, where every
+	// folder can be changed and nothing is run).
+	skipIfElevated(t)
 	sys := "/bin/sh"
 	if runtime.GOOS == "windows" {
 		sys = filepath.Join(FixedPath()[0], "cmd.exe")

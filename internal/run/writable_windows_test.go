@@ -16,6 +16,7 @@ import (
 // access (list the directory) but none of the rights that change it, and
 // the user's own temporary directory grants those.
 func TestAccessCheckIsReal(t *testing.T) {
+	skipIfElevated(t)
 	sys := filepath.Join(os.Getenv("SystemRoot"), "System32")
 	sd, err := windows.GetNamedSecurityInfo(sys, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
@@ -74,5 +75,15 @@ func TestStreamNameIsNotAProgram(t *testing.T) {
 	}
 	if _, err := Resolve(stream, nil); err == nil {
 		t.Fatal("x.txt:s.exe accepted")
+	}
+}
+
+// skipIfElevated: as an administrator, every folder can be changed, so a
+// test of a protected folder can't hold (and the connector refuses all
+// programs, which fails closed).
+func skipIfElevated(t *testing.T) {
+	t.Helper()
+	if windows.GetCurrentProcessToken().IsElevated() {
+		t.Skip("running as an administrator: every folder can be changed")
 	}
 }
