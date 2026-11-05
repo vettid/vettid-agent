@@ -247,14 +247,28 @@ func TestSubstituteSecretFile(t *testing.T) {
 	}
 }
 
+// systemDir is a directory the test's user can't change: what a good
+// --run-path looks like.
+func systemDir(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		return filepath.Join(os.Getenv("SystemRoot"), "System32")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("as root every directory is writable")
+	}
+	return "/usr/bin"
+}
+
 func TestCheckRunPaths(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "f")
 	os.WriteFile(file, nil, 0o600)
+	good := systemDir(t)
 	if err := CheckRunPaths(nil); err != nil {
 		t.Errorf("none: %v", err)
 	}
-	if err := CheckRunPaths([]string{dir}); err != nil {
+	if err := CheckRunPaths([]string{good}); err != nil {
 		t.Errorf("good: %v", err)
 	}
 	bad := map[string][]string{
@@ -273,12 +287,12 @@ func TestCheckRunPaths(t *testing.T) {
 	}
 	sixteen := make([]string, MaxRunPathDirs)
 	for i := range sixteen {
-		sixteen[i] = dir
+		sixteen[i] = good
 	}
 	if err := CheckRunPaths(sixteen); err != nil {
 		t.Errorf("16: %v", err)
 	}
-	if err := CheckRunPaths(append(sixteen, dir)); err == nil {
+	if err := CheckRunPaths(append(sixteen, good)); err == nil {
 		t.Error("17 accepted")
 	}
 }
@@ -303,4 +317,26 @@ func TestCheckRunEnv(t *testing.T) {
 		t.Error("33 accepted")
 	}
 	sort.Strings(names)
+}
+
+// Owner decision 2026-11-05: a --run-path the connector's own user can
+// change (the directory, or a parent) is refused, with the reason.
+func TestCheckRunPathsRefusesWritable(t *testing.T) {
+	_ = systemDir(t) // skips as root
+	own := t.TempDir() // the test user's own: writable
+	err := CheckRunPaths([]string{own})
+	if err == nil || !strings.Contains(err.Error(), "can be changed by this connector's user") {
+		t.Fatalf("own directory: %v", err)
+	}
+	// A directory the user can't write, under one it can: the parent counts.
+	sub := filepath.Join(own, "locked")
+	if err := os.Mkdir(sub, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		err = CheckRunPaths([]string{sub})
+		if err == nil || !strings.Contains(err.Error(), "its parent") {
+			t.Fatalf("writable parent: %v", err)
+		}
+	}
 }

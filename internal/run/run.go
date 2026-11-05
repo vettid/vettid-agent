@@ -215,8 +215,38 @@ func CheckRunPaths(paths []string) error {
 		if err := checkAbsDir(p); err != nil {
 			return fmt.Errorf("--run-path %q: %w", p, err)
 		}
+		if err := checkNotWritable(p); err != nil {
+			return fmt.Errorf("--run-path %q: %w", p, err)
+		}
 	}
 	return nil
+}
+
+// checkNotWritable refuses a --run-path directory that the connector's own
+// user could change, through the directory or any of its parents up to the
+// root (owner decision, 2026-11-05): an agent running as that user could
+// otherwise swap a bound program and receive the secret without a prompt.
+// Links are resolved first, so the real directories are the ones checked.
+func checkNotWritable(p string) error {
+	real, err := filepath.EvalSymlinks(p)
+	if err != nil {
+		return fmt.Errorf("can't be resolved: %w", err)
+	}
+	for dir, parent := real, false; ; dir, parent = filepath.Dir(dir), true {
+		w, err := writable(dir, parent)
+		if err != nil {
+			return fmt.Errorf("%s %w", dir, err)
+		}
+		if w {
+			if parent {
+				return fmt.Errorf("its parent %s can be changed by this connector's user, or by others; choose a directory only an administrator can change", dir)
+			}
+			return errors.New("can be changed by this connector's user, or by others; choose a directory only an administrator can change")
+		}
+		if filepath.Dir(dir) == dir {
+			return nil
+		}
+	}
 }
 
 // CheckRunEnv checks the operator's --run-env names: at most 32, each
