@@ -65,28 +65,41 @@ func (p *Program) recheck(s StartSpec) error {
 }
 
 // hashingCopy reads r to its end into w (nil: nowhere) through SHA-256,
-// and refuses a script: content that starts with #! (AGENT-PLAN §4.9,
-// "Scripts"). It returns the lowercase hex digest.
-func hashingCopy(w io.Writer, r io.Reader, path string) (string, error) {
+// refuses a script, content that starts with #! (AGENT-PLAN §4.9,
+// "Scripts"), and anything that is not this system's own program format
+// (checkFormat), and refuses content longer than limit bytes (0: no
+// limit). It returns the lowercase hex digest.
+func hashingCopy(w io.Writer, r io.Reader, path string, limit int64) (string, error) {
 	h := sha256.New()
-	var head [2]byte
+	var head [4]byte
 	n, err := io.ReadFull(r, head[:])
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		return "", notFound("%s can't be read: %v", path, err)
 	}
-	if bytes.Equal(head[:n], []byte("#!")) {
+	if bytes.HasPrefix(head[:n], []byte("#!")) {
 		return "", notFound("%s is a script (it starts with #!); run its interpreter with the script as an argument", path)
+	}
+	if err := checkFormat(head[:n]); err != nil {
+		return "", notFound("%s %v", path, err)
 	}
 	cw := &copyWriter{w: w}
 	dst := io.MultiWriter(h, cw)
 	if _, err := dst.Write(head[:n]); err != nil {
 		return "", runFailed("%s can't be copied: %v", path, err)
 	}
-	if _, err := io.Copy(dst, r); err != nil {
+	src := r
+	if limit > 0 {
+		src = io.LimitReader(r, limit-int64(n)+1)
+	}
+	copied, err := io.Copy(dst, src)
+	if err != nil {
 		if cw.err != nil {
 			return "", runFailed("%s can't be copied: %v", path, err)
 		}
 		return "", notFound("%s can't be read: %v", path, err)
+	}
+	if limit > 0 && int64(n)+copied > limit {
+		return "", notFound("%s is larger than %d MiB, the most the connector runs", path, limit>>20)
 	}
 	return digest(h), nil
 }

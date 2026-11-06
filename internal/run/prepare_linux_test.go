@@ -123,3 +123,28 @@ func TestStartRefusesWhenMemoryFilesCantRun(t *testing.T) {
 		t.Fatal("the program was started by its path")
 	}
 }
+
+// A program larger than the memory file's cap is refused; one at the cap
+// is held.
+func TestPrepareCapsTheMemoryFile(t *testing.T) {
+	old := maxMemfdSize
+	maxMemfdSize = 1 << 20
+	t.Cleanup(func() { maxMemfdSize = old })
+	p := filepath.Join(t.TempDir(), "big")
+	body := make([]byte, 1<<20)
+	copy(body, "\x7fELF")
+	if err := os.WriteFile(p, body, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	q, err := Prepare(p, "")
+	if err != nil {
+		t.Fatalf("at the cap: %v", err)
+	}
+	q.Close()
+	if err := os.WriteFile(p, append(body, 0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Prepare(p, ""); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "larger than 1 MiB") {
+		t.Fatalf("past the cap: %v", err)
+	}
+}

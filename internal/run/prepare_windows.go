@@ -106,7 +106,7 @@ func prepareHeld(f *os.File, h windows.Handle, path string) (*Program, error) {
 	if !allowedFileSystem(fs) {
 		return nil, notFound("%s is on a %s volume; programs are run only from NTFS or ReFS volumes", path, fs)
 	}
-	sum, err := hashingCopy(nil, f, path)
+	sum, err := hashingCopy(nil, f, path, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -457,4 +457,15 @@ func (p *platProcess) kill() error {
 		return nil
 	}
 	return windows.TerminateProcess(p.h, 1)
+}
+
+// checkFormat accepts a Windows program only: an MZ header. Anything else
+// (a .jar, a script without #!) would be run by whatever the system has
+// registered for it, not by the file that was hashed. (chosen; not in the
+// spec)
+func checkFormat(head []byte) error {
+	if len(head) >= 2 && head[0] == 'M' && head[1] == 'Z' {
+		return nil
+	}
+	return errors.New("is not a Windows program (no MZ header)")
 }

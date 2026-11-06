@@ -18,6 +18,11 @@ type platProgram struct{ exe *os.File }
 // The seals: no writing, growing or shrinking, and no seal changes.
 const programSeals = unix.F_SEAL_WRITE | unix.F_SEAL_GROW | unix.F_SEAL_SHRINK | unix.F_SEAL_SEAL
 
+// maxMemfdSize caps the memory file: a larger program is refused, so a run
+// can't take the connector's memory. A variable for tests. (chosen; not in
+// the spec)
+var maxMemfdSize int64 = 512 << 20
+
 // memfdCreate is unix.MemfdCreate, replaced by tests.
 var memfdCreate = unix.MemfdCreate
 
@@ -41,7 +46,7 @@ func Prepare(path, _ string) (*Program, error) {
 	}
 	mem := os.NewFile(uintptr(fd), "memfd")
 	defer mem.Close()
-	sum, err := hashingCopy(mem, src, path)
+	sum, err := hashingCopy(mem, src, path, maxMemfdSize)
 	if err != nil {
 		return nil, err
 	}
@@ -86,4 +91,14 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 		return nil, err
 	}
 	return startCmd(fmt.Sprintf("/proc/self/fd/%d", childExeFd), []*os.File{p.plat.exe}, s)
+}
+
+// checkFormat accepts an ELF program only. Anything else could be run by
+// a binfmt_misc handler (a .jar, Python byte code, an MZ file through
+// Wine), an interpreter that isn't pinned. (chosen; not in the spec)
+func checkFormat(head []byte) error {
+	if len(head) >= 4 && head[0] == 0x7f && head[1] == 'E' && head[2] == 'L' && head[3] == 'F' {
+		return nil
+	}
+	return errors.New("is not an ELF program")
 }

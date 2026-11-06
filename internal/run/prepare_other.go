@@ -25,3 +25,5 @@ type platProcess struct{}
 
 func (*platProcess) wait() (int, error) { return -1, errors.New("not supported") }
 func (*platProcess) kill() error        { return errors.New("not supported") }
+
+func checkFormat([]byte) error { return nil }

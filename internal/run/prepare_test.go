@@ -190,14 +190,70 @@ func TestPrepareRefusesAScript(t *testing.T) {
 	if !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "script") {
 		t.Fatalf("script: %v, want program_not_found for a script", err)
 	}
-	// "#" alone, or "#!" further in, is not a script.
-	if err := os.WriteFile(p, []byte("# not!#!"), 0o755); err != nil {
+	// "#!" further in is not a script: a program's own header with #!
+	// after it is held.
+	if err := os.WriteFile(p, append(programHeader(), "#!/bin/sh"...), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	q, err := Prepare(evalAbs(t, p), binDir(t))
 	if err != nil {
 		t.Fatalf("not a script: %v", err)
 	}
+	q.Close()
+}
+
+// programHeader is the start of a program in this system's format.
+func programHeader() []byte {
+	switch runtime.GOOS {
+	case "windows":
+		return []byte("MZ")
+	case "linux":
+		return []byte("\x7fELF")
+	case "darwin":
+		return []byte{0xcf, 0xfa, 0xed, 0xfe} // MH_MAGIC_64, little-endian
+	}
+	return nil
+}
+
+// Only this system's own program format is held: other formats, which the
+// system might hand to a registered interpreter, are refused.
+func TestPrepareRefusesOtherFormats(t *testing.T) {
+	if programHeader() == nil {
+		t.Skip("no program format on this system")
+	}
+	name := "tool"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	cases := map[string][]byte{
+		"empty":       {},
+		"one byte":    programHeader()[:1],
+		"jar":         []byte("PK\x03\x04rest"),
+		"python byte": {0x6f, 0x0d, 0x0d, 0x0a, 0, 0, 0, 0},
+		"text":        []byte("echo hi"),
+	}
+	if runtime.GOOS != "windows" {
+		cases["MZ"] = []byte("MZ\x90\x00")
+	}
+	if runtime.GOOS != "linux" {
+		cases["ELF"] = []byte("\x7fELF\x02")
+	}
+	if runtime.GOOS != "darwin" {
+		cases["Mach-O"] = []byte{0xcf, 0xfa, 0xed, 0xfe, 7}
+	}
+	for what, b := range cases {
+		p := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(p, b, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Prepare(evalAbs(t, p), binDir(t))
+		if !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "is not a") {
+			t.Errorf("%s: %v, want program_not_found for its format", what, err)
+		}
+	}
+	// The test's own helper, a real program, passes (it runs in the
+	// start tests too).
+	q := prepare(t, helperCopy(t, t.TempDir(), "helper"))
 	q.Close()
 }
 

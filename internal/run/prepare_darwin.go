@@ -3,6 +3,8 @@
 package run
 
 import (
+	"encoding/binary"
+	"errors"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -54,7 +56,7 @@ func Prepare(path, binDir string) (*Program, error) {
 		return nil, runFailed("the program's copy can't be made: %v", err)
 	}
 	out := os.NewFile(uintptr(fd), dst)
-	sum, err := hashingCopy(out, src, path)
+	sum, err := hashingCopy(out, src, path, 0)
 	if cerr := out.Close(); err == nil && cerr != nil {
 		err = runFailed("the program's copy can't be written: %v", cerr)
 	}
@@ -88,4 +90,21 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 		return nil, err
 	}
 	return startCmd(p.plat.copy, nil, s)
+}
+
+// checkFormat accepts a Mach-O program only: thin (MH_MAGIC, MH_MAGIC_64)
+// or universal (FAT_MAGIC, FAT_MAGIC_64), in either byte order. FAT_MAGIC
+// is also a Java class file's magic, which macOS doesn't run directly.
+// (chosen; not in the spec)
+func checkFormat(head []byte) error {
+	if len(head) >= 4 {
+		be := binary.BigEndian.Uint32(head)
+		le := binary.LittleEndian.Uint32(head)
+		for _, m := range []uint32{0xfeedface, 0xfeedfacf, 0xcafebabe, 0xcafebabf} {
+			if be == m || le == m {
+				return nil
+			}
+		}
+	}
+	return errors.New("is not a Mach-O program")
 }
