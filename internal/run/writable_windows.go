@@ -89,8 +89,11 @@ func plainPath(real string) error {
 	}
 }
 
-// samePath compares two resolved paths without case, as Windows does.
-func samePath(a, b string) bool { return strings.EqualFold(a, b) }
+// samePath compares two resolved paths exactly. Resolved paths carry the
+// case the disk holds, so the same file gives the same string; a
+// comparison without case would also equate characters Windows' own file
+// names keep apart (EqualFold folds the Kelvin sign into k, for example).
+func samePath(a, b string) bool { return a == b }
 
 // changes reports whether the current user holds, over an object of sd, a
 // right that changes it: any of dirRights, or for a folder above the

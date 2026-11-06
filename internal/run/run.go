@@ -180,19 +180,39 @@ func UnlistedEnv(listed []string, request []Var) []string {
 }
 
 // CheckEnvAllowed is the connector's check before it sends item.run, in
-// the vault's order: the name rule first (bad_request; the code-loading
-// names are refused there even when listed), then the allowlist
-// (env_not_allowed, with the unlisted names as {names}). Names are not
-// values: they may be shown and logged.
+// the vault's order: the request's env as Env checks it first (the count,
+// each value's length and NUL bytes, and the name rule, where the
+// code-loading names are refused even when listed: bad_request), then
+// the allowlist (env_not_allowed, with the unlisted names as {names}).
+// Names are not values: they may be shown and logged.
 func CheckEnvAllowed(listed []string, request []Var) error {
-	for _, v := range request {
-		if err := checkName(v.Name); err != nil {
-			return err
-		}
+	if err := checkRequestEnv(request); err != nil {
+		return err
 	}
 	if names := UnlistedEnv(listed, request); len(names) > 0 {
 		return &Error{Code: CodeEnvNotAllowed, Names: names,
 			Msg: "the program's binding does not allow the variables " + strings.Join(names, ", ")}
+	}
+	return nil
+}
+
+// checkRequestEnv checks the request's env: at most MaxRequestEnv
+// variables, each name by the rule, each value at most MaxEnvValueLen
+// bytes with no NUL byte (bad_request).
+func checkRequestEnv(request []Var) error {
+	if len(request) > MaxRequestEnv {
+		return badRequest("env has %d variables, at most %d", len(request), MaxRequestEnv)
+	}
+	for _, v := range request {
+		if err := checkName(v.Name); err != nil {
+			return err
+		}
+		if len(v.Value) > MaxEnvValueLen {
+			return badRequest("value of %s is longer than %d bytes", v.Name, MaxEnvValueLen)
+		}
+		if strings.IndexByte(v.Value, 0) >= 0 {
+			return badRequest("value of %s holds a NUL byte", v.Name)
+		}
 	}
 	return nil
 }
@@ -233,19 +253,8 @@ type Spec struct {
 // in the connector. A later entry of the same name replaces an earlier
 // one.
 func Env(spec Spec, lookup func(string) (string, bool)) ([]string, error) {
-	if len(spec.Request) > MaxRequestEnv {
-		return nil, badRequest("env has %d variables, at most %d", len(spec.Request), MaxRequestEnv)
-	}
-	for _, v := range spec.Request {
-		if err := checkName(v.Name); err != nil {
-			return nil, err
-		}
-		if len(v.Value) > MaxEnvValueLen {
-			return nil, badRequest("value of %s is longer than %d bytes", v.Name, MaxEnvValueLen)
-		}
-		if strings.IndexByte(v.Value, 0) >= 0 {
-			return nil, badRequest("value of %s holds a NUL byte", v.Name)
-		}
+	if err := checkRequestEnv(spec.Request); err != nil {
+		return nil, err
 	}
 	if spec.Secret != nil {
 		if err := checkName(spec.Secret.Name); err != nil {

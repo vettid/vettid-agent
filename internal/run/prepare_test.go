@@ -51,6 +51,9 @@ func TestMain(m *testing.M) {
 	case "exit7":
 		os.Exit(7)
 	default:
+		if platformHelper(os.Getenv(helperVar)) {
+			os.Exit(0)
+		}
 		os.Exit(2)
 	}
 }
@@ -231,7 +234,7 @@ func TestStartRefusesAChangedResolution(t *testing.T) {
 // unless it is exactly the catalog's pinned path.
 func TestResolvePinnedSkipsTheCheckForThePinnedPathOnly(t *testing.T) {
 	plainOnly(t)
-	own := makeExec(t, t.TempDir(), "tool")
+	own := makeExec(t, t.TempDir(), "ktool")
 	real := evalAbs(t, own)
 	if _, err := Resolve(real, nil); !errors.Is(err, ErrProgramNotFound) {
 		t.Fatalf("unpinned changeable program: %v", err)
@@ -240,15 +243,21 @@ func TestResolvePinnedSkipsTheCheckForThePinnedPathOnly(t *testing.T) {
 	if err != nil || got != real {
 		t.Fatalf("pinned: %s, %v", got, err)
 	}
-	if runtime.GOOS == "windows" {
-		if _, err := ResolvePinned(real, nil, strings.ToUpper(real)); err != nil {
-			t.Errorf("pinned, other case: %v", err)
-		}
-	} else if _, err := ResolvePinned(real, nil, strings.ToUpper(real)); !errors.Is(err, ErrProgramNotFound) {
-		t.Errorf("pinned, other case on POSIX: %v", err)
+	// The comparison is exact, on Windows too: another case, or a
+	// character that only folds to the same one (the Kelvin sign for k),
+	// is another path.
+	if _, err := ResolvePinned(real, nil, strings.ToUpper(real)); !errors.Is(err, ErrProgramNotFound) {
+		t.Errorf("pinned, other case: %v", err)
+	}
+	kelvin := strings.Replace(real, "ktool", string(rune(0x212A))+"tool", 1)
+	if kelvin == real || !strings.EqualFold(kelvin, real) {
+		t.Fatalf("test setup: %q", kelvin)
+	}
+	if _, err := ResolvePinned(real, nil, kelvin); !errors.Is(err, ErrProgramNotFound) {
+		t.Errorf("pinned with a Kelvin sign: %v", err)
 	}
 	// Moved, or copied, elsewhere: checked again.
-	moved := makeExec(t, t.TempDir(), "tool")
+	moved := makeExec(t, t.TempDir(), "ktool")
 	if _, err := ResolvePinned(evalAbs(t, moved), nil, real); !errors.Is(err, ErrProgramNotFound) {
 		t.Errorf("program away from its pinned path: %v", err)
 	}
@@ -258,7 +267,7 @@ func TestResolvePinnedSkipsTheCheckForThePinnedPathOnly(t *testing.T) {
 	}
 	// A bare name found on the run path at its pinned path.
 	dir := filepath.Dir(real)
-	got, err = ResolvePinned("tool", []string{dir}, real)
+	got, err = ResolvePinned("ktool", []string{dir}, real)
 	if err != nil || got != real {
 		t.Errorf("bare name at its pinned path: %s, %v", got, err)
 	}
@@ -317,5 +326,24 @@ func TestCheckEnvAllowed(t *testing.T) {
 	}
 	if got := UnlistedEnv([]string{"A"}, []Var{{"A", ""}, {"B", ""}}); len(got) != 1 || got[0] != "B" {
 		t.Fatalf("UnlistedEnv = %v", got)
+	}
+	// Env's own checks come first, as bad_request, even for unlisted
+	// names: the count, a value's length and a NUL byte.
+	var many []Var
+	for i := 0; i <= MaxRequestEnv; i++ {
+		many = append(many, Var{fmt.Sprintf("V%d", i), "x"})
+	}
+	for name, req := range map[string][]Var{
+		"too many":      many,
+		"too long":      {{"REGION", strings.Repeat("x", MaxEnvValueLen+1)}},
+		"NUL byte":      {{"REGION", "a\x00b"}},
+		"unlisted, NUL": {{"OTHER", "a\x00b"}},
+	} {
+		if err := CheckEnvAllowed(listed, req); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%s: %v, want bad_request", name, err)
+		}
+	}
+	if err := CheckEnvAllowed(listed, []Var{{"REGION", strings.Repeat("x", MaxEnvValueLen)}}); err != nil {
+		t.Errorf("value at the limit: %v", err)
 	}
 }

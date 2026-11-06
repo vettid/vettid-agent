@@ -27,7 +27,8 @@ type platProgram struct{ copy string }
 // regular file the operator may run and a script (#!), and copies it into
 // binDir while hashing it. binDir is the run's bin/ folder: created 0700
 // if missing, and refused unless it is a plain folder of this user's that
-// no one else may use.
+// no one else may use (this check of its owner and 0700 mode: chosen;
+// not in the spec).
 func Prepare(path, binDir string) (*Program, error) {
 	if binDir == "" || !filepath.IsAbs(binDir) {
 		return nil, runFailed("the run has no folder for the program's copy")

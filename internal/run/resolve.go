@@ -34,7 +34,8 @@ func Resolve(argv0 string, runPath []string) (string, error) {
 // pinned path (VAULT-MESSAGING §10.11, the catalog's `path`; AGENT-PLAN
 // §4.9, "The program's content"). The check of a program only an
 // administrator can change (checkProgram) runs for every resolved program
-// except one exactly equal to pinned (without case on Windows); the vault
+// except one exactly equal to pinned (on Windows too: resolved paths
+// carry the case on disk); the vault
 // pins that file by its SHA-256, so a changed file there is referred to
 // the phone. A pinned program moved elsewhere gets the check again. An
 // empty pinned matches nothing. The other refusals still apply to the
