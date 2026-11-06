@@ -293,10 +293,9 @@ func TestEnvAppliesTheAllowlist(t *testing.T) {
 func TestAddedLoaderNames(t *testing.T) {
 	names := []string{"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "SSLKEYLOGFILE",
 		"XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS", "ELECTRON_RUN_AS_NODE", "PYTHONWARNINGS",
-		"LUA_INIT", "LUA_INIT_5_4", "VIMINIT", "EXINIT", "CLASSPATH", "NPM_CONFIG_PREFIX", "PIP_INDEX_URL"}
-	if runtime.GOOS == "windows" {
-		names = append(names, "__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA")
-	}
+		"LUA_INIT", "LUA_INIT_5_4", "VIMINIT", "EXINIT", "CLASSPATH", "NPM_CONFIG_PREFIX", "PIP_INDEX_URL",
+		// Refused on every system (VAULT-MESSAGING 0.86.4).
+		"__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA"}
 	for _, n := range names {
 		if ValidName(n) {
 			t.Errorf("%s allowed for a request", n)

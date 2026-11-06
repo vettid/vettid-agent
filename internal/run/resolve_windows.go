@@ -105,7 +105,7 @@ func isUNC(path string) bool {
 	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`)
 }
 
-// platformLoaderNames: on Windows also the compatibility layer, which can
-// make a program load shims, and the folders programs find their own
-// files in. (chosen; not in the spec)
-var platformLoaderNames = []string{"__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA"}
+// platformLoaderNames: none beyond the shared list; the Windows names
+// (__COMPAT_LAYER and the program folders) are refused on every system
+// (VAULT-MESSAGING 0.86.4 §10.11), so they are in loaderNames.
+var platformLoaderNames []string

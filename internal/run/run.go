@@ -171,6 +171,11 @@ var loaderNames = []string{
 	"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "SSLKEYLOGFILE",
 	"XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS", "ELECTRON_RUN_AS_NODE",
 	"PYTHONWARNINGS", "LUA_INIT", "VIMINIT", "EXINIT", "CLASSPATH",
+	// Windows's compatibility layer, which can make a program load shims,
+	// and the folders Windows programs find their own files in: refused on
+	// every system, so the vault needs no knowledge of the connector's
+	// (VAULT-MESSAGING 0.86.4 §10.11).
+	"__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA",
 }
 
 func forbiddenNames() []string {
