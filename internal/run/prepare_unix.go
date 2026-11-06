@@ -82,12 +82,20 @@ func cloexecAll() error {
 	if runtime.GOOS == "linux" {
 		dir = "/proc/self/fd"
 	}
-	ents, err := os.ReadDir(dir)
+	// Names only: os.ReadDir would stat each entry, and on macOS that
+	// fails (EBADF) on the directory's own descriptor, which is listed and
+	// closed by the time it is looked at.
+	d, err := os.Open(dir)
 	if err != nil {
 		return err
 	}
-	for _, e := range ents {
-		fd, err := strconv.Atoi(e.Name())
+	names, err := d.Readdirnames(-1)
+	d.Close()
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		fd, err := strconv.Atoi(name)
 		if err != nil || fd < 3 {
 			continue
 		}
