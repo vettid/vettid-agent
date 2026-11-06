@@ -144,12 +144,11 @@ func shorten(s string) string {
 // operator's --run-env names are not checked against these lists (owner
 // decision, 2026-11-05).
 //
-// The names and prefixes after the "(chosen; not in the spec)" marks below
-// are the connector's additions, which a later erratum is to bring into
-// the specifications; they too apply to the request's env (listed or not)
-// and not to --run-env.
+// The names and prefixes marked VAULT-MESSAGING 0.86.4 below came in with
+// that erratum; they too apply to the request's env (listed or not) and
+// not to --run-env.
 var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_", "COR_PROFILER", "CORECLR_", "DOTNET_",
-	// (chosen; not in the spec)
+	// VAULT-MESSAGING 0.86.4 §10.11.
 	"LUA_INIT_", "NPM_CONFIG_", "PIP_",
 }
 
@@ -165,9 +164,9 @@ var loaderNames = []string{
 	// another certificate.
 	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
 	"NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
-	// (chosen; not in the spec) OpenSSL's configuration and modules, its
-	// key log, more configuration and data folders, Electron run as Node,
-	// and other runtimes' and editors' start-up code.
+	// VAULT-MESSAGING 0.86.4 §10.11: OpenSSL's configuration and modules,
+	// its key log, more configuration and data folders, Electron run as
+	// Node, and other runtimes' and editors' start-up code.
 	"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "SSLKEYLOGFILE",
 	"XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS", "ELECTRON_RUN_AS_NODE",
 	"PYTHONWARNINGS", "LUA_INIT", "VIMINIT", "EXINIT", "CLASSPATH",
