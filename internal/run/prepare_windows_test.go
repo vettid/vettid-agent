@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"golang.org/x/sys/windows"
 )
@@ -272,5 +274,166 @@ func TestStartArguments(t *testing.T) {
 	}
 	if got := strings.ReplaceAll(out, "\r\n", "\n"); got != want.String() {
 		t.Fatalf("arguments arrived as\n%s\nwant\n%s", got, want.String())
+	}
+}
+
+// The image check reads the native image path and reopens it through
+// \\?\GLOBALROOT, with no drive letter: for this process, that names the
+// same file as its drive-letter path.
+func TestNativeImagePathReopens(t *testing.T) {
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(windows.CurrentProcess(), windows.PROCESS_NAME_NATIVE, &buf[0], &n); err != nil {
+		t.Fatal(err)
+	}
+	native := windows.UTF16ToString(buf[:n])
+	if !strings.HasPrefix(native, `\Device\`) {
+		t.Fatalf("native image path %q", native)
+	}
+	open := func(p string) fileIdentity {
+		t.Helper()
+		p16, _ := windows.UTF16PtrFromString(p)
+		h, err := windows.CreateFile(p16, windows.FILE_READ_ATTRIBUTES,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
+		if err != nil {
+			t.Fatalf("open %s: %v", p, err)
+		}
+		defer windows.CloseHandle(h)
+		id, _, err := identityOf(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !open(globalRoot + native).same(open(self)) {
+		t.Fatalf("%s through GLOBALROOT is not %s", native, self)
+	}
+	t.Logf("native image path reopened through GLOBALROOT: %s", native)
+}
+
+// The start keeps the drive-letter path, which relies on a standard user
+// being unable to redefine an existing drive letter (the program's own
+// drive here) in its own session. If Windows ever allows it, this fails.
+func TestDriveLetterCantBeRedefined(t *testing.T) {
+	skipIfElevated(t)
+	dir := evalAbs(t, t.TempDir())
+	letter := filepath.VolumeName(dir)
+	if len(letter) != 2 || letter[1] != ':' {
+		t.Skipf("the temporary folder %s is not on a drive letter", dir)
+	}
+	name, _ := windows.UTF16PtrFromString(letter)
+	for _, c := range []struct {
+		flags  uint32
+		target string
+	}{
+		{0, dir},
+		{windows.DDD_RAW_TARGET_PATH, `\??\` + dir},
+	} {
+		target, _ := windows.UTF16PtrFromString(c.target)
+		err := windows.DefineDosDevice(c.flags, name, target)
+		if err == nil {
+			windows.DefineDosDevice(c.flags|windows.DDD_REMOVE_DEFINITION|windows.DDD_EXACT_MATCH_ON_REMOVE, name, target)
+			t.Fatalf("a standard user redefined %s (flags %#x)", letter, c.flags)
+		}
+		t.Logf("redefining %s as a standard user (flags %#x): refused: %v", letter, c.flags, err)
+	}
+}
+
+// The child has no console of the connector's: it runs with a console of
+// its own (CREATE_NO_WINDOW), which this process is not attached to.
+func TestStartGivesNoConsoleOfTheConnectors(t *testing.T) {
+	lookupOnly(t)
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	out, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	spec := helperSpec(t, exe, "console")
+	spec.Stdout = out
+	proc, err := p.Start(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := proc.Pid
+	if code, err := proc.Wait(); err != nil || code != 0 {
+		t.Fatalf("exit %d, %v", code, err)
+	}
+	b, _ := os.ReadFile(out.Name())
+	pids := strings.Fields(string(b))
+	for _, s := range pids {
+		if s == strconv.Itoa(os.Getpid()) {
+			t.Fatalf("the child shares this process's console: %v", pids)
+		}
+	}
+	if len(pids) == 0 || pids[0] == "none" || !strings.Contains(" "+string(b), strconv.Itoa(child)) {
+		t.Fatalf("the child's console holds %v; want the child's own", pids)
+	}
+}
+
+// Only the standard handles are inherited: another inheritable handle of
+// this process doesn't reach the child.
+func TestStartInheritsOnlyTheStandardHandles(t *testing.T) {
+	lookupOnly(t)
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	f, err := os.Create(filepath.Join(t.TempDir(), "vettid-inherit-probe"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h := windows.Handle(f.Fd())
+	if err := windows.SetHandleInformation(h, windows.HANDLE_FLAG_INHERIT, windows.HANDLE_FLAG_INHERIT); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runOutput(t, p, helperSpec(t, exe, "handle", Var{"VETTID_RUN_TEST_HANDLE", strconv.FormatUint(uint64(h), 10)}))
+	if code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if strings.Contains(strings.ToLower(out), "vettid-inherit-probe") {
+		t.Fatalf("the child holds the inheritable handle: %s", out)
+	}
+}
+
+// A command line past CreateProcess's 32,767 characters once quoted is
+// bad_request, and nothing starts.
+func TestStartRefusesALongCommandLine(t *testing.T) {
+	lookupOnly(t)
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	marker := filepath.Join(t.TempDir(), "marker")
+	spec := helperSpec(t, exe, "marker", Var{"VETTID_RUN_TEST_MARKER", marker})
+	spec.Argv = []string{exe}
+	for i := 0; i < 5; i++ {
+		spec.Argv = append(spec.Argv, strings.Repeat(`"`, 4000)) // each quoted to 8,002
+	}
+	if _, err := p.Start(spec); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("long command line: %v, want bad_request", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a process ran")
+	}
+}
+
+// The environment block is sorted by name without case.
+func TestEnvBlockSorted(t *testing.T) {
+	b, err := envBlock([]string{"b=1", "A=2", "c=3", "B_=4"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, s := range strings.Split(string(utf16.Decode(b)), "\x00") {
+		if s != "" {
+			got = append(got, s)
+		}
+	}
+	if strings.Join(got, ",") != "A=2,b=1,B_=4,c=3" {
+		t.Fatalf("block order %v", got)
 	}
 }

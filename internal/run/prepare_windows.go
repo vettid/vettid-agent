@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -67,6 +68,8 @@ func Prepare(path, _ string) (*Program, error) {
 	// itself, and refused below, not followed.
 	h, err := windows.CreateFile(p16, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil,
 		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	// A file someone else holds for writing is refused as
+	// program_not_found. (chosen; not in the spec)
 	if errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
 		return nil, notFound("%s is open for writing or deleting by another process, so it can't be held unchanged; the run is refused", path)
 	}
@@ -182,6 +185,12 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	if err != nil {
 		return nil, badRequest("an argument holds a NUL byte")
 	}
+	// CreateProcess takes at most 32,767 characters, the ending NUL
+	// included; quoting can take an argv within the request's limits past
+	// that.
+	if len(cmd) > maxCmdLine {
+		return nil, badRequest("the command line is %d characters once quoted, at most %d", len(cmd)-1, maxCmdLine-1)
+	}
 	env, err := envBlock(setVar(s.Env, noCwdExeName, "1"))
 	if err != nil {
 		return nil, err
@@ -197,7 +206,7 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	}
 	defer cleanup()
 	// Only the three standard handles are inherited, whatever else this
-	// process holds as inheritable.
+	// process holds as inheritable. (chosen; not in the spec)
 	al, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return nil, runFailed("the program can't be started: %v", err)
@@ -215,7 +224,11 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	si.ProcThreadAttributeList = al.List()
 
 	var pi windows.ProcessInformation
-	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT | windows.EXTENDED_STARTUPINFO_PRESENT)
+	// CREATE_NO_WINDOW: a console program gets a console of its own,
+	// without a window, never the connector's (AGENT-PLAN §4.9, "The
+	// process": no terminal); programs it starts share that hidden one.
+	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT |
+		windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NO_WINDOW)
 	if err := windows.CreateProcess(app, &cmd[0], nil, nil, true, flags, &env[0], dir, &si.StartupInfo, &pi); err != nil {
 		return nil, runFailed("the program can't be started: %v", err)
 	}
@@ -250,14 +263,26 @@ func hook(stage string) {
 // only while nothing can move the held file or its folders: the held file
 // can't be renamed, and on NTFS renaming a folder above it is refused
 // too (TestHeldProgramParentRename; ReFS not yet tried).
+//
+// The path is the native one (PROCESS_NAME_NATIVE, \Device\...), reopened
+// through \\?\GLOBALROOT, so no drive letter is involved in the check: a
+// letter redefined between the start and the check can't point the check
+// at the held file. (chosen; not in the spec) The start itself uses the
+// resolved drive-letter path, since programs read their own path and may
+// not handle a native one. That relies on a standard user being unable to
+// redefine an existing letter such as C: in its own session
+// (TestDriveLetterCantBeRedefined), as the --run-path check does.
 func (p *Program) verifyImage(proc windows.Handle) error {
 	buf := make([]uint16, windows.MAX_LONG_PATH)
 	n := uint32(len(buf))
-	if err := windows.QueryFullProcessImageName(proc, 0, &buf[0], &n); err != nil {
+	if err := windows.QueryFullProcessImageName(proc, windows.PROCESS_NAME_NATIVE, &buf[0], &n); err != nil {
 		return runFailed("the started program can't be checked: %v", err)
 	}
 	img := windows.UTF16ToString(buf[:n])
-	i16, err := windows.UTF16PtrFromString(img)
+	if !strings.HasPrefix(img, `\Device\`) {
+		return notFound("the started program's name %s is not a device path; the run is refused", img)
+	}
+	i16, err := windows.UTF16PtrFromString(globalRoot + img)
 	if err != nil {
 		return runFailed("the started program can't be checked")
 	}
@@ -289,6 +314,14 @@ func (a fileIdentity) same(b fileIdentity) bool {
 	}
 	return a.has128 == b.has128
 }
+
+// globalRoot, before a native path such as \Device\HarddiskVolume3\x.exe,
+// opens it through the Win32 file functions.
+const globalRoot = `\\?\GLOBALROOT`
+
+// maxCmdLine is CreateProcess's limit on lpCommandLine, in UTF-16 units
+// with the ending NUL.
+const maxCmdLine = 32767
 
 // endSuspended ends a process that was never resumed.
 func endSuspended(pi windows.ProcessInformation) {
@@ -322,8 +355,15 @@ func setVar(env []string, name, value string) []string {
 }
 
 // envBlock is a CREATE_UNICODE_ENVIRONMENT block: each NAME=VALUE ended
-// by a NUL, then one more NUL.
+// by a NUL, then one more NUL, sorted by name without case as
+// CreateProcess documents.
 func envBlock(env []string) ([]uint16, error) {
+	env = append([]string(nil), env...)
+	sort.SliceStable(env, func(i, j int) bool {
+		a, _, _ := strings.Cut(env[i], "=")
+		b, _, _ := strings.Cut(env[j], "=")
+		return strings.ToUpper(a) < strings.ToUpper(b)
+	})
 	var b []uint16
 	for _, kv := range env {
 		if i := strings.IndexByte(kv, '='); i <= 0 || strings.IndexByte(kv, 0) >= 0 {
