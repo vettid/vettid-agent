@@ -21,6 +21,7 @@ const helperVar = "VETTID_RUN_TEST_HELPER"
 func TestMain(m *testing.M) {
 	switch os.Getenv(helperVar) {
 	case "":
+		platformTestSetup()
 		os.Exit(m.Run())
 	case "env":
 		for _, kv := range os.Environ() {

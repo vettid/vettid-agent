@@ -3,6 +3,7 @@
 package run
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,5 +56,17 @@ func TestPrepareRefusesAnOpenBinFolder(t *testing.T) {
 	}
 	if _, err := Prepare(exe, bin); err == nil {
 		t.Fatal("bin folder 0755 accepted")
+	}
+}
+
+// Until the separate-account mode, macOS runs are refused.
+func TestStartRefusedOnMacOSWithoutSeparateAccount(t *testing.T) {
+	lookupOnly(t)
+	separateAccount = false
+	t.Cleanup(func() { separateAccount = true })
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	if _, err := p.Start(helperSpec(t, exe, "exit7")); !errors.Is(err, ErrRunFailed) || !strings.Contains(err.Error(), "separate-account") {
+		t.Fatalf("macOS run without the separate-account mode: %v", err)
 	}
 }

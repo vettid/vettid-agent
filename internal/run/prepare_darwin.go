@@ -23,7 +23,22 @@ import (
 // and the started bytes are then not the ones hashed. Only a separate
 // account for the agent closes it (AGENT-PLAN §4.9, "A separate account
 // is the only full protection").
+//
+// The copy also runs from run/<id>/bin/, not from where it was installed:
+// libraries it finds relative to itself (@rpath, @loader_path,
+// @executable_path) are looked up beside the copy, in a folder of the
+// connector's user, so an agent running as that user can put its own
+// libraries there for the program to load.
+//
+// So macOS runs are refused (run_failed) until the separate-account mode
+// is built (vettid.org #539); separateAccount is that mode's switch. The
+// copy code stays, and the tests turn the switch on. (chosen; not in the
+// spec)
 type platProgram struct{ copy string }
+
+// separateAccount is true only when the connector and its runs are under
+// an account the agent doesn't run as. Nothing sets it yet.
+var separateAccount = false
 
 // Prepare opens the resolved program path once, refuses anything but a
 // regular file the operator may run and a script (#!), and copies it into
@@ -80,9 +95,13 @@ func (p *Program) Close() error {
 	return err
 }
 
-// Start resolves argv[0] again (program_not_found if the path changed)
-// and starts the copy.
+// Start refuses the run unless separateAccount is set; then it resolves
+// argv[0] again (program_not_found if the path changed) and starts the
+// copy.
 func (p *Program) Start(s StartSpec) (*Process, error) {
+	if !separateAccount {
+		return nil, runFailed("runs on macOS wait for the separate-account mode: an agent running as the connector's user could change the program's copy before it starts")
+	}
 	if p.plat.copy == "" {
 		return nil, runFailed("the program is no longer held")
 	}
