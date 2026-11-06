@@ -4,6 +4,7 @@ package run
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -200,52 +201,63 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 		return nil, badRequest("cwd is invalid")
 	}
 
+	pi, err := createSuspended(app, &cmd[0], &env[0], dir, s)
+	if err != nil {
+		return nil, err
+	}
+	hook("created")
+	if err := p.verifyImage(pi.Process); err != nil {
+		return nil, endSuspended(pi, s, err)
+	}
+	hook("checked")
+	// The process limits assign the job here, before the resume.
+	if _, err := windows.ResumeThread(pi.Thread); err != nil {
+		return nil, endSuspended(pi, s, runFailed("the program can't be resumed: %v", err))
+	}
+	hook("resumed")
+	windows.CloseHandle(pi.Thread)
+	return &Process{Pid: int(pi.ProcessId), plat: platProcess{h: pi.Process}}, nil
+}
+
+// createSuspended creates the process suspended. The inheritable
+// duplicates of the standard files exist only under syscall.ForkLock, as
+// for Go's own process starts, so no other start in this process can
+// inherit them; only those three are inherited by this one.
+func createSuspended(app, cmd, env, dir *uint16, s StartSpec) (windows.ProcessInformation, error) {
+	var pi windows.ProcessInformation
+	syscall.ForkLock.Lock()
+	defer syscall.ForkLock.Unlock()
 	std, cleanup, err := inheritableStdio(s)
 	if err != nil {
-		return nil, runFailed("the program's standard files can't be set up: %v", err)
+		return pi, runFailed("the program's standard files can't be set up: %v", err)
 	}
 	defer cleanup()
 	// Only the three standard handles are inherited, whatever else this
 	// process holds as inheritable. (chosen; not in the spec)
 	al, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
-		return nil, runFailed("the program can't be started: %v", err)
+		return pi, runFailed("the program can't be started: %v", err)
 	}
 	defer al.Delete()
 	handles := uniqueHandles(std[:])
 	if err := al.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]),
 		uintptr(len(handles))*unsafe.Sizeof(handles[0])); err != nil {
-		return nil, runFailed("the program can't be started: %v", err)
+		return pi, runFailed("the program can't be started: %v", err)
 	}
 	si := new(windows.StartupInfoEx)
 	si.Cb = uint32(unsafe.Sizeof(*si))
 	si.Flags = windows.STARTF_USESTDHANDLES
 	si.StdInput, si.StdOutput, si.StdErr = std[0], std[1], std[2]
 	si.ProcThreadAttributeList = al.List()
-
-	var pi windows.ProcessInformation
 	// CREATE_NO_WINDOW: a console program gets a console of its own,
 	// without a window, never the connector's (AGENT-PLAN §4.9, "The
 	// process": no terminal); programs it starts share that hidden one.
 	flags := uint32(windows.CREATE_SUSPENDED | windows.CREATE_UNICODE_ENVIRONMENT |
 		windows.EXTENDED_STARTUPINFO_PRESENT | windows.CREATE_NO_WINDOW)
-	if err := windows.CreateProcess(app, &cmd[0], nil, nil, true, flags, &env[0], dir, &si.StartupInfo, &pi); err != nil {
-		return nil, runFailed("the program can't be started: %v", err)
+	if err := windows.CreateProcess(app, cmd, nil, nil, true, flags, env, dir, &si.StartupInfo, &pi); err != nil {
+		return pi, runFailed("the program can't be started: %v", err)
 	}
-	hook("created")
-	if err := p.verifyImage(pi.Process); err != nil {
-		endSuspended(pi)
-		return nil, err
-	}
-	hook("checked")
-	// The process limits assign the job here, before the resume.
-	if _, err := windows.ResumeThread(pi.Thread); err != nil {
-		endSuspended(pi)
-		return nil, runFailed("the program can't be resumed: %v", err)
-	}
-	hook("resumed")
-	windows.CloseHandle(pi.Thread)
-	return &Process{Pid: int(pi.ProcessId), plat: platProcess{h: pi.Process}}, nil
+	return pi, nil
 }
 
 // startHook, set by tests only, is told each stage of Start.
@@ -257,21 +269,32 @@ func hook(stage string) {
 	}
 }
 
-// verifyImage checks that the suspended process's image is the held file:
-// it opens the path QueryFullProcessImageNameW gives and compares its
-// identity with the held handle's. The reopen is by path, which is sound
-// only while nothing can move the held file or its folders: the held file
-// can't be renamed, and on NTFS renaming a folder above it is refused
-// too (TestHeldProgramParentRename; ReFS not yet tried).
+// verifyImage checks that the suspended process's image is the held file,
+// in two ways, each needed:
+//   - its native image name (PROCESS_NAME_NATIVE, \Device\...) is the
+//     held handle's own native name (GetFinalPathNameByHandle with
+//     VOLUME_NAME_NT), compared without case; and
+//   - that name, reopened through \\?\GLOBALROOT with no drive letter
+//     involved, is the held file by volume serial number and file id, on
+//     an NTFS or ReFS volume.
 //
-// The path is the native one (PROCESS_NAME_NATIVE, \Device\...), reopened
-// through \\?\GLOBALROOT, so no drive letter is involved in the check: a
-// letter redefined between the start and the check can't point the check
-// at the held file. (chosen; not in the spec) The start itself uses the
-// resolved drive-letter path, since programs read their own path and may
-// not handle a native one. That relies on a standard user being unable to
-// redefine an existing letter such as C: in its own session
-// (TestDriveLetterCantBeRedefined), as the --run-path check does.
+// What this shows: the process was created from a file whose name, at
+// the check, is the held file's own name and which is the held file. The
+// identity alone would not do: a process started from another file B (if
+// the start's path were redirected, as through a symbolic link object in
+// the user's own DosDevices folder), then B renamed and the held file
+// hard-linked at B's old name (which needs only FILE_WRITE_ATTRIBUTES on
+// it), would pass it; the names then differ (TestStartRefusesAHardLinkSwap).
+// What it does not show: that the image's bytes were read from the held
+// file if a name was redirected and put back between the start and the
+// check. The start uses the resolved drive-letter path, since programs
+// read their own path and may not handle a native one; DefineDosDevice
+// refuses a standard user's redefinition of an existing letter such as
+// C: (TestDriveLetterCantBeRedefined), but that test does not cover
+// other ways of redirecting a name in the user's own DosDevices folder.
+// The held file can't be renamed, and on NTFS renaming a folder above it
+// is refused too (TestHeldProgramParentRename; ReFS not yet tried).
+// (chosen; not in the spec)
 func (p *Program) verifyImage(proc windows.Handle) error {
 	buf := make([]uint16, windows.MAX_LONG_PATH)
 	n := uint32(len(buf))
@@ -281,6 +304,13 @@ func (p *Program) verifyImage(proc windows.Handle) error {
 	img := windows.UTF16ToString(buf[:n])
 	if !strings.HasPrefix(img, `\Device\`) {
 		return notFound("the started program's name %s is not a device path; the run is refused", img)
+	}
+	held, err := finalNativeName(windows.Handle(p.plat.f.Fd()))
+	if err != nil {
+		return runFailed("the held program's name can't be read: %v", err)
+	}
+	if !strings.EqualFold(img, held) {
+		return notFound("the started program %s is not the file that was checked (%s); the run is refused", img, held)
 	}
 	i16, err := windows.UTF16PtrFromString(globalRoot + img)
 	if err != nil {
@@ -302,7 +332,24 @@ func (p *Program) verifyImage(proc windows.Handle) error {
 	if !p.plat.id.same(got) {
 		return notFound("the started program %s is not the file that was checked; the run is refused", img)
 	}
+	if fs, err := volumeFileSystem(h); err != nil || !allowedFileSystem(fs) {
+		return notFound("the started program %s is not on an NTFS or ReFS volume; the run is refused", img)
+	}
 	return nil
+}
+
+// finalNativeName is a handle's file name as the system gives it now,
+// with the volume's device name (\Device\...).
+func finalNativeName(h windows.Handle) (string, error) {
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), fileNameNormalized|volumeNameNT)
+	if err != nil {
+		return "", err
+	}
+	if int(n) >= len(buf) {
+		return "", errors.New("the name is too long")
+	}
+	return windows.UTF16ToString(buf[:n]), nil
 }
 
 func (a fileIdentity) same(b fileIdentity) bool {
@@ -323,12 +370,23 @@ const globalRoot = `\\?\GLOBALROOT`
 // with the ending NUL.
 const maxCmdLine = 32767
 
-// endSuspended ends a process that was never resumed.
-func endSuspended(pi windows.ProcessInformation) {
-	windows.TerminateProcess(pi.Process, 1)
+// endSuspended ends a process that was never resumed, and returns
+// refusal, the run's error. If the process can't be ended, that is logged
+// (its id and the system's error only) and added to the error: it stays
+// suspended, never having run, until the connector exits.
+func endSuspended(pi windows.ProcessInformation, s StartSpec, refusal error) error {
+	defer windows.CloseHandle(pi.Process)
+	defer windows.CloseHandle(pi.Thread)
+	if err := windows.TerminateProcess(pi.Process, 1); err != nil {
+		logger(s).Warn("run: a refused suspended process could not be ended", "pid", pi.ProcessId, "err", err)
+		var e *Error
+		if errors.As(refusal, &e) {
+			return &Error{Code: e.Code, Msg: e.Msg + fmt.Sprintf("; the suspended process %d could not be ended: %v", pi.ProcessId, err)}
+		}
+		return fmt.Errorf("%w; the suspended process %d could not be ended: %v", refusal, pi.ProcessId, err)
+	}
 	windows.WaitForSingleObject(pi.Process, 5000)
-	windows.CloseHandle(pi.Thread)
-	windows.CloseHandle(pi.Process)
+	return refusal
 }
 
 // makeCmdLine quotes argv for CreateProcess as Go's os/exec does
@@ -469,3 +527,10 @@ func checkFormat(head []byte) error {
 	}
 	return errors.New("is not a Windows program (no MZ header)")
 }
+
+// GetFinalPathNameByHandleW's flags: the normalized name, with the
+// volume's device name.
+const (
+	fileNameNormalized = 0x0
+	volumeNameNT       = 0x2
+)

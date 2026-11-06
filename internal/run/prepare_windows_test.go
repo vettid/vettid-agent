@@ -437,3 +437,77 @@ func TestEnvBlockSorted(t *testing.T) {
 		t.Fatalf("block order %v", got)
 	}
 }
+
+// A hard-link swap: the process is started from another file B (standing
+// in for a start whose path was redirected), then, before the check, B is
+// renamed and the held file A hard-linked at B's old name. The image's
+// name then reopens to A, so the file identity alone would pass; the
+// native names differ, and the run is refused.
+func TestStartRefusesAHardLinkSwap(t *testing.T) {
+	lookupOnly(t)
+	dir := t.TempDir()
+	a := helperCopy(t, dir, "a")
+	b := helperCopy(t, dir, "b")
+	p := prepare(t, a)
+	p.Path = b // the start opens B
+	marker := filepath.Join(t.TempDir(), "marker")
+	var linked, identityAlonePasses bool
+	startHook = func(stage string) {
+		if stage != "created" {
+			return
+		}
+		if err := os.Rename(b, b+".moved"); err != nil {
+			t.Logf("renaming the started file: refused: %v", err)
+			return
+		}
+		if err := os.Link(a, b); err != nil {
+			t.Logf("hard-linking the held file at the started file's old name: refused: %v", err)
+			return
+		}
+		linked = true
+		b16, _ := windows.UTF16PtrFromString(b)
+		h, err := windows.CreateFile(b16, windows.FILE_READ_ATTRIBUTES,
+			windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil, windows.OPEN_EXISTING, 0, 0)
+		if err == nil {
+			id, _, err := identityOf(h)
+			identityAlonePasses = err == nil && p.plat.id.same(id)
+			windows.CloseHandle(h)
+		}
+	}
+	t.Cleanup(func() { startHook = nil })
+	_, err := p.Start(helperSpec(t, b, "marker", Var{"VETTID_RUN_TEST_MARKER", marker}))
+	if !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "is not the file that was checked") {
+		t.Fatalf("hard-link swap: %v, want a refusal at the image check", err)
+	}
+	t.Logf("swap made: %v; the file identity alone would have passed: %v; refused: %v", linked, identityAlonePasses, err)
+	if !linked {
+		t.Fatal("the swap could not be made here, so the name check was not exercised")
+	}
+	if !identityAlonePasses {
+		t.Error("after the swap the identity already differs: the test doesn't show the name check is needed")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the refused process ran")
+	}
+}
+
+// A refused start whose suspended process can't be ended says so, and
+// keeps the refusal's code.
+func TestEndSuspendedReportsAFailure(t *testing.T) {
+	refusal := notFound("refused")
+	// A process handle without PROCESS_TERMINATE: this process, opened
+	// for querying only.
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, windows.GetCurrentProcessId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	th, err := windows.OpenThread(windows.THREAD_QUERY_LIMITED_INFORMATION, false, windows.GetCurrentThreadId())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = endSuspended(windows.ProcessInformation{Process: h, Thread: th, ProcessId: windows.GetCurrentProcessId()}, StartSpec{}, refusal)
+	if !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "could not be ended") {
+		t.Fatalf("endSuspended = %v", err)
+	}
+}

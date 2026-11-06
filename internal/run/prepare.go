@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"hash"
 	"io"
+	"log/slog"
 	"os"
 )
 
@@ -43,6 +44,16 @@ type StartSpec struct {
 	// Stdin, Stdout and Stderr are the process's standard files; nil is
 	// the null device. The output limits and redaction are the caller's.
 	Stdin, Stdout, Stderr *os.File
+	// Log receives what Start logs (ids and errors, never values); nil
+	// discards it.
+	Log *slog.Logger
+}
+
+func logger(s StartSpec) *slog.Logger {
+	if s.Log != nil {
+		return s.Log
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 // resolveAgain is ResolvePinned, replaced by tests of the start alone.

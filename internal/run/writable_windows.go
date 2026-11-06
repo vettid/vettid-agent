@@ -153,9 +153,12 @@ func maxAllowed(sd *windows.SECURITY_DESCRIPTOR) (uint32, error) {
 // fixedLocalDrive refuses a drive that is not a fixed local disk (a network,
 // removable or optical drive, a RAM disk), and a drive letter mapped to a
 // folder (subst, or DefineDosDevice in the user's own session), which its
-// user can point elsewhere after the check. A standard user can't redefine
-// an existing letter such as C: (Windows refuses it), only add new ones.
-// (chosen; not in the spec)
+// user can point elsewhere after the check. DefineDosDevice refuses a
+// standard user's redefinition of an existing letter such as C:
+// (TestDriveLetterCantBeRedefined) and allows new ones, which this
+// refuses. That test does not cover other ways of redirecting a name in
+// the user's own DosDevices folder (a symbolic link object made directly),
+// which this check would not see after it ran. (chosen; not in the spec)
 func fixedLocalDrive(root string) error {
 	p, err := windows.UTF16PtrFromString(root)
 	if err != nil {
