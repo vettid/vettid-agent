@@ -174,3 +174,17 @@ func makeReadableByOthers(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+func assertDirOwnerOnly(t *testing.T, dir string) {
+	t.Helper()
+	if m := mode(t, dir); m != 0o700 {
+		t.Errorf("%s: mode %04o, want 0700", dir, m)
+	}
+}
+
+func assertFileOwnerOnly(t *testing.T, path string) {
+	t.Helper()
+	if m := mode(t, path); m != 0o600 {
+		t.Errorf("%s: mode %04o, want 0600", path, m)
+	}
+}
