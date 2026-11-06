@@ -107,7 +107,11 @@ func prepare(t *testing.T, path string) *Program {
 func helperSpec(t *testing.T, argv0, mode string, extra ...Var) StartSpec {
 	t.Helper()
 	req := append([]Var{{helperVar, mode}}, extra...)
-	env, err := Env(Spec{Tmp: t.TempDir(), Request: req}, os.LookupEnv)
+	var listed []string
+	for _, v := range req {
+		listed = append(listed, v.Name)
+	}
+	env, err := Env(Spec{Tmp: t.TempDir(), Listed: listed, Request: req}, os.LookupEnv)
 	if err != nil {
 		t.Fatal(err)
 	}

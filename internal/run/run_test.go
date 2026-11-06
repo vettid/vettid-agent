@@ -63,6 +63,7 @@ func TestEnvExactSet(t *testing.T) {
 		Tmp:     tmp,
 		RunPath: []string{rp},
 		RunEnv:  []string{"OPERATOR_ALLOWED", "OPERATOR_MISSING"},
+		Listed:  []string{"REQ_ONE", "REQ_TWO"},
 		Request: []Var{{"REQ_ONE", "1"}, {"REQ_TWO", "two"}},
 		Secret:  &Var{"THE_SECRET", "s"},
 	}
@@ -217,13 +218,14 @@ func TestEnvRefusals(t *testing.T) {
 		}
 	}
 	// Right at the limits.
-	ok := Spec{Tmp: t.TempDir(), Request: []Var{{strings.Repeat("A", 64), strings.Repeat("v", MaxEnvValueLen)}}}
+	ok := Spec{Tmp: t.TempDir(), Listed: []string{strings.Repeat("A", 64)}, Request: []Var{{strings.Repeat("A", 64), strings.Repeat("v", MaxEnvValueLen)}}}
 	if _, err := Env(ok, mapLookup(nil)); err != nil {
 		t.Errorf("limits: %v", err)
 	}
 	many := Spec{Tmp: t.TempDir()}
 	for i := 0; i <= MaxRequestEnv; i++ {
 		many.Request = append(many.Request, Var{"V" + string(rune('A'+i%26)) + string(rune('A'+i/26)), "x"})
+		many.Listed = append(many.Listed, many.Request[i].Name)
 	}
 	if _, err := Env(many, mapLookup(nil)); !errors.Is(err, ErrBadRequest) {
 		t.Errorf("33 variables: %v", err)
@@ -265,10 +267,59 @@ func TestEnvWindowsForbiddenIgnoresCase(t *testing.T) {
 	}
 }
 
+// Env applies the binding's allowlist itself: an unlisted name, or any
+// name for an unbound item, is env_not_allowed, and a listed code-loading
+// name bad_request.
+func TestEnvAppliesTheAllowlist(t *testing.T) {
+	for name, c := range map[string]struct {
+		listed []string
+		req    []Var
+		want   error
+	}{
+		"listed":               {[]string{"REGION"}, []Var{{"REGION", "eu"}}, nil},
+		"unlisted":             {[]string{"REGION"}, []Var{{"OTHER", "x"}}, ErrEnvNotAllowed},
+		"unbound":              {nil, []Var{{"REGION", "eu"}}, ErrEnvNotAllowed},
+		"listed, code-loading": {[]string{"OPENSSL_CONF"}, []Var{{"OPENSSL_CONF", "x"}}, ErrBadRequest},
+	} {
+		_, err := Env(Spec{Tmp: t.TempDir(), Listed: c.listed, Request: c.req}, mapLookup(nil))
+		if c.want == nil && err != nil || c.want != nil && !errors.Is(err, c.want) {
+			t.Errorf("%s: %v, want %v", name, err, c.want)
+		}
+	}
+}
+
+// The connector's additions to the code-loading names, refused even when
+// listed; --run-env is not checked against them.
+func TestAddedLoaderNames(t *testing.T) {
+	names := []string{"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "SSLKEYLOGFILE",
+		"XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS", "ELECTRON_RUN_AS_NODE", "PYTHONWARNINGS",
+		"LUA_INIT", "LUA_INIT_5_4", "VIMINIT", "EXINIT", "CLASSPATH", "NPM_CONFIG_PREFIX", "PIP_INDEX_URL"}
+	if runtime.GOOS == "windows" {
+		names = append(names, "__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA")
+	}
+	for _, n := range names {
+		if ValidName(n) {
+			t.Errorf("%s allowed for a request", n)
+		}
+		if err := CheckEnvAllowed([]string{n}, []Var{{n, "x"}}); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%s listed: %v", n, err)
+		}
+		if err := CheckRunEnv([]string{n}); err != nil {
+			t.Errorf("--run-env %s: %v", n, err)
+		}
+	}
+	for _, n := range []string{"LUA_INITX", "PIPE", "NPM_TOKEN"} {
+		if !ValidName(n) {
+			t.Errorf("%s refused", n)
+		}
+	}
+}
+
 func TestEnvLaterReplacesEarlier(t *testing.T) {
 	spec := Spec{
 		Tmp:     t.TempDir(),
 		RunEnv:  []string{"SHARED"},
+		Listed:  []string{"SHARED"},
 		Request: []Var{{"SHARED", "from-request"}},
 		Secret:  &Var{"SHARED", "from-secret"},
 	}

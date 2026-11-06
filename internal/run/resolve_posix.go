@@ -47,3 +47,6 @@ func canExecute(path string, fi os.FileInfo) bool {
 	}
 	return unix.Access(path, unix.X_OK) == nil
 }
+
+// platformLoaderNames: none beyond the shared list on POSIX.
+var platformLoaderNames []string

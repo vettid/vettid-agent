@@ -96,7 +96,7 @@ func checkName(name string) error {
 			return badRequest("variable name %q is not allowed", name)
 		}
 	}
-	for _, f := range loaderNames {
+	for _, f := range append(loaderNames, platformLoaderNames...) {
 		if sameName(f, name) {
 			return badRequest("variable name %q is not allowed", name)
 		}
@@ -143,7 +143,15 @@ func shorten(s string) string {
 // GIT_ family is refused because git reads many of them as commands. The
 // operator's --run-env names are not checked against these lists (owner
 // decision, 2026-11-05).
-var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_", "COR_PROFILER", "CORECLR_", "DOTNET_"}
+//
+// The names and prefixes after the "(chosen; not in the spec)" marks below
+// are the connector's additions, which a later erratum is to bring into
+// the specifications; they too apply to the request's env (listed or not)
+// and not to --run-env.
+var loaderPrefixes = []string{"LD_", "DYLD_", "GIT_", "COR_PROFILER", "CORECLR_", "DOTNET_",
+	// (chosen; not in the spec)
+	"LUA_INIT_", "NPM_CONFIG_", "PIP_",
+}
 
 var loaderNames = []string{
 	"NODE_OPTIONS", "NODE_PATH", "BASH_ENV", "ENV",
@@ -157,6 +165,12 @@ var loaderNames = []string{
 	// another certificate.
 	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
 	"NODE_EXTRA_CA_CERTS", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+	// (chosen; not in the spec) OpenSSL's configuration and modules, its
+	// key log, more configuration and data folders, Electron run as Node,
+	// and other runtimes' and editors' start-up code.
+	"OPENSSL_CONF", "OPENSSL_ENGINES", "OPENSSL_MODULES", "SSLKEYLOGFILE",
+	"XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS", "ELECTRON_RUN_AS_NODE",
+	"PYTHONWARNINGS", "LUA_INIT", "VIMINIT", "EXINIT", "CLASSPATH",
 }
 
 func forbiddenNames() []string {
@@ -239,6 +253,10 @@ type Spec struct {
 	// RunEnv is the operator's --run-env names, copied from the
 	// connector's environment when present there.
 	RunEnv []string
+	// Listed is the bound program's env allowlist, the catalog entry's
+	// `env`; empty for an unbound item. Env refuses a request name not
+	// in it (env_not_allowed), as CheckEnvAllowed does.
+	Listed []string
 	// Request is the request's env, in order.
 	Request []Var
 	// Secret is the secret's variable for how env or file; nil for
@@ -251,9 +269,11 @@ type Spec struct {
 // by the connector, the --run-env names, the request's env, then the
 // secret's variable. Nothing else is inherited. lookup is os.LookupEnv
 // in the connector. A later entry of the same name replaces an earlier
-// one.
+// one. The request's env is checked as CheckEnvAllowed checks it, against
+// spec.Listed, so no caller can build a run's environment past the
+// allowlist.
 func Env(spec Spec, lookup func(string) (string, bool)) ([]string, error) {
-	if err := checkRequestEnv(spec.Request); err != nil {
+	if err := CheckEnvAllowed(spec.Listed, spec.Request); err != nil {
 		return nil, err
 	}
 	if spec.Secret != nil {

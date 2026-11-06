@@ -104,3 +104,8 @@ func canExecute(path string, _ os.FileInfo) bool {
 func isUNC(path string) bool {
 	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`)
 }
+
+// platformLoaderNames: on Windows also the compatibility layer, which can
+// make a program load shims, and the folders programs find their own
+// files in. (chosen; not in the spec)
+var platformLoaderNames = []string{"__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA"}
