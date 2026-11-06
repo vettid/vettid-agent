@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -27,15 +29,20 @@ func TestPrepareSealsTheMemoryFile(t *testing.T) {
 	if _, err := unix.FcntlInt(uintptr(fd), unix.F_ADD_SEALS, unix.F_SEAL_FUTURE_WRITE); err == nil {
 		t.Error("seals changed after F_SEAL_SEAL")
 	}
+	// Opening for writing is allowed; the seals refuse the writes.
 	w, err := os.OpenFile(fmt.Sprintf("/proc/self/fd/%d", fd), os.O_WRONLY, 0)
-	if err == nil {
-		defer w.Close()
-		if _, err := w.Write([]byte("x")); err == nil {
-			t.Fatal("wrote to the sealed memory file")
-		}
-		if err := w.Truncate(0); err == nil {
-			t.Fatal("shrank the sealed memory file")
-		}
+	if err != nil {
+		t.Fatalf("opening the memory file for writing, to try the seals: %v", err)
+	}
+	defer w.Close()
+	if _, err := w.Write([]byte("x")); err == nil {
+		t.Fatal("wrote to the sealed memory file")
+	}
+	if _, err := w.WriteAt([]byte("x"), 1<<40); err == nil {
+		t.Fatal("grew the sealed memory file")
+	}
+	if err := w.Truncate(0); err == nil {
+		t.Fatal("shrank the sealed memory file")
 	}
 	// The file on disk can still change; the memory file doesn't.
 	if err := os.WriteFile(exe, []byte("changed"), 0o755); err != nil {
@@ -101,7 +108,18 @@ func TestStartRefusesWhenMemoryFilesCantRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	if _, err := p.Start(helperSpec(t, exe, "exit7")); !errors.Is(err, ErrRunFailed) {
+	// The file at the path is the helper, which would write the marker if
+	// it were started by its path.
+	marker := filepath.Join(t.TempDir(), "marker")
+	proc, err := p.Start(helperSpec(t, exe, "marker", Var{"VETTID_RUN_TEST_MARKER", marker}))
+	if !errors.Is(err, ErrRunFailed) {
+		if proc != nil {
+			proc.Wait()
+		}
 		t.Fatalf("non-executable memory file: %v, want run_failed", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the program was started by its path")
 	}
 }

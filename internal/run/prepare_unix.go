@@ -7,6 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -33,18 +36,24 @@ func openProgram(path string) (*os.File, error) {
 }
 
 // startCmd starts the program at exe (the memory file's /proc path or the
-// private copy), with extra as the child's files from 3 on. The process
-// group and the limits come with the process limits.
+// private copy), with extra as the child's files from 3 on. It runs in a
+// session of its own (setsid), so it has no controlling terminal, never
+// the connector's (AGENT-PLAN §4.9, "The process": no terminal). The
+// limits and the group's ending come with the process limits.
 func startCmd(exe string, extra []*os.File, s StartSpec) (*Process, error) {
 	if s.Dir == "" || !filepath.IsAbs(s.Dir) {
 		return nil, badRequest("cwd is not an absolute path")
 	}
+	if err := cloexecAll(); err != nil {
+		return nil, runFailed("the connector's open files can't be kept from the program: %v", err)
+	}
 	cmd := &exec.Cmd{
-		Path:       exe,
-		Args:       append([]string(nil), s.Argv...),
-		Env:        append([]string{}, s.Env...),
-		Dir:        s.Dir,
-		ExtraFiles: extra,
+		Path:        exe,
+		Args:        append([]string(nil), s.Argv...),
+		Env:         append([]string{}, s.Env...),
+		Dir:         s.Dir,
+		ExtraFiles:  extra,
+		SysProcAttr: &syscall.SysProcAttr{Setsid: true},
 	}
 	// A nil *os.File in an io.Reader or io.Writer isn't nil: set only
 	// those given, so the others are the null device.
@@ -61,6 +70,34 @@ func startCmd(exe string, extra []*os.File, s StartSpec) (*Process, error) {
 		return nil, runFailed("the program can't be started: %v", err)
 	}
 	return &Process{Pid: cmd.Process.Pid, plat: platProcess{cmd: cmd}}, nil
+}
+
+// cloexecAll marks every descriptor from 3 up close-on-exec, so none
+// that the connector holds without the flag (one its starter, the MCP
+// client, left open, for example) reaches a run. The standard files and
+// ExtraFiles are placed in the child by os/exec, which clears the flag on
+// those alone. (chosen; not in the spec)
+func cloexecAll() error {
+	dir := "/dev/fd"
+	if runtime.GOOS == "linux" {
+		dir = "/proc/self/fd"
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, e := range ents {
+		fd, err := strconv.Atoi(e.Name())
+		if err != nil || fd < 3 {
+			continue
+		}
+		// The directory's own descriptor is listed too, and closed by
+		// now: EBADF is expected for it.
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC); err != nil && err != unix.EBADF {
+			return err
+		}
+	}
+	return nil
 }
 
 // platProcess is the started command.
