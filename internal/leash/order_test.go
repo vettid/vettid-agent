@@ -194,6 +194,10 @@ func TestListOvertaken(t *testing.T) {
 	e := newEnv(t)
 	now := e.c.Now()
 	g1, g2 := grant(t, now, spec{id: gid(1)}), grant(t, now, spec{id: gid(2)})
+	e.listingN(t, 49, false, g1, g2) // a number is held
+	mustPresent(t, e, gid(1))
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+	base := e.f.count("leash.grant.list")
 	first := true
 	e.f.list = func() *vaultconn.Response {
 		if first {
@@ -204,7 +208,7 @@ func TestListOvertaken(t *testing.T) {
 		return ok(setN(t, 51, false, g2))
 	}
 	refused(t, e, gid(1), ErrNotGranted)
-	if n := e.f.count("leash.grant.list"); n != 2 {
+	if n := e.f.count("leash.grant.list") - base; n != 2 {
 		t.Errorf("%d lists", n)
 	}
 	mustPresent(t, e, gid(2))
@@ -231,7 +235,9 @@ func TestNotFoundStaysDead(t *testing.T) {
 	refused(t, e, gid(1), ErrNotGranted)
 	e.updateN(t, 61, false, g1, g2)
 	refused(t, e, gid(1), ErrNotGranted)
-	e.staleList(t, 62, false, g1, g2)
+	e.staleList(t, 61, false, g1, g2) // equal
+	refused(t, e, gid(1), ErrNotGranted)
+	e.staleList(t, 62, false, g1, g2) // higher
 	refused(t, e, gid(1), ErrNotGranted)
 	if !needsList(e) {
 		t.Error("no list wanted after a list sent before the not_found")
@@ -258,7 +264,9 @@ func TestForbiddenStaysSuspended(t *testing.T) {
 	g1 = grant(t, now, spec{id: gid(1)})
 	e.updateN(t, 71, false, g1)
 	refused(t, e, gid(1), ErrSuspended)
-	e.staleList(t, 72, false, g1)
+	e.staleList(t, 71, false, g1) // equal
+	refused(t, e, gid(1), ErrSuspended)
+	e.staleList(t, 72, false, g1) // higher
 	refused(t, e, gid(1), ErrSuspended)
 	if s, _ := ReadSaved(e.m.Snapshot(), testAgent, e.c.Now()); !s.Suspended {
 		t.Error("saved as resumed")
@@ -266,6 +274,118 @@ func TestForbiddenStaysSuspended(t *testing.T) {
 	e.listingN(t, 72, false, g1)
 	e.m.step(ctx)
 	mustPresent(t, e, gid(1))
+}
+
+// TestMarkWhileListInFlight: a not_found or forbidden learned while the
+// connector's own list is on its way makes that list's answer stale, so
+// it does not undo the mark, even with an equal or higher number; the
+// next list does.
+func TestMarkWhileListInFlight(t *testing.T) {
+	for _, code := range []string{"not_found", "forbidden"} {
+		e := newEnv(t)
+		now := e.c.Now()
+		g1 := grant(t, now, spec{id: gid(1), noStatus: true})
+		e.listingN(t, 140, false, g1)
+		want := map[string]error{"not_found": ErrNotGranted, "forbidden": ErrSuspended}[code]
+		e.f.statusGet = func(string) *vaultconn.Response { return fail(code) }
+		n := 0
+		e.f.list = func() *vaultconn.Response {
+			n++
+			if n == 1 {
+				// Learned while the answer below is on its way.
+				if err := e.m.refresh(ctx, gid(1)); err == nil {
+					t.Errorf("%s: refresh succeeded", code)
+				}
+				return ok(setN(t, 141, false, g1))
+			}
+			return ok(setN(t, 141, false, g1))
+		}
+		e.m.mu.Lock()
+		e.m.needList = true
+		e.m.mu.Unlock()
+		_ = e.m.List(ctx)
+		e.m.mu.Lock()
+		marked := e.m.dead[gid(1)] || e.m.forbidden
+		e.m.mu.Unlock()
+		if n != 2 {
+			t.Errorf("%s: %d lists, want 2 (the first answer was stale)", code, n)
+		}
+		if marked {
+			t.Errorf("%s: the second list (sent after the mark) did not clear it", code)
+		}
+
+		// Again, with the first answer the only one: the mark holds.
+		e2 := newEnv(t)
+		e2.listingN(t, 150, false, g1)
+		e2.f.statusGet = func(string) *vaultconn.Response { return fail(code) }
+		e2.f.list = func() *vaultconn.Response {
+			_ = e2.m.refresh(ctx, gid(1))
+			// From now on the vault would give a statement: only the
+			// mark can keep the grant from being presented.
+			e2.f.statusGet = statusAnswer(t, e2.c, map[string]json.RawMessage{gid(1): g1})
+			e2.f.list = func() *vaultconn.Response { return &vaultconn.Response{ErrorCode: "internal"} }
+			return ok(setN(t, 151, false, g1))
+		}
+		e2.m.mu.Lock()
+		e2.m.needList = true
+		e2.m.mu.Unlock()
+		_ = e2.m.List(ctx)
+		refused(t, e2, gid(1), want)
+	}
+}
+
+// TestEarlierSessionList: the answer to a list sent in an earlier access
+// session does not confirm the grants in this one (the vault sends no
+// events between sessions, so it may miss a revocation made then).
+func TestEarlierSessionList(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1 := grant(t, now, spec{id: gid(1)})
+	e.listingN(t, 160, false, g1)
+	mustPresent(t, e, gid(1))
+	const id = "01JB2Z6V9K3M4N5P6Q7R8S9TWW"
+	e.m.mu.Lock()
+	e.m.lists[id] = e.m.gen // sent in this session
+	e.m.mu.Unlock()
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.ended", Body: json.RawMessage(`{}`)}})
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.list", Re: id, OK: true, Body: setN(t, 161, false, g1)}})
+	if in := e.m.ConnectionInfo(); in.GrantsConfirmed {
+		t.Error("confirmed by a list sent in an earlier session")
+	}
+}
+
+// TestSeqlessUpdateWhileListed: a leash.grant.updated without grant_seq
+// may have been a revocation: although it is ignored, nothing is
+// presented until a list with a number is applied.
+func TestSeqlessUpdateWhileListed(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1 := grant(t, now, spec{id: gid(1)})
+	e.listingN(t, 170, false, g1)
+	mustPresent(t, e, gid(1))
+	e.updateN(t, 0, false) // no number: g1 revoked?
+	refused(t, e, gid(1), ErrVaultTooOld)
+	e.c.Add(minGap)
+	mustPresent(t, e, gid(1)) // the list (number 170) confirms again
+}
+
+// TestNotFoundPaced: a grant the vault lists but answers not_found for
+// is not asked about in a tight loop.
+func TestNotFoundPaced(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1 := grant(t, now, spec{id: gid(1), noStatus: true})
+	e.listingN(t, 180, false, g1)
+	e.f.statusGet = func(string) *vaultconn.Response { return fail("not_found") }
+	refused(t, e, gid(1), ErrNotGranted) // wanted from now on
+	for i := 0; i < 200; i++ {           // 10 s in 50 ms steps
+		e.c.Add(50 * time.Millisecond)
+		e.m.step(ctx)
+	}
+	if n := e.f.count("leash.status.get"); n > 3 {
+		t.Errorf("%d statement requests in 10 s", n)
+	}
 }
 
 // TestSuspendResumeByNumber: suspension and resumption each take a new

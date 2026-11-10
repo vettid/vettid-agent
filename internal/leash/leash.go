@@ -313,6 +313,10 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 			delete(m.lists, msg.Re)
 			m.applySet(msg.Body, src)
 		case msg.Re == "" && msg.Type == "device.session.granted":
+			// A list sent in an earlier session describes the grants as
+			// they were then (the vault sends no events between
+			// sessions): its answer counts as another's list.
+			m.lists = map[string]uint64{}
 			m.listed, m.needList = false, true
 			m.listFails, m.nextList = 0, time.Time{}
 			m.tooOldLogged = false
@@ -334,7 +338,8 @@ type grantSet struct {
 
 // parseSeq reads grant_seq: an unsigned 64-bit integer, written as
 // digits; 0, absent, null or anything else counts as absent (0)
-// (VAULT-MESSAGING §10.11, 0.85.3).
+// (VAULT-MESSAGING §10.11, 0.85.3), including forms such as 1e3 or
+// 42.0 (chosen; not in the spec: the vault writes plain digits).
 func parseSeq(raw json.RawMessage) uint64 {
 	n, err := strconv.ParseUint(string(raw), 10, 64)
 	if err != nil {
@@ -378,7 +383,9 @@ func (m *Manager) applySet(body json.RawMessage, src source) {
 			m.log.Warn("grant set without grant_seq ignored: the vault is too old for this connector")
 			m.tooOldLogged = true
 		}
-		m.tooOld, m.needList = true, true
+		// It may have been a revocation: nothing is presented until a
+		// list with a number is applied.
+		m.tooOld, m.needList, m.listed = true, true, false
 		m.listFailed()
 		m.signal()
 		return
@@ -509,7 +516,8 @@ func (m *Manager) clearMarks(suspended bool) {
 		m.forbidden, m.suspended, m.saved = false, suspended, true
 	}
 	m.dead = map[string]bool{}
-	m.fails = map[string]int{}
+	// fails is kept: it paces refreshes of a grant the vault lists but
+	// answers not_found for, and a successful refresh resets it.
 }
 
 // confirmed records that the answer to this process's own list was
@@ -771,6 +779,7 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 			// this says otherwise.
 			delete(m.statements, id)
 			m.dead[id] = true
+			m.fails[id]++ // paces the background loop's next try
 			m.gen++
 			m.needList = true
 			out = ErrNotGranted
