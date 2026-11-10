@@ -590,11 +590,15 @@ func (m *Manager) OnStatus(ownerCheck string) {
 // suspension, and refused requests are themselves rate-limited) and
 // marks nothing: for a `forbidden` answer to an agent.request, which
 // names no grant (AGENT-PLAN §4.5). The numbered list says whether the
-// agent was suspended or a grant revoked.
+// agent was suspended or a grant revoked. A vault known to be too old
+// keeps its pause: its lists carry no number, so they could not say.
 func (m *Manager) Relist() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.needList, m.nextList = true, time.Time{}
+	m.needList = true
+	if !m.tooOld {
+		m.nextList = time.Time{}
+	}
 	m.signal()
 }
 

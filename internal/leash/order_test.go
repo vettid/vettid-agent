@@ -441,6 +441,21 @@ func TestRelist(t *testing.T) {
 		t.Errorf("%d lists after Relist, want 1", n)
 	}
 	mustPresent(t, e, gid(1))
+
+	// A vault too old for numbers keeps its pause.
+	e.listingN(t, 0, false, g1)
+	e.m.mu.Lock()
+	e.m.needList = true
+	e.m.mu.Unlock()
+	e.m.step(ctx) // answered without a number: paused
+	base = e.f.count("leash.grant.list")
+	for i := 0; i < 10; i++ {
+		e.m.Relist()
+		e.m.step(ctx)
+	}
+	if n := e.f.count("leash.grant.list") - base; n != 0 {
+		t.Errorf("%d lists to a too-old vault during its pause", n)
+	}
 }
 
 // TestSuspendResumeByNumber: suspension and resumption each take a new
