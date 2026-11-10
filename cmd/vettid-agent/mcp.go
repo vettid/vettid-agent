@@ -160,7 +160,7 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 	if err := grants.Bind(conn); err != nil {
 		return fail(err)
 	}
-	ro := request.Options{Log: logger, Suspended: grants.Suspended}
+	ro := request.Options{Log: logger, Suspended: grants.Suspended, OnForbidden: grants.Relist}
 	if mcpRequestOptions != nil {
 		mcpRequestOptions(&ro)
 	}

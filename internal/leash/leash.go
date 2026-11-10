@@ -585,6 +585,17 @@ func (m *Manager) OnStatus(ownerCheck string) {
 	}
 }
 
+// Relist asks the background loop for a fresh list of the grants (paced
+// as any list) and marks nothing: for a `forbidden` answer to an
+// agent.request, which names no grant (AGENT-PLAN §4.5). The numbered
+// list says whether the agent was suspended or a grant revoked.
+func (m *Manager) Relist() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.needList = true
+	m.signal()
+}
+
 // Held reports whether the vault answered owner_check_required and no
 // vault.status has shown the hold ended since.
 func (m *Manager) Held() bool {

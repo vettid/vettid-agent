@@ -414,6 +414,33 @@ func TestNotFoundPaced(t *testing.T) {
 	}
 }
 
+// TestRelist: a forbidden from agent.request (Relist) makes the
+// background loop send one list and marks nothing.
+func TestRelist(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1 := grant(t, now, spec{id: gid(1)})
+	e.listingN(t, 190, false, g1)
+	mustPresent(t, e, gid(1))
+	base := e.f.count("leash.grant.list")
+	e.m.mu.Lock()
+	gen := e.m.gen
+	e.m.mu.Unlock()
+	e.m.Relist()
+	e.m.mu.Lock()
+	marked := e.m.gen != gen || e.m.forbidden || e.m.suspended || len(e.m.dead) > 0
+	e.m.mu.Unlock()
+	if marked {
+		t.Error("Relist marked something")
+	}
+	e.m.step(ctx)
+	e.m.step(ctx)
+	if n := e.f.count("leash.grant.list") - base; n != 1 {
+		t.Errorf("%d lists after Relist, want 1", n)
+	}
+	mustPresent(t, e, gid(1))
+}
+
 // TestSuspendResumeByNumber: suspension and resumption each take a new
 // number; a late set from before the suspension does not end it, a
 // resumption does.
