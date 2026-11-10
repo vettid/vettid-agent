@@ -315,7 +315,9 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 		case msg.Re == "" && msg.Type == "device.session.granted":
 			// A list sent in an earlier session describes the grants as
 			// they were then (the vault sends no events between
-			// sessions): its answer counts as another's list.
+			// sessions): its answer counts as another's list. (A list
+			// the new session sent before this message was applied is
+			// forgotten too; that costs one more list.)
 			m.lists = map[string]uint64{}
 			m.listed, m.needList = false, true
 			m.listFails, m.nextList = 0, time.Time{}

@@ -353,6 +353,32 @@ func TestEarlierSessionList(t *testing.T) {
 	if in := e.m.ConnectionInfo(); in.GrantsConfirmed {
 		t.Error("confirmed by a list sent in an earlier session")
 	}
+
+	// Through List: a session starts while its list is on its way; that
+	// answer does not confirm, and the next list does.
+	n := 0
+	e.f.list = func() *vaultconn.Response {
+		n++
+		if n == 1 {
+			e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+			e.m.mu.Lock()
+			listed := e.m.listed
+			e.m.mu.Unlock()
+			if listed {
+				t.Error("listed right after a session start")
+			}
+		}
+		return ok(setN(t, 161, false, g1))
+	}
+	if err := e.m.List(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n != 2 {
+		t.Errorf("%d lists, want 2", n)
+	}
+	if in := e.m.ConnectionInfo(); !in.GrantsConfirmed {
+		t.Error("not confirmed by the list sent in this session")
+	}
 }
 
 // TestSeqlessUpdateWhileListed: a leash.grant.updated without grant_seq
