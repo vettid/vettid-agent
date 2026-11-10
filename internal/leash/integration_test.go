@@ -184,7 +184,7 @@ func TestOverVault(t *testing.T) {
 	seed := func(grants ...json.RawMessage) {
 		m := New(Options{})
 		f := &fakeConn{m: m, ik: ik, device: devID, access: pairing.Access{State: pairing.AccessActive},
-			list: func() *vaultconn.Response { return ok(set(t, false, grants...)) }}
+			list: func() *vaultconn.Response { return ok(setN(t, 5, false, grants...)) }}
 		if err := m.Bind(f); err != nil {
 			t.Fatal(err)
 		}
@@ -221,7 +221,7 @@ func TestOverVault(t *testing.T) {
 	seed(g1, g2)
 	sp := &grantSpy{v: v, id: id1, device: devID}
 	run(func(s vaultconn.Store) vaultconn.Store { sp.Store = s; return sp }, func(o *opened) {
-		if _, err := v.SendEvent("leash.grant.updated", set(t, false, g2)); err != nil { // gid(1) revoked
+		if _, err := v.SendEvent("leash.grant.updated", setN(t, 6, false, g2)); err != nil { // gid(1) revoked
 			t.Fatal(err)
 		}
 	}, func(o *opened) {
@@ -239,7 +239,10 @@ func TestOverVault(t *testing.T) {
 	}
 
 	// Next start: shown as saved, unconfirmed; the session check at start
-	// narrows (the vault lists none); Present's own list confirms.
+	// (a higher number: the vault revoked gid(2) since) replaces the set
+	// without confirming it (the vault lists none); Present's own list,
+	// with the same number, confirms.
+	v.GrantSeq = 7
 	run(nil, nil, func(o *opened) {
 		if in := o.m.ConnectionInfo(); len(in.Grants) != 1 || in.GrantsConfirmed {
 			t.Errorf("info at start: %+v", in)

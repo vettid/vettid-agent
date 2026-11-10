@@ -219,8 +219,10 @@ JSON in text, with `status` `ok`, `pending` (with a `request_id`) or
 The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
 `not_found`, `limit`, …) or the connector's own: `access_requested`,
 `access_denied`, `vault_unreachable`, `owner_check_required`,
-`suspended`, `expired`, `bad_request`, `rate_limited_local` and
-`superseded` (not expected: another copy of the request took its place).
+`suspended`, `expired`, `bad_request`, `rate_limited_local`,
+`vault_too_old` (your vault does not number its grant sets; update it)
+and `superseded` (not expected: another copy of the request took its
+place).
 
 The connector answers up to 120 tool calls in a burst and then 2 a
 second; calls beyond that get `rate_limited_local` before anything
@@ -356,13 +358,17 @@ longer lists, that has ended, or anything at all while your vault has
 paused the agent after repeated refused requests ("suspended"; you
 resume it on your phone).
 
-Messages from your vault can arrive out of order, so only the answer to
-a list the connector sent, with nothing learned while it was on its
-way, can add a grant, bring back a removed one or end a pause. Every
-update, and any other list answer, can only take grants away or pause
-the agent; the connector then asks for the grants again, and that list
-brings what the update added. A pause ends only when a list sent after
-it says so.
+Messages from your vault can arrive out of order, so your vault numbers
+each change to the agent's grants, and the connector keeps the highest
+number it has seen: a list or update with a higher number replaces the
+grants, one with a lower number (sent before a later change) is
+ignored, and one with the same number only brings fresher status
+statements. A grant your vault refused when asked for a statement, or a
+pause your vault answered with, holds until the answer to a list the
+connector sent after learning it. A vault that does not number its
+grant sets is too old for this connector: nothing is presented, the
+connector asks again from time to time, and tools answer
+`vault_too_old`.
 
 In the background the connector refreshes a statement only for a grant
 it was asked to present in the last 15 minutes, at most once a minute;
