@@ -585,14 +585,16 @@ func (m *Manager) OnStatus(ownerCheck string) {
 	}
 }
 
-// Relist asks the background loop for a fresh list of the grants (paced
-// as any list) and marks nothing: for a `forbidden` answer to an
-// agent.request, which names no grant (AGENT-PLAN §4.5). The numbered
-// list says whether the agent was suspended or a grant revoked.
+// Relist asks the background loop for a fresh list of the grants at once
+// (not waiting out the pause after failed lists: the refusal may mean a
+// suspension, and refused requests are themselves rate-limited) and
+// marks nothing: for a `forbidden` answer to an agent.request, which
+// names no grant (AGENT-PLAN §4.5). The numbered list says whether the
+// agent was suspended or a grant revoked.
 func (m *Manager) Relist() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.needList = true
+	m.needList, m.nextList = true, time.Time{}
 	m.signal()
 }
 

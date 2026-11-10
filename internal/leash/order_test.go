@@ -415,7 +415,8 @@ func TestNotFoundPaced(t *testing.T) {
 }
 
 // TestRelist: a forbidden from agent.request (Relist) makes the
-// background loop send one list and marks nothing.
+// background loop send one list at once, even during the pause after
+// failed lists, and marks nothing.
 func TestRelist(t *testing.T) {
 	e := newEnv(t)
 	now := e.c.Now()
@@ -425,6 +426,7 @@ func TestRelist(t *testing.T) {
 	base := e.f.count("leash.grant.list")
 	e.m.mu.Lock()
 	gen := e.m.gen
+	e.m.listFails, e.m.nextList = 5, e.c.Now().Add(retryMax) // lists were failing
 	e.m.mu.Unlock()
 	e.m.Relist()
 	e.m.mu.Lock()
