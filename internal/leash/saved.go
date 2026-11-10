@@ -13,29 +13,37 @@ import (
 
 // The record's `leash` member (docs/STATE-FILE.md):
 //
-//	{"v":1,"as_of":"<RFC 3339>","suspended":false,"grants":[<grant>…]}
+//	{"v":2,"as_of":"<RFC 3339>","suspended":false,"grant_seq":42,"grants":[<grant>…]}
 //
 // each grant in its wire form (VAULT-MESSAGING §10.11) without the
-// status members: statements are not saved.
+// status members: statements are not saved. `grant_seq` is the number of
+// the set the grants came from (AGENT-PLAN §4.5), 0 if it is not known.
+// A member of `"v":1` (no `grant_seq`, written before numbers were kept)
+// reads as number unknown.
 type savedJSON struct {
 	V         int               `json:"v"`
 	AsOf      time.Time         `json:"as_of"`
 	Suspended bool              `json:"suspended"`
+	GrantSeq  *uint64           `json:"grant_seq,omitempty"`
 	Grants    []json.RawMessage `json:"grants"`
 }
 
-const savedVersion = 1
+const (
+	savedVersion   = 2
+	savedVersionV1 = 1
+)
 
 type saved struct {
 	grants    []*Grant
 	suspended bool
 	asOf      time.Time
+	seq       uint64 // 0: not known
 }
 
 var errSaved = errors.New("the saved grants are not valid")
 
-func encodeSaved(gs []*Grant, suspended bool, asOf time.Time) (json.RawMessage, error) {
-	s := savedJSON{V: savedVersion, AsOf: asOf.UTC(), Suspended: suspended, Grants: []json.RawMessage{}}
+func encodeSaved(gs []*Grant, suspended bool, asOf time.Time, seq uint64) (json.RawMessage, error) {
+	s := savedJSON{V: savedVersion, AsOf: asOf.UTC(), Suspended: suspended, GrantSeq: &seq, Grants: []json.RawMessage{}}
 	for _, g := range gs {
 		b, err := json.Marshal(g.wire())
 		if err != nil {
@@ -59,10 +67,14 @@ func decodeSaved(raw json.RawMessage, agentID string) (*saved, error) {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%w: data after it", errSaved)
 	}
-	if s.V != savedVersion || s.AsOf.IsZero() || len(s.Grants) > MaxGrants {
+	formOK := s.V == savedVersion && s.GrantSeq != nil || s.V == savedVersionV1 && s.GrantSeq == nil
+	if !formOK || s.AsOf.IsZero() || len(s.Grants) > MaxGrants {
 		return nil, fmt.Errorf("%w: unknown version or form", errSaved)
 	}
 	out := &saved{suspended: s.Suspended, asOf: s.AsOf}
+	if s.GrantSeq != nil {
+		out.seq = *s.GrantSeq
+	}
 	for _, r := range s.Grants {
 		gd := json.NewDecoder(bytes.NewReader(r))
 		gd.DisallowUnknownFields()

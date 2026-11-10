@@ -121,7 +121,9 @@ func TestMCPNotPaired(t *testing.T) {
 const (
 	toolItem     = "01JB2Z6V9K3M4N5P6Q7R8S9XYZ"
 	referredItem = "01JB2Z6V9K3M4N5P6Q7R8S9XY0"
-	toolValue    = "tool-test-value-not-a-secret"
+	// forbiddenItem: item.get is answered forbidden.
+	forbiddenItem = "01JB2Z6V9K3M4N5P6Q7R8S9XY1"
+	toolValue     = "tool-test-value-not-a-secret"
 )
 
 // lineLog keeps everything written, for the stdout check, and passes it
@@ -168,6 +170,8 @@ func fakeAgentVault(t *testing.T, v *pairtest.Vault) <-chan string {
 		switch {
 		case b.Op == "catalog":
 			_, _ = v.SendResponse(id, typ, []byte(`{"items":[{"item_id":"`+toolItem+`","name":"Example","category":"login","labels":[{"field_id":"password","label":"Password","kind":"password"}]}]}`), "")
+		case b.Op == "item.get" && b.ItemID == forbiddenItem:
+			_, _ = v.SendResponse(id, typ, nil, "forbidden")
 		case b.Op == "item.get" && b.ItemID == referredItem:
 			exp := time.Now().Add(time.Minute).UTC().Format(time.RFC3339Nano)
 			_, _ = v.SendEvent("approval.waiting", []byte(`{"approval_id":"01JB2Z6V9K3M4N5P6Q7R8S9APP","request_id":"`+id+`","exp":"`+exp+`"}`))
@@ -314,6 +318,30 @@ func TestMCPTools(t *testing.T) {
 	sc, isErr = callTool(t, cs, "leash.connection_info", nil)
 	if isErr || sc["device_id"] != pairtest.DeviceID || sc["access_session"] != "active" || sc["waiting_for_daily_check"] != false {
 		t.Fatalf("connection_info: %v", sc)
+	}
+
+	// A forbidden answer makes the grants be listed again (AGENT-PLAN
+	// §4.5).
+	lists := func() int {
+		n := 0
+		for _, typ := range v.Received() {
+			if typ == "leash.grant.list" {
+				n++
+			}
+		}
+		return n
+	}
+	before := lists()
+	sc, isErr = callTool(t, cs, "leash.request_secret", map[string]any{"item_id": forbiddenItem})
+	if !isErr || sc["code"] != "forbidden" {
+		t.Fatalf("forbidden request_secret: %v", sc)
+	}
+	deadline = time.Now().Add(10 * time.Second)
+	for lists() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("no list after a forbidden answer")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	if err := cs.Close(); err != nil {

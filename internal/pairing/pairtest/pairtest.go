@@ -98,6 +98,11 @@ type Vault struct {
 	// SessionSeconds, if positive, makes the approval grant a first
 	// access session of that length (device.paired session_expires_at).
 	SessionSeconds int
+	// GrantSeq is the grant_seq of the (empty) set leash.grant.list
+	// answers with (VAULT-MESSAGING §10.11); 0: 1. NoGrantSeq leaves it
+	// out, as a vault older than 0.41.0 does.
+	GrantSeq   uint64
+	NoGrantSeq bool
 	// GrantListError, if set, answers leash.grant.list with this error
 	// code (for example session_required) instead of an empty list.
 	GrantListError string
@@ -604,7 +609,11 @@ func (v *Vault) toVault(payload []byte) {
 					hook = func() { f(id, typ, body) }
 				}
 				if in.Type == "leash.grant.list" && in.Re == "" {
-					resp := &envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK, Body: []byte(`{"grants":[],"suspended":false}`)}
+					body := `{"grants":[],"suspended":false}`
+					if !v.NoGrantSeq {
+						body = `{"grants":[],"suspended":false,"grant_seq":` + strconv.FormatUint(max(v.GrantSeq, 1), 10) + `}`
+					}
+					resp := &envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK, Body: []byte(body)}
 					if v.GrantListError != "" {
 						resp.Status, resp.Body = envelope.StatusError, nil
 						resp.Error = &envelope.Error{Code: v.GrantListError}

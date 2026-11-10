@@ -18,15 +18,22 @@
 //     lifetime (at least a minute) remains.
 //
 // Messages arrive in no guaranteed order (VAULT-MESSAGING §8.4; a failed
-// deposit is sent again in a later flush, §8.3), so only the answer to
-// a list this process sent, with nothing learned since it was sent,
-// widens what the connector holds (see Apply). Everything else, every
-// leash.grant.updated included, may only narrow it and asks for a list.
+// deposit is sent again in a later flush, §8.3), so each grant set
+// carries the vault's grant_seq (§10.11, AGENT-PLAN §4.5) and the
+// connector keeps the highest it has seen: a set with a higher number
+// replaces the grants, whether it is a list answer or an event; a lower
+// one is ignored; an equal one describes the set already held and gives
+// only fresher status statements. A set without a number is ignored
+// (the vault is too old). While the number is unknown (a state saved
+// before numbers were kept), only the answer to a list this process sent
+// widens the grants; anything else may only narrow them. What the
+// connector learns outside the sets (not_found, forbidden) is undone
+// only by the answer to a list sent after it was learned.
 //
-// The grants are saved in the record's `leash` member with the batch
-// that carried them (vaultconn.Part), before the batch is acknowledged;
-// status statements are kept in memory only (the list at the next
-// session start brings fresh ones).
+// The grants and their number are saved in the record's `leash` member
+// with the batch that carried them (vaultconn.Part), before the batch is
+// acknowledged; status statements are kept in memory only (the list at
+// the next session start brings fresh ones).
 //
 // Logs carry grant ids, types and error codes, never delegations or
 // statements.
@@ -41,6 +48,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -111,6 +119,9 @@ var (
 	// ErrUnconfirmed: the grants have not been listed in this session
 	// and could not be (chosen text).
 	ErrUnconfirmed = &Error{Code: "vault_unreachable", Text: "This agent's grants could not be confirmed with your vault. Try again."}
+	// ErrVaultTooOld: the vault sends grant sets without grant_seq
+	// (AGENT-PLAN §4.5; owner decision of 2026-11-05).
+	ErrVaultTooOld = &Error{Code: "vault_too_old", Text: "Your vault is too old for this connector. Update your vault, then try again."}
 	// ErrNoDevice: the connection has no device id, so no grant could be
 	// checked as this agent's.
 	ErrNoDevice = errors.New("the saved pairing has no device id: run `vettid-agent pair --restart`")
@@ -156,13 +167,25 @@ type Manager struct {
 	grants    []*Grant
 	suspended bool
 	asOf      time.Time
-	saved     bool // grants, suspended and asOf hold something to save
-	// gen counts what the connector learned that a list sent earlier may
-	// not reflect: every applied leash.grant.updated, every narrowing,
-	// not_found and forbidden. lists maps the id of each list this
-	// process sent to gen at the time it was sent.
-	gen   uint64
-	lists map[string]uint64
+	saved     bool // grants, suspended, asOf and seq hold something to save
+	// seq is the grant_seq of the grants held (saved with them); 0: not
+	// known (none applied yet, or a state saved before numbers were
+	// kept). While it is 0, floor is the highest number of a set applied
+	// only as a narrowing: a list answer below it is older than what was
+	// learned from that set.
+	seq   uint64
+	floor uint64
+	// gen counts what the connector learned outside the sets: not_found
+	// and forbidden (forbidden: the suspension it taught). lists maps the
+	// id of each list this process sent to gen at the time it was sent;
+	// only the answer to a list sent after a mark clears it.
+	gen       uint64
+	lists     map[string]uint64
+	forbidden bool
+	// tooOld: the last grant set had no grant_seq (ignored; tools answer
+	// vault_too_old); tooOldLogged: said so in the log in this session.
+	tooOld       bool
+	tooOldLogged bool
 	// listed: a grant set was applied in full from a list sent in this
 	// access session (in this process). Nothing is presented without it.
 	listed   bool
@@ -228,7 +251,7 @@ func (m *Manager) Bind(conn Conn) error {
 		if err != nil {
 			m.log.Warn("saved grants ignored", "err", err)
 		} else {
-			m.grants, m.suspended, m.asOf, m.saved = m.forMe(s.grants), s.suspended, s.asOf, true
+			m.grants, m.suspended, m.asOf, m.seq, m.saved = m.forMe(s.grants), s.suspended, s.asOf, s.seq, true
 		}
 	}
 	return nil
@@ -252,26 +275,23 @@ func (m *Manager) signal() {
 	}
 }
 
-// How a grant set is applied.
-type mode int
+// Where a grant set came from.
+type source int
 
 const (
-	// modeList: the answer to a list this process sent, with nothing
-	// learned since it was sent. It replaces the grants, ends a
-	// suspension, revives grants answered not_found, and confirms them.
-	modeList mode = iota
-	// modeNarrow: anything else: every leash.grant.updated (nothing in a
-	// message tells its order: VAULT-MESSAGING §8.4 gives none, and an
-	// inner id's time is the sender's clock), an answer to a list sent
-	// before something was learned, or to a list this process did not
-	// send. It only removes: grants absent from it, or present in another
-	// version, go; nothing is added; it can suspend but not resume. A
-	// fresh list is asked for, which brings what it could not add.
-	modeNarrow
+	// fromEvent: a leash.grant.updated, or the answer to a list this
+	// process did not send (internal/access's check).
+	fromEvent source = iota
+	// fromOwnStale: the answer to a list this process sent before
+	// something was learned outside the sets (not_found, forbidden).
+	fromOwnStale
+	// fromOwn: the answer to a list this process sent, with nothing
+	// learned outside the sets since.
+	fromOwn
 )
 
 // Apply takes a batch of messages inside its save (vaultconn.Part):
-// leash.grant.updated and answers to leash.grant.list (see mode);
+// leash.grant.updated and answers to leash.grant.list (see applySet);
 // device.session.granted starts a session, whose grants are listed
 // again before anything is presented; device.session.ended ends it.
 // Applying the same batch again gives the same result or a narrower one.
@@ -281,19 +301,27 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 	for _, msg := range batch {
 		switch {
 		case msg.Re == "" && msg.Type == "leash.grant.updated":
-			m.applySet(msg.Body, modeNarrow)
-			m.gen++
+			m.applySet(msg.Body, fromEvent)
 		case msg.Re != "" && msg.Type == "leash.grant.list" && msg.OK:
-			md := modeNarrow
-			g, mine := m.lists[msg.Re]
-			delete(m.lists, msg.Re)
-			if mine && g == m.gen {
-				md = modeList
+			src := fromEvent
+			if g, mine := m.lists[msg.Re]; mine {
+				src = fromOwnStale
+				if g == m.gen {
+					src = fromOwn
+				}
 			}
-			m.applySet(msg.Body, md)
+			delete(m.lists, msg.Re)
+			m.applySet(msg.Body, src)
 		case msg.Re == "" && msg.Type == "device.session.granted":
+			// A list sent in an earlier session describes the grants as
+			// they were then (the vault sends no events between
+			// sessions): its answer counts as another's list. (A list
+			// the new session sent before this message was applied is
+			// forgotten too; that costs one more list.)
+			m.lists = map[string]uint64{}
 			m.listed, m.needList = false, true
 			m.listFails, m.nextList = 0, time.Time{}
+			m.tooOldLogged = false
 			m.signal()
 		case msg.Re == "" && msg.Type == "device.session.ended":
 			m.listed = false
@@ -302,26 +330,69 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 }
 
 // grantSet is the body of leash.grant.updated and of an agent's
-// leash.grant.list answer: all of its grants, and whether it is
-// suspended.
+// leash.grant.list answer: all of its grants, whether it is suspended,
+// and the set's number.
 type grantSet struct {
 	Grants    *[]json.RawMessage `json:"grants"`
 	Suspended *bool              `json:"suspended"`
+	GrantSeq  json.RawMessage    `json:"grant_seq"`
 }
 
-// applySet applies a grant set in a mode (m.mu held) and reports
-// whether it parsed. A set that does not parse presents nothing until a
-// list is applied; a grant that does not parse, is for another agent or
-// appears twice is dropped.
-func (m *Manager) applySet(body json.RawMessage, md mode) bool {
+// parseSeq reads grant_seq: an unsigned 64-bit integer, written as
+// digits; 0, absent, null or anything else counts as absent (0)
+// (VAULT-MESSAGING §10.11, 0.85.3), including forms such as 1e3 or
+// 42.0 (chosen; not in the spec: the vault writes plain digits).
+func parseSeq(raw json.RawMessage) uint64 {
+	n, err := strconv.ParseUint(string(raw), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// applySet applies a grant set (m.mu held). A set that does not parse
+// presents nothing until a list is applied; a set without grant_seq is
+// ignored and paced as a failed list; a grant that does not parse, is
+// for another agent or appears twice is dropped. Then, by its number
+// against the one held (AGENT-PLAN §4.5):
+//
+//   - lower: ignored (an answer to this process's own list asks for
+//     another);
+//   - equal: the set already held; only fresher statements are taken; as
+//     the answer to this process's own list it confirms the grants;
+//   - higher: it replaces the grants, adding as well as removing;
+//   - while the number held is unknown, only the answer to this
+//     process's own list replaces the grants; anything else only removes
+//     (grants absent from it or present in another version) and may
+//     suspend, and a list is asked for.
+//
+// What was learned outside the sets (a grant answered not_found, a
+// suspension answered forbidden) holds whatever the number, until the
+// answer to a list sent after it was learned.
+func (m *Manager) applySet(body json.RawMessage, src source) {
 	now := m.now()
+	own := src != fromEvent
 	var set grantSet
 	if json.Unmarshal(body, &set) != nil || set.Grants == nil || set.Suspended == nil || len(*set.Grants) > MaxGrants {
 		m.log.Warn("malformed grant set; nothing is presented until the grants are listed again")
 		m.listed, m.needList = false, true
 		m.signal()
-		return false
+		return
 	}
+	seq := parseSeq(set.GrantSeq)
+	if seq == 0 {
+		if !m.tooOldLogged {
+			m.log.Warn("grant set without grant_seq ignored: the vault is too old for this connector")
+			m.tooOldLogged = true
+		}
+		// It may have been a revocation: nothing is presented until a
+		// list with a number is applied.
+		m.tooOld, m.needList, m.listed = true, true, false
+		m.listFailed()
+		m.signal()
+		return
+	}
+	m.tooOld = false
 	var in []*Grant
 	seen := map[string]int{}
 	raw := map[string]*wireGrant{}
@@ -353,32 +424,50 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 		byID[g.ID] = g
 	}
 
-	if md == modeNarrow {
-		changed := false
-		var kept []*Grant
-		for _, g := range m.grants {
-			if n := byID[g.ID]; n != nil && n.Version == g.Version {
-				kept = append(kept, g)
-				continue
+	switch {
+	case m.seq != 0 && seq < m.seq, m.seq == 0 && seq < m.floor:
+		// Older than what is held.
+		if own {
+			m.needList = true
+			m.signal()
+		}
+		return
+	case m.seq != 0 && seq == m.seq:
+		if src == fromOwn {
+			m.clearMarks(*set.Suspended)
+		}
+		if !m.suspended {
+			for _, g := range m.grants {
+				n := byID[g.ID]
+				if n == nil || n.Version != g.Version || m.dead[g.ID] {
+					continue
+				}
+				// Checked against the grant held: its statement must bind
+				// the delegation that is presented.
+				if st := m.statementFrom(g, raw[g.ID], now); st != nil {
+					if cur := m.statements[g.ID]; cur == nil || st.issuedAt.After(cur.issuedAt) {
+						m.statements[g.ID] = st
+					}
+				}
 			}
-			delete(m.statements, g.ID)
-			changed = true
 		}
-		if *set.Suspended && !m.suspended {
-			m.suspended = true
-			m.statements = map[string]*statement{}
-			changed = true
+		if own {
+			m.confirmed(src)
 		}
-		if changed {
-			m.grants, m.asOf, m.saved = kept, now, true
-			m.gen++
-		}
+		return
+	case m.seq == 0 && !own:
+		m.narrow(byID, *set.Suspended, now)
+		m.floor = max(m.floor, seq)
 		m.needList = true
 		m.signal()
-		return true
+		return
 	}
 
-	// modeList replaces the grants.
+	// A higher number (or, while it is unknown, this process's own list)
+	// replaces the grants.
+	if src == fromOwn {
+		m.clearMarks(*set.Suspended)
+	}
 	var gs []*Grant
 	for _, g := range in {
 		if old := m.find(g.ID); old != nil && g.Version < old.Version {
@@ -389,35 +478,86 @@ func (m *Manager) applySet(body json.RawMessage, md mode) bool {
 		gs = append(gs, g)
 	}
 	slices.SortFunc(gs, func(a, b *Grant) int { return strings.Compare(a.ID, b.ID) })
-	suspended := *set.Suspended
+	suspended := *set.Suspended || m.forbidden
 	// Each grant's statement is the one sent with it, if any (the vault
 	// sends none for a grant not in force, while suspended or while held):
 	// statements of grants no longer present, or sent without one, go.
 	stmts := map[string]*statement{}
 	if !suspended {
 		for _, g := range gs {
-			w := raw[g.ID]
-			if w.Status == nil && w.StatusSig == nil {
-				continue
+			if st := m.statementFrom(g, raw[g.ID], now); st != nil {
+				stmts[g.ID] = st
 			}
-			st, err := checkStatement(g, w.Status, w.StatusSig, w.Rotations, now)
-			if err != nil {
-				m.log.Warn("status statement refused", "grant", g.ID)
-				continue
-			}
-			stmts[g.ID] = st
 		}
 	}
-	m.grants, m.suspended, m.asOf, m.saved = gs, suspended, now, true
+	m.grants, m.suspended, m.asOf, m.seq, m.floor, m.saved = gs, suspended, now, seq, 0, true
 	m.statements = stmts
-	m.fails = map[string]int{}
+	if own {
+		m.confirmed(src)
+	}
+	m.signal()
+}
+
+// statementFrom checks the statement sent with g, if any (m.mu held).
+func (m *Manager) statementFrom(g *Grant, w *wireGrant, now time.Time) *statement {
+	if w == nil || w.Status == nil && w.StatusSig == nil {
+		return nil
+	}
+	st, err := checkStatement(g, w.Status, w.StatusSig, w.Rotations, now)
+	if err != nil {
+		m.log.Warn("status statement refused", "grant", g.ID)
+		return nil
+	}
+	return st
+}
+
+// clearMarks undoes what was learned outside the sets (m.mu held): the
+// answer to a list sent after it was learned says what holds now.
+func (m *Manager) clearMarks(suspended bool) {
+	if m.forbidden {
+		m.forbidden, m.suspended, m.saved = false, suspended, true
+	}
 	m.dead = map[string]bool{}
+	// fails is kept: it paces refreshes of a grant the vault lists but
+	// answers not_found for, and a successful refresh resets it.
+}
+
+// confirmed records that the answer to this process's own list was
+// applied (m.mu held): the grants count as listed in this session; one
+// sent before a mark asks for another, which can clear it.
+func (m *Manager) confirmed(src source) {
 	m.listed = true
+	if src == fromOwnStale && (m.forbidden || len(m.dead) > 0) {
+		m.needList = true
+	}
 	if !m.needList {
 		m.listFails, m.nextList = 0, time.Time{}
 	}
 	m.signal()
-	return true
+}
+
+// narrow removes the grants absent from byID or present in it in another
+// version, and suspends if it says so (m.mu held); it adds nothing and
+// resumes nothing.
+func (m *Manager) narrow(byID map[string]*Grant, suspended bool, now time.Time) {
+	changed := false
+	var kept []*Grant
+	for _, g := range m.grants {
+		if n := byID[g.ID]; n != nil && n.Version == g.Version {
+			kept = append(kept, g)
+			continue
+		}
+		delete(m.statements, g.ID)
+		changed = true
+	}
+	if suspended && !m.suspended {
+		m.suspended = true
+		m.statements = map[string]*statement{}
+		changed = true
+	}
+	if changed {
+		m.grants, m.asOf, m.saved = kept, now, true
+	}
 }
 
 // Snapshot returns the record's `leash` member (vaultconn.Part).
@@ -427,7 +567,7 @@ func (m *Manager) Snapshot() json.RawMessage {
 	if !m.saved {
 		return m.o.Saved
 	}
-	b, err := encodeSaved(m.grants, m.suspended, m.asOf)
+	b, err := encodeSaved(m.grants, m.suspended, m.asOf, m.seq)
 	if err != nil {
 		return m.o.Saved
 	}
@@ -443,6 +583,23 @@ func (m *Manager) OnStatus(ownerCheck string) {
 		m.held = false
 		m.signal()
 	}
+}
+
+// Relist asks the background loop for a fresh list of the grants at once
+// (not waiting out the pause after failed lists: the refusal may mean a
+// suspension, and refused requests are themselves rate-limited) and
+// marks nothing: for a `forbidden` answer to an agent.request, which
+// names no grant (AGENT-PLAN §4.5). The numbered list says whether the
+// agent was suspended or a grant revoked. A vault known to be too old
+// keeps its pause: its lists carry no number, so they could not say.
+func (m *Manager) Relist() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.needList = true
+	if !m.tooOld {
+		m.nextList = time.Time{}
+	}
+	m.signal()
 }
 
 // Held reports whether the vault answered owner_check_required and no
@@ -492,6 +649,9 @@ func (m *Manager) List(ctx context.Context) error {
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		if m.tooOld {
+			return ErrVaultTooOld
+		}
 		if !m.listed || m.needList {
 			return ErrUnconfirmed
 		}
@@ -520,7 +680,7 @@ func (m *Manager) List(ctx context.Context) error {
 }
 
 // listOnce sends one list; done is false when its answer was overtaken
-// (applied only as a narrowing).
+// (older than what was learned meanwhile, or sent before a mark).
 func (m *Manager) listOnce(ctx context.Context, conn Conn) (done bool, err error) {
 	now := m.now()
 	id, err := envelope.NewULID(now)
@@ -574,9 +734,13 @@ func (m *Manager) listOnce(ctx context.Context, conn Conn) (done bool, err error
 		m.listFailed()
 		return true, ErrUnconfirmed
 	}
+	if m.tooOld {
+		// No grant_seq: ignored, and already paced as a failed list.
+		return true, ErrVaultTooOld
+	}
 	if m.needList {
-		// Overtaken by something learned meanwhile (applied only as a
-		// narrowing), or the set did not parse: list again.
+		// Overtaken by something learned meanwhile, or the set did not
+		// parse: list again.
 		return false, nil
 	}
 	if !m.listed {
@@ -634,13 +798,14 @@ func (m *Manager) refresh(ctx context.Context, id string) error {
 			// this says otherwise.
 			delete(m.statements, id)
 			m.dead[id] = true
+			m.fails[id]++ // paces the background loop's next try
 			m.gen++
 			m.needList = true
 			out = ErrNotGranted
 		case "forbidden":
 			// Suspended (§10.11): nothing is presented until a list sent
 			// after this says otherwise.
-			m.suspended, m.saved = true, true
+			m.suspended, m.forbidden, m.saved = true, true, true
 			m.statements = map[string]*statement{}
 			m.gen++
 			m.needList = true
@@ -713,6 +878,9 @@ func (m *Manager) presentable(id string, now time.Time) (*Grant, error) {
 		return nil, ErrNoSession
 	}
 	if !m.listed {
+		if m.tooOld {
+			return nil, ErrVaultTooOld
+		}
 		return nil, ErrUnconfirmed
 	}
 	g := m.find(id)
@@ -752,8 +920,10 @@ func (m *Manager) Present(ctx context.Context, id string) (*leashwire.Presented,
 	m.mu.Lock()
 	m.wanted[id] = m.now()
 	_, err := m.presentable(id, m.now())
+	// An old vault is asked again only when the pacing allows.
+	retry := errors.Is(err, ErrUnconfirmed) || errors.Is(err, ErrVaultTooOld) && !m.now().Before(m.nextList)
 	m.mu.Unlock()
-	if errors.Is(err, ErrUnconfirmed) {
+	if retry {
 		if err := m.List(ctx); err != nil {
 			return nil, err
 		}
@@ -832,7 +1002,7 @@ func (m *Manager) step(ctx context.Context) time.Time {
 		if now.Before(at) {
 			return earliest(at, now.Add(idle))
 		}
-		if err := m.List(ctx); err != nil && ctx.Err() == nil {
+		if err := m.List(ctx); err != nil && ctx.Err() == nil && !errors.Is(err, ErrVaultTooOld) {
 			m.log.Warn("grants not listed", "err", errText(err))
 		}
 		m.mu.Lock()
