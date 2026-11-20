@@ -995,3 +995,37 @@ func TestStaleEqualListSuspends(t *testing.T) {
 		t.Error("saved as resumed")
 	}
 }
+
+// TestStaleEqualListNarrows: the answer to a list sent before a mark,
+// under the number held, removes the grants it omits (an expiry) and
+// keeps the mark; after a restart, the own list under that number
+// confirms what it lists.
+func TestStaleEqualListNarrows(t *testing.T) {
+	e := newEnv(t)
+	start := e.c.Now()
+	g1 := grant(t, start, spec{id: gid(1), exp: start.Add(10 * time.Minute)})
+	g2 := grant(t, start, spec{id: gid(2)})
+	e.listingN(t, 330, false, g1, g2)
+	mustPresent(t, e, gid(1))
+	mustPresent(t, e, gid(2))
+	e.c.Add(700 * time.Second) // gid(1) expires; the vault drops it
+	e.f.statusGet = func(string) *vaultconn.Response { return fail("not_found") }
+	refused(t, e, gid(2), ErrNotGranted) // a mark: the next list is stale
+	e.staleList(t, 330, false, g2)
+	// Checked on the saved member itself: ReadSaved leaves out expired
+	// grants.
+	s, err := decodeSaved(e.m.Snapshot(), testAgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.grants) != 1 || s.grants[0].ID != gid(2) {
+		t.Errorf("saved %d grants", len(s.grants))
+	}
+	refused(t, e, gid(2), ErrNotGranted)
+
+	e2 := bindSaved(t, e, e.m.Snapshot())
+	e.c.Add(listGrace)
+	e2.listingN(t, 330, false, grant(t, start, spec{id: gid(2), statusAt: e.c.Now()}))
+	e2.m.step(ctx)
+	mustPresent(t, e2, gid(2))
+}

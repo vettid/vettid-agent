@@ -28,6 +28,11 @@ type savedJSON struct {
 	Grants    []json.RawMessage `json:"grants"`
 }
 
+// savedVersion must be raised by a build that accepts grants an earlier
+// build dropped (a new scope, say), and the earlier version read as
+// number unknown, as v1 is: a saved set without those grants matches no
+// list under the same number (applySet), so nothing would be confirmed
+// until the number changes.
 const (
 	savedVersion   = 2
 	savedVersionV1 = 1

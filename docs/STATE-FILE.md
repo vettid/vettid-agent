@@ -104,6 +104,11 @@ batch does not reach `internal/leash`), so a new pairing starts with
 none. A `leash` member of `"v": 1` (no `grant_seq`, from a build before
 numbers were kept) reads as `grant_seq` 0; a build older than `"v": 2`
 refuses a record that has it, and no such build was released. A
+build that accepts grants an earlier build dropped (a new scope, say)
+must raise the member's `v` and read the earlier `v` as `grant_seq` 0:
+otherwise the saved set lacks those grants, and every list under the
+same number lists a grant not held, so nothing is confirmed until the
+number changes. A
 status statement (`leash.status.get`) and what a refused one teaches
 (`not_found`, a suspension) are kept in memory and saved with the next
 batch; statements are never saved, since a grant is presented only
