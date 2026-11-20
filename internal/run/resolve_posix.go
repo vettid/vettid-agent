@@ -50,3 +50,6 @@ func canExecute(path string, fi os.FileInfo) bool {
 
 // platformLoaderNames: none beyond the shared list on POSIX.
 var platformLoaderNames []string
+
+// shimFor: no npm shims outside Windows.
+func shimFor(string) (string, bool) { return "", false }

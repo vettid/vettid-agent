@@ -60,11 +60,15 @@ func FixedPath() []string {
 // hasSeparator: a slash, a backslash or a volume name (a colon).
 func hasSeparator(s string) bool { return strings.ContainsAny(s, `/\:`) }
 
-// pathExt: the program extensions, fixed, never an inherited PATHEXT.
-// .bat and .cmd are left out: their arguments go through cmd.exe, which
-// Go can't quote safely, so an agent's argument could run a command.
+// pathExt: the extensions tried after a bare name, fixed, never an
+// inherited PATHEXT. A batch file (.cmd, .bat) is run only when named
+// with its extension, or as an npm shim (shimFor); it runs through
+// cmd.exe with its arguments checked (batch_windows.go).
 // (chosen; not in the spec)
 func pathExt() []string { return []string{".exe", ".com"} }
+
+// programExt: the extensions of a file the connector runs.
+func programExt() []string { return []string{".exe", ".com", ".cmd", ".bat"} }
 
 func hasExt(name string, exts []string) bool {
 	e := strings.ToLower(filepath.Ext(name))
@@ -76,15 +80,14 @@ func hasExt(name string, exts []string) bool {
 	return false
 }
 
-// candidates: the name itself when it has a PATHEXT extension, then the
+// candidates: the name itself when it has a program extension, then the
 // name with each PATHEXT extension appended.
 func candidates(dir, name string) []string {
-	exts := pathExt()
 	var out []string
-	if hasExt(name, exts) {
+	if hasExt(name, programExt()) {
 		out = append(out, filepath.Join(dir, name))
 	}
-	for _, x := range exts {
+	for _, x := range pathExt() {
 		out = append(out, filepath.Join(dir, name+x))
 	}
 	return out
@@ -96,7 +99,7 @@ func canExecute(path string, _ os.FileInfo) bool {
 	if strings.Contains(path[len(filepath.VolumeName(path)):], ":") {
 		return false
 	}
-	return hasExt(path, pathExt())
+	return hasExt(path, programExt())
 }
 
 // isUNC: a network path, \\host\share\... or //host/share/... (the

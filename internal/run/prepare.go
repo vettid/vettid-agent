@@ -81,6 +81,12 @@ func (p *Program) recheck(s StartSpec) error {
 // (checkFormat), and refuses content longer than limit bytes (0: no
 // limit). It returns the lowercase hex digest.
 func hashingCopy(w io.Writer, r io.Reader, path string, limit int64) (string, error) {
+	return hashingCopyAs(w, r, path, limit, checkFormat)
+}
+
+// hashingCopyAs is hashingCopy with the format check given (a batch file
+// is checked as one, not as a program).
+func hashingCopyAs(w io.Writer, r io.Reader, path string, limit int64, checkFormat func([]byte) error) (string, error) {
 	h := sha256.New()
 	var head [4]byte
 	n, err := io.ReadFull(r, head[:])

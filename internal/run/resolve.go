@@ -51,6 +51,9 @@ func ResolvePinned(argv0 string, runPath []string, pinned string) (string, error
 		if isUNC(argv0) {
 			return "", notFound("%s is on a network share", argv0)
 		}
+		if shim, ok := shimFor(argv0); ok {
+			argv0 = shim
+		}
 		p, ok := executable(argv0)
 		if !ok {
 			return "", notFound("%s is not an executable file", argv0)

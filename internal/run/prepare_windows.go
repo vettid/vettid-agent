@@ -22,6 +22,11 @@ import (
 type platProgram struct {
 	f  *os.File
 	id fileIdentity
+
+	// For a batch file: System32's cmd.exe, held the same way, which is
+	// the image the image check expects (batch_windows.go).
+	cmd   *os.File
+	cmdID fileIdentity
 }
 
 // fileIdentity is what names a file on its volume: the volume serial
@@ -56,13 +61,37 @@ func allowedFileSystem(name string) bool {
 // another process has open for writing or deleting (the open with
 // read-only sharing fails then), and a script (#!). It hashes the file
 // through the held handle. binDir is not used on Windows.
+//
+// A batch file (.cmd, .bat) is held and hashed the same way (it must not
+// be a Windows program), and System32's cmd.exe, which runs it, is
+// checked like any program and held too.
 func Prepare(path, _ string) (*Program, error) {
 	if path == "" || !filepath.IsAbs(path) || isUNC(path) || !canExecute(path, nil) {
 		return nil, notFound("%s is not a program the connector runs", path)
 	}
+	f, h, err := holdFile(path)
+	if err != nil {
+		return nil, err
+	}
+	prog, err := prepareHeld(f, h, path)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	if isBatch(path) {
+		if err := prog.holdCmd(); err != nil {
+			prog.Close()
+			return nil, err
+		}
+	}
+	return prog, nil
+}
+
+// holdFile opens path to hold it unchanged.
+func holdFile(path string) (*os.File, windows.Handle, error) {
 	p16, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return nil, notFound("the program path is invalid")
+		return nil, 0, notFound("the program path is invalid")
 	}
 	// FILE_SHARE_READ alone: no writing, renaming or deleting while held.
 	// FILE_FLAG_OPEN_REPARSE_POINT: a link at the path is opened as
@@ -72,18 +101,34 @@ func Prepare(path, _ string) (*Program, error) {
 	// A file someone else holds for writing is refused as
 	// program_not_found. (chosen; not in the spec)
 	if errors.Is(err, windows.ERROR_SHARING_VIOLATION) {
-		return nil, notFound("%s is open for writing or deleting by another process, so it can't be held unchanged; the run is refused", path)
+		return nil, 0, notFound("%s is open for writing or deleting by another process, so it can't be held unchanged; the run is refused", path)
 	}
 	if err != nil {
-		return nil, notFound("%s can't be opened: %v", path, err)
+		return nil, 0, notFound("%s can't be opened: %v", path, err)
 	}
-	f := os.NewFile(uintptr(h), path)
-	prog, err := prepareHeld(f, h, path)
+	return os.NewFile(uintptr(h), path), h, nil
+}
+
+// holdCmd checks and holds System32's cmd.exe for a batch run.
+func (p *Program) holdCmd() error {
+	cmd, err := cmdExePath()
+	if err != nil {
+		return err
+	}
+	if err := checkProgram(cmd); err != nil {
+		return notFound("cmd.exe isn't run: %v", err)
+	}
+	f, h, err := holdFile(cmd)
+	if err != nil {
+		return err
+	}
+	held, err := prepareHeld(f, h, cmd)
 	if err != nil {
 		f.Close()
-		return nil, err
+		return err
 	}
-	return prog, nil
+	p.plat.cmd, p.plat.cmdID = f, held.plat.id
+	return nil
 }
 
 func prepareHeld(f *os.File, h windows.Handle, path string) (*Program, error) {
@@ -107,7 +152,11 @@ func prepareHeld(f *os.File, h windows.Handle, path string) (*Program, error) {
 	if !allowedFileSystem(fs) {
 		return nil, notFound("%s is on a %s volume; programs are run only from NTFS or ReFS volumes", path, fs)
 	}
-	sum, err := hashingCopy(nil, f, path, 0)
+	format := checkFormat
+	if isBatch(path) {
+		format = checkBatchFormat
+	}
+	sum, err := hashingCopyAs(nil, f, path, 0, format)
 	if err != nil {
 		return nil, err
 	}
@@ -141,14 +190,21 @@ func identityOf(h windows.Handle) (fileIdentity, uint32, error) {
 	return id, bi.FileAttributes, nil
 }
 
-// Close releases the held file. Call it after Start, or when the run is
-// refused.
+// Close releases the held files. Call it after Start, or when the run is
+// refused. A started batch file stays held by its Process until the
+// process ends: cmd.exe reads it while it runs.
 func (p *Program) Close() error {
-	if p.plat.f == nil {
-		return nil
+	var err error
+	if p.plat.f != nil {
+		err = p.plat.f.Close()
+		p.plat.f = nil
 	}
-	err := p.plat.f.Close()
-	p.plat.f = nil
+	if p.plat.cmd != nil {
+		if cerr := p.plat.cmd.Close(); err == nil {
+			err = cerr
+		}
+		p.plat.cmd = nil
+	}
 	return err
 }
 
@@ -178,11 +234,24 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	if s.Dir == "" || !filepath.IsAbs(s.Dir) {
 		return nil, badRequest("cwd is not an absolute path")
 	}
-	app, err := windows.UTF16PtrFromString(p.Path)
+	appPath, line := p.Path, makeCmdLine(s.Argv)
+	image, imageID := p.plat.f, p.plat.id
+	if p.plat.cmd != nil {
+		// A batch file: cmd.exe runs it, with every part checked first.
+		if err := checkBatch(p.Path, s.Dir, s.Argv[1:]); err != nil {
+			return nil, err
+		}
+		appPath, line = p.plat.cmd.Name(), batchCmdLine(p.plat.cmd.Name(), p.Path, s.Argv[1:])
+		if n := len(windows.StringToUTF16(line)) - 1; n > maxBatchCmdLine {
+			return nil, badRequest("the command line is %d characters, at most %d for a batch file", n, maxBatchCmdLine)
+		}
+		image, imageID = p.plat.cmd, p.plat.cmdID
+	}
+	app, err := windows.UTF16PtrFromString(appPath)
 	if err != nil {
 		return nil, notFound("the program path is invalid")
 	}
-	cmd, err := windows.UTF16FromString(makeCmdLine(s.Argv))
+	cmd, err := windows.UTF16FromString(line)
 	if err != nil {
 		return nil, badRequest("an argument holds a NUL byte")
 	}
@@ -206,7 +275,7 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 		return nil, err
 	}
 	hook("created")
-	if err := p.verifyImage(pi.Process); err != nil {
+	if err := verifyImage(pi.Process, image, imageID); err != nil {
 		return nil, endSuspended(pi, s, err)
 	}
 	hook("checked")
@@ -216,7 +285,13 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	}
 	hook("resumed")
 	windows.CloseHandle(pi.Thread)
-	return &Process{Pid: int(pi.ProcessId), plat: platProcess{h: pi.Process}}, nil
+	proc := &Process{Pid: int(pi.ProcessId), plat: platProcess{h: pi.Process}}
+	if p.plat.cmd != nil {
+		// cmd.exe reads the batch file while it runs: the process holds
+		// it until it ends (platProcess.wait), not Close.
+		proc.plat.held, p.plat.f = p.plat.f, nil
+	}
+	return proc, nil
 }
 
 // createSuspended creates the process suspended. The inheritable
@@ -295,7 +370,10 @@ func hook(stage string) {
 // The held file can't be renamed, and on NTFS renaming a folder above it
 // is refused too (TestHeldProgramParentRename; ReFS not yet tried).
 // (chosen; not in the spec)
-func (p *Program) verifyImage(proc windows.Handle) error {
+//
+// For a batch file the image is System32's cmd.exe, held by the Program
+// beside the batch file; held and id are that file's.
+func verifyImage(proc windows.Handle, held *os.File, id fileIdentity) error {
 	buf := make([]uint16, windows.MAX_LONG_PATH)
 	n := uint32(len(buf))
 	if err := windows.QueryFullProcessImageName(proc, windows.PROCESS_NAME_NATIVE, &buf[0], &n); err != nil {
@@ -305,12 +383,12 @@ func (p *Program) verifyImage(proc windows.Handle) error {
 	if !strings.HasPrefix(img, `\Device\`) {
 		return notFound("the started program's name %s is not a device path; the run is refused", img)
 	}
-	held, err := finalNativeName(windows.Handle(p.plat.f.Fd()))
+	heldName, err := finalNativeName(windows.Handle(held.Fd()))
 	if err != nil {
 		return runFailed("the held program's name can't be read: %v", err)
 	}
-	if !strings.EqualFold(img, held) {
-		return notFound("the started program %s is not the file that was checked (%s); the run is refused", img, held)
+	if !strings.EqualFold(img, heldName) {
+		return notFound("the started program %s is not the file that was checked (%s); the run is refused", img, heldName)
 	}
 	i16, err := windows.UTF16PtrFromString(globalRoot + img)
 	if err != nil {
@@ -329,7 +407,7 @@ func (p *Program) verifyImage(proc windows.Handle) error {
 	if err != nil {
 		return notFound("the started program %s can't be checked: %v; the run is refused", img, err)
 	}
-	if !p.plat.id.same(got) {
+	if !id.same(got) {
 		return notFound("the started program %s is not the file that was checked; the run is refused", img)
 	}
 	if fs, err := volumeFileSystem(h); err != nil || !allowedFileSystem(fs) {
@@ -491,7 +569,12 @@ func uniqueHandles(hs []windows.Handle) []windows.Handle {
 }
 
 // platProcess is the process handle from CreateProcess.
-type platProcess struct{ h windows.Handle }
+// held, for a batch run, is the batch file, held until the process ends:
+// cmd.exe reads it while it runs.
+type platProcess struct {
+	h    windows.Handle
+	held *os.File
+}
 
 func (p *platProcess) wait() (int, error) {
 	if p.h == 0 {
@@ -504,6 +587,10 @@ func (p *platProcess) wait() (int, error) {
 	err := windows.GetExitCodeProcess(p.h, &code)
 	windows.CloseHandle(p.h)
 	p.h = 0
+	if p.held != nil {
+		p.held.Close()
+		p.held = nil
+	}
 	if err != nil {
 		return -1, err
 	}
