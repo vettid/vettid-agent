@@ -433,6 +433,7 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 	// while the client does not read).
 	if ok, wait := s.limit.take(); !ok {
 		out := rateLimited(s.o.Now(), wait)
+		out.textOnly = out.textOnly || t.textOnly
 		s.log.Info("tool call", "tool", t.def.Name, "outcome", out.logCode)
 		s.writeToolResult(id, out)
 		return
@@ -441,6 +442,7 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 	case s.slots <- struct{}{}:
 	default:
 		out := tooManyInFlight()
+		out.textOnly = out.textOnly || t.textOnly
 		s.log.Info("tool call", "tool", t.def.Name, "outcome", out.logCode)
 		s.writeToolResult(id, out)
 		return
@@ -460,6 +462,7 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 			<-s.slots
 		}()
 		out := s.runTool(cctx, t, args)
+		out.textOnly = out.textOnly || t.textOnly
 		defer out.wipe()
 		if cctx.Err() != nil {
 			// Cancelled by the client, or the session ended: no answer.
@@ -536,6 +539,9 @@ const (
 	trTail = "}}\n"
 )
 
+// trMidText closes the content of a text-only result (toolOut.textOnly).
+const trMidText = `}]`
+
 // toolResultSize is the most bytes writeToolResult's message takes.
 func toolResultSize(id, body []byte) int {
 	return len(trHead) + len(id) + len(trMid1) + quotedBound(len(body)) + len(trMid2) + len(body) + len(trMid3) + len("false") + len(trTail)
@@ -544,16 +550,22 @@ func toolResultSize(id, body []byte) int {
 // writeToolResult writes a tool's result: its structured content, and
 // the same JSON as the text content (MCP: a tool that returns
 // structured content should also return it serialised as text, for
-// clients that pass only the text to the model). The message is built
-// in one byte slice, sized up front, and zeroed once written.
+// clients that pass only the text to the model). A text-only result
+// (an item's values, AGENT-PLAN §4.9 "Reveal") is the text content
+// alone, so that the values appear in it once. The message is built in
+// one byte slice, sized up front, and zeroed once written.
 func (s *Server) writeToolResult(id json.RawMessage, out *toolOut) {
 	b := make([]byte, 0, toolResultSize(id, out.body))
 	b = append(b, trHead...)
 	b = append(b, id...)
 	b = append(b, trMid1...)
 	b = appendQuoted(b, out.body)
-	b = append(b, trMid2...)
-	b = append(b, out.body...)
+	if out.textOnly {
+		b = append(b, trMidText...)
+	} else {
+		b = append(b, trMid2...)
+		b = append(b, out.body...)
+	}
 	b = append(b, trMid3...)
 	if out.isError {
 		b = append(b, "true"...)

@@ -1,0 +1,18 @@
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"error\",\"code\":\"way_not_allowed\",\"message\":\"Your vault does not allow this agent to use that item this way. It allows: none. You can change this on your phone.\"}"
+      }
+    ],
+    "structuredContent": {
+      "status": "error",
+      "code": "way_not_allowed",
+      "message": "Your vault does not allow this agent to use that item this way. It allows: none. You can change this on your phone."
+    },
+    "isError": true
+  }
+}

@@ -78,8 +78,11 @@ func (f *fakeRequests) Catalog(ctx context.Context) (*request.Outcome, error) {
 	}
 	return f.keep(&request.Outcome{Result: &request.Result{Op: request.OpCatalog, Catalog: []request.CatalogItem{
 		{ItemID: testItem, Name: "Example login", Category: "login", Labels: []request.Label{
-			{FieldID: "username", Label: "Username", Kind: "text"}, {FieldID: "password", Label: "Password", Kind: "password"}}},
-		{ItemID: "01JB2Z6V9K3M4N5P6Q7R8S9AAA", Name: "Empty note", Category: "note"},
+			{FieldID: "username", Label: "Username", Kind: "text"}, {FieldID: "password", Label: "Password", Kind: "password"}},
+			Ways:     []string{"proxy", "reveal", "run", "use"},
+			Programs: []request.CatalogProgram{{Program: "git", Path: "/usr/bin/git", Env: []string{"GIT_ASKPASS"}}, {Program: "curl", Env: []string{}}},
+			Hosts:    []string{"api.example.test"}},
+		{ItemID: "01JB2Z6V9K3M4N5P6Q7R8S9AAA", Name: "Empty note", Category: "note", Ways: []string{"use"}},
 	}}}, nil)
 }
 
@@ -254,7 +257,7 @@ func (s *session) init() {
 }
 
 // toolCall sends tools/call and returns the result's structured content
-// and isError.
+// (for a text-only result, the JSON of its one text block) and isError.
 func (s *session) toolCall(id int, name, args string) (map[string]any, bool) {
 	s.t.Helper()
 	s.send(`{"jsonrpc":"2.0","id":` + itoa(id) + `,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`)
@@ -264,8 +267,27 @@ func (s *session) toolCall(id int, name, args string) (map[string]any, bool) {
 		s.t.Fatalf("no result: %v", m)
 	}
 	sc, _ := r["structuredContent"].(map[string]any)
+	if _, has := r["structuredContent"]; !has {
+		sc = textResult(s.t, r)
+	}
 	isErr, _ := r["isError"].(bool)
 	return sc, isErr
+}
+
+// textResult is the JSON of a result's one text block.
+func textResult(t *testing.T, r map[string]any) map[string]any {
+	t.Helper()
+	c, _ := r["content"].([]any)
+	if len(c) != 1 {
+		t.Fatalf("%d content blocks: %v", len(c), r)
+	}
+	b, _ := c[0].(map[string]any)
+	text, _ := b["text"].(string)
+	var m map[string]any
+	if b["type"] != "text" || json.Unmarshal([]byte(text), &m) != nil {
+		t.Fatalf("not one JSON text block: %v", r)
+	}
+	return m
 }
 
 func itoa(n int) string {

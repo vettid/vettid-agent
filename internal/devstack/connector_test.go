@@ -304,6 +304,11 @@ func (m *MCP) call(ctx context.Context, name string, args map[string]any) (map[s
 		m.t.Fatalf("%s: %v\nconnector log:\n%s", name, err, m.Stderr)
 	}
 	b, _ := json.Marshal(res.StructuredContent)
+	if res.StructuredContent == nil && len(res.Content) == 1 {
+		if tc, ok := res.Content[0].(*sdk.TextContent); ok {
+			b = []byte(tc.Text) // a text-only result (leash.request_secret)
+		}
+	}
 	var out map[string]any
 	if err := json.Unmarshal(b, &out); err != nil {
 		m.t.Fatalf("%s: structured content: %v", name, err)

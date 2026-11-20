@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"slices"
 
 	"github.com/vettid/vettid-vault/vms/envelope"
 )
@@ -25,9 +26,20 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 		if json.Unmarshal(body, &b) != nil || b.Items == nil {
 			return nil, errParse
 		}
-		for _, it := range *b.Items {
+		for i := range *b.Items {
+			it := &(*b.Items)[i]
 			if !envelope.ValidULID(it.ItemID) {
 				return nil, errParse
+			}
+			// A way that is not a short lower-case name is left out
+			// (chosen; not in the spec); a program's env is never null.
+			if it.Ways != nil {
+				it.Ways = slices.DeleteFunc(it.Ways, func(w string) bool { return !wayRE.MatchString(w) })
+			}
+			for j := range it.Programs {
+				if it.Programs[j].Env == nil {
+					it.Programs[j].Env = []string{}
+				}
 			}
 		}
 		items := *b.Items

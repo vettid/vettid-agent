@@ -63,6 +63,14 @@ func callSDK(t *testing.T, cs *sdk.ClientSession, name string, args map[string]a
 	if err := json.Unmarshal([]byte(tc.Text), &fromText); err != nil {
 		t.Fatalf("%s: text is not JSON: %v", name, err)
 	}
+	if res.StructuredContent == nil {
+		// Text only (leash.request_secret; an item's values from
+		// leash.check_status).
+		return fromText, res.IsError
+	}
+	if name == ToolRequestSecret {
+		t.Errorf("%s: structured content", name)
+	}
 	b, _ := json.Marshal(res.StructuredContent)
 	if err := json.Unmarshal(b, &fromStructured); err != nil {
 		t.Fatalf("%s: structured content: %v", name, err)
@@ -100,7 +108,7 @@ func TestSDKClient(t *testing.T) {
 			for _, tl := range lt.Tools {
 				names = append(names, tl.Name)
 			}
-			if !slices.Equal(names, []string{ToolListAvailable, ToolRequestSecret, ToolExecuteAction, ToolCheckStatus, ToolConnectionInfo}) {
+			if !slices.Equal(names, []string{ToolListAvailable, ToolExecuteAction, ToolRequestSecret, ToolCheckStatus, ToolConnectionInfo}) {
 				t.Fatalf("tools: %v", names)
 			}
 

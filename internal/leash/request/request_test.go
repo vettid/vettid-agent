@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1004,5 +1005,63 @@ func TestStatusAfterApprovalWindow(t *testing.T) {
 	}
 	if n := len(e.conn.copies()); n != 1 {
 		t.Errorf("%d copies sent", n)
+	}
+}
+
+// TestCatalogWays: the catalog's ways, programs and hosts (VAULT-MESSAGING
+// §10.11, 0.42.0 and 0.85.3) are passed on; a way that is not a short
+// lower-case name is left out, a program's env is never null, and a
+// catalog without them (a vault before 0.42.0) has none.
+func TestCatalogWays(t *testing.T) {
+	var next string
+	e := newEnv(t, func(int, string) (*vaultconn.Response, error) { return ok(next), nil }, nil)
+	next = `{"items":[{"item_id":"` + itemID + `","name":"Bank","category":"login","labels":[],` +
+		`"ways":["reveal","run","use","Bad way",""],"programs":[{"program":"git","path":"/usr/bin/git","env":["GIT_ASKPASS"]},{"program":"curl"}],` +
+		`"hosts":["api.example.test"]}]}`
+	out, err := e.c.Catalog(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	it := out.Result.Catalog[0]
+	if !slices.Equal(it.Ways, []string{"reveal", "run", "use"}) || len(it.Programs) != 2 || it.Programs[0].Path != "/usr/bin/git" ||
+		!slices.Equal(it.Programs[0].Env, []string{"GIT_ASKPASS"}) || it.Programs[1].Env == nil || len(it.Programs[1].Env) != 0 ||
+		!slices.Equal(it.Hosts, []string{"api.example.test"}) {
+		t.Errorf("item: %+v", it)
+	}
+	next = `{"items":[{"item_id":"` + itemID + `","name":"Bank","category":"login","labels":[]}]}`
+	if out, err := e.c.Catalog(context.Background()); err != nil || out.Result.Catalog[0].Ways != nil || out.Result.Catalog[0].Programs != nil {
+		t.Errorf("no ways: %+v, %v", out, err)
+	}
+}
+
+// TestWayNotAllowed: way_not_allowed (VAULT-MESSAGING §10.11, 0.42.0)
+// gives AGENT-PLAN §11's text with the ways its body names, and the ways;
+// a way that is not a short lower-case name, or a repeated one, is left
+// out; a body without ways gives "none".
+func TestWayNotAllowed(t *testing.T) {
+	var body string
+	e := newEnv(t, func(int, string) (*vaultconn.Response, error) {
+		r := refused("way_not_allowed")
+		r.Body = json.RawMessage(body)
+		return r, nil
+	}, nil)
+	for _, c := range []struct {
+		body, list string
+		ways       []string
+	}{
+		{`{"ways":["use","run"]}`, "use, run", []string{"use", "run"}},
+		{`{"ways":["use","use","<b>","Run"]}`, "use", []string{"use"}},
+		{`{}`, "none", []string{}},
+		{`not json`, "none", []string{}},
+	} {
+		body = c.body
+		_, err := e.c.Get(context.Background(), itemID, nil)
+		var re *Error
+		if !errors.As(err, &re) || re.Code != "way_not_allowed" || re.Text != fmt.Sprintf(TextWayNotAllowed, c.list) || !slices.Equal(re.Ways, c.ways) {
+			t.Errorf("%s: %#v", c.body, err)
+		}
+	}
+	if !strings.HasPrefix(TextWayNotAllowed, "Your vault does not allow this agent to use that item this way. It allows: ") {
+		t.Error("text")
 	}
 }

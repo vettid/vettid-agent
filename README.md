@@ -206,18 +206,21 @@ over standard input and output only. It offers these tools:
 
 | Tool | What it does |
 |---|---|
-| `leash.list_available` | The items you shared with this agent: id, name, category and field labels, never values |
-| `leash.request_secret` | An item's values (all fields, or those named) |
-| `leash.execute_action` | HMAC-SHA-256 of the agent's data keyed with one field's value, computed in your vault: the value never reaches the agent (preferred where it suffices) |
+| `leash.list_available` | The items you shared with this agent: id, name, category and field labels, never values, and how you allow the agent to use each (`ways`: `use`, and where you allowed them `run`, `proxy` or `reveal`; the `programs` it may be run with and the `hosts` of its proxy, when your vault sends them) |
+| `leash.execute_action` | HMAC-SHA-256 of the agent's data keyed with one field's value, computed in your vault: the value never reaches the agent (the best way where it suffices) |
+| `leash.request_secret` | An item's values (all fields, or those named), as the last resort: only for an item you allowed to be shown to this agent (`reveal`), asked on your phone every time |
 | `leash.check_status` | The outcome of a request that answered `pending` |
 | `leash.connection_info` | The vault and device ids, last contact, access session, grants, whether the agent is paused, whether your vault waits for your daily check |
 
 Every result is a JSON object, as structured content and as the same
-JSON in text, with `status` `ok`, `pending` (with a `request_id`) or
+JSON in text (`leash.request_secret`'s results, and a `leash.check_status`
+result that holds an item's values, as text only), with `status` `ok`,
+`pending` (with a `request_id`) or
 `error` (with a stable `code` and a `message`, and `request_id` or
 `retry_after` where they apply; the result is then marked as an error).
 The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
-`not_found`, `limit`, …) or the connector's own: `access_requested`,
+`not_found`, `limit`, `way_not_allowed` with the `ways` the item allows,
+…) or the connector's own: `access_requested`,
 `access_denied`, `vault_unreachable`, `owner_check_required`,
 `suspended`, `expired`, `bad_request`, `rate_limited_local`,
 `vault_too_old` (your vault does not number its grant sets; update it)
@@ -232,10 +235,11 @@ your daily check, a tool call makes the connector ask it again at most
 once a minute, so that the agent can continue soon after you check in.
 
 An item's values reach the agent's MCP client in one tool result
-message, in which **each value appears twice**: in the structured
-content and in the text block that repeats the same JSON (MCP
-recommends both, and many clients pass only the text to the model). The
-connector writes that message once, from one buffer that it zeroes
+message, **as text only**: one text block holding the JSON, without
+structured content, so that each value appears in it once (MCP
+recommends both forms for structured results; following that would
+send each value twice, and every client reads the text). The connector
+writes that message once, from one buffer that it zeroes
 after the write, and never logs or stores a value. Before it is
 collected, a result is kept **in memory for up to 10 minutes** (a
 request still waiting for your approval, then for `leash.check_status`)

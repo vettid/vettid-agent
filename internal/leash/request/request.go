@@ -39,6 +39,8 @@ import (
 	"io"
 	"log/slog"
 	"regexp"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -110,6 +112,9 @@ type Error struct {
 	RequestID string
 	// Until, from internal/access: when a new access request may be sent.
 	Until time.Time
+	// Ways, for way_not_allowed (VAULT-MESSAGING §10.11, 0.42.0): the
+	// ways the item allows this agent, as the vault sent them.
+	Ways []string
 }
 
 func (e *Error) Error() string { return e.Text }
@@ -183,11 +188,28 @@ type Label struct {
 }
 
 // CatalogItem is an item the agent's grants include: metadata only.
+// Ways, Programs and Hosts (VAULT-MESSAGING §10.11, 0.42.0 and 0.85.3;
+// AGENT-PLAN §4.9) are what the member allows this agent for the item:
+// its ways to use a secret, the programs it may run with it (the pinned
+// path, never the hash) and the hosts of its proxy. A vault without them
+// sends none, and none is passed on.
 type CatalogItem struct {
-	ItemID   string  `json:"item_id"`
-	Name     string  `json:"name"`
-	Category string  `json:"category"`
-	Labels   []Label `json:"labels"`
+	ItemID   string           `json:"item_id"`
+	Name     string           `json:"name"`
+	Category string           `json:"category"`
+	Labels   []Label          `json:"labels"`
+	Ways     []string         `json:"ways,omitempty"`
+	Programs []CatalogProgram `json:"programs,omitempty"`
+	Hosts    []string         `json:"hosts,omitempty"`
+}
+
+// CatalogProgram is a program an item may be run with: its name or
+// path as the member allowed it, the pinned path when there is a pin,
+// and the environment variable names the run may set.
+type CatalogProgram struct {
+	Program string   `json:"program"`
+	Path    string   `json:"path,omitempty"`
+	Env     []string `json:"env"`
 }
 
 // Field is an item field with its value. Value is the value's JSON text
@@ -338,6 +360,9 @@ func (c *Client) Close() {
 }
 
 var fieldIDRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
+// wayRE is the form of a way's name (use, run, proxy, reveal, §10.11).
+var wayRE = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
 
 func badInput(what string) *Error {
 	return &Error{Code: "bad_request", Text: "The request is not valid: " + what + "."}
@@ -797,6 +822,8 @@ func (c *Client) answer(e *entry, resp *vaultconn.Response) {
 		err = ErrNotFound
 	case "limit":
 		err = ErrLimit
+	case "way_not_allowed":
+		err = wayNotAllowed(resp.Body)
 	case "bad_request":
 		err = badInput("your vault refused it")
 	default:
@@ -804,6 +831,32 @@ func (c *Client) answer(e *entry, resp *vaultconn.Response) {
 		err = &Error{Code: sc, Text: "Your vault refused the request (" + sc + ")."}
 	}
 	c.finish(e, nil, err)
+}
+
+// TextWayNotAllowed answers way_not_allowed (AGENT-PLAN §11); %s is the
+// ways the item allows.
+const TextWayNotAllowed = "Your vault does not allow this agent to use that item this way. It allows: %s. You can change this on your phone."
+
+// wayNotAllowed is the error for a way_not_allowed answer, whose body
+// {ways} names the ways the item allows (§10.11). A way that is not a
+// short lower-case name is left out; a body that does not parse gives
+// no ways.
+func wayNotAllowed(body json.RawMessage) *Error {
+	var b struct {
+		Ways []string `json:"ways"`
+	}
+	_ = json.Unmarshal(body, &b)
+	ways := []string{}
+	for _, w := range b.Ways {
+		if wayRE.MatchString(w) && !slices.Contains(ways, w) {
+			ways = append(ways, w)
+		}
+	}
+	list := "none"
+	if len(ways) > 0 {
+		list = strings.Join(ways, ", ")
+	}
+	return &Error{Code: "way_not_allowed", Text: fmt.Sprintf(TextWayNotAllowed, list), Ways: ways}
 }
 
 // finish records e's final outcome.
