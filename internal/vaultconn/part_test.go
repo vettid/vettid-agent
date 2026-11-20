@@ -139,6 +139,42 @@ func TestPartAppliedInSave(t *testing.T) {
 	}
 }
 
+// TestPartReappliedAfterFailedSave: while the save of a batch fails, its
+// event is given to Apply again in each attempt and is not handed to
+// OnEvent; once a save succeeds it is handed over once.
+func TestPartReappliedAfterFailedSave(t *testing.T) {
+	e := newPaired(t)
+	p := &recPart{}
+	sp := &leashSpy{}
+	o := e.openWith(p, sp)
+	fs := &failingStore{Store: sp.Store, fail: true}
+	sp.Store = fs
+	id, err := e.v.SendEvent("leash.grant.updated", []byte(`{"grants":[],"suspended":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := o.run()
+	defer stop()
+	eventually(t, "two failed saves", func() bool { return fs.failures() >= 2 })
+	noEvent(t, o, "leash.grant.updated")
+	fs.mu.Lock()
+	fs.fail = false
+	fs.mu.Unlock()
+	nextEvent(t, o, "leash.grant.updated")
+	noEvent(t, o, "leash.grant.updated")
+	p.mu.Lock()
+	n := 0
+	for _, m := range p.seen {
+		if m.ID == id {
+			n++
+		}
+	}
+	p.mu.Unlock()
+	if n < 3 {
+		t.Errorf("applied %d times, want once per failed save and once more", n)
+	}
+}
+
 // TestPartAbsentKeepsMember: without Options.Grants the record's
 // `leash` member is saved again as loaded.
 func TestPartAbsentKeepsMember(t *testing.T) {

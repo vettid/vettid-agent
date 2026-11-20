@@ -481,6 +481,7 @@ func TestSaveFailureBounded(t *testing.T) {
 	}
 	eventually(t, "several failed saves", func() bool { return fs.failures() >= 4 })
 	time.Sleep(300 * time.Millisecond)
+	noEvent(t, o, "test.ping") // not handed over before it is saved
 	if n := count(e.v.Received(), "vault.status"); n != 1 {
 		t.Errorf("%d vault.status during the failure, want only the one at start", n)
 	}
@@ -638,6 +639,37 @@ func TestTokenRevokedStops(t *testing.T) {
 	}
 	rec, st := e.saved()
 	if rec == nil || rec.Phase != pairing.PhasePaired || st.DeviceID != pairtest.DeviceID {
+		t.Fatal("the state was changed")
+	}
+}
+
+// TestTokenRevokedOnOutboxDeposit: the relay refuses token_revoked a
+// deposit the client makes from its outbox inside Poll (the answer to
+// relay.token.refresh), with no Send after it: Run stops with the AG12
+// text and nothing is wiped.
+func TestTokenRevokedOnOutboxDeposit(t *testing.T) {
+	e := newPaired(t)
+	o := e.open(nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- o.conn.Run(ctx) }()
+	eventually(t, "the status response to be saved", func() bool {
+		return count(e.v.Received(), "vault.status") == 1 && e.v.Pending() == 0
+	})
+	e.v.SetDepositError(&pairtest.RelayError{Status: 403, Code: "token_revoked"})
+	if _, err := e.v.SendEvent("relay.token.refresh", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	err := <-done
+	o.store.Close()
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(e.out.String(), TextRefused) {
+		t.Errorf("output:\n%s", e.out)
+	}
+	if rec, st := e.saved(); rec == nil || rec.Phase != pairing.PhasePaired || st.DeviceID != pairtest.DeviceID {
 		t.Fatal("the state was changed")
 	}
 }

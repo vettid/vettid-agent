@@ -1,8 +1,9 @@
 // Package vaultconn is the connector's use of the vault client
 // (AGENT-PLAN §3.1, §3.3, §6 A2.2): it owns the client.Device in one
 // goroutine (Run), collects the device's mailbox by long poll, saves the
-// state before a collected batch is acknowledged (the client's
-// Config.Persist, AGENT-PLAN §7.1 AV1), dispatches responses to waiting
+// state, with what the batch's events change, before a collected batch
+// is acknowledged (the client's Config.PersistBatch, AGENT-PLAN §7.1
+// AV1), dispatches responses to waiting
 // requests by `re`, and handles device.unlinked and a refused relay key
 // (AG12). Token upkeep, rekeys and identity rotation are done by the
 // client while it handles messages, and saved with the batch.
@@ -79,15 +80,14 @@ type Options struct {
 	Log *slog.Logger
 	// OnEvent, if set, receives the events (messages without `re`) of a
 	// batch after Poll returns, in Run's goroutine; it must not block or
-	// call back into Conn synchronously. An event is delivered even when
-	// its batch could not be saved (the batch is then collected again but
-	// recognised as handled, so not delivered twice in this process), and
-	// after a crash between the save and the acknowledgement it may be
-	// delivered again by the next process... or, if the crash came after
-	// the acknowledgement, not at all. Handlers must therefore be
-	// idempotent and must not rely on seeing every event: the state they
-	// depend on is read again from the vault at start. device.unlinked is
-	// not passed on (vaultconn acts on it itself).
+	// call back into Conn synchronously. An event is delivered only once
+	// its batch is saved: after a failed save, when a later save of it
+	// succeeds; after a crash once its batch is saved, not at all (the
+	// record saved with it holds what Part.Apply and the access session
+	// made of it). The vault may also send an event again. Handlers must
+	// therefore be idempotent and must not rely on seeing every event: the
+	// state they depend on is read again from the vault at start.
+	// device.unlinked is not passed on (vaultconn acts on it itself).
 	OnEvent func(Event)
 	// OnStatus, if set, receives the owner check state ("ok", "due",
 	// "held") of every vault.status response, in Run's goroutine.
@@ -114,12 +114,13 @@ type Options struct {
 type Part interface {
 	// Apply is called inside the save of a batch (in Run's goroutine,
 	// before the record is written and the batch acknowledged) with the
-	// batch's messages, responses included, as collected (VAULT-MESSAGING
-	// §8.4 guarantees no order between them; a Part must not rely on
-	// one). It
-	// must not block or call Conn. Idempotent handling is required: a
-	// batch may be applied again by the next process after a crash
-	// between the save and the acknowledgement.
+	// messages handled and not yet saved, responses included, oldest
+	// first: the batch's, after those of earlier batches whose save
+	// failed, which are given again (VAULT-MESSAGING §8.4 guarantees no
+	// order between them; a Part must not rely on one). It must not block
+	// or call Conn. Idempotent handling is required: after a failed save
+	// the same messages are applied again, and a message may be sent again
+	// by the vault.
 	Apply(batch []Message)
 	// Snapshot returns the member's JSON for the record (nil: absent).
 	Snapshot() json.RawMessage
@@ -176,7 +177,6 @@ type Conn struct {
 
 	// Run's goroutine only:
 	pending    map[string]*call
-	events     []*envelope.Inner // drained in persist, dispatched after Poll
 	unlinked   bool
 	wipeErr    error
 	persistErr error
@@ -206,8 +206,8 @@ type Conn struct {
 	lastContact time.Time
 }
 
-// New restores the device from the record, with Persist writing the
-// state through Store.
+// New restores the device from the record, with PersistBatch writing
+// the state through Store.
 func New(o Options) (*Conn, error) {
 	if o.Record == nil || o.Record.Phase != pairing.PhasePaired {
 		return nil, ErrNotPaired
@@ -229,7 +229,7 @@ func New(o Options) (*Conn, error) {
 	if err := json.Unmarshal(o.Record.Device, &st); err != nil || st.Role != "agent" || st.DeviceID == "" || st.Vault == nil {
 		return nil, ErrNotPaired
 	}
-	d, err := client.Load(client.Config{HTTP: o.HTTP, Now: o.Now, PollWait: o.PollWait, Persist: c.persist}, o.Record.Device)
+	d, err := client.Load(client.Config{HTTP: o.HTTP, Now: o.Now, PollWait: o.PollWait, PersistBatch: c.persist}, o.Record.Device)
 	if err != nil {
 		return nil, fmt.Errorf("the saved state could not be restored: %w", err)
 	}
@@ -329,15 +329,16 @@ func ParseGranted(body json.RawMessage) (pairing.Access, bool) {
 	return a, a.Valid()
 }
 
-// persist is the client's Config.Persist: called inside Poll after a
-// batch was handled and before it is acknowledged. It takes the batch's
-// responses and events (they are dispatched after Poll returns); on
+// persist is the client's Config.PersistBatch: called inside Poll after
+// a batch was handled and before it is acknowledged, with the responses
+// and events not yet saved (evs; the client hands them over after a
+// successful save, and dispatch takes them after Poll returns). On
 // device.unlinked it wipes the state instead of saving it; otherwise it
-// writes the record durably. An error leaves the batch unacknowledged.
-func (c *Conn) persist(st []byte) error {
+// writes the record durably. An error leaves the batch unacknowledged
+// and its messages held; the next Poll calls persist with them again
+// before it collects.
+func (c *Conn) persist(st []byte, evs []*envelope.Inner) error {
 	c.collected = true
-	evs := c.dev.Events()
-	c.events = append(c.events, evs...)
 	if len(evs) > 0 {
 		c.contactMu.Lock()
 		c.lastContact = c.o.Now()
@@ -462,7 +463,11 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 			c.persistErr = nil
 			pause(ctx, backoff(retryBase, retryMax, c.saveFails))
 		case perr != nil:
+			// Also a deposit from the outbox (a rekey's hs.resp, a
+			// token's) that the relay refused: token_revoked makes the
+			// client refused (client.ErrRefused).
 			c.log.Warn("collect failed", "err", errCode(perr))
+			c.noteRefused(perr)
 			pause(ctx, retryBase)
 		}
 		if c.refused {
@@ -532,7 +537,13 @@ func (c *Conn) sendStatus(ctx context.Context) {
 // sendFailed records a failed deposit to the vault's mailbox.
 func (c *Conn) sendFailed(err error) {
 	c.log.Warn("send failed", "err", errCode(err))
-	if relayclient.IsCode(err, "token_revoked") && !c.refused {
+	c.noteRefused(err)
+}
+
+// noteRefused: a token_revoked from the vault's mailbox (on a send, or
+// on an outbox deposit inside Poll) makes this agent refused.
+func (c *Conn) noteRefused(err error) {
+	if (relayclient.IsCode(err, "token_revoked") || errors.Is(err, client.ErrRefused)) && !c.refused {
 		c.refused, c.refusedAt = true, c.o.Now()
 		c.failPending(ErrRefused)
 	}
@@ -582,8 +593,7 @@ func (c *Conn) takeCalls(ctx context.Context) {
 // dispatch hands the batch's responses to their requests by `re` and
 // its events to OnEvent.
 func (c *Conn) dispatch() {
-	evs := c.events
-	c.events = nil
+	evs := c.dev.Events()
 	for id, cl := range c.pending {
 		if cl.ctx.Err() != nil {
 			delete(c.pending, id)

@@ -712,11 +712,12 @@ type failingStore struct {
 	failAt  int   // the write (1-based: Create/CreateReplace, then Saves) that fails
 	failErr error // returned after the write was done (ErrNotDurable) or instead of it
 	after   bool  // perform the write before returning failErr
+	times   int   // how many writes fail from failAt on (0: all)
 }
 
 func (f *failingStore) do(op func() error) error {
 	f.writes++
-	if f.writes >= f.failAt && f.failAt > 0 {
+	if f.writes >= f.failAt && f.failAt > 0 && (f.times == 0 || f.writes < f.failAt+f.times) {
 		if f.after {
 			if err := op(); err != nil {
 				return err
@@ -765,13 +766,22 @@ func TestPairStartedNotDurable(t *testing.T) {
 // agent.
 func TestPairFinalSaveFails(t *testing.T) {
 	e := newEnv(t)
-	// Writes: 1 started (Create), 2 the hs.resp batch (Persist), 3
-	// waiting (Save), 4 the device.paired batch (Persist, fails: the
-	// batch stays unacknowledged), 5 paired (Save, fails).
-	withFailingStore(t, &failingStore{failAt: 4, failErr: errors.New("disk full")})
+	// Writes: 1 started (Create), 2 the hs.resp batch (PersistBatch), 3
+	// waiting (Save), 4 the device.paired batch (PersistBatch, fails: the
+	// batch stays unacknowledged and device.paired held), 5 the same
+	// batch again (fails): the pairing stops, not at the deadline.
+	f := &failingStore{failAt: 4, failErr: errors.New("disk full")}
+	withFailingStore(t, f)
+	start := time.Now()
 	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
 	if err == nil || !strings.Contains(err.Error(), "Unlink the agent on your phone") || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("got %v", err)
+	}
+	if f.writes != 5 {
+		t.Errorf("%d writes, want 5", f.writes)
+	}
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("took %v", d)
 	}
 	if strings.Contains(e.out.String(), TextPaired) {
 		t.Error("said paired")
@@ -779,6 +789,45 @@ func TestPairFinalSaveFails(t *testing.T) {
 	wrapStore = func(s store) store { return s }
 	if r, _ := e.record(); r != nil {
 		t.Errorf("state kept: %v", r.Phase)
+	}
+}
+
+// TestPairPairedSaveRetried: the first save of the batch holding
+// device.paired fails, the next succeeds: paired, saved as paired.
+func TestPairPairedSaveRetried(t *testing.T) {
+	e := newEnv(t)
+	f := &failingStore{failAt: 4, times: 1, failErr: errors.New("disk full")}
+	withFailingStore(t, f)
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if !strings.Contains(e.out.String(), TextPaired) {
+		t.Errorf("output:\n%s", e.out)
+	}
+	if f.writes < 5 {
+		t.Errorf("%d writes: the batch was not saved again", f.writes)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, st := e.record(); r == nil || r.Phase != PhasePaired || st.DeviceID != pairtest.DeviceID {
+		t.Fatalf("record %+v", r)
+	}
+}
+
+// TestPairPairedNotDurable: the saves of the batch holding device.paired
+// are in place but not flushed: paired, with the warning, as a final
+// save that is not durable.
+func TestPairPairedNotDurable(t *testing.T) {
+	e := newEnv(t)
+	withFailingStore(t, &failingStore{failAt: 4, failErr: state.ErrNotDurable, after: true})
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if out := e.out.String(); !strings.Contains(out, TextPaired) || !strings.Contains(out, "could not be flushed") {
+		t.Errorf("output:\n%s", out)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r == nil || r.Phase != PhasePaired {
+		t.Fatalf("record %+v", r)
 	}
 }
 
