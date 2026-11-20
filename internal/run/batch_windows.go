@@ -3,13 +3,16 @@
 package run
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 // A Windows batch file (.cmd or .bat) runs through System32's cmd.exe
@@ -209,6 +212,71 @@ func checkBatchFormat(head []byte) error {
 		return fmt.Errorf("is a Windows program named as a batch file")
 	}
 	return nil
+}
+
+// symlinkCapable is canCreateSymlinks, replaced by tests.
+var symlinkCapable = canCreateSymlinks
+
+// batchMayRun: cmd.exe reads a batch file by path for each command. While
+// the file is held it can't be written, renamed or deleted, nor can a
+// folder above it be renamed, and Start checks before the resume that the
+// path names it. What's left is a symbolic link set on the held file
+// itself while it runs, which needs the symbolic-link privilege or
+// Developer Mode. So when this user can make symbolic links, only a batch
+// file that only an administrator can change is run, pinned or not.
+// (chosen; not in the spec)
+func batchMayRun(path string) error {
+	if checkProgram(path) == nil {
+		return nil
+	}
+	capable, err := symlinkCapable()
+	if err != nil || capable {
+		return notFound("%s can be changed by this user, who can also make symbolic links (Developer Mode or the privilege), "+
+			"so a link set on it while cmd.exe runs it could redirect the run. Only a batch file that only an administrator can change is run then", path)
+	}
+	return nil
+}
+
+// canCreateSymlinks reports whether this process's user can make
+// symbolic links: Developer Mode is on, or the token holds
+// SeCreateSymbolicLinkPrivilege (enabled or not). A check that fails
+// counts as capable (fail closed).
+func canCreateSymlinks() (bool, error) {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, `SOFTWARE\Microsoft\Windows\CurrentVersion\AppModelUnlock`, registry.QUERY_VALUE)
+	switch {
+	case err == nil:
+		v, _, verr := k.GetIntegerValue("AllowDevelopmentWithoutDevLicense")
+		k.Close()
+		if verr == nil && v != 0 {
+			return true, nil
+		}
+		if verr != nil && verr != registry.ErrNotExist {
+			return true, verr
+		}
+	case err != registry.ErrNotExist:
+		return true, err
+	}
+	var luid windows.LUID
+	if err := windows.LookupPrivilegeValue(nil, windows.StringToUTF16Ptr("SeCreateSymbolicLinkPrivilege"), &luid); err != nil {
+		return true, err
+	}
+	tok := windows.GetCurrentProcessToken()
+	var n uint32
+	windows.GetTokenInformation(tok, windows.TokenPrivileges, nil, 0, &n)
+	if n == 0 {
+		return true, errors.New("the token's privileges can't be read")
+	}
+	buf := make([]byte, n)
+	if err := windows.GetTokenInformation(tok, windows.TokenPrivileges, &buf[0], n, &n); err != nil {
+		return true, err
+	}
+	tp := (*windows.Tokenprivileges)(unsafe.Pointer(&buf[0]))
+	for _, a := range tp.AllPrivileges() {
+		if a.Luid == luid {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // shimFor: an absolute path without an extension that names a regular

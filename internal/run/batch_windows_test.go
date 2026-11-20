@@ -5,6 +5,7 @@ package run
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -309,4 +310,95 @@ func TestBatchKillReleases(t *testing.T) {
 	}
 	f.Close()
 	proc.Wait()
+}
+
+// A program reached through a junction above it is refused at the hold:
+// the held file's final name must be the path.
+func TestHoldThroughJunctionRefused(t *testing.T) {
+	lookupOnly(t)
+	real := t.TempDir()
+	writeBatch(t, real, "t.cmd", "@echo off")
+	helperCopy(t, real, "helper")
+	link := filepath.Join(t.TempDir(), "j")
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, real).CombinedOutput(); err != nil {
+		t.Fatalf("can't make a junction: %v %s", err, out)
+	}
+	for _, name := range []string{"t.cmd", "helper.exe"} {
+		if _, err := Prepare(filepath.Join(link, name), ""); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "through a link or junction") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// Before a batch run resumes, its path must still name the held batch
+// file: a path naming another file is refused and nothing runs.
+func TestBatchPathRecheckedAtStart(t *testing.T) {
+	lookupOnly(t)
+	dir := t.TempDir()
+	held := writeBatch(t, dir, "held.cmd", "@echo off")
+	other := writeBatch(t, dir, "other.cmd", "@echo off", `echo x> "%~dp0marker"`)
+	p := prepare(t, held)
+	p.Path = other // as if the path now named another file
+	spec := helperSpec(t, other, "")
+	if _, err := p.Start(spec); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "no longer names the batch file") {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(filepath.Join(dir, "marker")); err == nil {
+		t.Fatal("the other batch ran")
+	}
+}
+
+// When the user can make symbolic links, a batch file the user can
+// change is refused, pinned or not; one only an administrator can change
+// still runs, and without the capability the rule is the usual one.
+func TestBatchSymlinkCapable(t *testing.T) {
+	lookupOnly(t)
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off")
+	old, oldCheck := symlinkCapable, checkProgram
+	t.Cleanup(func() { symlinkCapable, checkProgram = old, oldCheck })
+	userChangeable := func(p string) error {
+		if p == bat {
+			return errors.New("the user can change it")
+		}
+		return nil
+	}
+	symlinkCapable = func() (bool, error) { return true, nil }
+	checkProgram = userChangeable
+	if _, err := Prepare(bat, ""); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "symbolic links") {
+		t.Errorf("capable, user-changeable: %v", err)
+	}
+	symlinkCapable = func() (bool, error) { return false, errors.New("unknown") }
+	if _, err := Prepare(bat, ""); !errors.Is(err, ErrProgramNotFound) {
+		t.Errorf("a failed check didn't refuse: %v", err)
+	}
+	checkProgram = func(string) error { return nil }
+	symlinkCapable = func() (bool, error) { return true, nil }
+	if p, err := Prepare(bat, ""); err != nil {
+		t.Errorf("capable, admin-only: %v", err)
+	} else {
+		p.Close()
+	}
+	symlinkCapable = func() (bool, error) { return false, nil }
+	checkProgram = userChangeable
+	if p, err := Prepare(bat, ""); err != nil {
+		t.Errorf("not capable: %v", err)
+	} else {
+		p.Close()
+	}
+}
+
+// This machine's user (a standard user, Developer Mode off) can't make
+// symbolic links: the check agrees with the system.
+func TestCanCreateSymlinksAgrees(t *testing.T) {
+	capable, err := canCreateSymlinks()
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "l")
+	made := os.Symlink(os.Args[0], link) == nil
+	if made && !capable {
+		t.Fatal("a symbolic link was made, but the check says this user can't make one")
+	}
+	t.Logf("can make symbolic links: %v (made one: %v)", capable, made)
 }

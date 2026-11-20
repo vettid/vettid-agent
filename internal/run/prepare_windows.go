@@ -79,6 +79,10 @@ func Prepare(path, _ string) (*Program, error) {
 		return nil, err
 	}
 	if isBatch(path) {
+		if err := batchMayRun(path); err != nil {
+			prog.Close()
+			return nil, err
+		}
 		if err := prog.holdCmd(); err != nil {
 			prog.Close()
 			return nil, err
@@ -106,7 +110,64 @@ func holdFile(path string) (*os.File, windows.Handle, error) {
 	if err != nil {
 		return nil, 0, notFound("%s can't be opened: %v", path, err)
 	}
+	// The file held must be the one the path names, through no link or
+	// junction above it: its final name is the path, exactly. (chosen;
+	// not in the spec)
+	if name, err := finalDosName(h); err != nil || name != path {
+		windows.CloseHandle(h)
+		if err != nil {
+			return nil, 0, notFound("%s can't be checked: %v", path, err)
+		}
+		return nil, 0, notFound("%s is reached through a link or junction (it is %s); the run is refused", path, name)
+	}
 	return os.NewFile(uintptr(h), path), h, nil
+}
+
+// finalDosName is a handle's file name as the system gives it now, with
+// a drive letter, without the \\?\ prefix.
+func finalDosName(h windows.Handle) (string, error) {
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n, err := windows.GetFinalPathNameByHandle(h, &buf[0], uint32(len(buf)), fileNameNormalized)
+	if err != nil {
+		return "", err
+	}
+	if int(n) >= len(buf) {
+		return "", errors.New("the name is too long")
+	}
+	name := windows.UTF16ToString(buf[:n])
+	if strings.HasPrefix(name, `\\?\UNC\`) {
+		return "", errors.New("it is on a network share")
+	}
+	return strings.TrimPrefix(name, `\\?\`), nil
+}
+
+// verifyBatchPath checks, before a batch run resumes, that its path still
+// names the held batch file (cmd.exe opens it by path for each command):
+// the same file, by its final name and its identity, with no reparse
+// point on it.
+func verifyBatchPath(path string, id fileIdentity) error {
+	p16, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return notFound("the program path is invalid")
+	}
+	h, err := windows.CreateFile(p16, windows.FILE_READ_ATTRIBUTES,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, nil,
+		windows.OPEN_EXISTING, windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
+	if err != nil {
+		return notFound("%s can't be opened to check it: %v; the run is refused", path, err)
+	}
+	defer windows.CloseHandle(h)
+	got, attrs, err := identityOf(h)
+	if err != nil {
+		return notFound("%s can't be checked: %v; the run is refused", path, err)
+	}
+	if attrs&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		return notFound("%s is now a link or other reparse point; the run is refused", path)
+	}
+	if name, err := finalDosName(h); err != nil || name != path || !id.same(got) {
+		return notFound("%s no longer names the batch file that was checked; the run is refused", path)
+	}
+	return nil
 }
 
 // holdCmd checks and holds System32's cmd.exe for a batch run.
@@ -114,6 +175,11 @@ func (p *Program) holdCmd() error {
 	cmd, err := cmdExePath()
 	if err != nil {
 		return err
+	}
+	// The system directory's name as on disk (GetSystemDirectory may
+	// differ in case), for holdFile's exact name check.
+	if cmd, err = filepath.EvalSymlinks(cmd); err != nil {
+		return runFailed("cmd.exe can't be found: %v", err)
 	}
 	if err := checkProgram(cmd); err != nil {
 		return notFound("cmd.exe isn't run: %v", err)
@@ -277,6 +343,11 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	hook("created")
 	if err := verifyImage(pi.Process, image, imageID); err != nil {
 		return nil, endSuspended(pi, s, err)
+	}
+	if p.plat.cmd != nil {
+		if err := verifyBatchPath(p.Path, p.plat.id); err != nil {
+			return nil, endSuspended(pi, s, err)
+		}
 	}
 	hook("checked")
 	// The process limits assign the job here, before the resume.
