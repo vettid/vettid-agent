@@ -22,6 +22,28 @@ const (
 	CodeRunFailed       = "run_failed"
 )
 
+// CodeArgumentNotAllowed is a batch run refused for an argument, its path
+// or its working folder.
+const CodeArgumentNotAllowed = "argument_not_allowed"
+
+// ErrArgumentNotAllowed is a sentinel for errors.Is.
+var ErrArgumentNotAllowed error = &Error{Code: CodeArgumentNotAllowed}
+
+// TextArgumentNotAllowed is the refusal shown to the agent. (NEW text)
+const TextArgumentNotAllowed = "This program is a Windows batch file (.cmd or .bat), which runs through cmd.exe. " +
+	"Its arguments, the environment variables the request sets, its path and its working folder can't hold any of " +
+	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII " +
+	"(so a file name in another alphabet can't be passed to it), and an argument or variable can't end in a backslash: " +
+	"cmd.exe would read them as commands. A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
+	"Pass the value in a file instead."
+
+// TextSecretNotForBatch refuses a secret given to a batch file in an
+// environment variable when cmd.exe would read some of its characters:
+// expanded as %NAME%, it would be syntax, and fragments could show in
+// cmd.exe's errors. It names nothing of the value. (NEW text)
+const TextSecretNotForBatch = "This program is a Windows batch file (.cmd or .bat), and the secret's value can't be given to it in an environment variable: " +
+	"cmd.exe would read some of its characters as commands. Give it to this program as a file (how: file) instead."
+
 // Error carries a wire code and a message that holds no secret value.
 // Names is the body of env_not_allowed ({names}).
 type Error struct {
@@ -105,8 +127,8 @@ func checkName(name string) error {
 }
 
 // checkBaseName is the name rule of AGENT-PLAN §4.9 alone: it matches
-// ^[A-Z_][A-Z0-9_]{0,63}$, is not in the minimal set, PATH, TMPDIR, TEMP
-// or TMP, and does not start with LD_ or DYLD_. The operator's --run-env
+// ^[A-Z_][A-Z0-9_]{0,63}$, is not in any system's minimal set
+// (allMinimalNames), PATH, TMPDIR, TEMP or TMP, and does not start with LD_ or DYLD_. The operator's --run-env
 // names get this rule only, not the longer lists (owner decision,
 // 2026-11-05).
 func checkBaseName(name string) error {
@@ -119,7 +141,7 @@ func checkBaseName(name string) error {
 		}
 	}
 	for _, f := range forbiddenNames() {
-		if sameName(f, name) {
+		if strings.EqualFold(f, name) {
 			return badRequest("variable name %q is not allowed", name)
 		}
 	}
@@ -177,8 +199,17 @@ var loaderNames = []string{
 	"__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA",
 }
 
+// allMinimalNames are the minimal sets of every system, so that a name is
+// refused the same way whichever system the connector runs on, as the
+// vault refuses it (VAULT-MESSAGING §10.11).
+var allMinimalNames = []string{
+	"HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+	"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT",
+	"USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+}
+
 func forbiddenNames() []string {
-	out := append([]string{}, minimalNames...)
+	out := append([]string{}, allMinimalNames...)
 	return append(out, "PATH", "TMPDIR", "TEMP", "TMP")
 }
 
@@ -384,6 +415,11 @@ func CheckRunPaths(paths []string) ([]string, error) {
 		real, err := checkNotWritable(p)
 		if err != nil {
 			return nil, fmt.Errorf("--run-path %q: %w", p, err)
+		}
+		// The resolved directory is the one used: it must pass the same
+		// rules (no path list separator in it, a directory).
+		if err := checkAbsDir(real); err != nil {
+			return nil, fmt.Errorf("--run-path %q resolves to %q, which %w", p, real, err)
 		}
 		out = append(out, real)
 	}

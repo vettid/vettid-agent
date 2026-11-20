@@ -471,3 +471,40 @@ func TestStartSecretArrives(t *testing.T) {
 		t.Fatalf("exit %d, output %q", code, out)
 	}
 }
+
+// The command line is exactly the planned one: /d, /e:on, /v:off, /s /c
+// and the quotes.
+func TestBatchCmdLineExact(t *testing.T) {
+	q := `"`
+	cmd := `C:` + backslash + `W` + backslash + `cmd.exe`
+	bat := `C:` + backslash + `x` + backslash + `t.cmd`
+	got := batchCmdLine(cmd, bat, []string{"a b", ""})
+	want := q + cmd + q + ` /d /e:on /v:off /s /c ` + q + q + bat + q + ` ` + q + `a b` + q + ` ` + q + q + q
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+}
+
+// A working folder given as a network or device path is refused; for a
+// batch file, so is a drive's root.
+func TestStartRefusesDeviceAndRootCwd(t *testing.T) {
+	lookupOnly(t)
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	noStart(t)
+	b := backslash
+	for _, dir := range []string{b + b + `?` + b + `C:` + b + `x`, b + `??` + b + `C:` + b + `x`, b + b + `server` + b + `share`, `//server/share`} {
+		spec := helperSpec(t, exe, "")
+		spec.Dir = dir
+		if _, err := p.Start(spec); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("cwd %s: %v", dir, err)
+		}
+	}
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off")
+	pb := prepare(t, bat)
+	spec := helperSpec(t, bat, "")
+	spec.Dir = filepath.VolumeName(bat) + b
+	if _, err := pb.Start(spec); !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "root") {
+		t.Errorf("root cwd: %v", err)
+	}
+}

@@ -49,28 +49,6 @@ import (
 // bare, as in `if %~1==x`, can still be steered by spaces, which are
 // allowed: that is the batch file's own bug.
 
-// CodeArgumentNotAllowed is a batch run refused for an argument, its path
-// or its working folder.
-const CodeArgumentNotAllowed = "argument_not_allowed"
-
-// ErrArgumentNotAllowed is a sentinel for errors.Is.
-var ErrArgumentNotAllowed error = &Error{Code: CodeArgumentNotAllowed}
-
-// TextArgumentNotAllowed is the refusal shown to the agent. (NEW text)
-const TextArgumentNotAllowed = "This program is a Windows batch file (.cmd or .bat), which runs through cmd.exe. " +
-	"Its arguments, the environment variables the request sets, its path and its working folder can't hold any of " +
-	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII " +
-	"(so a file name in another alphabet can't be passed to it), and an argument or variable can't end in a backslash: " +
-	"cmd.exe would read them as commands. A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
-	"Pass the value in a file instead."
-
-// TextSecretNotForBatch refuses a secret given to a batch file in an
-// environment variable when cmd.exe would read some of its characters:
-// expanded as %NAME%, it would be syntax, and fragments could show in
-// cmd.exe's errors. It names nothing of the value. (NEW text)
-const TextSecretNotForBatch = "This program is a Windows batch file (.cmd or .bat), and the secret's value can't be given to it in an environment variable: " +
-	"cmd.exe would read some of its characters as commands. Give it to this program as a file (how: file) instead."
-
 // batchSecretOK reports whether a secret value can be given to a batch
 // file in an environment variable: by the argument rule, on its bytes.
 func batchSecretOK(v []byte) bool {
@@ -166,6 +144,9 @@ func checkBatch(path, dir string, args, env, trusted []string) error {
 	if err := batchText(dir, "the working folder"); err != nil {
 		return err
 	}
+	if filepath.Dir(dir) == dir {
+		return argNotAllowed("the working folder is a drive's root (cmd.exe's %%CD%% would end in a backslash)")
+	}
 	for i, a := range args {
 		if err := batchValue(a, fmt.Sprintf("argument %d", i+1)); err != nil {
 			return err
@@ -203,12 +184,12 @@ func argNotAllowed(format string, a ...any) error {
 
 // batchCmdLine is cmd.exe's command line for a batch run: /d (no AutoRun
 // commands from the registry), /v:off (no ! expansion, whatever the
-// registry says), /s /c and the whole command in one more pair of quotes,
-// which /s strips. Command extensions stay on: batch files such as npm's
-// shims need %~dp0 and setlocal. The parts were checked by checkBatch.
+// registry says), /e:on (command extensions on, whatever the registry
+// says: batch files such as npm's shims need %~dp0 and setlocal), /s /c
+// and the whole command in one more pair of quotes, which /s strips. The parts were checked by checkBatch.
 func batchCmdLine(cmdExe, bat string, args []string) string {
 	var b strings.Builder
-	b.WriteString(`"` + cmdExe + `" /d /v:off /s /c ""` + bat + `"`)
+	b.WriteString(`"` + cmdExe + `" /d /e:on /v:off /s /c ""` + bat + `"`)
 	for _, a := range args {
 		b.WriteString(` "` + a + `"`)
 	}

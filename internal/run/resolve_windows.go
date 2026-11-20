@@ -102,10 +102,10 @@ func canExecute(path string, _ os.FileInfo) bool {
 	return hasExt(path, programExt())
 }
 
-// isUNC: a network path, \\host\share\... or //host/share/... (the
+// isUNC: a native NT path (\??\...), or a network path, \\host\share\... or //host/share/... (the
 // \\?\UNC\ form included). (chosen; not in the spec)
 func isUNC(path string) bool {
-	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`)
+	return strings.HasPrefix(path, `\\`) || strings.HasPrefix(path, `//`) || strings.HasPrefix(path, `\??\`)
 }
 
 // platformLoaderNames: none beyond the shared list; the Windows names

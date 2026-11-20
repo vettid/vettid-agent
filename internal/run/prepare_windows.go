@@ -302,6 +302,9 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	if s.Dir == "" || !filepath.IsAbs(s.Dir) {
 		return nil, badRequest("cwd is not an absolute path")
 	}
+	if isUNC(s.Dir) {
+		return nil, badRequest("cwd is a network or device path")
+	}
 	if err := checkSecret(s.Secret); err != nil {
 		return nil, err
 	}

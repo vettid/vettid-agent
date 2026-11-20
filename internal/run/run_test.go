@@ -481,3 +481,24 @@ func TestUnchangeableLevels(t *testing.T) {
 		t.Error("that folder as a --run-path accepted")
 	}
 }
+
+// The name rule refuses every system's minimal names, on every system,
+// as the vault does.
+func TestNameRuleAllSystems(t *testing.T) {
+	for _, n := range []string{"HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
+		"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT",
+		"USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+		"PATH", "TMPDIR", "TEMP", "TMP"} {
+		if ValidName(n) {
+			t.Errorf("%s is allowed", n)
+		}
+		if err := CheckRunEnv([]string{n}); err == nil {
+			t.Errorf("--run-env %s is allowed", n)
+		}
+	}
+	for _, n := range minimalNames {
+		if !contains(allMinimalNames, strings.ToUpper(n)) {
+			t.Errorf("this system's minimal name %s is not in allMinimalNames", n)
+		}
+	}
+}

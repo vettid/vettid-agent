@@ -11,7 +11,7 @@ import (
 )
 
 // writable reports whether dir can be written by the connector's own user,
-// or by its group or others. The same rule holds for a --run-path
+// or by its group or others, or is owned by a user other than root. The same rule holds for a --run-path
 // directory and for each of its parents: a writable parent lets its
 // entries be renamed, the directory included.
 func writable(dir string, _ bool) (bool, error) {
@@ -22,11 +22,21 @@ func writable(dir string, _ bool) (bool, error) {
 	if fi.Mode().Perm()&0o022 != 0 {
 		return true, nil
 	}
-	// Owned by this user: it can chmod it writable, whatever the mode.
-	if st, ok := fi.Sys().(*syscall.Stat_t); ok && int(st.Uid) == os.Geteuid() {
+	// Owned by anyone but root (this user included): the owner can chmod
+	// it writable, whatever the mode (AGENT-PLAN §4.9). Unknown: refused.
+	if uid, ok := ownerOf(fi); !ok || uid != 0 {
 		return true, nil
 	}
 	return unix.Access(dir, unix.W_OK) == nil, nil
+}
+
+// ownerOf is a file's owner's uid, replaced by tests.
+var ownerOf = func(fi os.FileInfo) (uint32, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return st.Uid, true
 }
 
 // plainPath: no reparse points on POSIX; links were resolved by Resolve.
