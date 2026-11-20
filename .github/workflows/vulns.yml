@@ -37,10 +37,12 @@ jobs:
 
   issue:
     # One issue for all findings: opened, or commented on while open; a
-    # clean run closes it.
-    if: always() && github.ref == 'refs/heads/main'
+    # clean run closes it. A cancelled run reports nothing; a timed-out
+    # scan is a failure, reported as one that could not run.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
     needs: [govulncheck]
     runs-on: ubuntu-26.04
+    timeout-minutes: 5
     permissions:
       issues: write
     steps:
