@@ -12,7 +12,7 @@ import (
 var errParse = errors.New("request: the answer does not have the expected shape")
 
 // errWithheld: the answer is the vault's cached copy, without the value
-// (VAULT-MESSAGING 0.91.1 §8.2, §10.11): the request was handled, and is
+// (VAULT-MESSAGING 0.92.0 §8.2, §10.11): the request was handled, and is
 // to be asked again as a new request.
 var errWithheld = errors.New("request: the answer withheld the value")
 
@@ -22,6 +22,23 @@ var errWithheld = errors.New("request: the answer withheld the value")
 // in byte slices of their own (encoding/json copies a RawMessage), never
 // Go strings; on an error they are zeroed.
 func parse(e *entry, body json.RawMessage) (*Result, error) {
+	// "withheld": true marks the vault's cached copy (§8.2, 0.92.0; owner
+	// decision a, GC #15273), whatever else the answer carries, for every
+	// op: nothing of it is read. A live answer never carries the member,
+	// so any other value of it is not an answer.
+	var m struct {
+		Withheld json.RawMessage `json:"withheld"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return nil, errParse
+	}
+	switch {
+	case m.Withheld == nil:
+	case bytes.Equal(m.Withheld, []byte("true")):
+		return nil, errWithheld
+	default:
+		return nil, errParse
+	}
 	switch e.op {
 	case OpCatalog:
 		var b struct {
@@ -41,20 +58,8 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 		}
 		return &Result{Op: OpCatalog, Catalog: items}, nil
 	case OpGet:
-		// The copy is marked "withheld": true (owner decision a, GC
-		// #15273), checked first: the backstop copy is that alone, and a
-		// notes-only item's copy has no field to mark it. A field without
-		// `value` marks it too (§10.11: an agent's answer has `value` in
-		// every field).
-		var m struct {
-			Withheld *bool `json:"withheld"`
-		}
-		if json.Unmarshal(body, &m) != nil {
-			return nil, errParse
-		}
-		if m.Withheld != nil && *m.Withheld {
-			return nil, errWithheld
-		}
+		// Unmarked, a field without `value` marks the copy too (§8.2's
+		// backstop: an agent's answer has `value` in every field).
 		it := &Item{}
 		res := &Result{Op: OpGet, Item: it}
 		if err := json.Unmarshal(body, it); err != nil || !validItem(e, it) {

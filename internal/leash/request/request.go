@@ -18,12 +18,14 @@
 // other code) is never sent again (AGENT-PLAN §4.1, §4.7).
 //
 // The vault answers a retransmission from its dedupe with a copy of the
-// answer that leaves out the secret value (VAULT-MESSAGING 0.91.1 §8.2,
-// §10.11; AGENT-PLAN 0.1.13 §4.3): it carries "withheld": true, and its
+// answer that leaves out the secret value (VAULT-MESSAGING 0.92.0 §8.2,
+// §10.11; AGENT-PLAN 0.1.14 §4.3): it carries "withheld": true, and its
 // fields have no `value`. Such a copy is never taken for an empty item:
 // the request is asked again once, as a new request under a new inner id
 // (counted, decided and referred by the vault like any other), and keeps
-// the id the tool call returned for leash.check_status.
+// the id the tool call returned for leash.check_status. Nothing is asked
+// again for a request whose tool call ended without its id, or while the
+// vault is known to be held.
 //
 // Results are kept in memory only, for Options.Keep (AG9: 10 minutes)
 // after the answer, and returned once: a result handed to a caller is
@@ -164,6 +166,9 @@ type Access interface {
 	Ensure(ctx context.Context) error
 	Snapshot() pairing.Access
 	OnAnswer(code string, sentWith pairing.Access)
+	// Held reports whether the vault was last seen held (AGENT-PLAN
+	// §4.4): then nothing is asked again.
+	Held() bool
 }
 
 // Options configure New. Zero durations take the defaults.
@@ -685,11 +690,26 @@ func (c *Client) run(e *entry) {
 // Status, and forgets the old request's approval: the vault decides the
 // new one again, and a held one gets its own approval.waiting. Like the
 // first request, it renews no access session (AGENT-PLAN §4.4): without
-// one the vault answers session_required. It returns false when it
-// ended e instead.
+// one the vault answers session_required.
+// Nothing is sent for a request whose tool call ended without its id
+// (nobody could collect the value, and the new request would count a use
+// and may ask the member), for a suspended agent, or while the vault is
+// known to be held (§4.4: it would answer owner_check_required). It
+// returns false when it ended e instead.
 func (c *Client) askAgain(e *entry) bool {
-	if c.o.Suspended != nil && c.o.Suspended() {
+	c.mu.Lock()
+	abandoned := e.abandoned
+	c.mu.Unlock()
+	switch {
+	case abandoned:
+		c.log.Info("agent.request not asked again: nobody waits for it", "op", e.op, "id", e.id)
+		c.finish(e, nil, ErrWithheld)
+		return false
+	case c.o.Suspended != nil && c.o.Suspended():
 		c.finish(e, nil, ErrSuspended)
+		return false
+	case c.acc.Held():
+		c.finish(e, nil, ErrOwnerCheck)
 		return false
 	}
 	id, err := c.conn.NewID()
@@ -698,7 +718,7 @@ func (c *Client) askAgain(e *entry) bool {
 		return false
 	}
 	c.mu.Lock()
-	if c.closed || c.life.Err() != nil {
+	if c.closed || c.life.Err() != nil || e.abandoned {
 		c.mu.Unlock()
 		c.finish(e, nil, ErrStopped)
 		return false

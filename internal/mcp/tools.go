@@ -375,6 +375,9 @@ func itemJSON(it *request.Item) []byte {
 		str(f.Label)
 		b = append(b, `,"kind":`...)
 		str(f.Kind)
+		// A result's fields always hold a value (internal/leash/request
+		// asks again for an answer with a field without one); the check
+		// keeps this JSON valid regardless.
 		if f.Value != nil {
 			b = append(b, `,"value":`...)
 			b = appendCompact(b, f.Value)

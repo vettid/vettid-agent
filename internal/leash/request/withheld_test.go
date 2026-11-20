@@ -11,10 +11,16 @@ import (
 	"github.com/vettid/vettid-agent/internal/vaultconn"
 )
 
-// The vault's cached copies of an item.get answer (VAULT-MESSAGING 0.91.1
+// stale is a value in a marked copy: never used (VAULT-MESSAGING §8.2:
+// "whatever else it carries").
+const stale = "st4le-Value-9876"
+
+// The vault's cached copies of an item.get answer (VAULT-MESSAGING 0.92.0
 // §8.2, §10.11; owner decision a, GC #15273): marked "withheld": true,
-// fields without `value`, no notes.
+// fields without `value`, no notes; and a marked answer that carries
+// values all the same.
 var copies = map[string]string{
+	"marked, with values": strings.Replace(strings.TrimSuffix(itemBody, "}"), secret, stale, -1) + `,"withheld":true}`,
 	"marked": `{"item_id":"` + itemID + `","name":"Bank","category":"login","fields":[{"field_id":"pw","label":"Password","kind":"password"},` +
 		`{"field_id":"addr","label":"Address","kind":"address"}],"withheld":true}`,
 	"field without value only": `{"item_id":"` + itemID + `","name":"Bank","category":"login","fields":[{"field_id":"pw","label":"Password","kind":"password","value":"` + secret + `"},` +
@@ -47,6 +53,14 @@ func TestWithheldAskedAgain(t *testing.T) {
 			if err != nil || res.Result == nil || len(res.Result.Item.Fields) != 2 ||
 				string(res.Result.Item.Fields[0].Value) != `"`+secret+`"` {
 				t.Fatalf("Status: %+v, %v", res, err)
+			}
+			for _, f := range res.Result.Item.Fields {
+				if strings.Contains(string(f.Value), stale) {
+					t.Error("a value of the copy reached the result")
+				}
+			}
+			if strings.Contains(string(res.Result.Item.Notes), stale) || strings.Contains(e.log.String(), stale) {
+				t.Error("a value of the copy reached the result or the log")
 			}
 			res.Result.Wipe()
 			c := e.conn.copies()
@@ -197,6 +211,80 @@ func TestWithheldSuspended(t *testing.T) {
 	}
 	if c := e.conn.copies(); len(c) != 1 {
 		t.Errorf("copies: %+v", c)
+	}
+}
+
+// A request whose tool call ended before it got the id asks nothing
+// again: nobody could collect the value, and a new request would count a
+// use and may ask the member.
+func TestWithheldAbandoned(t *testing.T) {
+	e := newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		time.Sleep(150 * time.Millisecond) // after the tool call ended
+		return ok(copies["marked"]), nil
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := e.c.Get(ctx, itemID, nil); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Get: %v", err)
+	}
+	eventually(t, "the request ends", func() bool {
+		e.c.mu.Lock()
+		defer e.c.mu.Unlock()
+		return len(e.c.entries) == 0
+	})
+	if c := e.conn.copies(); len(c) != 1 {
+		t.Errorf("copies: %+v", c)
+	}
+}
+
+// While the vault is known to be held, nothing is asked again
+// (AGENT-PLAN §4.4): the request ends with owner_check_required.
+func TestWithheldHeld(t *testing.T) {
+	var e *env
+	e = newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		e.acc.mu.Lock()
+		e.acc.held = true
+		e.acc.mu.Unlock()
+		return ok(copies["marked"]), nil
+	}, nil)
+	if _, err := e.c.Get(context.Background(), itemID, nil); !errors.Is(err, ErrOwnerCheck) {
+		t.Fatalf("Get: %v", err)
+	}
+	if c := e.conn.copies(); len(c) != 1 {
+		t.Errorf("copies: %+v", c)
+	}
+}
+
+// The marker is checked for every op, not only item.get.
+func TestWithheldAnyOp(t *testing.T) {
+	cat := `{"items":[{"item_id":"` + itemID + `","name":"Bank","category":"login","labels":[]}]}`
+	e := newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		if n == 1 {
+			return ok(`{"items":[],"withheld":true}`), nil
+		}
+		return ok(cat), nil
+	}, nil)
+	out, err := e.c.Catalog(context.Background())
+	if err != nil || out.Result == nil || len(out.Result.Catalog) != 1 {
+		t.Fatalf("Catalog: %+v, %v", out, err)
+	}
+	if c := e.conn.copies(); len(c) != 2 || c[0].id == c[1].id {
+		t.Errorf("copies: %+v", c)
+	}
+}
+
+// "withheld" is absent from a live answer, never false (§8.2): any value
+// but true is not an answer.
+func TestWithheldNotTrue(t *testing.T) {
+	for _, v := range []string{`false`, `null`, `"true"`, `1`} {
+		body := strings.TrimSuffix(itemBody, "}") + `,"withheld":` + v + `}`
+		e := newEnv(t, func(int, string) (*vaultconn.Response, error) { return ok(body), nil }, nil)
+		if _, err := e.c.Get(context.Background(), itemID, nil); !errors.Is(err, ErrProtocol) {
+			t.Errorf("withheld %s: %v", v, err)
+		}
+		if c := e.conn.copies(); len(c) != 1 {
+			t.Errorf("withheld %s: copies: %+v", v, c)
+		}
 	}
 }
 
