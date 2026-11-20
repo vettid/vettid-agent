@@ -171,7 +171,7 @@ func (s *Store) ClearRuns() error {
 	return errors.Join(errs...)
 }
 
-// removeRunDir overwrites the files in dir/secret, then removes dir.
+// removeRunDir overwrites the secret files (s-*) in dir/secret, then removes dir.
 // Links are removed themselves, never followed.
 func (s *Store) removeRunDir(dir string) error {
 	fi, err := os.Lstat(dir)
@@ -189,8 +189,13 @@ func (s *Store) removeRunDir(dir string) error {
 			if err != nil {
 				errs = append(errs, err)
 			}
+			// Only the files WriteRunSecret made (s-*) are overwritten;
+			// RemoveAll below removes anything else unread.
 			for _, e := range es {
-				if err := overwriteAndRemove(filepath.Join(sec, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if !strings.HasPrefix(e.Name(), "s-") {
+					continue
+				}
+				if err := overwriteSecretAndRemove(filepath.Join(sec, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
 					errs = append(errs, err)
 				}
 			}
@@ -218,4 +223,35 @@ func reservedName(id string) bool {
 		return true
 	}
 	return false
+}
+
+// removeSecret is os.Remove, wrapped by tests to read a secret file just
+// before its name is removed.
+var removeSecret = os.Remove
+
+// overwriteSecretAndRemove is overwriteAndRemove for a run's secret file:
+// the zeros are written only when the file has this one name. A file with
+// another name (a hard link made to it, or a link in secret/ to some other
+// file) is removed, not overwritten, so no other file is zeroed through
+// it. A link or other non-file is removed itself.
+func overwriteSecretAndRemove(path string) error {
+	f, err := openForOverwrite(path)
+	if errors.Is(err, errNotRegular) {
+		return removeSecret(path)
+	}
+	if err != nil {
+		return err
+	}
+	if n, err := linkCount(f); err != nil || n != 1 {
+		f.Close()
+		return removeSecret(path)
+	}
+	if err := overwriteFile(f); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return removeSecret(path)
 }

@@ -503,3 +503,12 @@ func lockDir(path string) (io.Closer, error) {
 
 // flushRetries: FlushFileBuffers may be retried (see retryDurable).
 const flushRetries = 3
+
+// linkCount is the number of names f has.
+func linkCount(f *os.File) (uint64, error) {
+	var bi windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bi); err != nil {
+		return 0, err
+	}
+	return uint64(bi.NumberOfLinks), nil
+}

@@ -98,21 +98,62 @@ func TestRemoveRunOverwritesSecret(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A hard link keeps the bytes reachable after the name is removed,
-	// which shows what was left in the file: zeros.
-	link := filepath.Join(s.Dir(), "keep")
-	if err := os.Link(path, link); err != nil {
-		t.Skipf("hard links not available: %v", err)
+	// What the file holds just before its name is removed: zeros.
+	var before []byte
+	old := removeSecret
+	removeSecret = func(p string) error {
+		if p == path {
+			before, _ = os.ReadFile(p)
+		}
+		return old(p)
 	}
+	t.Cleanup(func() { removeSecret = old })
 	if err := s.RemoveRun("r3"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(link)
-	if err != nil {
+	if len(before) == 0 || bytes.Contains(before, []byte("topsecret")) || len(bytes.Trim(before, "\x00")) != 0 {
+		t.Errorf("the secret file held %q before its removal", before)
+	}
+}
+
+// Only the file WriteRunSecret made, with that one name, is overwritten:
+// a file in secret/ with another name elsewhere (here a hard link to a
+// file outside the run) is removed, not zeroed, and so is a file not
+// named as a secret file.
+func TestRemoveRunZeroesOnlyItsOwnSecret(t *testing.T) {
+	s := openTest(t)
+	d, _ := s.PrepareRun("r4")
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("keep-these-bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if bytes.Contains(got, []byte("topsecret")) {
-		t.Error("secret bytes survived RemoveRun")
+	if err := os.Link(outside, filepath.Join(d.Secret, "s-planted")); err != nil {
+		t.Skipf("hard links not available: %v", err)
+	}
+	other := filepath.Join(d.Secret, "not-a-secret")
+	if err := os.WriteFile(other, []byte("other-bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var zeroed []string
+	old := removeSecret
+	removeSecret = func(p string) error {
+		if b, _ := os.ReadFile(p); len(b) > 0 && len(bytes.Trim(b, "\x00")) == 0 {
+			zeroed = append(zeroed, filepath.Base(p))
+		}
+		return old(p)
+	}
+	t.Cleanup(func() { removeSecret = old })
+	if err := s.RemoveRun("r4"); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(outside); err != nil || string(got) != "keep-these-bytes" {
+		t.Errorf("the file outside the run was changed: %q, %v", got, err)
+	}
+	if len(zeroed) != 0 {
+		t.Errorf("zeroed %v", zeroed)
+	}
+	if _, err := os.Stat(d.Root); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("the run directory is still there: %v", err)
 	}
 }
 
