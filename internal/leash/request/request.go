@@ -17,6 +17,14 @@
 // request answered `forbidden`, `denied` or `approval_timeout` (or any
 // other code) is never sent again (AGENT-PLAN §4.1, §4.7).
 //
+// The vault answers a retransmission from its dedupe with a copy of the
+// answer that leaves out the secret value (VAULT-MESSAGING 0.91.1 §8.2,
+// §10.11; AGENT-PLAN 0.1.13 §4.3): it carries "withheld": true, and its
+// fields have no `value`. Such a copy is never taken for an empty item:
+// the request is asked again once, as a new request under a new inner id
+// (counted, decided and referred by the vault like any other), and keeps
+// the id the tool call returned for leash.check_status.
+//
 // Results are kept in memory only, for Options.Keep (AG9: 10 minutes)
 // after the answer, and returned once: a result handed to a caller is
 // no longer kept here. Nothing of a request is written to the state
@@ -64,6 +72,10 @@ const (
 	// Retransmissions: an application retry reuses the inner id, at
 	// most twice (VAULT-MESSAGING §8.6).
 	Retransmissions = 2
+	// AskAgain is how many new requests a request makes after answers
+	// that withheld the value (§8.2; chosen; not in the spec): each one
+	// may ask the member again, so one, and then ErrWithheld.
+	AskAgain = 1
 	// ApprovalTTL is how long the vault holds a request (§6.8); an
 	// approval.waiting `exp` further ahead than this (plus a minute of
 	// clock skew) is read as this.
@@ -98,6 +110,7 @@ const (
 	TextStopped        = "The connection to your vault has stopped."
 	TextSuperseded     = "Another copy of this request took its place, so its answer cannot be returned here. Make the request again if you still need it."
 	TextApprovalPassed = "The time to approve this request on your phone has passed; waiting for your vault's final answer. Check again with leash.check_status."
+	TextWithheld       = "Your vault handled this request, but its answer with the value was lost on the way, and asking again went the same way. Make the request again."
 )
 
 // Error is a request's outcome other than a result, with a stable code
@@ -137,6 +150,7 @@ var (
 	ErrStopped     = &Error{Code: "vault_unreachable", Text: TextStopped}
 	ErrRefused     = &Error{Code: "refused", Text: vaultconn.TextRefused}
 	ErrSuperseded  = &Error{Code: "superseded", Text: TextSuperseded}
+	ErrWithheld    = &Error{Code: "withheld", Text: TextWithheld}
 )
 
 // Conn is what this package uses of *vaultconn.Conn.
@@ -191,8 +205,9 @@ type CatalogItem struct {
 }
 
 // Field is an item field with its value. Value is the value's JSON text
-// as the vault sent it (a string, or an address object), absent for a
-// field without a stored value.
+// as the vault sent it (a string, or an address object); every field of
+// a result has one (VAULT-MESSAGING §10.11: a field without `value`
+// marks the vault's cached copy, which is never a result).
 type Field struct {
 	FieldID string          `json:"field_id"`
 	Label   string          `json:"label"`
@@ -281,9 +296,12 @@ type entry struct {
 	fields   []string
 	body     json.RawMessage
 	sentWith pairing.Access
-	created  time.Time
+	created  time.Time     // set again under Client.mu by askAgain
 	poke     chan struct{} // buffered 1: the deadline may have changed
 	finished chan struct{} // closed when done
+
+	// Client.mu (written only by the request's goroutine once it runs):
+	wire string // the inner id in flight: id, or a new one after askAgain
 
 	// Client.mu:
 	waiting    bool
@@ -428,7 +446,7 @@ func (c *Client) do(ctx context.Context, e *entry) (*Outcome, error) {
 	if err != nil {
 		return nil, ErrStopped
 	}
-	e.id, e.created = id, time.Now()
+	e.id, e.wire, e.created = id, id, time.Now()
 	e.sentWith = c.acc.Snapshot()
 	e.poke, e.finished = make(chan struct{}, 1), make(chan struct{})
 	c.mu.Lock()
@@ -618,7 +636,7 @@ func (c *Client) OnEvent(ev vaultconn.Event) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	e := c.entries[b.RequestID]
+	e := c.byWireLocked(b.RequestID)
 	if e == nil || e.done {
 		return
 	}
@@ -632,31 +650,88 @@ func (c *Client) OnEvent(ev vaultconn.Event) {
 	}
 }
 
+// byWireLocked finds the request whose inner id in flight is id; an
+// event about an inner id that a request replaced with a new one is
+// stale.
+func (c *Client) byWireLocked(id string) *entry {
+	if e := c.entries[id]; e != nil && e.wire == id {
+		return e
+	}
+	for _, e := range c.entries {
+		if e.wire == id {
+			return e
+		}
+	}
+	return nil
+}
+
 var errAttemptTimeout = errors.New("no answer in time")
 
-// run sends e's request, and again under the same inner id while no
-// answer comes (at most Retransmissions times), and records the answer.
+// run sends e's request and records the answer; an answer that withheld
+// the value makes it ask again (AskAgain).
 func (c *Client) run(e *entry) {
 	defer c.wg.Done()
+	for asked := 0; ; asked++ {
+		resp := c.send(e)
+		if resp == nil || !c.answer(e, resp, asked < AskAgain) || !c.askAgain(e) {
+			return
+		}
+	}
+}
+
+// askAgain makes e a new request under a new inner id, after an answer
+// that withheld the value (VAULT-MESSAGING §8.2). It keeps e.id for
+// Status, and forgets the old request's approval: the vault decides the
+// new one again, and a held one gets its own approval.waiting. Like the
+// first request, it renews no access session (AGENT-PLAN §4.4): without
+// one the vault answers session_required. It returns false when it
+// ended e instead.
+func (c *Client) askAgain(e *entry) bool {
+	if c.o.Suspended != nil && c.o.Suspended() {
+		c.finish(e, nil, ErrSuspended)
+		return false
+	}
+	id, err := c.conn.NewID()
+	if err != nil {
+		c.finish(e, nil, ErrStopped)
+		return false
+	}
+	c.mu.Lock()
+	if c.closed || c.life.Err() != nil {
+		c.mu.Unlock()
+		c.finish(e, nil, ErrStopped)
+		return false
+	}
+	e.wire, e.created = id, time.Now()
+	e.waiting, e.exp, e.approvalID = false, time.Time{}, ""
+	c.mu.Unlock()
+	e.sentWith = c.acc.Snapshot()
+	c.log.Info("agent.request asked again", "op", e.op, "id", e.id, "inner_id", id)
+	return true
+}
+
+// send sends e's request under its inner id, and again under the same
+// inner id while no answer comes (at most Retransmissions times). It
+// returns the answer, or nil once it has ended e without one.
+func (c *Client) send(e *entry) *vaultconn.Response {
 	for n := 0; n <= Retransmissions; n++ {
 		if n > 0 {
-			c.log.Info("agent.request sent again", "op", e.op, "id", e.id, "attempt", n+1)
+			c.log.Info("agent.request sent again", "op", e.op, "id", e.id, "inner_id", e.wire, "attempt", n+1)
 		}
 		resp, err := c.attempt(e)
 		if err == nil && resp != nil {
-			c.answer(e, resp)
-			return
+			return resp
 		}
 		switch {
 		case c.life.Err() != nil:
 			c.finish(e, nil, ErrStopped)
-			return
+			return nil
 		case errors.Is(err, vaultconn.ErrRefused):
 			c.finish(e, nil, ErrRefused)
-			return
+			return nil
 		case errors.Is(err, vaultconn.ErrStopped):
 			c.finish(e, nil, ErrStopped)
-			return
+			return nil
 		case errors.Is(err, vaultconn.ErrSuperseded):
 			// Another send under this inner id now waits for the answer,
 			// so this copy will never get it; and it was sent, so sending
@@ -665,7 +740,7 @@ func (c *Client) run(e *entry) {
 			// this is not expected; the request ends.
 			c.log.Warn("agent.request superseded", "op", e.op, "id", e.id)
 			c.finish(e, nil, ErrSuperseded)
-			return
+			return nil
 		case errors.Is(err, errAttemptTimeout):
 		default:
 			// The deposit failed (the relay was unreachable): the vault
@@ -677,12 +752,13 @@ func (c *Client) run(e *entry) {
 			case <-c.life.Done():
 				t.Stop()
 				c.finish(e, nil, ErrStopped)
-				return
+				return nil
 			}
 		}
 	}
 	c.log.Warn("agent.request unanswered", "op", e.op, "id", e.id)
 	c.finish(e, nil, ErrUnreachable)
+	return nil
 }
 
 // deadline is when the current attempt, started at start, stops
@@ -730,7 +806,7 @@ func (c *Client) attempt(e *entry) (*vaultconn.Response, error) {
 	// encrypting it, so it is zeroed only once the connection has
 	// answered for it, and e.body (which finish zeroes) is never shared.
 	body := append(json.RawMessage(nil), e.body...)
-	resp, err := c.conn.RequestWithID(ctx, e.id, "agent.request", body)
+	resp, err := c.conn.RequestWithID(ctx, e.wire, "agent.request", body)
 	if handedBack(err) {
 		clear(body)
 	}
@@ -755,19 +831,29 @@ func handedBack(err error) bool {
 }
 
 // answer records the vault's answer; the response body is zeroed once
-// it is parsed.
-func (c *Client) answer(e *entry, resp *vaultconn.Response) {
+// it is parsed. An answer that withheld the value ends e only when it
+// may not ask again (ErrWithheld); otherwise answer returns true, and e
+// is to be asked again.
+func (c *Client) answer(e *entry, resp *vaultconn.Response, mayAskAgain bool) bool {
 	defer clear(resp.Body)
 	if resp.OK {
 		res, err := parse(e, resp.Body)
-		if err != nil {
+		switch {
+		case errors.Is(err, errWithheld) && mayAskAgain:
+			c.log.Info("agent.request answered without the value", "op", e.op, "id", e.id, "inner_id", e.wire)
+			return true
+		case errors.Is(err, errWithheld):
+			c.log.Warn("agent.request answered without the value again", "op", e.op, "id", e.id, "inner_id", e.wire)
+			c.finish(e, nil, ErrWithheld)
+			return false
+		case err != nil:
 			c.log.Warn("agent.request answer not readable", "op", e.op, "id", e.id)
 			c.finish(e, nil, ErrProtocol)
-			return
+			return false
 		}
 		c.log.Info("agent.request answered", "op", e.op, "id", e.id)
 		c.finish(e, res, nil)
-		return
+		return false
 	}
 	code := resp.ErrorCode
 	c.log.Info("agent.request refused", "op", e.op, "id", e.id, "code", code)
@@ -804,6 +890,7 @@ func (c *Client) answer(e *entry, resp *vaultconn.Response) {
 		err = &Error{Code: sc, Text: "Your vault refused the request (" + sc + ")."}
 	}
 	c.finish(e, nil, err)
+	return false
 }
 
 // finish records e's final outcome.

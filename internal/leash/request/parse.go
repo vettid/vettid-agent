@@ -11,6 +11,11 @@ import (
 
 var errParse = errors.New("request: the answer does not have the expected shape")
 
+// errWithheld: the answer is the vault's cached copy, without the value
+// (VAULT-MESSAGING 0.91.1 §8.2, §10.11): the request was handled, and is
+// to be asked again as a new request.
+var errWithheld = errors.New("request: the answer withheld the value")
+
 // parse reads an ok answer to e's request (VAULT-MESSAGING §10.11). It
 // checks that the answer is about what was asked: the same item, only
 // the fields asked for, the same field and action. Values stay JSON text
@@ -36,11 +41,31 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 		}
 		return &Result{Op: OpCatalog, Catalog: items}, nil
 	case OpGet:
+		// The copy is marked "withheld": true (owner decision a, GC
+		// #15273), checked first: the backstop copy is that alone, and a
+		// notes-only item's copy has no field to mark it. A field without
+		// `value` marks it too (§10.11: an agent's answer has `value` in
+		// every field).
+		var m struct {
+			Withheld *bool `json:"withheld"`
+		}
+		if json.Unmarshal(body, &m) != nil {
+			return nil, errParse
+		}
+		if m.Withheld != nil && *m.Withheld {
+			return nil, errWithheld
+		}
 		it := &Item{}
 		res := &Result{Op: OpGet, Item: it}
 		if err := json.Unmarshal(body, it); err != nil || !validItem(e, it) {
 			res.Wipe()
 			return nil, errParse
+		}
+		for _, f := range it.Fields {
+			if f.Value == nil {
+				res.Wipe()
+				return nil, errWithheld
+			}
 		}
 		return res, nil
 	case OpUse:
@@ -67,6 +92,8 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 
 // validItem checks item.get's answer against the request; notes sent
 // with fields asked for (which §10.11 rules out) are zeroed and dropped.
+// A field without `value` passes here (the caller takes it for the cached
+// copy); a `null` value does not.
 func validItem(e *entry, it *Item) bool {
 	if it.ItemID != e.itemID || it.Fields == nil {
 		return false
@@ -84,8 +111,6 @@ func validItem(e *entry, it *Item) bool {
 		seen[f.FieldID] = true
 		switch {
 		case f.Value == nil:
-		case bytes.Equal(f.Value, []byte("null")):
-			f.Value = nil
 		case f.Value[0] != '"' && f.Value[0] != '{':
 			return false
 		}
