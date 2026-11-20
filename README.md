@@ -222,9 +222,17 @@ The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
 `not_found`, `limit`, …) or the connector's own: `access_requested`,
 `access_denied`, `vault_unreachable`, `owner_check_required`,
 `suspended`, `expired`, `bad_request`, `rate_limited_local`,
-`vault_too_old` (your vault does not number its grant sets; update it)
-and `superseded` (not expected: another copy of the request took its
-place).
+`vault_too_old` (your vault does not number its grant sets; update it),
+`superseded` (not expected: another copy of the request took its
+place) and `withheld` (the answer with the values was lost twice; see
+below).
+
+When an answer is lost, the connector sends the request again under the
+same id, and your vault answers that from its record of answers: for
+`leash.request_secret` a copy without the values (it never stores them
+there). The connector then asks once more, as a new request, which your
+vault counts and may put to you on your phone again. An answer without
+values is never handed to the agent as an empty item.
 
 The connector answers up to 120 tool calls in a burst and then 2 a
 second; calls beyond that get `rate_limited_local` before anything
