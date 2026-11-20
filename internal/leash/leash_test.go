@@ -150,15 +150,11 @@ func TestNothingWhileSuspended(t *testing.T) {
 			t.Error("a statement shown while suspended")
 		}
 	}
-	// Resumed (leash.agent.resume sends leash.grant.updated): the update
-	// alone does not end the suspension; the list the background loop
-	// sends then (while suspended) does.
+	// Resumed (leash.agent.resume sends leash.grant.updated with a new
+	// grant_seq): the higher number ends the suspension.
 	now = e.c.Now()
 	g1 = grant(t, now, spec{id: gid(1)})
 	e.update(t, false, g1)
-	refused(t, e, gid(1), ErrSuspended)
-	e.listing(t, false, g1)
-	e.m.step(ctx)
 	mustPresent(t, e, gid(1))
 }
 
@@ -552,7 +548,7 @@ func TestSnapshot(t *testing.T) {
 		t.Error("read for another device")
 	}
 	for _, alt := range []string{
-		strings.Replace(string(raw), `"v":1`, `"v":2`, 1),
+		strings.Replace(string(raw), `"v":2`, `"v":3`, 1),
 		strings.Replace(string(raw), `"suspended"`, `"x":1,"suspended"`, 1),
 		strings.Replace(string(raw), `"approval":"ask"`, `"approval":"auto"`, 1),
 		string(raw) + " {}",

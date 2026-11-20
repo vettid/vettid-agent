@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vettid/vettid-agent/internal/access"
 )
 
 // pairAgent pairs a new connector with m's vault: device.pair.create
@@ -81,12 +83,14 @@ var statusAnswered = regexp.MustCompile(`msg=response type=vault\.status .*ok=tr
 // TestExitA2 is AGENT-PLAN §6 A2's exit test: enroll a test vault with
 // vaultctl, create and unlock its credential, pair the connector with
 // session_seconds 600, compare the SAS on both sides, see vault.status
-// answered, end the session from the app, request a new one and approve
-// it, unlink, and see the connector wipe itself; a rejected pairing ends
-// with "Rejected on your phone".
+// answered, end the session from the app (no new request during the
+// quiet period that starts; README "Access sessions and status"),
+// request a new one after it and approve it, unlink, and see the
+// connector wipe itself; a rejected pairing ends with "Rejected on your
+// phone". The quiet period is waited out for real: 10 minutes.
 func TestExitA2(t *testing.T) {
 	s := devStack(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Minute)
 	defer cancel()
 
 	t.Log("enroll a test vault (api-enroll creates the credential) and unlock its credential")
@@ -108,9 +112,30 @@ func TestExitA2(t *testing.T) {
 	t.Log("the app ends the session")
 	m.must(ctx, "session", "end", "-device", dev)
 	c.waitInfo(ctx, "ended", func(in map[string]any) bool { return in["access_session"] == "none" }, time.Minute)
+	// The quiet period started when the connector applied
+	// device.session.ended, which is before it showed the session as none.
+	quietEnd := time.Now().Add(access.QuietAfterRefusal)
 
-	t.Log("a tool call asks for a new session; the app approves it")
+	t.Log("a tool call right away gets the quiet period after an ended session, and asks the phone nothing")
 	out, isErr := c.call(ctx, "leash.list_available", nil)
+	if msg, _ := out["message"].(string); !isErr || code(out) != "access_denied" ||
+		!strings.HasPrefix(msg, "Access was ended on your phone. No new request is sent before ") {
+		t.Fatalf("list_available after the app ended the session: %v", out)
+	}
+
+	t.Logf("wait out the quiet period (%v)", access.QuietAfterRefusal)
+	select {
+	case <-time.After(time.Until(quietEnd) + 5*time.Second):
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	m.keep(objects(m.must(ctx, "events", "-wait", "3s")))
+	if _, ok := m.take("device.session.pending", has("device_id", dev)); ok {
+		t.Fatal("a session request was sent during the quiet period")
+	}
+
+	t.Log("then a tool call asks for a new session; the app approves it")
+	out, isErr = c.call(ctx, "leash.list_available", nil)
 	if !isErr || code(out) != "access_requested" {
 		t.Fatalf("list_available without a session: %v", out)
 	}

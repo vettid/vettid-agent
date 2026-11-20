@@ -11,12 +11,34 @@ import (
 
 var errParse = errors.New("request: the answer does not have the expected shape")
 
+// errWithheld: the answer is the vault's cached copy, without the value
+// (VAULT-MESSAGING 0.92.0 §8.2, §10.11): the request was handled, and is
+// to be asked again as a new request.
+var errWithheld = errors.New("request: the answer withheld the value")
+
 // parse reads an ok answer to e's request (VAULT-MESSAGING §10.11). It
 // checks that the answer is about what was asked: the same item, only
 // the fields asked for, the same field and action. Values stay JSON text
 // in byte slices of their own (encoding/json copies a RawMessage), never
 // Go strings; on an error they are zeroed.
 func parse(e *entry, body json.RawMessage) (*Result, error) {
+	// "withheld": true marks the vault's cached copy (§8.2, 0.92.0; owner
+	// decision a, GC #15273), whatever else the answer carries, for every
+	// op: nothing of it is read. A live answer never carries the member,
+	// so any other value of it is not an answer.
+	var m struct {
+		Withheld json.RawMessage `json:"withheld"`
+	}
+	if json.Unmarshal(body, &m) != nil {
+		return nil, errParse
+	}
+	switch {
+	case m.Withheld == nil:
+	case bytes.Equal(m.Withheld, []byte("true")):
+		return nil, errWithheld
+	default:
+		return nil, errParse
+	}
 	switch e.op {
 	case OpCatalog:
 		var b struct {
@@ -36,11 +58,19 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 		}
 		return &Result{Op: OpCatalog, Catalog: items}, nil
 	case OpGet:
+		// Unmarked, a field without `value` marks the copy too (§8.2's
+		// backstop: an agent's answer has `value` in every field).
 		it := &Item{}
 		res := &Result{Op: OpGet, Item: it}
 		if err := json.Unmarshal(body, it); err != nil || !validItem(e, it) {
 			res.Wipe()
 			return nil, errParse
+		}
+		for _, f := range it.Fields {
+			if f.Value == nil {
+				res.Wipe()
+				return nil, errWithheld
+			}
 		}
 		return res, nil
 	case OpUse:
@@ -67,6 +97,8 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 
 // validItem checks item.get's answer against the request; notes sent
 // with fields asked for (which §10.11 rules out) are zeroed and dropped.
+// A field without `value` passes here (the caller takes it for the cached
+// copy); a `null` value does not.
 func validItem(e *entry, it *Item) bool {
 	if it.ItemID != e.itemID || it.Fields == nil {
 		return false
@@ -84,8 +116,6 @@ func validItem(e *entry, it *Item) bool {
 		seen[f.FieldID] = true
 		switch {
 		case f.Value == nil:
-		case bytes.Equal(f.Value, []byte("null")):
-			f.Value = nil
 		case f.Value[0] != '"' && f.Value[0] != '{':
 			return false
 		}

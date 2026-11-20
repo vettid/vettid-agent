@@ -64,7 +64,9 @@ is the stack's `vaultctl` (`internal/devstack`). They do not run in CI.
 | `VETTID_DEVSTACK_SRC` | a vettid-vault checkout: when no stack answers, the tests build `cmd/devstack` from it, start it (only with 8 GB of memory available) and stop it at the end |
 | `VETTID_AGENT_BIN` | a connector already built with `-tags devstack` (default: built by the tests) |
 
-One stack at a time and `go test -p 1`. The hold step of A3's exit test
+One stack at a time and `go test -p 1`. A2's exit test waits out the
+real 10-minute quiet period after it ends the session from the app
+("Access sessions and `status`"), so it takes over 10 minutes. The hold step of A3's exit test
 (`owner_check_required`) waits for a real one-hour owner-check deadline,
 because the dev stack has no clock to move for it; it runs only with
 `make devstack-hold-test` (over an hour).
@@ -219,8 +221,18 @@ JSON in text, with `status` `ok`, `pending` (with a `request_id`) or
 The codes are your vault's (`forbidden`, `denied`, `approval_timeout`,
 `not_found`, `limit`, …) or the connector's own: `access_requested`,
 `access_denied`, `vault_unreachable`, `owner_check_required`,
-`suspended`, `expired`, `bad_request`, `rate_limited_local` and
-`superseded` (not expected: another copy of the request took its place).
+`suspended`, `expired`, `bad_request`, `rate_limited_local`,
+`vault_too_old` (your vault does not number its grant sets; update it),
+`superseded` (not expected: another copy of the request took its
+place) and `withheld` (the answer with the values was lost twice; see
+below).
+
+When an answer is lost, the connector sends the request again under the
+same id, and your vault answers that from its record of answers: for
+`leash.request_secret` a copy without the values (it never stores them
+there). The connector then asks once more, as a new request, which your
+vault counts and may put to you on your phone again. An answer without
+values is never handed to the agent as an empty item.
 
 The connector answers up to 120 tool calls in a burst and then 2 a
 second; calls beyond that get `rate_limited_local` before anything
@@ -356,13 +368,17 @@ longer lists, that has ended, or anything at all while your vault has
 paused the agent after repeated refused requests ("suspended"; you
 resume it on your phone).
 
-Messages from your vault can arrive out of order, so only the answer to
-a list the connector sent, with nothing learned while it was on its
-way, can add a grant, bring back a removed one or end a pause. Every
-update, and any other list answer, can only take grants away or pause
-the agent; the connector then asks for the grants again, and that list
-brings what the update added. A pause ends only when a list sent after
-it says so.
+Messages from your vault can arrive out of order, so your vault numbers
+each change to the agent's grants, and the connector keeps the highest
+number it has seen: a list or update with a higher number replaces the
+grants, one with a lower number (sent before a later change) is
+ignored, and one with the same number only brings fresher status
+statements. A grant your vault refused when asked for a statement, or a
+pause your vault answered with, holds until the answer to a list the
+connector sent after learning it. A vault that does not number its
+grant sets is too old for this connector: nothing is presented, the
+connector asks again from time to time, and tools answer
+`vault_too_old`.
 
 In the background the connector refreshes a statement only for a grant
 it was asked to present in the last 15 minutes, at most once a minute;

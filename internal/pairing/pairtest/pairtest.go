@@ -98,6 +98,11 @@ type Vault struct {
 	// SessionSeconds, if positive, makes the approval grant a first
 	// access session of that length (device.paired session_expires_at).
 	SessionSeconds int
+	// GrantSeq is the grant_seq of the (empty) set leash.grant.list
+	// answers with (VAULT-MESSAGING §10.11); 0: 1. NoGrantSeq leaves it
+	// out, as a vault older than 0.41.0 does.
+	GrantSeq   uint64
+	NoGrantSeq bool
 	// GrantListError, if set, answers leash.grant.list with this error
 	// code (for example session_required) instead of an empty list.
 	GrantListError string
@@ -279,6 +284,27 @@ func (v *Vault) decide(d Decision) error {
 		v.session.Activate(v.epoch, now)
 	}
 	v.epoch = nil
+	v.enqueueLocked(raw)
+	return nil
+}
+
+// SendInEpoch sends the device an event in the completed handshake's
+// epoch, before Approve or Reject (as a vault message that precedes
+// device.paired). It may be called from Decide.
+func (v *Vault) SendInEpoch(typ string, body []byte) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.epoch == nil {
+		return errors.New("pairtest: no completed handshake")
+	}
+	id, now, err := ulidNow()
+	if err != nil {
+		return err
+	}
+	raw, err := v.epoch.Seal(&envelope.Inner{ID: id, Type: typ, TS: now, Body: body})
+	if err != nil {
+		return err
+	}
 	v.enqueueLocked(raw)
 	return nil
 }
@@ -604,7 +630,11 @@ func (v *Vault) toVault(payload []byte) {
 					hook = func() { f(id, typ, body) }
 				}
 				if in.Type == "leash.grant.list" && in.Re == "" {
-					resp := &envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK, Body: []byte(`{"grants":[],"suspended":false}`)}
+					body := `{"grants":[],"suspended":false}`
+					if !v.NoGrantSeq {
+						body = `{"grants":[],"suspended":false,"grant_seq":` + strconv.FormatUint(max(v.GrantSeq, 1), 10) + `}`
+					}
+					resp := &envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK, Body: []byte(body)}
 					if v.GrantListError != "" {
 						resp.Status, resp.Body = envelope.StatusError, nil
 						resp.Error = &envelope.Error{Code: v.GrantListError}

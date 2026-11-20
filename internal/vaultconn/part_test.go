@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -29,10 +31,19 @@ func (p *recPart) Apply(b []Message) {
 	p.n++
 }
 
+// Snapshot gives the number of batches applied and the ids of the
+// messages seen (once each).
 func (p *recPart) Snapshot() json.RawMessage {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return json.RawMessage(fmt.Sprintf(`{"batches":%d}`, p.n))
+	var ids []string
+	for _, m := range p.seen {
+		if !slices.Contains(ids, m.ID) {
+			ids = append(ids, m.ID)
+		}
+	}
+	b, _ := json.Marshal(ids)
+	return json.RawMessage(fmt.Sprintf(`{"batches":%d,"ids":%s}`, p.n, b))
 }
 
 func (p *recPart) find(typ string, response bool) (Message, bool) {
@@ -136,6 +147,50 @@ func TestPartAppliedInSave(t *testing.T) {
 	}
 	if o.conn.LastContact().IsZero() {
 		t.Error("no last contact")
+	}
+}
+
+// TestPartReappliedAfterFailedSave: while the save of a batch fails, its
+// event is given to Apply again in each attempt and is not handed to
+// OnEvent; once a save succeeds it is handed over once.
+func TestPartReappliedAfterFailedSave(t *testing.T) {
+	e := newPaired(t)
+	p := &recPart{}
+	sp := &leashSpy{}
+	o := e.openWith(p, sp)
+	fs := &failingStore{Store: sp.Store, fail: true}
+	sp.Store = fs
+	id, err := e.v.SendEvent("leash.grant.updated", []byte(`{"grants":[],"suspended":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop := o.run()
+	defer stop()
+	eventually(t, "two failed saves", func() bool { return fs.failures() >= 2 })
+	noEvent(t, o, "leash.grant.updated")
+	if !o.conn.LastContact().IsZero() {
+		t.Error("last contact set while nothing was saved")
+	}
+	fs.mu.Lock()
+	fs.fail = false
+	fs.mu.Unlock()
+	nextEvent(t, o, "leash.grant.updated")
+	noEvent(t, o, "leash.grant.updated")
+	p.mu.Lock()
+	n := 0
+	for _, m := range p.seen {
+		if m.ID == id {
+			n++
+		}
+	}
+	p.mu.Unlock()
+	if n < 3 {
+		t.Errorf("applied %d times, want once per failed save and once more", n)
+	}
+	// The save that succeeded holds what Apply made of the event.
+	stop()
+	if rec, _ := e.saved(); rec == nil || !strings.Contains(string(rec.Leash), `"`+id+`"`) {
+		t.Errorf("the saved member lacks the event: %s", rec.Leash)
 	}
 }
 

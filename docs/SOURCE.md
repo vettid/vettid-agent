@@ -8,7 +8,7 @@ tests passing (AGENT-PLAN §5, §10 risk 2).
 
 | Module | Version in `go.mod` | Commit | Date (UTC) |
 |---|---|---|---|
-| `github.com/vettid/vettid-vault` | `v0.0.0-20261018030705-f75ea0b945b7` | `f75ea0b945b7a665a1edf676c1b70e67ac42ff75` (`main`, "client: Paired, device.paired's fields kept in the state", #113) | 2026-10-18 03:07:05 |
+| `github.com/vettid/vettid-vault` | `v0.0.0-20261120172539-ed4b423ef11b` | `ed4b423ef11bfa949dc3fc4e3209c63e5340f03e` (`main`, "client: Config.PersistBatch, the save given its unsaved responses and events (AV1)", #283) | 2026-11-20 17:25:39 |
 | `github.com/vettid/vettid-relay` (the version vettid-vault requires; imported directly since A2.1) | `v0.0.0-20261015153542-cc3ce892f9dc` | `cc3ce892f9dcb990e9e9752f19c3e0e296dd12b9` (`main`, RELAY-PROTOCOL 0.9.4 byte budgets, #14) | 2026-10-15 15:35:42 |
 
 Other direct dependencies are ordinary tagged releases chosen in the PR
@@ -55,8 +55,15 @@ and 2024-11-05.
   `device.paired`'s fields kept in the client state, among them the end
   of the first access session (`SessionExpiresAt`), which pairing now
   records. The vectors used here are unchanged (same sha256).
+- **vettid-vault `ed4b423`** adds the client's `Config.PersistBatch`
+  (AGENT-PLAN §7.1 AV1): since `f75ea0b` the client holds a batch's
+  responses and events from the caller until the save succeeds, so the
+  save is now given them, and the connector saves the record with what
+  they change (LEASH grants, the access session, `device.unlinked`'s
+  wipe) before the batch is acknowledged. The vectors used here are
+  unchanged (same sha256).
 - **vettid-relay `cc3ce89`** is not chosen here: it is the version
-  vettid-vault `f75ea0b` requires in its own `go.mod` (the relay client
+  vettid-vault `ed4b423` requires in its own `go.mod` (the relay client
   and token packages its `client` imports), and Go's minimal version
   selection keeps it. It is recorded so that a relay change reaching the
   connector is visible in review.

@@ -79,6 +79,7 @@ type fakeAccess struct {
 	answers  []string
 	sentWith []pairing.Access
 	snap     pairing.Access
+	held     bool
 }
 
 func (a *fakeAccess) Ensure(context.Context) error {
@@ -97,6 +98,11 @@ func (a *fakeAccess) OnAnswer(code string, sentWith pairing.Access) {
 	defer a.mu.Unlock()
 	a.answers = append(a.answers, code)
 	a.sentWith = append(a.sentWith, sentWith)
+}
+func (a *fakeAccess) Held() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.held
 }
 func (a *fakeAccess) set(err error) {
 	a.mu.Lock()
@@ -398,9 +404,11 @@ func TestApprovalTimeout(t *testing.T) {
 // nothing is sent.
 func TestForbidden(t *testing.T) {
 	susp := false
+	relists := 0
 	var mu sync.Mutex
 	e := newEnv(t, func(int, string) (*vaultconn.Response, error) { return refused("forbidden"), nil }, func(o *Options) {
 		o.Suspended = func() bool { mu.Lock(); defer mu.Unlock(); return susp }
+		o.OnForbidden = func() { mu.Lock(); relists++; mu.Unlock() }
 	})
 	if _, err := e.c.Get(context.Background(), itemID, nil); !errors.Is(err, ErrForbidden) || err.Error() != TextForbidden {
 		t.Fatalf("Get: %v", err)
@@ -409,6 +417,11 @@ func TestForbidden(t *testing.T) {
 	if n := len(e.conn.copies()); n != 1 {
 		t.Fatalf("%d copies after forbidden", n)
 	}
+	mu.Lock()
+	if relists != 1 {
+		t.Errorf("forbidden asked for %d lists, want 1", relists)
+	}
+	mu.Unlock()
 	// Answered forbidden in the background: Status keeps saying so.
 	e2 := newEnv(t, func(int, string) (*vaultconn.Response, error) {
 		time.Sleep(400 * time.Millisecond)
