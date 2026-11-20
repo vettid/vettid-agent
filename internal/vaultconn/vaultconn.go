@@ -646,28 +646,7 @@ func (c *Conn) dispatch() {
 	}
 	for _, in := range evs {
 		if in.Re != "" {
-			resp := &Response{Type: in.Type, OK: in.Status == envelope.StatusOK, Body: in.Body}
-			if in.Error != nil {
-				resp.ErrorCode = in.Error.Code
-			}
-			c.log.Info("response", "type", in.Type, "re", in.Re, "ok", resp.OK, "code", resp.ErrorCode)
-			if in.Re == c.statusID {
-				c.statusID = ""
-				c.readStatus(resp)
-				continue
-			}
-			if cl, ok := c.pending[in.Re]; ok {
-				delete(c.pending, in.Re)
-				if cl.deliver(resp) {
-					continue
-				}
-			}
-			// Nobody waits for it (its caller gave up, or it answers an
-			// inner id that a request replaced): it may carry a secret
-			// value, so it is zeroed now rather than left to the garbage
-			// collector.
-			c.log.Info("response dropped: nobody waits for it", "type", in.Type, "re", in.Re, "bytes", len(in.Body))
-			dropResponse(in.Body)
+			c.handResponse(in)
 			continue
 		}
 		c.log.Info("event", "type", in.Type, "id", in.ID)
@@ -678,6 +657,35 @@ func (c *Conn) dispatch() {
 			c.o.OnEvent(Event{ID: in.ID, Type: in.Type, Body: in.Body})
 		}
 	}
+}
+
+// handResponse hands a response to the call waiting for it; Run's
+// goroutine only. Every response is either handed over (the caller owns
+// its body from then on) or zeroed here: it may carry a secret value. The
+// zeroing clears the connector's copy, the body the vault client
+// decrypted; it cannot reach copies made before it.
+func (c *Conn) handResponse(in *envelope.Inner) {
+	resp := &Response{Type: in.Type, OK: in.Status == envelope.StatusOK, Body: in.Body}
+	if in.Error != nil {
+		resp.ErrorCode = in.Error.Code
+	}
+	c.log.Info("response", "type", in.Type, "re", in.Re, "ok", resp.OK, "code", resp.ErrorCode)
+	if in.Re == c.statusID {
+		c.statusID = ""
+		c.readStatus(resp)
+		dropResponse(in.Body)
+		return
+	}
+	if cl, ok := c.pending[in.Re]; ok {
+		delete(c.pending, in.Re)
+		if cl.deliver(resp) {
+			return
+		}
+	}
+	// Nobody waits for it: its caller gave up, or it answers an inner id
+	// that a request replaced.
+	c.log.Info("response dropped: nobody waits for it", "type", in.Type, "re", in.Re)
+	dropResponse(in.Body)
 }
 
 // readStatus keeps what vault.status says about the owner check.
