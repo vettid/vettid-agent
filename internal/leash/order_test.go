@@ -3,6 +3,7 @@ package leash
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -265,6 +266,9 @@ func TestForbiddenStaysSuspended(t *testing.T) {
 	e.updateN(t, 71, false, g1)
 	refused(t, e, gid(1), ErrSuspended)
 	e.staleList(t, 71, false, g1) // equal
+	if !e.m.Suspended() {
+		t.Error("resumed by a list sent before the forbidden")
+	}
 	refused(t, e, gid(1), ErrSuspended)
 	e.staleList(t, 72, false, g1) // higher
 	refused(t, e, gid(1), ErrSuspended)
@@ -741,5 +745,196 @@ func TestBindNeedsDevice(t *testing.T) {
 	}
 	if _, err := parseGrant(&w, ""); err == nil {
 		t.Error("a grant parsed without a device id")
+	}
+}
+
+// TestRestartLiftsUnsetPause: a suspension learned from a forbidden is
+// saved under the number held; after a restart the connector's own list
+// under that number says the agent is not suspended, and the grants are
+// presentable again. The same holds when a higher update arrived after
+// the forbidden (saved suspended under the higher number).
+func TestRestartLiftsUnsetPause(t *testing.T) {
+	for _, higher := range []bool{false, true} {
+		e := newEnv(t)
+		base := e.c.Now()
+		g1 := grant(t, base, spec{id: gid(1)})
+		e.listingN(t, 180, false, g1)
+		mustPresent(t, e, gid(1))
+		e.c.Add(700 * time.Second)
+		e.f.statusGet = func(string) *vaultconn.Response { return fail("forbidden") }
+		refused(t, e, gid(1), ErrSuspended)
+		seq := uint64(180)
+		if higher {
+			seq = 181
+			base = e.c.Now()
+			g1 = grant(t, base, spec{id: gid(1)})
+			e.updateN(t, seq, false, g1)
+			refused(t, e, gid(1), ErrSuspended)
+		}
+		if s, _ := ReadSaved(e.m.Snapshot(), testAgent, e.c.Now()); !s.Suspended {
+			t.Fatalf("higher %v: saved as resumed", higher)
+		}
+
+		e2 := bindSaved(t, e, e.m.Snapshot())
+		if !e2.m.Suspended() {
+			t.Fatalf("higher %v: reloaded as resumed", higher)
+		}
+		refused(t, e2, gid(1), ErrSuspended) // not listed yet
+		e.c.Add(listGrace)
+		// The same grant, with a fresh statement.
+		e2.listingN(t, seq, false, grant(t, base, spec{id: gid(1), statusAt: e.c.Now()}))
+		e2.m.step(ctx) // the background loop lists at start
+		mustPresent(t, e2, gid(1))
+		if s, _ := ReadSaved(e2.m.Snapshot(), testAgent, e.c.Now()); s.Suspended {
+			t.Errorf("higher %v: saved as suspended after the list", higher)
+		}
+
+		// The same list saying suspended suspends.
+		e2.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+		e2.listingN(t, seq, true, grant(t, e.c.Now(), spec{id: gid(1), noStatus: true}))
+		e2.m.step(ctx)
+		refused(t, e2, gid(1), ErrSuspended)
+	}
+}
+
+// TestEqualOwnListDiffers: the answer to the connector's own list under
+// the number held must list exactly the grants held. One that does not
+// confirms nothing and adds nothing (a suspension in it is taken), and
+// the grants are listed again, paced as a failed list.
+func TestEqualOwnListDiffers(t *testing.T) {
+	now := time.Unix(1790856000, 0).UTC()
+	g1 := grant(t, now, spec{id: gid(1)})
+	g2 := grant(t, now, spec{id: gid(2)})
+	g1v2 := grant(t, now, spec{id: gid(1), version: 2})
+	for name, c := range map[string]struct {
+		suspended bool
+		grants    []json.RawMessage
+		want      error
+	}{
+		"empty suspended": {true, nil, ErrUnconfirmed},
+		"empty":           {false, nil, ErrUnconfirmed},
+		"one more":        {false, []json.RawMessage{g1, g2}, ErrUnconfirmed},
+		"other version":   {false, []json.RawMessage{g1v2}, ErrUnconfirmed},
+	} {
+		e := newEnv(t)
+		e.listingN(t, 190, false, g1)
+		mustPresent(t, e, gid(1))
+		e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+		lists := e.f.count("leash.grant.list")
+		e.listingN(t, 190, c.suspended, c.grants...)
+		refused(t, e, gid(1), c.want)
+		if n := e.f.count("leash.grant.list") - lists; n != 1 {
+			t.Errorf("%s: %d lists, want 1", name, n)
+		}
+		refused(t, e, gid(2), nil)
+		lists = e.f.count("leash.grant.list")
+		if in := e.m.ConnectionInfo(); in.GrantsConfirmed {
+			t.Errorf("%s: confirmed", name)
+		}
+		if ids := savedIDs(t, e); len(ids) != 1 || ids[0] != gid(1) {
+			t.Errorf("%s: saved %v", name, ids)
+		}
+		if e.m.Suspended() != c.suspended {
+			t.Errorf("%s: suspended %v", name, e.m.Suspended())
+		}
+		// Listed again after the pause, by the background loop.
+		e.m.mu.Lock()
+		next := e.m.nextList
+		e.m.mu.Unlock()
+		if !next.After(e.c.Now()) {
+			t.Errorf("%s: not paced", name)
+		}
+		e.listingN(t, 190, false, g1)
+		e.c.Add(listGrace + time.Second)
+		e.m.step(ctx)
+		if n := e.f.count("leash.grant.list") - lists; n != 1 {
+			t.Errorf("%s: %d lists after the pause, want 1", name, n)
+		}
+		mustPresent(t, e, gid(1)) // that list matches and says not suspended
+	}
+}
+
+// TestSessionEndedForgetsLists: the answer to a list sent before
+// device.session.ended does not confirm the grants, even when no
+// device.session.granted reaches Apply before it.
+func TestSessionEndedForgetsLists(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1 := grant(t, now, spec{id: gid(1)})
+	e.listingN(t, 200, false, g1)
+	mustPresent(t, e, gid(1))
+	const id = "01JB2Z6V9K3M4N5P6Q7R8S9TVV"
+	e.m.mu.Lock()
+	e.m.lists[id] = e.m.gen
+	e.m.mu.Unlock()
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.ended", Body: json.RawMessage(`{}`)}})
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.list", Re: id, OK: true, Body: setN(t, 200, false, g1)}})
+	if in := e.m.ConnectionInfo(); in.GrantsConfirmed {
+		t.Error("confirmed by a list sent before the session ended")
+	}
+}
+
+// TestEqualSkipsDeadAndSuspended: an equal-numbered set brings no
+// statement for a grant answered not_found, nor any while suspended.
+func TestEqualSkipsDeadAndSuspended(t *testing.T) {
+	e := newEnv(t)
+	start := e.c.Now()
+	g1, g2 := grant(t, start, spec{id: gid(1)}), grant(t, start, spec{id: gid(2)})
+	e.listingN(t, 210, false, g1, g2)
+	mustPresent(t, e, gid(1))
+	mustPresent(t, e, gid(2))
+	e.c.Add(700 * time.Second)
+	e.f.statusGet = func(string) *vaultconn.Response { return fail("not_found") }
+	refused(t, e, gid(1), ErrNotGranted)
+	stmt := func(id string) *statement {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return e.m.statements[id]
+	}
+	before2 := stmt(gid(2))
+	fresh := func() []json.RawMessage {
+		now := e.c.Now()
+		return []json.RawMessage{grant(t, start, spec{id: gid(1), statusAt: now}), grant(t, start, spec{id: gid(2), statusAt: now})}
+	}
+	e.updateN(t, 210, false, fresh()...)
+	if stmt(gid(1)) != nil {
+		t.Error("a statement taken for a grant answered not_found")
+	}
+	if st := stmt(gid(2)); st == nil || st == before2 {
+		t.Error("no fresh statement taken for the grant in force")
+	}
+
+	e.c.Add(time.Second)
+	e.f.statusGet = func(string) *vaultconn.Response { return fail("forbidden") }
+	e.m.mu.Lock()
+	e.m.fetched, e.m.refreshed = map[string]time.Time{}, map[string]time.Time{}
+	e.m.mu.Unlock()
+	if err := e.m.refresh(ctx, gid(2)); !errors.Is(err, ErrSuspended) {
+		t.Fatalf("refresh: %v", err)
+	}
+	e.updateN(t, 210, false, fresh()...)
+	if stmt(gid(1)) != nil || stmt(gid(2)) != nil {
+		t.Error("a statement taken while suspended")
+	}
+}
+
+// TestStaleEqualListSuspends: the answer to a list sent before a mark,
+// under the number held and listing the grants held, still suspends if
+// it says so (it may only narrow).
+func TestStaleEqualListSuspends(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1, g2 := grant(t, now, spec{id: gid(1)}), grant(t, now, spec{id: gid(2)})
+	e.listingN(t, 220, false, g1, g2)
+	mustPresent(t, e, gid(1))
+	e.c.Add(700 * time.Second)
+	e.f.statusGet = func(string) *vaultconn.Response { return fail("not_found") }
+	refused(t, e, gid(2), ErrNotGranted) // a mark: the next list is stale
+	e.staleList(t, 220, true, g1, g2)
+	if !e.m.Suspended() {
+		t.Error("not suspended by a stale equal list saying so")
+	}
+	if s, _ := ReadSaved(e.m.Snapshot(), testAgent, e.c.Now()); !s.Suspended {
+		t.Error("saved as resumed")
 	}
 }

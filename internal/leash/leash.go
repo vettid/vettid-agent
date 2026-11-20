@@ -324,6 +324,10 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 			m.tooOldLogged = false
 			m.signal()
 		case msg.Re == "" && msg.Type == "device.session.ended":
+			// As for granted: a session can start without a granted
+			// reaching Apply (internal/access's probe), and a list sent in
+			// the ended one must not confirm the grants in the next.
+			m.lists = map[string]uint64{}
 			m.listed = false
 		}
 	}
@@ -359,7 +363,9 @@ func parseSeq(raw json.RawMessage) uint64 {
 //   - lower: ignored (an answer to this process's own list asks for
 //     another);
 //   - equal: the set already held; only fresher statements are taken; as
-//     the answer to this process's own list it confirms the grants;
+//     the answer to this process's own list it must list exactly the
+//     grants held (else it confirms nothing and the grants are listed
+//     again), confirms them and says whether the agent is suspended;
 //   - higher: it replaces the grants, adding as well as removing;
 //   - while the number held is unknown, only the answer to this
 //     process's own list replaces the grants; anything else only removes
@@ -433,8 +439,39 @@ func (m *Manager) applySet(body json.RawMessage, src source) {
 		}
 		return
 	case m.seq != 0 && seq == m.seq:
-		if src == fromOwn {
-			m.clearMarks(*set.Suspended)
+		if own {
+			if !sameGrants(m.grants, byID) {
+				// The vault numbers every change, so the answer to this
+				// process's own list under the number held lists the
+				// grants held. One that does not is never trusted to
+				// widen or confirm anything; only a suspension in it is
+				// taken. The grants are listed again (paced as a failed
+				// list, by listOnce or the background loop).
+				m.log.Warn("grant list differs from the grants held under the same grant_seq; listing again")
+				if *set.Suspended && !m.suspended {
+					m.suspended, m.saved = true, true
+					m.statements = map[string]*statement{}
+				}
+				m.listed = false
+				m.signal()
+				return
+			}
+			if src == fromOwn {
+				// It says whether the agent is suspended now, including
+				// a suspension saved before a restart that the vault has
+				// since lifted (or never set) under the same number.
+				m.clearMarks(*set.Suspended)
+				if m.suspended != *set.Suspended {
+					m.suspended, m.saved = *set.Suspended, true
+					if m.suspended {
+						m.statements = map[string]*statement{}
+					}
+				}
+			} else if *set.Suspended && !m.suspended {
+				// Sent before a mark: it may only narrow.
+				m.suspended, m.saved = true, true
+				m.statements = map[string]*statement{}
+			}
 		}
 		if !m.suspended {
 			for _, g := range m.grants {
@@ -509,6 +546,20 @@ func (m *Manager) statementFrom(g *Grant, w *wireGrant, now time.Time) *statemen
 		return nil
 	}
 	return st
+}
+
+// sameGrants reports whether in (by id) holds exactly the grants held,
+// each in the same version.
+func sameGrants(held []*Grant, in map[string]*Grant) bool {
+	if len(held) != len(in) {
+		return false
+	}
+	for _, g := range held {
+		if n := in[g.ID]; n == nil || n.Version != g.Version {
+			return false
+		}
+	}
+	return true
 }
 
 // clearMarks undoes what was learned outside the sets (m.mu held): the
