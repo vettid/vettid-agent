@@ -709,14 +709,19 @@ func TestPairRelayNotHTTPS(t *testing.T) {
 type failingStore struct {
 	store
 	writes  int
-	failAt  int   // the write (1-based: Create/CreateReplace, then Saves) that fails
-	failErr error // returned after the write was done (ErrNotDurable) or instead of it
-	after   bool  // perform the write before returning failErr
+	failAt  int    // the write (1-based: Create/CreateReplace, then Saves) that fails
+	failErr error  // returned after the write was done (ErrNotDurable) or instead of it
+	after   bool   // perform the write before returning failErr
+	times   int    // how many writes fail from failAt on (0: all)
+	onFail  func() // if set, called after each failed write
 }
 
 func (f *failingStore) do(op func() error) error {
 	f.writes++
-	if f.writes >= f.failAt && f.failAt > 0 {
+	if f.writes >= f.failAt && f.failAt > 0 && (f.times == 0 || f.writes < f.failAt+f.times) {
+		if f.onFail != nil {
+			defer f.onFail()
+		}
 		if f.after {
 			if err := op(); err != nil {
 				return err
@@ -765,16 +770,149 @@ func TestPairStartedNotDurable(t *testing.T) {
 // agent.
 func TestPairFinalSaveFails(t *testing.T) {
 	e := newEnv(t)
-	// Writes: 1 started (Create), 2 the hs.resp batch (Persist), 3
-	// waiting (Save), 4 the device.paired batch (Persist, fails: the
-	// batch stays unacknowledged), 5 paired (Save, fails).
-	withFailingStore(t, &failingStore{failAt: 4, failErr: errors.New("disk full")})
+	// Writes: 1 started (Create), 2 the hs.resp batch (PersistBatch), 3
+	// waiting (Save), 4 the device.paired batch (PersistBatch, fails: the
+	// batch stays unacknowledged and device.paired held), 5 the same
+	// batch again (fails): the pairing stops, not at the deadline.
+	f := &failingStore{failAt: 4, failErr: errors.New("disk full")}
+	withFailingStore(t, f)
+	start := time.Now()
 	err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil)
 	if err == nil || !strings.Contains(err.Error(), "Unlink the agent on your phone") || !strings.Contains(err.Error(), "disk full") {
 		t.Fatalf("got %v", err)
 	}
+	if f.writes != 5 {
+		t.Errorf("%d writes, want 5", f.writes)
+	}
+	if d := time.Since(start); d > 30*time.Second {
+		t.Errorf("took %v", d)
+	}
 	if strings.Contains(e.out.String(), TextPaired) {
 		t.Error("said paired")
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r != nil {
+		t.Errorf("state kept: %v", r.Phase)
+	}
+}
+
+// TestPairPairedSaveRetried: the first save of the batch holding
+// device.paired fails, the next succeeds: paired, saved as paired.
+func TestPairPairedSaveRetried(t *testing.T) {
+	e := newEnv(t)
+	f := &failingStore{failAt: 4, times: 1, failErr: errors.New("disk full")}
+	withFailingStore(t, f)
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if !strings.Contains(e.out.String(), TextPaired) {
+		t.Errorf("output:\n%s", e.out)
+	}
+	if f.writes < 5 {
+		t.Errorf("%d writes: the batch was not saved again", f.writes)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, st := e.record(); r == nil || r.Phase != PhasePaired || st.DeviceID != pairtest.DeviceID {
+		t.Fatalf("record %+v", r)
+	}
+}
+
+// TestPairPairedNotDurable: the saves of the batch holding device.paired
+// are in place but not flushed: paired, with the warning, as a final
+// save that is not durable.
+func TestPairPairedNotDurable(t *testing.T) {
+	e := newEnv(t)
+	withFailingStore(t, &failingStore{failAt: 4, failErr: state.ErrNotDurable, after: true})
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if out := e.out.String(); !strings.Contains(out, TextPaired) || !strings.Contains(out, "could not be flushed") {
+		t.Errorf("output:\n%s", out)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r == nil || r.Phase != PhasePaired {
+		t.Fatalf("record %+v", r)
+	}
+}
+
+// TestPairNotDurableInterrupted: the save of the batch holding
+// device.paired is in place but not flushed, and the operator interrupts
+// the wait right after: the file says paired, so "paired" with the
+// warning, not "interrupted".
+func TestPairNotDurableInterrupted(t *testing.T) {
+	e := newEnv(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	withFailingStore(t, &failingStore{failAt: 4, failErr: state.ErrNotDurable, after: true, onFail: cancel})
+	if err := e.pair(ctx, e.code(invite.KindAgent, time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if out := e.out.String(); !strings.Contains(out, TextPaired) || !strings.Contains(out, "could not be flushed") {
+		t.Errorf("output:\n%s", out)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r == nil || r.Phase != PhasePaired {
+		t.Fatalf("record %+v", r)
+	}
+}
+
+// TestPairNotDurableBeforePaired: the save of a vault message that
+// precedes device.paired is in place but not flushed, and so is every
+// later one: it is taken as saved, device.paired is collected after it,
+// and the pairing completes with the warning.
+func TestPairNotDurableBeforePaired(t *testing.T) {
+	e := newEnv(t)
+	old := Window
+	Window = 5 * time.Second
+	t.Cleanup(func() { Window = old })
+	e.v.Decide = func(string) pairtest.Decision {
+		if err := e.v.SendInEpoch("test.note", []byte(`{}`)); err != nil {
+			t.Error(err)
+		}
+		return pairtest.Hold
+	}
+	// The approval is sent once the note's save was written (write 4),
+	// so device.paired comes in a later batch.
+	var once sync.Once
+	approve := func() {
+		once.Do(func() {
+			if err := e.v.Approve(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	withFailingStore(t, &failingStore{failAt: 4, failErr: state.ErrNotDurable, after: true, onFail: approve})
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, 10*time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if out := e.out.String(); !strings.Contains(out, TextPaired) || !strings.Contains(out, "could not be flushed") {
+		t.Errorf("output:\n%s", out)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r == nil || r.Phase != PhasePaired {
+		t.Fatalf("record %+v", r)
+	}
+}
+
+// TestPairSaveFailsBeforePaired: the save of a vault message that
+// precedes device.paired keeps failing, so device.paired is never
+// collected, and the window ends: the operator is told the state could
+// not be saved (the phone may have approved), not that the time ran out.
+func TestPairSaveFailsBeforePaired(t *testing.T) {
+	e := newEnv(t)
+	old := Window
+	Window = 1500 * time.Millisecond
+	t.Cleanup(func() { Window = old })
+	e.v.Decide = func(string) pairtest.Decision {
+		if err := e.v.SendInEpoch("test.note", []byte(`{}`)); err != nil {
+			t.Error(err)
+		}
+		return pairtest.Hold
+	}
+	withFailingStore(t, &failingStore{failAt: 4, failErr: errors.New("disk full")})
+	err := e.pair(context.Background(), e.code(invite.KindAgent, 10*time.Minute), nil)
+	if err == nil || errors.Is(err, ErrExpired) || !strings.Contains(err.Error(), "could not be saved") || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("got %v", err)
 	}
 	wrapStore = func(s store) store { return s }
 	if r, _ := e.record(); r != nil {

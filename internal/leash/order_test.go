@@ -931,6 +931,45 @@ func TestSessionEndedForgetsLists(t *testing.T) {
 	}
 }
 
+// TestSessionMsgReapplied: device.session.granted and .ended applied
+// again under the same inner id (a retried save) change nothing: the
+// lists' pacing and the lists sent since are kept. Another id applies.
+func TestSessionMsgReapplied(t *testing.T) {
+	e := newEnv(t)
+	granted := vaultconn.Message{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}
+	e.m.Apply([]vaultconn.Message{granted})
+	next := e.c.Now().Add(time.Minute)
+	const sent = "01JB2Z6V9K3M4N5P6Q7R8S9TWW"
+	set := func() {
+		e.m.mu.Lock()
+		e.m.listFails, e.m.nextList = 3, next
+		e.m.lists[sent] = e.m.gen
+		e.m.mu.Unlock()
+	}
+	kept := func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		_, ok := e.m.lists[sent]
+		return e.m.listFails == 3 && e.m.nextList.Equal(next) && ok
+	}
+	set()
+	e.m.Apply([]vaultconn.Message{granted})
+	if !kept() {
+		t.Error("granted applied again reset the pacing")
+	}
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+	if kept() {
+		t.Error("a new granted did not reset the pacing")
+	}
+	ended := vaultconn.Message{ID: nextULID(), Type: "device.session.ended", Body: json.RawMessage(`{}`)}
+	e.m.Apply([]vaultconn.Message{ended})
+	set()
+	e.m.Apply([]vaultconn.Message{granted, ended})
+	if !kept() {
+		t.Error("granted and ended applied again forgot the lists")
+	}
+}
+
 // TestEqualSkipsDeadAndSuspended: an equal-numbered set brings no
 // statement for a grant answered not_found, nor any while suspended.
 func TestEqualSkipsDeadAndSuspended(t *testing.T) {

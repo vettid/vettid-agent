@@ -16,6 +16,7 @@ import (
 
 	"github.com/vettid/vettid-relay/relayclient"
 	"github.com/vettid/vettid-vault/client"
+	"github.com/vettid/vettid-vault/vms/envelope"
 	"github.com/vettid/vettid-vault/vms/invite"
 
 	"github.com/vettid/vettid-agent/internal/state"
@@ -184,6 +185,16 @@ type run struct {
 	// persist; persistedPaired is set once persist saved it as paired.
 	cur             *Record
 	persistedPaired bool
+	// saveErr is the error of the last save by persist, nil once one
+	// succeeds; pairedFails counts the failed saves of a batch holding
+	// device.paired and pairedErr is the last one's error (both cleared
+	// by a save that succeeds), and stopWait ends wait's AwaitPaired once
+	// maxPairedSaves of them failed.
+	saveErr     error
+	notDurable  error // the last save was in place but not flushed
+	pairedFails int
+	pairedErr   error
+	stopWait    context.CancelFunc
 	// replacing says what the first write replaces ("unfinished",
 	// "paired" or "unreadable"); replaced is set once it did.
 	replacing    string
@@ -324,7 +335,7 @@ func (r *run) resume(ctx context.Context, rec *Record) error {
 
 func (r *run) clientConfig(c client.Config) client.Config {
 	c.HTTP, c.Now, c.PollWait = r.o.HTTP, r.o.Now, r.o.PollWait
-	c.Persist = r.persist
+	c.PersistBatch = r.persist
 	return c
 }
 
@@ -353,18 +364,55 @@ func accessFromPaired(p *client.Paired) Access {
 // read again; the client applies its own messages (tokens, rekeys) while
 // handling them, whoever polls.
 //
-// persist is the client's Config.Persist while pairing: it saves the
-// device state with the current phase after each collected batch and
+// persist is the client's Config.PersistBatch while pairing: it saves
+// the device state with the current phase after each collected batch and
 // before the batch is acknowledged, so that device.paired (which the
 // client records while handling it) is in the state file before the
 // relay drops it. A batch whose state holds the device id is saved as
 // paired. A rejection (the client dropped the vault record) is not
-// saved: the state is wiped right after. An error leaves the batch
-// unacknowledged.
-func (r *run) persist(st []byte) error {
+// saved: the state is wiped right after. A save in place but not flushed
+// is taken as saved (save1). An error leaves the batch
+// unacknowledged, and the client holds its messages (device.paired
+// included) from AwaitPaired until a save succeeds; when a save of a
+// batch holding device.paired has failed maxPairedSaves times, wait is
+// stopped instead of retrying until the deadline (pairedErr).
+func (r *run) persist(st []byte, batch []*envelope.Inner) error {
 	if !r.created || r.cur == nil {
 		return nil // no batch is collected before the first write
 	}
+	err := r.save1(st)
+	if err == nil {
+		r.saveErr, r.pairedErr, r.pairedFails = nil, nil, 0
+		return nil
+	}
+	r.saveErr = err
+	if holdsPaired(batch) {
+		r.pairedFails++
+		r.pairedErr = err
+		if r.pairedFails >= maxPairedSaves && r.stopWait != nil {
+			r.stopWait()
+		}
+	}
+	return err
+}
+
+// maxPairedSaves is how many saves of a batch holding device.paired are
+// tried before the pairing stops (as before the client held events
+// until a save: the batch's save, then one more).
+const maxPairedSaves = 2
+
+// holdsPaired reports whether batch holds the event device.paired.
+func holdsPaired(batch []*envelope.Inner) bool {
+	for _, in := range batch {
+		if in.Re == "" && in.Type == "device.paired" {
+			return true
+		}
+	}
+	return false
+}
+
+// save1 is one save of persist.
+func (r *run) save1(st []byte) error {
 	var cs struct {
 		DeviceID string          `json:"device_id"`
 		Vault    json.RawMessage `json:"vault"`
@@ -389,13 +437,31 @@ func (r *run) persist(st []byte) error {
 	}
 	err = r.st.Save(b)
 	clear(b)
-	if err != nil {
+	switch {
+	case errors.Is(err, state.ErrNotDurable):
+		// In place but not flushed: taken as saved, as a final save that
+		// is not durable always was (the batch is acknowledged), so that
+		// the client goes on to collect device.paired; the operator is
+		// warned at the end, unless a later save is durable.
+		r.notDurable = err
+	case err != nil:
 		return err
+	default:
+		r.notDurable = nil
 	}
 	if rec.Phase == PhasePaired {
 		r.persistedPaired = true
 	}
 	return nil
+}
+
+// pairedText tells the operator the pairing is complete, with the
+// warning if the last save was in place but not flushed.
+func (r *run) pairedText() {
+	fmt.Fprintln(r.o.Out, TextPaired)
+	if r.notDurable != nil {
+		fmt.Fprintf(r.o.Out, "Warning: the state file is in place but could not be flushed to disk (%v); it may not survive a power loss.\n", r.notDurable)
+	}
 }
 
 func (r *run) pairNew(ctx context.Context) error {
@@ -466,13 +532,30 @@ func (r *run) pairNew(ctx context.Context) error {
 // wait waits for the owner's decision until rec.Deadline.
 func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 	o := r.o
-	wctx, cancel := deadlineCtx(ctx, rec.Deadline, o.Now())
+	dctx, cancel := deadlineCtx(ctx, rec.Deadline, o.Now())
 	defer cancel()
+	wctx, stop := context.WithCancel(dctx)
+	defer stop()
+	r.stopWait = stop
+	defer func() { r.stopWait = nil }()
+	// Only saves during the wait count; one still due from before is
+	// retried by the client's first Poll here.
+	r.saveErr = nil
+	// Once a batch holding device.paired is saved (durably or not), the
+	// same Poll hands device.paired to AwaitPaired, which then returns nil
+	// even if ctx has ended.
 	err := d.AwaitPaired(wctx)
+	if err != nil && r.pairedErr != nil && ctx.Err() == nil {
+		// device.paired came, but the state could not be saved with it
+		// (maxPairedSaves times, or once and then the window ended). An
+		// interrupted wait is resumable instead: the file still says
+		// waiting, and device.paired is still unacknowledged.
+		return r.failWipe(approvedNotSaved(r.pairedErr))
+	}
 	switch {
 	case err == nil && r.persistedPaired:
 		// Saved as paired before device.paired was acknowledged.
-		fmt.Fprintln(o.Out, TextPaired)
+		r.pairedText()
 		return nil
 	case err == nil:
 		rec.Phase, rec.Deadline = PhasePaired, time.Time{}
@@ -487,7 +570,7 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 			}
 			// A `waiting` file left behind would be resumed for an
 			// approval that already came: delete it.
-			return r.failWipe(fmt.Errorf("your phone approved this agent, but its keys could not be saved (%w), so this computer cannot use the pairing; its unfinished state is deleted. Unlink the agent on your phone (Devices & agents) and pair again", err))
+			return r.failWipe(approvedNotSaved(err))
 		}
 		fmt.Fprintln(o.Out, TextPaired)
 		return nil
@@ -495,11 +578,27 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 		return r.failWipe(ErrRejected)
 	case ctx.Err() != nil:
 		return &interrupted{fmt.Sprintf(textInterrupted, rec.Deadline.Local().Format("15:04"))}
-	case wctx.Err() != nil:
+	case dctx.Err() != nil && r.saveErr != nil:
+		// A batch before device.paired could not be saved, so the client
+		// collected nothing after it: the phone may have approved.
+		return r.failWipe(notSavedInTime(r.saveErr))
+	case dctx.Err() != nil:
 		return r.failWipe(ErrExpired)
 	default:
 		return r.failWipe(errors.New("your vault's answer could not be read; start again from your phone"))
 	}
+}
+
+// approvedNotSaved: device.paired came but the paired state could not be
+// saved.
+func approvedNotSaved(err error) error {
+	return fmt.Errorf("your phone approved this agent, but its keys could not be saved (%w), so this computer cannot use the pairing; its unfinished state is deleted. Unlink the agent on your phone (Devices & agents) and pair again", err)
+}
+
+// notSavedInTime: the window ended while a save failed, before
+// device.paired could be collected.
+func notSavedInTime(err error) error {
+	return fmt.Errorf("this agent's pairing state could not be saved (%w) before the time to approve it ran out, so this computer cannot complete the pairing; its unfinished state is deleted. If your phone lists this agent, remove it there (Devices & agents), then pair again", err)
 }
 
 // save writes rec with the device's current state: the first write of
