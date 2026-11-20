@@ -191,6 +191,7 @@ type run struct {
 	// by a save that succeeds), and stopWait ends wait's AwaitPaired once
 	// maxPairedSaves of them failed.
 	saveErr     error
+	notDurable  error // the last save was in place but not flushed
 	pairedFails int
 	pairedErr   error
 	stopWait    context.CancelFunc
@@ -369,7 +370,8 @@ func accessFromPaired(p *client.Paired) Access {
 // client records while handling it) is in the state file before the
 // relay drops it. A batch whose state holds the device id is saved as
 // paired. A rejection (the client dropped the vault record) is not
-// saved: the state is wiped right after. An error leaves the batch
+// saved: the state is wiped right after. A save in place but not flushed
+// is taken as saved (save1). An error leaves the batch
 // unacknowledged, and the client holds its messages (device.paired
 // included) from AwaitPaired until a save succeeds; when a save of a
 // batch holding device.paired has failed maxPairedSaves times, wait is
@@ -435,13 +437,31 @@ func (r *run) save1(st []byte) error {
 	}
 	err = r.st.Save(b)
 	clear(b)
-	if err != nil {
+	switch {
+	case errors.Is(err, state.ErrNotDurable):
+		// In place but not flushed: taken as saved, as a final save that
+		// is not durable always was (the batch is acknowledged), so that
+		// the client goes on to collect device.paired; the operator is
+		// warned at the end, unless a later save is durable.
+		r.notDurable = err
+	case err != nil:
 		return err
+	default:
+		r.notDurable = nil
 	}
 	if rec.Phase == PhasePaired {
 		r.persistedPaired = true
 	}
 	return nil
+}
+
+// pairedText tells the operator the pairing is complete, with the
+// warning if the last save was in place but not flushed.
+func (r *run) pairedText() {
+	fmt.Fprintln(r.o.Out, TextPaired)
+	if r.notDurable != nil {
+		fmt.Fprintf(r.o.Out, "Warning: the state file is in place but could not be flushed to disk (%v); it may not survive a power loss.\n", r.notDurable)
+	}
 }
 
 func (r *run) pairNew(ctx context.Context) error {
@@ -521,16 +541,10 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 	// Only saves during the wait count; one still due from before is
 	// retried by the client's first Poll here.
 	r.saveErr = nil
+	// Once a batch holding device.paired is saved (durably or not), the
+	// same Poll hands device.paired to AwaitPaired, which then returns nil
+	// even if ctx has ended.
 	err := d.AwaitPaired(wctx)
-	if err != nil && errors.Is(r.pairedErr, state.ErrNotDurable) {
-		// device.paired came and the paired state is in place but not
-		// flushed, as a final save below; also when the wait was
-		// interrupted, since the file already says paired. The batch stays
-		// unacknowledged: the agent collects device.paired again.
-		fmt.Fprintln(o.Out, TextPaired)
-		fmt.Fprintf(o.Out, "Warning: the state file is in place but could not be flushed to disk (%v); it may not survive a power loss.\n", r.pairedErr)
-		return nil
-	}
 	if err != nil && r.pairedErr != nil && ctx.Err() == nil {
 		// device.paired came, but the state could not be saved with it
 		// (maxPairedSaves times, or once and then the window ended). An
@@ -541,7 +555,7 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 	switch {
 	case err == nil && r.persistedPaired:
 		// Saved as paired before device.paired was acknowledged.
-		fmt.Fprintln(o.Out, TextPaired)
+		r.pairedText()
 		return nil
 	case err == nil:
 		rec.Phase, rec.Deadline = PhasePaired, time.Time{}

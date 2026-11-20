@@ -856,6 +856,44 @@ func TestPairNotDurableInterrupted(t *testing.T) {
 	}
 }
 
+// TestPairNotDurableBeforePaired: the save of a vault message that
+// precedes device.paired is in place but not flushed, and so is every
+// later one: it is taken as saved, device.paired is collected after it,
+// and the pairing completes with the warning.
+func TestPairNotDurableBeforePaired(t *testing.T) {
+	e := newEnv(t)
+	old := Window
+	Window = 5 * time.Second
+	t.Cleanup(func() { Window = old })
+	e.v.Decide = func(string) pairtest.Decision {
+		if err := e.v.SendInEpoch("test.note", []byte(`{}`)); err != nil {
+			t.Error(err)
+		}
+		return pairtest.Hold
+	}
+	// The approval is sent once the note's save was written (write 4),
+	// so device.paired comes in a later batch.
+	var once sync.Once
+	approve := func() {
+		once.Do(func() {
+			if err := e.v.Approve(); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	withFailingStore(t, &failingStore{failAt: 4, failErr: state.ErrNotDurable, after: true, onFail: approve})
+	if err := e.pair(context.Background(), e.code(invite.KindAgent, 10*time.Minute), nil); err != nil {
+		t.Fatalf("Pair: %v\n%s", err, e.out)
+	}
+	if out := e.out.String(); !strings.Contains(out, TextPaired) || !strings.Contains(out, "could not be flushed") {
+		t.Errorf("output:\n%s", out)
+	}
+	wrapStore = func(s store) store { return s }
+	if r, _ := e.record(); r == nil || r.Phase != PhasePaired {
+		t.Fatalf("record %+v", r)
+	}
+}
+
 // TestPairSaveFailsBeforePaired: the save of a vault message that
 // precedes device.paired keeps failing, so device.paired is never
 // collected, and the window ends: the operator is told the state could
