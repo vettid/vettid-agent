@@ -296,12 +296,13 @@ type entry struct {
 	fields   []string
 	body     json.RawMessage
 	sentWith pairing.Access
-	created  time.Time     // set again under Client.mu by askAgain
 	poke     chan struct{} // buffered 1: the deadline may have changed
 	finished chan struct{} // closed when done
 
-	// Client.mu (written only by the request's goroutine once it runs):
-	wire string // the inner id in flight: id, or a new one after askAgain
+	// Client.mu (set by do before the request runs; then written only by
+	// its goroutine, in askAgain):
+	wire    string    // the inner id in flight: id, or a new one after askAgain
+	created time.Time // when the request in flight was made
 
 	// Client.mu:
 	waiting    bool

@@ -89,7 +89,6 @@ func TestWithheldTwice(t *testing.T) {
 	if !errors.Is(err, ErrWithheld) || out != nil {
 		t.Fatalf("Get: %+v, %v", out, err)
 	}
-	time.Sleep(50 * time.Millisecond)
 	if c := e.conn.copies(); len(c) != 1+AskAgain || c[0].id == c[1].id {
 		t.Errorf("copies: %+v", c)
 	}
@@ -144,6 +143,45 @@ func TestWithheldNewRequestHeld(t *testing.T) {
 	if c := e.conn.copies(); len(c) != 2 {
 		t.Errorf("%d copies sent", len(c))
 	}
+}
+
+// The new request starts afresh: the first one's approval (held, then
+// answered by a copy after longer than Options.Unanswered) neither
+// makes it Waiting nor makes Status call it unanswered.
+func TestWithheldNewRequestStartsAfresh(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	var e *env
+	e = newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		if n == 1 {
+			waiting(e, id, time.Now().Add(2*time.Second))
+			time.Sleep(250 * time.Millisecond) // past Options.Unanswered
+			return ok(copies["marked"]), nil
+		}
+		close(started)
+		<-release
+		return ok(itemBody), nil
+	}, nil)
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free) // before Close (cleanups run last first), even on a failure
+	out, err := e.c.Get(context.Background(), itemID, nil)
+	if err != nil || !out.Pending {
+		t.Fatalf("Get: %+v, %v", out, err)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("not asked again")
+	}
+	if o, err := e.c.Status(context.Background(), out.RequestID); err != nil || !o.Pending || o.Waiting {
+		t.Fatalf("Status after asking again: %+v, %v", o, err)
+	}
+	free()
+	res, err := status(t, e, out.RequestID)
+	if err != nil || res.Result == nil {
+		t.Fatalf("Status: %+v, %v", res, err)
+	}
+	res.Result.Wipe()
 }
 
 // No new request once the vault suspended the agent.
