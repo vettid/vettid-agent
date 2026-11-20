@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -671,6 +672,84 @@ func TestTokenRevokedOnOutboxDeposit(t *testing.T) {
 	}
 	if rec, st := e.saved(); rec == nil || rec.Phase != pairing.PhasePaired || st.DeviceID != pairtest.DeviceID {
 		t.Fatal("the state was changed")
+	}
+}
+
+// TestRefusedWithFailedSave: the client is refused in a Poll whose save
+// fails (Poll returns the refusal joined to the save error, once): Run
+// still stops with ErrRefused after its drain. The refusal is the
+// client's own state, read after every Poll; here it is set directly.
+func TestRefusedWithFailedSave(t *testing.T) {
+	e := newPaired(t)
+	var refused atomic.Bool
+	old := deviceRefused
+	deviceRefused = func(d *client.Device) error {
+		if refused.Load() {
+			return fmt.Errorf("%w: test", client.ErrRefused)
+		}
+		return old(d)
+	}
+	t.Cleanup(func() { deviceRefused = old })
+	fs := &failingStore{}
+	o := e.open(func(s Store) Store { fs.Store = s; return fs })
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- o.conn.Run(ctx) }()
+	eventually(t, "the status response to be saved", func() bool {
+		return count(e.v.Received(), "vault.status") == 1 && e.v.Pending() == 0
+	})
+	fs.mu.Lock()
+	fs.fail = true
+	fs.mu.Unlock()
+	if _, err := e.v.SendEvent("test.ping", []byte(`{}`)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "a failed save", func() bool { return fs.failures() >= 1 })
+	refused.Store(true)
+	err := <-done
+	o.store.Close()
+	if !errors.Is(err, ErrRefused) {
+		t.Fatalf("Run: %v", err)
+	}
+	if !strings.Contains(e.out.String(), TextRefused) {
+		t.Errorf("output:\n%s", e.out)
+	}
+}
+
+// TestAccessReappliedAfterFailedSave: device.session.granted in a batch
+// whose save fails is in every save tried, and in the record once a save
+// succeeds; OnEvent gets it only then.
+func TestAccessReappliedAfterFailedSave(t *testing.T) {
+	e := newPaired(t)
+	exp := time.Now().Add(time.Hour).Truncate(time.Second)
+	if _, err := e.v.SendEvent("device.session.granted", granted("sess-2", exp)); err != nil {
+		t.Fatal(err)
+	}
+	fs := &failingStore{fail: true}
+	sp := &accessSpy{v: e.v}
+	o := e.open(func(s Store) Store { fs.Store = s; sp.Store = fs; return sp })
+	stop := o.run()
+	eventually(t, "two failed saves", func() bool { return fs.failures() >= 2 })
+	noEvent(t, o, "device.session.granted")
+	sp.mu.Lock()
+	tries := 0
+	for _, s := range sp.saves {
+		if strings.HasPrefix(s, "active/sess-2/") {
+			tries++
+		}
+	}
+	sp.mu.Unlock()
+	if tries < 2 {
+		t.Errorf("the grant was in %d of the failed saves, want each", tries)
+	}
+	fs.mu.Lock()
+	fs.fail = false
+	fs.mu.Unlock()
+	nextEvent(t, o, "device.session.granted")
+	stop()
+	if rec, _ := e.saved(); rec.Access.State != pairing.AccessActive || rec.Access.SessionID != "sess-2" || !rec.Access.ExpiresAt.Equal(exp) {
+		t.Errorf("file: %+v", rec.Access)
 	}
 }
 

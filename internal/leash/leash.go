@@ -194,6 +194,12 @@ type Manager struct {
 	// listFails and nextList pace the background loop's lists.
 	listFails int
 	nextList  time.Time
+	// sessionMsgs: the inner ids of the last device.session.granted and
+	// .ended applied (at most maxSessionMsgs). After a failed save the
+	// same messages are applied again (vaultconn.Part); one already
+	// applied in this process changes nothing, so retried saves don't
+	// reset the lists' pacing.
+	sessionMsgs []string
 	// held: the vault answered owner_check_required; the background loop
 	// lists and refreshes nothing until a vault.status that is not held
 	// (OnStatus) shows the hold ended, and then resumes at once (OnStatus
@@ -313,6 +319,9 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 			delete(m.lists, msg.Re)
 			m.applySet(msg.Body, src)
 		case msg.Re == "" && msg.Type == "device.session.granted":
+			if m.sessionMsgSeen(msg.ID) {
+				continue
+			}
 			// A list sent in an earlier session describes the grants as
 			// they were then (the vault sends no events between
 			// sessions): its answer counts as another's list. (A list
@@ -324,6 +333,9 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 			m.tooOldLogged = false
 			m.signal()
 		case msg.Re == "" && msg.Type == "device.session.ended":
+			if m.sessionMsgSeen(msg.ID) {
+				continue
+			}
 			// As for granted: a session can start without a granted
 			// reaching Apply (internal/access's probe), and a list sent in
 			// the ended one must not confirm the grants in the next.
@@ -331,6 +343,25 @@ func (m *Manager) Apply(batch []vaultconn.Message) {
 			m.listed = false
 		}
 	}
+}
+
+// maxSessionMsgs bounds sessionMsgs.
+const maxSessionMsgs = 64
+
+// sessionMsgSeen reports whether the session message id was applied
+// already, and notes it if not. m.mu is held.
+func (m *Manager) sessionMsgSeen(id string) bool {
+	if id == "" {
+		return false
+	}
+	if slices.Contains(m.sessionMsgs, id) {
+		return true
+	}
+	if len(m.sessionMsgs) >= maxSessionMsgs {
+		m.sessionMsgs = append(m.sessionMsgs[:0], m.sessionMsgs[1:]...)
+	}
+	m.sessionMsgs = append(m.sessionMsgs, id)
+	return false
 }
 
 // grantSet is the body of leash.grant.updated and of an agent's

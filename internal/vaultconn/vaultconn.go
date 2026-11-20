@@ -201,7 +201,8 @@ type Conn struct {
 	access pairing.Access
 
 	ik ed25519.PublicKey
-	// lastContact: when a batch from the vault was last collected.
+	// lastContact: when messages from the vault were last handed over
+	// (after their batch was saved).
 	contactMu   sync.Mutex
 	lastContact time.Time
 }
@@ -246,8 +247,9 @@ func (c *Conn) DeviceID() string { return c.dev.DeviceID() }
 // `sub` of its LEASH delegations).
 func (c *Conn) IdentityKey() ed25519.PublicKey { return bytes.Clone(c.ik) }
 
-// LastContact returns when a message from the vault was last collected
-// in this process (zero: none yet).
+// LastContact returns when messages from the vault were last handed
+// over in this process, once their batch was saved (zero: none yet).
+// While saves fail it stays where it was.
 func (c *Conn) LastContact() time.Time {
 	c.contactMu.Lock()
 	defer c.contactMu.Unlock()
@@ -339,11 +341,6 @@ func ParseGranted(body json.RawMessage) (pairing.Access, bool) {
 // before it collects.
 func (c *Conn) persist(st []byte, evs []*envelope.Inner) error {
 	c.collected = true
-	if len(evs) > 0 {
-		c.contactMu.Lock()
-		c.lastContact = c.o.Now()
-		c.contactMu.Unlock()
-	}
 	for _, ev := range evs {
 		if ev.Re == "" && ev.Type == "device.unlinked" {
 			c.unlinked = true
@@ -396,6 +393,9 @@ func (c *Conn) persist(st []byte, evs []*envelope.Inner) error {
 	return nil
 }
 
+// deviceRefused is (*client.Device).Refused; tests replace it.
+var deviceRefused = (*client.Device).Refused
+
 // Pauses after failures; tests shorten them.
 var (
 	retryBase       = time.Second
@@ -435,6 +435,13 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 		c.collected = false
 		perr := c.dev.Poll(ctx)
 		c.dispatch()
+		// A deposit from the outbox inside Poll (a rekey's hs.resp, a
+		// token's) that the relay refused token_revoked makes the client
+		// refused. Poll reports it once, possibly joined to a failed
+		// save, so the device is asked after every Poll.
+		if rerr := deviceRefused(c.dev); rerr != nil {
+			c.noteRefused(rerr)
+		}
 		if c.unlinked {
 			if c.wipeErr != nil {
 				// The batch stays unacknowledged, so device.unlinked is
@@ -463,11 +470,7 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 			c.persistErr = nil
 			pause(ctx, backoff(retryBase, retryMax, c.saveFails))
 		case perr != nil:
-			// Also a deposit from the outbox (a rekey's hs.resp, a
-			// token's) that the relay refused: token_revoked makes the
-			// client refused (client.ErrRefused).
 			c.log.Warn("collect failed", "err", errCode(perr))
-			c.noteRefused(perr)
 			pause(ctx, retryBase)
 		}
 		if c.refused {
@@ -594,6 +597,13 @@ func (c *Conn) takeCalls(ctx context.Context) {
 // its events to OnEvent.
 func (c *Conn) dispatch() {
 	evs := c.dev.Events()
+	if len(evs) > 0 {
+		// Set here, not in persist: a save retried after a failure is
+		// given the same messages again, which is no new contact.
+		c.contactMu.Lock()
+		c.lastContact = c.o.Now()
+		c.contactMu.Unlock()
+	}
 	for id, cl := range c.pending {
 		if cl.ctx.Err() != nil {
 			delete(c.pending, id)

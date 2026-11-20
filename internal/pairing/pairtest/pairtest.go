@@ -288,6 +288,27 @@ func (v *Vault) decide(d Decision) error {
 	return nil
 }
 
+// SendInEpoch sends the device an event in the completed handshake's
+// epoch, before Approve or Reject (as a vault message that precedes
+// device.paired). It may be called from Decide.
+func (v *Vault) SendInEpoch(typ string, body []byte) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.epoch == nil {
+		return errors.New("pairtest: no completed handshake")
+	}
+	id, now, err := ulidNow()
+	if err != nil {
+		return err
+	}
+	raw, err := v.epoch.Seal(&envelope.Inner{ID: id, Type: typ, TS: now, Body: body})
+	if err != nil {
+		return err
+	}
+	v.enqueueLocked(raw)
+	return nil
+}
+
 func ulidNow() (string, time.Time, error) {
 	now := time.Now().UTC().Truncate(time.Millisecond)
 	id, err := envelope.NewULID(now)

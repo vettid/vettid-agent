@@ -185,9 +185,12 @@ type run struct {
 	// persist; persistedPaired is set once persist saved it as paired.
 	cur             *Record
 	persistedPaired bool
-	// pairedFails counts the failed saves of a batch holding
-	// device.paired, pairedErr is the last one's error, and stopWait
-	// ends wait's AwaitPaired once maxPairedSaves of them failed.
+	// saveErr is the error of the last save by persist, nil once one
+	// succeeds; pairedFails counts the failed saves of a batch holding
+	// device.paired and pairedErr is the last one's error (both cleared
+	// by a save that succeeds), and stopWait ends wait's AwaitPaired once
+	// maxPairedSaves of them failed.
+	saveErr     error
 	pairedFails int
 	pairedErr   error
 	stopWait    context.CancelFunc
@@ -376,7 +379,12 @@ func (r *run) persist(st []byte, batch []*envelope.Inner) error {
 		return nil // no batch is collected before the first write
 	}
 	err := r.save1(st)
-	if err != nil && holdsPaired(batch) {
+	if err == nil {
+		r.saveErr, r.pairedErr, r.pairedFails = nil, nil, 0
+		return nil
+	}
+	r.saveErr = err
+	if holdsPaired(batch) {
 		r.pairedFails++
 		r.pairedErr = err
 		if r.pairedFails >= maxPairedSaves && r.stopWait != nil {
@@ -510,19 +518,24 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 	defer stop()
 	r.stopWait = stop
 	defer func() { r.stopWait = nil }()
+	// Only saves during the wait count; one still due from before is
+	// retried by the client's first Poll here.
+	r.saveErr = nil
 	err := d.AwaitPaired(wctx)
+	if err != nil && errors.Is(r.pairedErr, state.ErrNotDurable) {
+		// device.paired came and the paired state is in place but not
+		// flushed, as a final save below; also when the wait was
+		// interrupted, since the file already says paired. The batch stays
+		// unacknowledged: the agent collects device.paired again.
+		fmt.Fprintln(o.Out, TextPaired)
+		fmt.Fprintf(o.Out, "Warning: the state file is in place but could not be flushed to disk (%v); it may not survive a power loss.\n", r.pairedErr)
+		return nil
+	}
 	if err != nil && r.pairedErr != nil && ctx.Err() == nil {
 		// device.paired came, but the state could not be saved with it
 		// (maxPairedSaves times, or once and then the window ended). An
-		// interrupted wait is resumable instead: device.paired is still
-		// unacknowledged.
-		if errors.Is(r.pairedErr, state.ErrNotDurable) {
-			// In place but not flushed, as a final save below. The batch
-			// stays unacknowledged: the agent collects device.paired again.
-			fmt.Fprintln(o.Out, TextPaired)
-			fmt.Fprintf(o.Out, "Warning: the state file is in place but could not be flushed to disk (%v); it may not survive a power loss.\n", r.pairedErr)
-			return nil
-		}
+		// interrupted wait is resumable instead: the file still says
+		// waiting, and device.paired is still unacknowledged.
 		return r.failWipe(approvedNotSaved(r.pairedErr))
 	}
 	switch {
@@ -551,6 +564,10 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 		return r.failWipe(ErrRejected)
 	case ctx.Err() != nil:
 		return &interrupted{fmt.Sprintf(textInterrupted, rec.Deadline.Local().Format("15:04"))}
+	case dctx.Err() != nil && r.saveErr != nil:
+		// A batch before device.paired could not be saved, so the client
+		// collected nothing after it: the phone may have approved.
+		return r.failWipe(notSavedInTime(r.saveErr))
 	case dctx.Err() != nil:
 		return r.failWipe(ErrExpired)
 	default:
@@ -562,6 +579,12 @@ func (r *run) wait(ctx context.Context, d *client.Device, rec *Record) error {
 // saved.
 func approvedNotSaved(err error) error {
 	return fmt.Errorf("your phone approved this agent, but its keys could not be saved (%w), so this computer cannot use the pairing; its unfinished state is deleted. Unlink the agent on your phone (Devices & agents) and pair again", err)
+}
+
+// notSavedInTime: the window ended while a save failed, before
+// device.paired could be collected.
+func notSavedInTime(err error) error {
+	return fmt.Errorf("this agent's pairing state could not be saved (%w) before the time to approve it ran out, so this computer cannot complete the pairing; its unfinished state is deleted. If your phone lists this agent, remove it there (Devices & agents), then pair again", err)
 }
 
 // save writes rec with the device's current state: the first write of
