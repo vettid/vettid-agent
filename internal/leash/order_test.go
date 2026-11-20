@@ -798,9 +798,9 @@ func TestRestartLiftsUnsetPause(t *testing.T) {
 }
 
 // TestEqualOwnListDiffers: the answer to the connector's own list under
-// the number held must list exactly the grants held. One that does not
-// confirms nothing and adds nothing (a suspension in it is taken), and
-// the grants are listed again, paced as a failed list.
+// the number held must list only grants held, in their versions. One
+// that does not confirms nothing and adds nothing (a suspension in it is
+// taken), and the grants are listed again, paced as a failed list.
 func TestEqualOwnListDiffers(t *testing.T) {
 	now := time.Unix(1790856000, 0).UTC()
 	g1 := grant(t, now, spec{id: gid(1)})
@@ -811,10 +811,10 @@ func TestEqualOwnListDiffers(t *testing.T) {
 		grants    []json.RawMessage
 		want      error
 	}{
-		"empty suspended": {true, nil, ErrUnconfirmed},
-		"empty":           {false, nil, ErrUnconfirmed},
-		"one more":        {false, []json.RawMessage{g1, g2}, ErrUnconfirmed},
-		"other version":   {false, []json.RawMessage{g1v2}, ErrUnconfirmed},
+		"one more":           {false, []json.RawMessage{g1, g2}, ErrUnconfirmed},
+		"one more suspended": {true, []json.RawMessage{g1, g2}, ErrUnconfirmed},
+		"other grant":        {false, []json.RawMessage{g2}, ErrUnconfirmed},
+		"other version":      {false, []json.RawMessage{g1v2}, ErrUnconfirmed},
 	} {
 		e := newEnv(t)
 		e.listingN(t, 190, false, g1)
@@ -852,6 +852,63 @@ func TestEqualOwnListDiffers(t *testing.T) {
 		}
 		mustPresent(t, e, gid(1)) // that list matches and says not suspended
 	}
+}
+
+// TestEqualOwnListDiffersMidSession: grants confirmed in this session
+// stop being presented when the connector's own list under the same
+// number lists a grant not held.
+func TestEqualOwnListDiffersMidSession(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1, g2 := grant(t, now, spec{id: gid(1)}), grant(t, now, spec{id: gid(2)})
+	e.listingN(t, 310, false, g1)
+	mustPresent(t, e, gid(1))
+	e.listingN(t, 310, false, g1, g2)
+	e.m.Relist()
+	e.m.step(ctx)
+	if in := e.m.ConnectionInfo(); in.GrantsConfirmed {
+		t.Error("still confirmed")
+	}
+	refused(t, e, gid(1), ErrUnconfirmed)
+	refused(t, e, gid(2), nil)
+}
+
+// TestEqualOwnListNarrows: an expiry takes no number, so the connector's
+// own list under the number held may omit grants held. Those go (and
+// are saved gone); the rest are confirmed. A list omitting all of them
+// and saying suspended suspends.
+func TestEqualOwnListNarrows(t *testing.T) {
+	e := newEnv(t)
+	start := e.c.Now()
+	g1 := grant(t, start, spec{id: gid(1), exp: start.Add(10 * time.Minute)})
+	g2 := grant(t, start, spec{id: gid(2)})
+	e.listingN(t, 320, false, g1, g2)
+	mustPresent(t, e, gid(1))
+	mustPresent(t, e, gid(2))
+	e.c.Add(11 * time.Minute) // gid(1) expires; the vault drops it
+	e.f.statusGet = statusAnswer(t, e.c, map[string]json.RawMessage{gid(2): g2})
+	e.listingN(t, 320, false, g2)
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "device.session.granted", Body: json.RawMessage(`{}`)}})
+	mustPresent(t, e, gid(2))
+	refused(t, e, gid(1), ErrNotGranted)
+	if ids := savedIDs(t, e); len(ids) != 1 || ids[0] != gid(2) {
+		t.Errorf("saved %v", ids)
+	}
+	if s := e.heldSeq(); s != 320 {
+		t.Errorf("held number %d", s)
+	}
+
+	// The vault's clock ahead: it omits a grant still current here.
+	e.listingN(t, 320, true)
+	e.m.Relist()
+	e.m.step(ctx)
+	if !e.m.Suspended() {
+		t.Error("not suspended")
+	}
+	if ids := savedIDs(t, e); len(ids) != 0 {
+		t.Errorf("saved %v", ids)
+	}
+	refused(t, e, gid(2), ErrSuspended)
 }
 
 // TestSessionEndedForgetsLists: the answer to a list sent before

@@ -363,9 +363,11 @@ func parseSeq(raw json.RawMessage) uint64 {
 //   - lower: ignored (an answer to this process's own list asks for
 //     another);
 //   - equal: the set already held; only fresher statements are taken; as
-//     the answer to this process's own list it must list exactly the
-//     grants held (else it confirms nothing and the grants are listed
-//     again), confirms them and says whether the agent is suspended;
+//     the answer to this process's own list it must list only grants
+//     held, in their versions (else it confirms nothing and the grants
+//     are listed again); it removes the grants it omits (an expiry takes
+//     no number), confirms the rest and says whether the agent is
+//     suspended;
 //   - higher: it replaces the grants, adding as well as removing;
 //   - while the number held is unknown, only the answer to this
 //     process's own list replaces the grants; anything else only removes
@@ -440,13 +442,15 @@ func (m *Manager) applySet(body json.RawMessage, src source) {
 		return
 	case m.seq != 0 && seq == m.seq:
 		if own {
-			if !sameGrants(m.grants, byID) {
-				// The vault numbers every change, so the answer to this
-				// process's own list under the number held lists the
-				// grants held. One that does not is never trusted to
-				// widen or confirm anything; only a suspension in it is
-				// taken. The grants are listed again (paced as a failed
-				// list, by listOnce or the background loop).
+			if !heldGrants(m.grants, byID) {
+				// The vault numbers every change but an expiry, so the
+				// answer to this process's own list under the number
+				// held lists the grants held, less any expired since.
+				// One listing a grant not held, or in another version, is
+				// never trusted to widen or confirm anything; only a
+				// suspension in it is taken. The grants are listed again
+				// (paced as a failed list, by listOnce or the background
+				// loop).
 				m.log.Warn("grant list differs from the grants held under the same grant_seq; listing again")
 				if *set.Suspended && !m.suspended {
 					m.suspended, m.saved = true, true
@@ -456,6 +460,9 @@ func (m *Manager) applySet(body json.RawMessage, src source) {
 				m.signal()
 				return
 			}
+			// Grants it omits (expired at the vault, or by the vault's
+			// clock) go.
+			m.narrow(byID, false, now)
 			if src == fromOwn {
 				// It says whether the agent is suspended now, including
 				// a suspension saved before a restart that the vault has
@@ -548,14 +555,12 @@ func (m *Manager) statementFrom(g *Grant, w *wireGrant, now time.Time) *statemen
 	return st
 }
 
-// sameGrants reports whether in (by id) holds exactly the grants held,
-// each in the same version.
-func sameGrants(held []*Grant, in map[string]*Grant) bool {
-	if len(held) != len(in) {
-		return false
-	}
-	for _, g := range held {
-		if n := in[g.ID]; n == nil || n.Version != g.Version {
+// heldGrants reports whether every grant in in (by id) is held, in the
+// same version.
+func heldGrants(held []*Grant, in map[string]*Grant) bool {
+	for id, n := range in {
+		i := slices.IndexFunc(held, func(g *Grant) bool { return g.ID == id })
+		if i < 0 || held[i].Version != n.Version {
 			return false
 		}
 	}
