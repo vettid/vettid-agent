@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 
 	"github.com/vettid/vettid-vault/client"
+	"github.com/vettid/vettid-vault/vms/envelope"
 	"github.com/vettid/vettid-vault/vms/invite"
 
 	"github.com/vettid/vettid-agent/internal/pairing"
@@ -1123,5 +1124,165 @@ func TestRequestWithID(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("no response")
+	}
+}
+
+// TestUnmatchedResponseZeroed: a response nobody waits for (its caller
+// gave up, or no request of this connection has its id) may carry a
+// secret value; dispatch zeroes its body instead of leaving it to the
+// garbage collector.
+func TestUnmatchedResponseZeroed(t *testing.T) {
+	e := newPaired(t)
+	var mu sync.Mutex
+	var dropped [][]byte
+	old := dropResponse
+	dropResponse = func(b []byte) {
+		old(b) // zeroed before the test can see it
+		mu.Lock()
+		dropped = append(dropped, b)
+		mu.Unlock()
+	}
+	t.Cleanup(func() { dropResponse = old })
+	o := e.open(nil)
+	stop := o.run()
+	defer stop()
+	id, err := o.conn.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gone := make(chan error, 1)
+	go func() {
+		_, err := o.conn.RequestWithID(ctx, id, "test.req", json.RawMessage(`{}`))
+		gone <- err
+	}()
+	eventually(t, "the request", func() bool { return count(e.v.Received(), "test.req") == 1 })
+	cancel()
+	if err := <-gone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RequestWithID: %v", err)
+	}
+	const value = `{"value":"s3cr3t-Unmatched-42"}`
+	if _, err := e.v.SendResponse(id, "test.req", []byte(value), ""); err != nil {
+		t.Fatal(err)
+	}
+	other, _ := o.conn.NewID()
+	if _, err := e.v.SendResponse(other, "test.req", []byte(value), ""); err != nil {
+		t.Fatal(err)
+	}
+	// The vault.status responses are zeroed through dropResponse too;
+	// the two test responses are the ones of the value's size.
+	ours := func() (n int) {
+		for _, b := range dropped {
+			if len(b) == len(value) {
+				n++
+			}
+		}
+		return n
+	}
+	eventually(t, "both responses dropped", func() bool { mu.Lock(); defer mu.Unlock(); return ours() == 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	for _, b := range dropped {
+		if len(bytes.Trim(b, "\x00")) != 0 {
+			t.Errorf("a dropped body was not zeroed (%d bytes)", len(b))
+		}
+	}
+	if strings.Contains(e.out.String(), "s3cr3t") || strings.Contains(e.log.String(), "s3cr3t") {
+		t.Error("the value reached the output or the log")
+	}
+}
+
+// TestCallGivenUp: the race between a caller giving up and its response
+// arriving. A response that reached the call before the caller gave up
+// is zeroed by giveUp; one that arrives after is refused by deliver, and
+// the dispatcher drops (zeroes) it.
+func TestCallGivenUp(t *testing.T) {
+	value := func() *Response { return &Response{OK: true, Body: json.RawMessage(`{"value":"s3cr3t"}`)} }
+	zero := func(b []byte) bool { return len(b) > 0 && len(bytes.Trim(b, "\x00")) == 0 }
+
+	before := &call{done: make(chan result, 1)}
+	r := value()
+	if !before.deliver(r) {
+		t.Fatal("deliver to a waiting caller refused")
+	}
+	before.giveUp()
+	if !zero(r.Body) {
+		t.Errorf("a response that reached a caller who gave up was not zeroed: %q", r.Body)
+	}
+
+	after := &call{done: make(chan result, 1)}
+	after.giveUp()
+	r = value()
+	if after.deliver(r) {
+		t.Fatal("delivered to a caller who gave up")
+	}
+	if len(after.done) != 0 {
+		t.Error("a response was queued for a caller who gave up")
+	}
+}
+
+// TestRequestGivesUp: a caller whose context ends after its call was
+// taken marks the call gone, so a response arriving afterwards is not
+// queued for it but dropped by the dispatcher.
+func TestRequestGivesUp(t *testing.T) {
+	c := &Conn{calls: make(chan *call), stopped: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() {
+		_, err := c.request(ctx, "", "test.req", json.RawMessage(`{}`))
+		errc <- err
+	}()
+	cl := <-c.calls
+	cancel()
+	if err := <-errc; !errors.Is(err, context.Canceled) {
+		t.Fatalf("request: %v", err)
+	}
+	if cl.deliver(&Response{OK: true, Body: json.RawMessage(`{"value":"s3cr3t"}`)}) {
+		t.Fatal("delivered to a caller who gave up")
+	}
+}
+
+// TestHandResponse: every response is handed over or zeroed. The body
+// checked is the decrypted inner's own, not a copy.
+func TestHandResponse(t *testing.T) {
+	var logs syncBuf
+	c := &Conn{log: slog.New(slog.NewTextHandler(&logs, nil)), pending: map[string]*call{}}
+	zero := func(b []byte) bool { return len(b) > 0 && len(bytes.Trim(b, "\x00")) == 0 }
+	inner := func(re string) *envelope.Inner {
+		return &envelope.Inner{ID: "r-" + re, Type: "test.req", Re: re, Status: envelope.StatusOK, Body: json.RawMessage(`{"value":"s3cr3t"}`)}
+	}
+
+	waiting := &call{done: make(chan result, 1)}
+	c.pending["w"] = waiting
+	in := inner("w")
+	c.handResponse(in)
+	if zero(in.Body) || len(waiting.done) != 1 {
+		t.Error("a response for a waiting caller was not handed over intact")
+	}
+
+	gone := &call{done: make(chan result, 1)}
+	gone.giveUp()
+	c.pending["g"] = gone
+	in = inner("g")
+	c.handResponse(in)
+	if !zero(in.Body) || len(gone.done) != 0 {
+		t.Errorf("a response for a caller who gave up was not zeroed: %q", in.Body)
+	}
+
+	in = inner("unknown")
+	c.handResponse(in)
+	if !zero(in.Body) {
+		t.Errorf("a response nobody asked for was not zeroed: %q", in.Body)
+	}
+
+	c.statusID = "s"
+	in = inner("s")
+	in.Body = json.RawMessage(`{"owner_check":{"state":"held"}}`)
+	c.handResponse(in)
+	if c.ownerCheck != "held" || !zero(in.Body) || c.statusID != "" {
+		t.Errorf("status response: owner check %q, body %q", c.ownerCheck, in.Body)
+	}
+	if strings.Contains(logs.String(), "s3cr3t") {
+		t.Error("the value reached the log")
 	}
 }
