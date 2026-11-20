@@ -160,6 +160,11 @@ type Options struct {
 	// (internal/leash, from leash.grant.updated): then nothing is sent,
 	// and a `forbidden` answer is reported as the suspension.
 	Suspended func() bool
+	// OnForbidden, if set, is called (without locks held) for each
+	// `forbidden` answer, so that internal/leash lists the grants again:
+	// the numbered list tells it of a suspension or revocation. The
+	// answer names no grant, so nothing is marked (AGENT-PLAN §4.5).
+	OnForbidden func()
 
 	Wait       time.Duration // a tool call's wait before it returns pending
 	Attempt    time.Duration // the wait for an answer before a retransmission
@@ -776,6 +781,9 @@ func (c *Client) answer(e *entry, resp *vaultconn.Response) {
 		err = ErrForbidden
 		if c.o.Suspended != nil && c.o.Suspended() {
 			err = ErrSuspended
+		}
+		if c.o.OnForbidden != nil {
+			c.o.OnForbidden()
 		}
 	case "denied":
 		err = ErrDenied

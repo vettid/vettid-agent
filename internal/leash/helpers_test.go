@@ -137,13 +137,38 @@ func status(t *testing.T, delegation []byte, at time.Time) (st, sig []byte) {
 	return st, sig
 }
 
-// set builds a grant set body.
+// seqs numbers the sets set builds: each is a change at the test
+// vault, so it takes the next grant_seq (VAULT-MESSAGING §10.11). It
+// starts well above 1 so that tests can build older sets with setN.
+var (
+	seqMu sync.Mutex
+	seqN  uint64 = 1000
+)
+
+func nextSeq() uint64 {
+	seqMu.Lock()
+	defer seqMu.Unlock()
+	seqN++
+	return seqN
+}
+
+// set builds a grant set body with the next grant_seq.
 func set(t *testing.T, suspended bool, grants ...json.RawMessage) json.RawMessage {
+	t.Helper()
+	return setN(t, nextSeq(), suspended, grants...)
+}
+
+// setN builds a grant set body with this grant_seq (0: none).
+func setN(t *testing.T, seq uint64, suspended bool, grants ...json.RawMessage) json.RawMessage {
 	t.Helper()
 	if grants == nil {
 		grants = []json.RawMessage{}
 	}
-	b, err := json.Marshal(map[string]any{"grants": grants, "suspended": suspended})
+	m := map[string]any{"grants": grants, "suspended": suspended}
+	if seq != 0 {
+		m["grant_seq"] = seq
+	}
+	b, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -299,17 +324,36 @@ func newEnv(t *testing.T) *env {
 	return &env{c: c, f: f, m: m}
 }
 
-// listing makes the vault answer leash.grant.list with these grants.
+// listing makes the vault answer leash.grant.list with these grants, as
+// a new set (the next grant_seq); every answer carries that number.
 func (e *env) listing(t *testing.T, suspended bool, grants ...json.RawMessage) {
-	body := set(t, suspended, grants...)
+	e.listingN(t, nextSeq(), suspended, grants...)
+}
+
+// listingN is listing with this grant_seq (0: none).
+func (e *env) listingN(t *testing.T, seq uint64, suspended bool, grants ...json.RawMessage) {
+	body := setN(t, seq, suspended, grants...)
 	e.f.mu.Lock()
 	e.f.list = func() *vaultconn.Response { return ok(body) }
 	e.f.mu.Unlock()
 }
 
-// update applies a leash.grant.updated (which only narrows).
+// update applies a leash.grant.updated of a new set (the next
+// grant_seq).
 func (e *env) update(t *testing.T, suspended bool, grants ...json.RawMessage) {
-	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.updated", Body: set(t, suspended, grants...)}})
+	e.updateN(t, nextSeq(), suspended, grants...)
+}
+
+// updateN applies a leash.grant.updated with this grant_seq (0: none).
+func (e *env) updateN(t *testing.T, seq uint64, suspended bool, grants ...json.RawMessage) {
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.updated", Body: setN(t, seq, suspended, grants...)}})
+}
+
+// heldSeq is the grant_seq the Manager holds.
+func (e *env) heldSeq() uint64 {
+	e.m.mu.Lock()
+	defer e.m.mu.Unlock()
+	return e.m.seq
 }
 
 // ulidMSBase and ulidN number the test vault's messages: each nextULID
@@ -331,11 +375,18 @@ func nextULID() string {
 	return id
 }
 
-// staleList applies the answer to a list sent before the last thing the
-// connector learned (as if it arrived late).
-func (e *env) staleList(t *testing.T, suspended bool, grants ...json.RawMessage) {
+// staleList applies the answer, with this grant_seq, to a list this
+// process sent before the last mark it learned (not_found, forbidden),
+// as if it arrived late.
+func (e *env) staleList(t *testing.T, seq uint64, suspended bool, grants ...json.RawMessage) {
 	e.m.mu.Lock()
 	e.m.lists["01JB2Z6V9K3M4N5P6Q7R8S9TZZ"] = e.m.gen - 1
 	e.m.mu.Unlock()
-	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.list", Re: "01JB2Z6V9K3M4N5P6Q7R8S9TZZ", OK: true, Body: set(t, suspended, grants...)}})
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.list", Re: "01JB2Z6V9K3M4N5P6Q7R8S9TZZ", OK: true, Body: setN(t, seq, suspended, grants...)}})
+}
+
+// otherList applies the answer, with this grant_seq, to a list this
+// process did not send (internal/access's check).
+func (e *env) otherList(t *testing.T, seq uint64, suspended bool, grants ...json.RawMessage) {
+	e.m.Apply([]vaultconn.Message{{ID: nextULID(), Type: "leash.grant.list", Re: "01JB2Z6V9K3M4N5P6Q7R8S9TYY", OK: true, Body: setN(t, seq, suspended, grants...)}})
 }
