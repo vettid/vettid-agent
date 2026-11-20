@@ -60,12 +60,12 @@ func TestEnvExactSet(t *testing.T) {
 		connector[n] = "min-" + n
 	}
 	spec := Spec{
-		Tmp:     tmp,
-		RunPath: []string{rp},
-		RunEnv:  []string{"OPERATOR_ALLOWED", "OPERATOR_MISSING"},
-		Listed:  []string{"REQ_ONE", "REQ_TWO"},
-		Request: []Var{{"REQ_ONE", "1"}, {"REQ_TWO", "two"}},
-		Secret:  &Var{"THE_SECRET", "s"},
+		Tmp:        tmp,
+		RunPath:    []string{rp},
+		RunEnv:     []string{"OPERATOR_ALLOWED", "OPERATOR_MISSING"},
+		Listed:     []string{"REQ_ONE", "REQ_TWO"},
+		Request:    []Var{{"REQ_ONE", "1"}, {"REQ_TWO", "two"}},
+		SecretName: "THE_SECRET",
 	}
 	env, err := Env(spec, mapLookup(connector))
 	if err != nil {
@@ -74,7 +74,7 @@ func TestEnvExactSet(t *testing.T) {
 	want := map[string]string{
 		"PATH":             SearchPath([]string{rp}),
 		"OPERATOR_ALLOWED": "op-value",
-		"REQ_ONE":          "1", "REQ_TWO": "two", "THE_SECRET": "s",
+		"REQ_ONE":          "1", "REQ_TWO": "two",
 	}
 	for _, n := range wantMinimal() {
 		want[n] = "min-" + n
@@ -97,7 +97,8 @@ func TestEnvExactSet(t *testing.T) {
 	if !strings.HasSuffix(got["PATH"], string(os.PathListSeparator)+rp) {
 		t.Errorf("PATH %q does not end with the run-path directory", got["PATH"])
 	}
-	// Order: minimal, PATH and temp, run-env, request, secret.
+	// Order: minimal, PATH and temp, run-env, request (the secret is
+	// added by Start).
 	idx := func(prefix string) int {
 		for i, e := range env {
 			if strings.HasPrefix(e, prefix+"=") {
@@ -106,7 +107,7 @@ func TestEnvExactSet(t *testing.T) {
 		}
 		return -1
 	}
-	order := []string{wantMinimal()[0], "PATH", wantTemp()[0], "OPERATOR_ALLOWED", "REQ_ONE", "REQ_TWO", "THE_SECRET"}
+	order := []string{wantMinimal()[0], "PATH", wantTemp()[0], "OPERATOR_ALLOWED", "REQ_ONE", "REQ_TWO"}
 	for i := 1; i < len(order); i++ {
 		if idx(order[i-1]) >= idx(order[i]) {
 			t.Errorf("%s should come before %s in %v", order[i-1], order[i], env)
@@ -202,12 +203,12 @@ func TestEnvRefusals(t *testing.T) {
 	}
 	for _, c := range cases {
 		for _, secret := range []bool{false, true} {
-			if secret && c.name == "value too long" {
-				continue // the 4096-byte limit is for the request's env
+			if secret && (strings.HasPrefix(c.name, "value") || c.name == "empty") {
+				continue // the secret's value is Start's to check; "" is no secret
 			}
 			spec := Spec{Tmp: t.TempDir()}
 			if secret {
-				spec.Secret = &c.v
+				spec.SecretName = c.v.Name
 			} else {
 				spec.Request = []Var{c.v}
 			}
@@ -314,20 +315,31 @@ func TestAddedLoaderNames(t *testing.T) {
 	}
 }
 
-func TestEnvLaterReplacesEarlier(t *testing.T) {
-	spec := Spec{
-		Tmp:     t.TempDir(),
-		RunEnv:  []string{"SHARED"},
-		Listed:  []string{"SHARED"},
-		Request: []Var{{"SHARED", "from-request"}},
-		Secret:  &Var{"SHARED", "from-secret"},
+// The request's env can't name a variable whose value is trusted: an
+// operator's --run-env name or the secret's variable; nor can a --run-env
+// name be the secret's. The secret's value is never in Env's result.
+func TestEnvTrustedNamesNotShadowed(t *testing.T) {
+	lookup := mapLookup(map[string]string{"OPERATOR": "from-operator"})
+	for name, spec := range map[string]Spec{
+		"request names --run-env":  {RunEnv: []string{"OPERATOR"}, Listed: []string{"OPERATOR"}, Request: []Var{{"OPERATOR", `x" & whoami & "`}}},
+		"request names the secret": {SecretName: "THE_SECRET", Listed: []string{"THE_SECRET"}, Request: []Var{{"THE_SECRET", "x"}}},
+		"--run-env is the secret":  {SecretName: "OPERATOR", RunEnv: []string{"OPERATOR"}},
+	} {
+		spec.Tmp = t.TempDir()
+		if _, err := Env(spec, lookup); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
-	env, err := Env(spec, mapLookup(map[string]string{"SHARED": "from-operator"}))
+	spec := Spec{Tmp: t.TempDir(), RunEnv: []string{"OPERATOR"}, SecretName: "THE_SECRET"}
+	env, err := Env(spec, lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := envMap(t, env)["SHARED"]; got != "from-secret" {
-		t.Errorf("SHARED = %q", got)
+	if _, ok := envMap(t, env)["THE_SECRET"]; ok {
+		t.Error("the secret's variable is in Env's result")
+	}
+	if got := spec.TrustedNames(); !reflect.DeepEqual(got, []string{"OPERATOR", "THE_SECRET"}) {
+		t.Errorf("TrustedNames = %q", got)
 	}
 }
 

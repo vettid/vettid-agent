@@ -263,33 +263,55 @@ type Spec struct {
 	Listed []string
 	// Request is the request's env, in order.
 	Request []Var
-	// Secret is the secret's variable for how env or file; nil for
-	// stdin.
-	Secret *Var
+	// SecretName is the secret's variable for how env or file; "" for
+	// stdin. Its value is not in what Env returns: Start adds it from
+	// StartSpec.Secret, as bytes it can clear (AGENT-PLAN §4.9).
+	SecretName string
+}
+
+// TrustedNames are the variables of the environment Env builds from spec
+// whose values the agent does not set: the operator's --run-env names
+// and the secret's variable. (StartSpec.Trusted)
+func (spec Spec) TrustedNames() []string {
+	out := append([]string(nil), spec.RunEnv...)
+	if spec.SecretName != "" {
+		out = append(out, spec.SecretName)
+	}
+	return out
 }
 
 // Env builds the process environment as KEY=VALUE strings: the minimal
 // set copied from lookup when present, PATH and the temp variables set
 // by the connector, the --run-env names, the request's env, then the
-// secret's variable. Nothing else is inherited. lookup is os.LookupEnv
-// in the connector. A later entry of the same name replaces an earlier
-// one. The request's env is checked as CheckEnvAllowed checks it, against
-// spec.Listed, so no caller can build a run's environment past the
-// allowlist.
+// secret's variable, which Start adds. Nothing else is inherited. lookup
+// is os.LookupEnv in the connector. The request's env is checked as
+// CheckEnvAllowed checks it, against spec.Listed, so no caller can build a
+// run's environment past the allowlist; and it can't name a --run-env
+// variable or the secret's, whose values are trusted (TrustedNames), nor
+// can a --run-env name be the secret's.
 func Env(spec Spec, lookup func(string) (string, bool)) ([]string, error) {
 	if err := CheckEnvAllowed(spec.Listed, spec.Request); err != nil {
 		return nil, err
 	}
-	if spec.Secret != nil {
-		if err := checkName(spec.Secret.Name); err != nil {
+	if spec.SecretName != "" {
+		if err := checkName(spec.SecretName); err != nil {
 			return nil, err
-		}
-		if strings.IndexByte(spec.Secret.Value, 0) >= 0 {
-			return nil, badRequest("value of %s holds a NUL byte", spec.Secret.Name)
 		}
 	}
 	if err := CheckRunEnv(spec.RunEnv); err != nil {
 		return nil, badRequest("%v", err)
+	}
+	for _, v := range spec.Request {
+		for _, n := range spec.TrustedNames() {
+			if sameName(v.Name, n) {
+				return nil, badRequest("the request's env names %s, which the operator's --run-env or the secret's variable uses", v.Name)
+			}
+		}
+	}
+	for _, n := range spec.RunEnv {
+		if spec.SecretName != "" && sameName(n, spec.SecretName) {
+			return nil, badRequest("the secret's variable %s is also a --run-env name", n)
+		}
 	}
 	if spec.Tmp == "" {
 		return nil, badRequest("no tmp directory")
@@ -328,9 +350,6 @@ func Env(spec Spec, lookup func(string) (string, bool)) ([]string, error) {
 	}
 	for _, v := range spec.Request {
 		set(v.Name, v.Value)
-	}
-	if spec.Secret != nil {
-		set(spec.Secret.Name, spec.Secret.Value)
 	}
 	env := make([]string, len(out))
 	for i, v := range out {

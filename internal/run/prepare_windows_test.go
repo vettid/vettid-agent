@@ -423,7 +423,7 @@ func TestStartRefusesALongCommandLine(t *testing.T) {
 
 // The environment block is sorted by name without case.
 func TestEnvBlockSorted(t *testing.T) {
-	b, err := envBlock([]string{"b=1", "A=2", "c=3", "B_=4"})
+	b, err := envBlock([]string{"b=1", "A=2", "c=3", "B_=4"}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

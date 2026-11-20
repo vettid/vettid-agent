@@ -10,6 +10,8 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -300,12 +302,18 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	if s.Dir == "" || !filepath.IsAbs(s.Dir) {
 		return nil, badRequest("cwd is not an absolute path")
 	}
+	if err := checkSecret(s.Secret); err != nil {
+		return nil, err
+	}
 	appPath, line := p.Path, makeCmdLine(s.Argv)
 	image, imageID := p.plat.f, p.plat.id
 	if p.plat.cmd != nil {
 		// A batch file: cmd.exe runs it, with every part checked first.
 		if err := checkBatch(p.Path, s.Dir, s.Argv[1:], s.Env, s.Trusted); err != nil {
 			return nil, err
+		}
+		if s.Secret != nil && !batchSecretOK(s.Secret.Value) {
+			return nil, &Error{Code: CodeArgumentNotAllowed, Msg: TextSecretNotForBatch}
 		}
 		appPath, line = p.plat.cmd.Name(), batchCmdLine(p.plat.cmd.Name(), p.Path, s.Argv[1:])
 		if n := len(windows.StringToUTF16(line)) - 1; n > maxBatchCmdLine {
@@ -327,10 +335,13 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	if len(cmd) > maxCmdLine {
 		return nil, badRequest("the command line is %d characters once quoted, at most %d", len(cmd)-1, maxCmdLine-1)
 	}
-	env, err := envBlock(setVar(s.Env, noCwdExeName, "1"))
+	env, err := envBlock(setVar(s.Env, noCwdExeName, "1"), s.Secret)
 	if err != nil {
 		return nil, err
 	}
+	// The block holds the secret's value: cleared once the process is
+	// created (or not).
+	defer clear(env)
 	dir, err := windows.UTF16PtrFromString(s.Dir)
 	if err != nil {
 		return nil, badRequest("cwd is invalid")
@@ -563,25 +574,61 @@ func setVar(env []string, name, value string) []string {
 
 // envBlock is a CREATE_UNICODE_ENVIRONMENT block: each NAME=VALUE ended
 // by a NUL, then one more NUL, sorted by name without case as
-// CreateProcess documents.
-func envBlock(env []string) ([]uint16, error) {
-	env = append([]string(nil), env...)
-	sort.SliceStable(env, func(i, j int) bool {
-		a, _, _ := strings.Cut(env[i], "=")
-		b, _, _ := strings.Cut(env[j], "=")
-		return strings.ToUpper(a) < strings.ToUpper(b)
-	})
-	var b []uint16
+// CreateProcess documents. The secret, if any, is added from its bytes
+// (replacing an entry of the same name), never through a Go string; the
+// caller clears the block.
+func envBlock(env []string, secret *Secret) ([]uint16, error) {
+	type entry struct {
+		key    string
+		secret bool
+		kv     string
+	}
+	var es []entry
 	for _, kv := range env {
-		if i := strings.IndexByte(kv, '='); i <= 0 || strings.IndexByte(kv, 0) >= 0 {
+		k, _, ok := strings.Cut(kv, "=")
+		if !ok || k == "" || strings.IndexByte(kv, 0) >= 0 {
 			return nil, badRequest("an environment entry is invalid")
 		}
-		b = append(b, windows.StringToUTF16(kv)...)
+		if secret != nil && strings.EqualFold(k, secret.Name) {
+			continue
+		}
+		es = append(es, entry{key: strings.ToUpper(k), kv: kv})
+	}
+	if secret != nil {
+		es = append(es, entry{key: strings.ToUpper(secret.Name), secret: true})
+	}
+	sort.SliceStable(es, func(i, j int) bool { return es[i].key < es[j].key })
+	var b []uint16
+	for _, e := range es {
+		if !e.secret {
+			b = append(b, windows.StringToUTF16(e.kv)...)
+			continue
+		}
+		// Grown in place where it fits; a copy left by a reallocation is
+		// cleared at once.
+		for _, r := range secret.Name + "=" {
+			b = appendUTF16(b, r)
+		}
+		for rest := secret.Value; len(rest) > 0; {
+			r, n := utf8.DecodeRune(rest)
+			b = appendUTF16(b, r)
+			rest = rest[n:]
+		}
+		b = appendUTF16(b, 0)
 	}
 	if len(b) == 0 {
 		b = append(b, 0)
 	}
-	return append(b, 0), nil
+	return appendUTF16(b, 0), nil
+}
+
+// appendUTF16 appends r to b, clearing b's old array if it had to grow.
+func appendUTF16(b []uint16, r rune) []uint16 {
+	n := utf16.AppendRune(b, r)
+	if len(b) > 0 && &n[0] != &b[0] {
+		clear(b[:cap(b)])
+	}
+	return n
 }
 
 // inheritableStdio returns inheritable duplicates of the standard files

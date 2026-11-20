@@ -44,15 +44,42 @@ type StartSpec struct {
 	// Stdin, Stdout and Stderr are the process's standard files; nil is
 	// the null device. The output limits and redaction are the caller's.
 	Stdin, Stdout, Stderr *os.File
-	// Trusted names the variables in Env the agent does not control: the
-	// secret's variable and the operator's --run-env names. For a Windows
-	// batch file every other variable's value, beyond those the
-	// connector sets itself, is checked as an argument is; a variable not
-	// named here is taken for the agent's.
+	// Secret is the secret's variable for how env, added to Env by Start;
+	// nil for none. Its value stays in bytes: on Windows Start builds the
+	// environment block from them and clears its copy after the create.
+	Secret *Secret
+	// Trusted names the variables in Env the agent does not control:
+	// Spec.TrustedNames (the operator's --run-env names; the secret's
+	// variable is trusted anyway). For a Windows batch file every other
+	// variable's value, beyond those the connector sets itself, is
+	// checked as an argument is; a variable not named here is taken for
+	// the agent's.
 	Trusted []string
 	// Log receives what Start logs (ids and errors, never values); nil
 	// discards it.
 	Log *slog.Logger
+}
+
+// Secret is a secret's environment variable: its name, and its value as
+// bytes the caller clears once Start has returned.
+type Secret struct {
+	Name  string
+	Value []byte
+}
+
+// checkSecret refuses a secret value Start can't pass: one holding a NUL
+// byte (the message names nothing of it).
+func checkSecret(s *Secret) error {
+	if s == nil {
+		return nil
+	}
+	if !ValidName(s.Name) {
+		return badRequest("the secret's variable name is not valid")
+	}
+	if bytes.IndexByte(s.Value, 0) >= 0 {
+		return badRequest("the secret's value holds a NUL byte")
+	}
+	return nil
 }
 
 func logger(s StartSpec) *slog.Logger {

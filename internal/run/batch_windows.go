@@ -64,6 +64,24 @@ const TextArgumentNotAllowed = "This program is a Windows batch file (.cmd or .b
 	"cmd.exe would read them as commands. A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
 	"Pass the value in a file instead."
 
+// TextSecretNotForBatch refuses a secret given to a batch file in an
+// environment variable when cmd.exe would read some of its characters:
+// expanded as %NAME%, it would be syntax, and fragments could show in
+// cmd.exe's errors. It names nothing of the value. (NEW text)
+const TextSecretNotForBatch = "This program is a Windows batch file (.cmd or .bat), and the secret's value can't be given to it in an environment variable: " +
+	"cmd.exe would read some of its characters as commands. Give it to this program as a file (how: file) instead."
+
+// batchSecretOK reports whether a secret value can be given to a batch
+// file in an environment variable: by the argument rule, on its bytes.
+func batchSecretOK(v []byte) bool {
+	for _, c := range v {
+		if c < 0x20 || c >= 0x7f || strings.IndexByte(batchMeta, c) >= 0 {
+			return false
+		}
+	}
+	return len(v) == 0 || v[len(v)-1] != 0x5c // a backslash
+}
+
 // batchMeta are the ASCII characters cmd.exe reads as commands.
 const batchMeta = `%&|<>^()!"`
 
@@ -118,11 +136,14 @@ var cmdDynamicNames = []string{"CD", "DATE", "TIME", "RANDOM", "ERRORLEVEL", "CM
 	"CMDCMDLINE", "HIGHESTNUMANODENUMBER", "__CD__", "__APPDIR__"}
 
 // connectorSet reports whether the connector sets name itself from the
-// system or the operator's configuration (the minimal set, PATH, the temp
-// variables, NoDefaultCurrentDirectoryInExePath): its value is not the
-// agent's.
+// system (SystemRoot, windir, SystemDrive, PATHEXT), its configuration
+// (PATH) or the run (the temp variables, NoDefaultCurrentDirectoryInExePath):
+// its value is not the agent's. The minimal names copied from the
+// connector's own environment (USERPROFILE, APPDATA, ...) are not among
+// them: whoever started the connector set those, so a batch run checks
+// them.
 func connectorSet(name string) bool {
-	for _, set := range [][]string{minimalNames, tempNames, {"PATH", noCwdExeName}} {
+	for _, set := range [][]string{{"SystemRoot", "windir", "SystemDrive", "PATHEXT"}, tempNames, {"PATH", noCwdExeName}} {
 		for _, n := range set {
 			if sameName(n, name) {
 				return true

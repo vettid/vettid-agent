@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 )
 
 var (
@@ -401,4 +402,72 @@ func TestCanCreateSymlinksAgrees(t *testing.T) {
 		t.Fatal("a symbolic link was made, but the check says this user can't make one")
 	}
 	t.Logf("can make symbolic links: %v (made one: %v)", capable, made)
+}
+
+// The minimal names copied from the connector's own environment are
+// checked for a batch run too: whoever started the connector set them.
+func TestBatchCopiedMinimalChecked(t *testing.T) {
+	lookupOnly(t)
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off")
+	p := prepare(t, bat)
+	noStart(t)
+	spec := helperSpec(t, bat, "")
+	spec.Env = setVar(spec.Env, "USERPROFILE", `C:`+backslash+`a&b`)
+	if _, err := p.Start(spec); !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "USERPROFILE") {
+		t.Fatalf("Start: %v", err)
+	}
+}
+
+// The secret reaches the program from its bytes; for a batch file, a
+// value cmd.exe would read is refused with a message naming nothing of it.
+func TestBatchSecret(t *testing.T) {
+	lookupOnly(t)
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off", "echo [%MY_SECRET%]")
+	p := prepare(t, bat)
+	spec := helperSpec(t, bat, "")
+	spec.Secret = &Secret{Name: "MY_SECRET", Value: []byte("plain-value-123")}
+	code, out := runOutput(t, p, spec)
+	if code != 0 || out != "[plain-value-123]"+crlf {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
+
+	p = prepare(t, bat)
+	noStart(t)
+	for _, v := range []string{"a&b", `pa"ss`, "x)", "100%", "end" + backslash, "caf" + string(rune(0xe9))} {
+		spec.Secret = &Secret{Name: "MY_SECRET", Value: []byte(v)}
+		_, err := p.Start(spec)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "how: file") {
+			t.Errorf("%q: %v", v, err)
+		}
+		if err != nil && strings.Contains(err.Error(), v) {
+			t.Errorf("the refusal repeats the value: %v", err)
+		}
+	}
+}
+
+// envBlock adds the secret from its bytes, in name order, replacing an
+// entry of the same name.
+func TestEnvBlockSecret(t *testing.T) {
+	euro := string(rune(0x20ac))
+	b, err := envBlock([]string{"Z=2", "s=old", "A=1"}, &Secret{Name: "S", Value: []byte("v" + euro)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nul := string(rune(0))
+	if got, want := string(utf16.Decode(b)), "A=1"+nul+"S=v"+euro+nul+"Z=2"+nul+nul; got != want {
+		t.Fatalf("block %q, want %q", got, want)
+	}
+}
+
+// For a program, the secret arrives in its environment.
+func TestStartSecretArrives(t *testing.T) {
+	lookupOnly(t)
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	spec := helperSpec(t, exe, "env")
+	spec.Secret = &Secret{Name: "MY_SECRET", Value: []byte("from-bytes")}
+	code, out := runOutput(t, p, spec)
+	if code != 0 || !strings.Contains(out, "MY_SECRET=from-bytes") {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
 }

@@ -44,13 +44,23 @@ func startCmd(exe string, extra []*os.File, s StartSpec) (*Process, error) {
 	if s.Dir == "" || !filepath.IsAbs(s.Dir) {
 		return nil, badRequest("cwd is not an absolute path")
 	}
+	if err := checkSecret(s.Secret); err != nil {
+		return nil, err
+	}
 	if err := cloexecAll(); err != nil {
 		return nil, runFailed("the connector's open files can't be kept from the program: %v", err)
+	}
+	env := append([]string{}, s.Env...)
+	if s.Secret != nil {
+		// os/exec takes the environment as Go strings, which can't be
+		// cleared: this copy of the value stays until it is collected.
+		// (Windows builds its block from the bytes and clears it.)
+		env = append(env, s.Secret.Name+"="+string(s.Secret.Value))
 	}
 	cmd := &exec.Cmd{
 		Path:        exe,
 		Args:        append([]string(nil), s.Argv...),
-		Env:         append([]string{}, s.Env...),
+		Env:         env,
 		Dir:         s.Dir,
 		ExtraFiles:  extra,
 		SysProcAttr: &syscall.SysProcAttr{Setsid: true},
