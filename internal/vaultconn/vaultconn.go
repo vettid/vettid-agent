@@ -396,6 +396,10 @@ func (c *Conn) persist(st []byte, evs []*envelope.Inner) error {
 // deviceRefused is (*client.Device).Refused; tests replace it.
 var deviceRefused = (*client.Device).Refused
 
+// dropResponse zeroes the body of a response nobody waits for; tests
+// wrap it.
+var dropResponse = func(body []byte) { clear(body) }
+
 // Pauses after failures; tests shorten them.
 var (
 	retryBase       = time.Second
@@ -624,7 +628,14 @@ func (c *Conn) dispatch() {
 			if cl, ok := c.pending[in.Re]; ok {
 				delete(c.pending, in.Re)
 				cl.done <- result{resp: resp}
+				continue
 			}
+			// Nobody waits for it (its caller gave up, or it answers an
+			// inner id that a request replaced): it may carry a secret
+			// value, so it is zeroed now rather than left to the garbage
+			// collector.
+			c.log.Info("response dropped: nobody waits for it", "type", in.Type, "re", in.Re, "bytes", len(in.Body))
+			dropResponse(in.Body)
 			continue
 		}
 		c.log.Info("event", "type", in.Type, "id", in.ID)

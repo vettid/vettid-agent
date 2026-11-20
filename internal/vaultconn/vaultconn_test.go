@@ -1125,3 +1125,58 @@ func TestRequestWithID(t *testing.T) {
 		t.Fatal("no response")
 	}
 }
+
+// TestUnmatchedResponseZeroed: a response nobody waits for (its caller
+// gave up, or no request of this connection has its id) may carry a
+// secret value; dispatch zeroes its body instead of leaving it to the
+// garbage collector.
+func TestUnmatchedResponseZeroed(t *testing.T) {
+	e := newPaired(t)
+	var mu sync.Mutex
+	var dropped [][]byte
+	old := dropResponse
+	dropResponse = func(b []byte) {
+		mu.Lock()
+		dropped = append(dropped, b)
+		mu.Unlock()
+		old(b)
+	}
+	t.Cleanup(func() { dropResponse = old })
+	o := e.open(nil)
+	stop := o.run()
+	defer stop()
+	id, err := o.conn.NewID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	gone := make(chan error, 1)
+	go func() {
+		_, err := o.conn.RequestWithID(ctx, id, "test.req", json.RawMessage(`{}`))
+		gone <- err
+	}()
+	eventually(t, "the request", func() bool { return count(e.v.Received(), "test.req") == 1 })
+	cancel()
+	if err := <-gone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("RequestWithID: %v", err)
+	}
+	const value = `{"value":"s3cr3t-Unmatched-42"}`
+	if _, err := e.v.SendResponse(id, "test.req", []byte(value), ""); err != nil {
+		t.Fatal(err)
+	}
+	other, _ := o.conn.NewID()
+	if _, err := e.v.SendResponse(other, "test.req", []byte(value), ""); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "both responses dropped", func() bool { mu.Lock(); defer mu.Unlock(); return len(dropped) == 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	for _, b := range dropped {
+		if len(b) != len(value) || len(bytes.Trim(b, "\x00")) != 0 {
+			t.Errorf("a dropped body was not zeroed (%d bytes)", len(b))
+		}
+	}
+	if strings.Contains(e.out.String(), "s3cr3t") {
+		t.Error("the value reached the output")
+	}
+}
