@@ -64,7 +64,9 @@ is the stack's `vaultctl` (`internal/devstack`). They do not run in CI.
 | `VETTID_DEVSTACK_SRC` | a vettid-vault checkout: when no stack answers, the tests build `cmd/devstack` from it, start it (only with 8 GB of memory available) and stop it at the end |
 | `VETTID_AGENT_BIN` | a connector already built with `-tags devstack` (default: built by the tests) |
 
-One stack at a time and `go test -p 1`. The hold step of A3's exit test
+One stack at a time and `go test -p 1`. A2's exit test waits out the
+real 10-minute quiet period after it ends the session from the app
+("Access sessions and `status`"), so it takes over 10 minutes. The hold step of A3's exit test
 (`owner_check_required`) waits for a real one-hour owner-check deadline,
 because the dev stack has no clock to move for it; it runs only with
 `make devstack-hold-test` (over an hour).
