@@ -47,6 +47,11 @@ type annotations struct {
 type tool struct {
 	def toolDef
 	run func(ctx context.Context, args json.RawMessage) *toolOut
+	// textOnly: every answer of the tool is text only, refusals and
+	// pending answers too, not only those that hold values, so that the
+	// tool has one form of answer (leash.request_secret; chosen, not in
+	// the spec).
+	textOnly bool
 }
 
 // toolOut is a tool's result: body is its structured content (a JSON
@@ -60,6 +65,9 @@ type toolOut struct {
 	requestID string // for the log
 	res       *request.Result
 	secret    bool // body holds item values: zeroed by wipe
+	// textOnly: written as the text content alone, without
+	// structuredContent (AGENT-PLAN §4.9 "Reveal": the values once).
+	textOnly bool
 }
 
 func (o *toolOut) wipe() {
@@ -78,6 +86,9 @@ const (
 	emptySchema   = `{"type":"object","properties":{},"additionalProperties":false}`
 )
 
+// toolSet is the tools in AG13's order, best way first: the catalog,
+// use without seeing, reveal as the last resort, then the status and
+// connection tools (AGENT-PLAN §4.9).
 func (s *Server) toolSet() []*tool {
 	return []*tool{
 		{
@@ -85,33 +96,16 @@ func (s *Server) toolSet() []*tool {
 				Name:  ToolListAvailable,
 				Title: "List the items this agent may use",
 				Description: "Lists the items in the member's VettID vault that this agent may use: each item's item_id, name, category and " +
-					"field labels (field_id, label, kind), never values. The member decides on their phone which items are listed. " +
-					"Use an item_id and field_id from here with leash.execute_action (preferred: the value never leaves the vault) " +
-					"or leash.request_secret. Result: {\"status\":\"ok\",\"items\":[...]}, or {\"status\":\"pending\",\"request_id\"} " +
+					"field labels (field_id, label, kind), never values, and how the member allows this agent to use it: ways (use, and " +
+					"where allowed run, proxy or reveal), the programs it may be run with, and the hosts of its proxy. The member decides " +
+					"on their phone which items are listed and how each may be used. Use the best way an item allows for the task: " +
+					"leash.execute_action first (the value never leaves the vault); leash.request_secret only as the last resort, for an " +
+					"item whose ways include reveal. Result: {\"status\":\"ok\",\"items\":[...]}, or {\"status\":\"pending\",\"request_id\"} " +
 					"if the vault has not answered within about 20 seconds (then use leash.check_status).",
 				InputSchema: json.RawMessage(emptySchema),
 				Annotations: annotations{Title: "List the items this agent may use", ReadOnlyHint: true},
 			},
 			run: s.listAvailable,
-		},
-		{
-			def: toolDef{
-				Name:  ToolRequestSecret,
-				Title: "Read an item's values",
-				Description: "Reads an item's values from the member's VettID vault: all its fields, or only those named in fields. " +
-					"The values come from the member's vault and are the member's secrets: use them only for the task at hand and " +
-					"do not repeat them in your answers. Prefer leash.execute_action wherever an HMAC of a value suffices. " +
-					"The vault may ask the member on their phone first; then the result is {\"status\":\"pending\",\"request_id\"} " +
-					"and leash.check_status gives the outcome later (the member has up to 5 minutes to answer). " +
-					"Result: {\"status\":\"ok\",\"item\":{\"item_id\",\"name\",\"category\",\"fields\":[{\"field_id\",\"label\",\"kind\",\"value\"}],\"notes\"}}.",
-				InputSchema: json.RawMessage(`{"type":"object","properties":{` +
-					`"item_id":` + ulidSchema + `,` +
-					`"fields":{"type":"array","items":` + fieldIDSchema + `,"minItems":1,"maxItems":64,"uniqueItems":true,` +
-					`"description":"Only these fields (field ids from leash.list_available); all fields if absent."}` +
-					`},"required":["item_id"],"additionalProperties":false}`),
-				Annotations: annotations{Title: "Read an item's values"},
-			},
-			run: s.requestSecret,
 		},
 		{
 			def: toolDef{
@@ -131,6 +125,28 @@ func (s *Server) toolSet() []*tool {
 				Annotations: annotations{Title: "Use a field without revealing it", ReadOnlyHint: true},
 			},
 			run: s.executeAction,
+		},
+		{
+			def: toolDef{
+				Name:  ToolRequestSecret,
+				Title: "Show an item's values (last resort)",
+				Description: "Shows you an item's values from the member's VettID vault, as text: all its fields, or only those named in " +
+					"fields. The last resort: only for an item whose ways (leash.list_available) include reveal, and the member is " +
+					"asked on their phone every time. The values may stay in your app's chat history or logs after the task, so use " +
+					"leash.execute_action instead whenever it does the job. The values are the member's secrets: use them only for the " +
+					"task at hand and do not repeat them in your answers. While the member is asked, the result is " +
+					"{\"status\":\"pending\",\"request_id\"} and leash.check_status gives the outcome later (the member has up to 5 " +
+					"minutes to answer). Result: {\"status\":\"ok\",\"item\":{\"item_id\",\"name\",\"category\",\"fields\":[{\"field_id\",\"label\",\"kind\",\"value\"}],\"notes\"}}. " +
+					"An item that does not allow reveal is refused with the code way_not_allowed and the ways it allows.",
+				InputSchema: json.RawMessage(`{"type":"object","properties":{` +
+					`"item_id":` + ulidSchema + `,` +
+					`"fields":{"type":"array","items":` + fieldIDSchema + `,"minItems":1,"maxItems":64,"uniqueItems":true,` +
+					`"description":"Only these fields (field ids from leash.list_available); all fields if absent."}` +
+					`},"required":["item_id"],"additionalProperties":false}`),
+				Annotations: annotations{Title: "Show an item's values (last resort)"},
+			},
+			run:      s.requestSecret,
+			textOnly: true,
 		},
 		{
 			def: toolDef{
@@ -257,6 +273,9 @@ type errorBody struct {
 	Message    string `json:"message"`
 	RequestID  string `json:"request_id,omitempty"`
 	RetryAfter string `json:"retry_after,omitempty"`
+	// Ways is way_not_allowed's: the ways the item allows (AGENT-PLAN
+	// §4.9), so that the agent can choose again.
+	Ways []string `json:"ways,omitempty"`
 }
 
 // errorOut is the tool error for err (AGENT-PLAN §4.1: a stable code,
@@ -271,6 +290,12 @@ func errorOut(err error, now time.Time) *toolOut {
 	switch {
 	case errors.As(err, &re):
 		b.Code, b.Message, b.RequestID, until = re.Code, re.Text, re.RequestID, re.Until
+		if re.Code == "way_not_allowed" {
+			b.Ways = re.Ways
+			if b.Ways == nil {
+				b.Ways = []string{}
+			}
+		}
 	case errors.As(err, &ae):
 		b.Code, b.Message, until = ae.Code, ae.Text, ae.Until
 	case errors.As(err, &le):
@@ -330,7 +355,7 @@ func resultOut(r *request.Result) *toolOut {
 			Items  []request.CatalogItem `json:"items"`
 		}{"ok", items})
 	case r.Op == request.OpGet && r.Item != nil:
-		out.body, out.secret = itemJSON(r.Item), true
+		out.body, out.secret, out.textOnly = itemJSON(r.Item), true, true
 	case r.Op == request.OpUse && r.Use != nil:
 		out.body, out.secret = useJSON(r.Use), true
 	default:

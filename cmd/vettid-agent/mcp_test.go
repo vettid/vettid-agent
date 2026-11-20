@@ -196,6 +196,11 @@ func callTool(t *testing.T, cs *sdk.ClientSession, name string, args map[string]
 	}
 	var sc map[string]any
 	b, _ := json.Marshal(res.StructuredContent)
+	if res.StructuredContent == nil && len(res.Content) == 1 {
+		if tc, ok := res.Content[0].(*sdk.TextContent); ok {
+			b = []byte(tc.Text) // a text-only result
+		}
+	}
 	if err := json.Unmarshal(b, &sc); err != nil {
 		t.Fatalf("%s: %v", name, err)
 	}
@@ -258,7 +263,7 @@ func TestMCPTools(t *testing.T) {
 	for _, tl := range lt.Tools {
 		names = append(names, tl.Name)
 	}
-	if strings.Join(names, " ") != "leash.list_available leash.request_secret leash.execute_action leash.check_status leash.connection_info" {
+	if strings.Join(names, " ") != "leash.list_available leash.execute_action leash.request_secret leash.check_status leash.connection_info" {
 		t.Fatalf("tools: %v", names)
 	}
 

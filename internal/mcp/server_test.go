@@ -420,3 +420,118 @@ func TestLongID(t *testing.T) {
 		t.Errorf("long id: %v", m)
 	}
 }
+
+// TestRevealTextOnly (AGENT-PLAN §4.9 "Reveal", A3.7): leash.request_secret's
+// answer, and leash.check_status's for an item.get, is one text block
+// without structuredContent, so that the value appears once in the
+// serialized answer; leash.request_secret's other answers are text only
+// too; the other tools keep both forms. No tool declares an output
+// schema, and leash.request_secret has no readOnlyHint.
+func TestRevealTextOnly(t *testing.T) {
+	answer := func(t *testing.T, raw []byte) map[string]any {
+		t.Helper()
+		var m struct {
+			Result map[string]any `json:"result"`
+		}
+		if err := json.Unmarshal(raw, &m); err != nil || m.Result == nil {
+			t.Fatalf("not a result: %s", raw)
+		}
+		return m.Result
+	}
+	textOnly := func(t *testing.T, what string, raw []byte, secrets int) {
+		t.Helper()
+		r := answer(t, raw)
+		if _, has := r["structuredContent"]; has {
+			t.Errorf("%s: structuredContent", what)
+		}
+		if c, _ := r["content"].([]any); len(c) != 1 {
+			t.Errorf("%s: %d content blocks", what, len(c))
+		}
+		if n := bytes.Count(raw, []byte(testSecret)); n != secrets {
+			t.Errorf("%s: the value %d times", what, n)
+		}
+	}
+	call := func(f *fakeRequests, o func(*Options), name, args string) []byte {
+		s := newSession(t, f, o)
+		s.init()
+		s.send(`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"` + name + `","arguments":` + args + `}}`)
+		return s.recvRaw()
+	}
+	item := `{"item_id":"` + testItem + `"}`
+	textOnly(t, "request_secret", call(&fakeRequests{}, nil, ToolRequestSecret, item), 1)
+	textOnly(t, "check_status item.get", call(&fakeRequests{status: func(string) (*request.Outcome, error) {
+		return &request.Outcome{Result: fakeItem()}, nil
+	}}, nil, ToolCheckStatus, `{"request_id":"`+testRequest+`"}`), 1)
+	textOnly(t, "request_secret pending", call(&fakeRequests{get: func(string, []string) (*request.Outcome, error) {
+		return &request.Outcome{Pending: true, RequestID: testRequest, Waiting: true, Text: request.TextWaiting}, nil
+	}}, nil, ToolRequestSecret, item), 0)
+	textOnly(t, "request_secret refused", call(&fakeRequests{get: func(string, []string) (*request.Outcome, error) {
+		return nil, request.ErrForbidden
+	}}, nil, ToolRequestSecret, item), 0)
+	textOnly(t, "request_secret bad arguments", call(&fakeRequests{}, nil, ToolRequestSecret, `{}`), 0)
+
+	for _, c := range []struct{ name, args string }{
+		{ToolListAvailable, `{}`},
+		{ToolExecuteAction, `{"item_id":"` + testItem + `","field_id":"password","data":"x"}`},
+		{ToolConnectionInfo, `{}`},
+	} {
+		if _, has := answer(t, call(&fakeRequests{}, nil, c.name, c.args))["structuredContent"]; !has {
+			t.Errorf("%s: no structuredContent", c.name)
+		}
+	}
+	// A check_status result that is not an item's values keeps both forms.
+	if _, has := answer(t, call(&fakeRequests{status: func(string) (*request.Outcome, error) {
+		return &request.Outcome{Pending: true, RequestID: testRequest, Text: request.TextInFlight}, nil
+	}}, nil, ToolCheckStatus, `{"request_id":"`+testRequest+`"}`))["structuredContent"]; !has {
+		t.Error("check_status pending: no structuredContent")
+	}
+
+	s := newSession(t, &fakeRequests{}, nil)
+	s.init()
+	s.send(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
+	var tl struct {
+		Result struct {
+			Tools []map[string]any `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(s.recvRaw(), &tl); err != nil {
+		t.Fatal(err)
+	}
+	for _, tool := range tl.Result.Tools {
+		if _, has := tool["outputSchema"]; has {
+			t.Errorf("%v: outputSchema", tool["name"])
+		}
+		if tool["name"] == ToolRequestSecret {
+			if a, _ := tool["annotations"].(map[string]any); a["readOnlyHint"] != nil {
+				t.Errorf("request_secret: readOnlyHint %v", a["readOnlyHint"])
+			}
+		}
+	}
+}
+
+// TestRevealTooManyInFlight: leash.request_secret's refusal for a call
+// beyond MaxInFlight is text only too.
+func TestRevealTooManyInFlight(t *testing.T) {
+	f := &fakeRequests{block: make(chan struct{})}
+	s := newSession(t, f, func(o *Options) { o.Burst, o.Rate = 1000, 1000 })
+	s.init()
+	for i := 0; i < MaxInFlight; i++ {
+		s.send(`{"jsonrpc":"2.0","id":` + itoa(100+i) + `,"method":"tools/call","params":{"name":"leash.request_secret","arguments":{"item_id":"` + testItem + `"}}}`)
+	}
+	for deadline := time.Now().Add(5 * time.Second); len(f.seen()) < MaxInFlight; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d calls in flight", len(f.seen()))
+		}
+	}
+	s.send(`{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"leash.request_secret","arguments":{"item_id":"` + testItem + `"}}}`)
+	raw := s.recvRaw()
+	if !bytes.Contains(raw, []byte(`rate_limited_local`)) || bytes.Contains(raw, []byte(`structuredContent`)) {
+		t.Errorf("answer: %s", raw)
+	}
+	// The blocked calls answer once released; their answers are read so
+	// that the session can end.
+	close(f.block)
+	for i := 0; i < MaxInFlight; i++ {
+		s.recvRaw()
+	}
+}

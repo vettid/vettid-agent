@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,6 +65,17 @@ func TestGolden(t *testing.T) {
 			f.get = func(string, []string) (*request.Outcome, error) { return nil, request.ErrOwnerCheck }
 		}},
 		{name: "request_secret_bad_arguments", line: callLine(ToolRequestSecret, `{"item":"x"}`)},
+		{name: "request_secret_way_not_allowed", line: callLine(ToolRequestSecret, `{"item_id":"`+testItem+`"}`), setup: func(f *fakeRequests) {
+			f.get = func(string, []string) (*request.Outcome, error) {
+				return nil, &request.Error{Code: "way_not_allowed", Text: fmt.Sprintf(request.TextWayNotAllowed, "use, run"), Ways: []string{"use", "run"}}
+			}
+		}},
+		{name: "request_secret_rate_limited", line: callLine(ToolRequestSecret, `{"item_id":"`+testItem+`"}`), options: func(o *Options) { o.Burst = 1 }},
+		{name: "execute_action_way_not_allowed", line: callLine(ToolExecuteAction, `{"item_id":"`+testItem+`","field_id":"password","data":"hello"}`), setup: func(f *fakeRequests) {
+			f.use = func(string, string, []byte) (*request.Outcome, error) {
+				return nil, &request.Error{Code: "way_not_allowed", Text: fmt.Sprintf(request.TextWayNotAllowed, "none"), Ways: []string{}}
+			}
+		}},
 		{name: "execute_action", line: callLine(ToolExecuteAction, `{"item_id":"`+testItem+`","field_id":"password","data":"hello"}`)},
 		{name: "execute_action_bad_base64", line: callLine(ToolExecuteAction, `{"item_id":"`+testItem+`","field_id":"password","data":"%%%","data_encoding":"base64"}`)},
 		{name: "check_status_result", line: callLine(ToolCheckStatus, `{"request_id":"`+testRequest+`"}`), setup: func(f *fakeRequests) {
@@ -106,7 +118,7 @@ func TestGolden(t *testing.T) {
 			if !tc.noInit {
 				s.init()
 			}
-			if tc.name == "rate_limited" {
+			if tc.name == "rate_limited" || tc.name == "request_secret_rate_limited" {
 				s.toolCall(6, ToolConnectionInfo, `{}`) // takes the one token
 			}
 			s.send(tc.line)
