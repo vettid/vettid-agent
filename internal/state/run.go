@@ -89,11 +89,11 @@ func (s *Store) PrepareRun(id string) (RunDirs, error) {
 	}
 	for _, dir := range []string{d.Root, d.Tmp, d.Work, d.Secret} {
 		if err := mkdirOwnerOnly(dir); err != nil {
-			s.removeRunDir(d.Root)
+			s.removeRunDir(d.Root, nil)
 			return RunDirs{}, fmt.Errorf("state: create run directory: %w", err)
 		}
 		if err := checkDir(dir); err != nil {
-			s.removeRunDir(d.Root)
+			s.removeRunDir(d.Root, nil)
 			return RunDirs{}, err
 		}
 	}
@@ -114,9 +114,18 @@ func (s *Store) WriteRunSecret(d RunDirs, value []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("state: create secret file: %w", err)
 	}
+	key, kerr := fileKeyOf(f)
 	_, werr := f.Write(value)
 	if werr == nil {
 		werr = f.Sync()
+	}
+	if werr == nil && kerr == nil {
+		s.secretsMu.Lock()
+		if s.runSecrets == nil {
+			s.runSecrets = map[string][]fileKey{}
+		}
+		s.runSecrets[d.ID] = append(s.runSecrets[d.ID], key)
+		s.secretsMu.Unlock()
 	}
 	cerr := f.Close()
 	if werr == nil {
@@ -137,7 +146,11 @@ func (s *Store) RemoveRun(id string) error {
 	if !validRunID(id) {
 		return ErrBadRunID
 	}
-	return s.removeRunDir(filepath.Join(s.runRoot(), id))
+	s.secretsMu.Lock()
+	known := s.runSecrets[id]
+	delete(s.runSecrets, id)
+	s.secretsMu.Unlock()
+	return s.removeRunDir(filepath.Join(s.runRoot(), id), known)
 }
 
 // ClearRuns removes everything under run/ (overwriting secret files
@@ -164,7 +177,11 @@ func (s *Store) ClearRuns() error {
 	}
 	var errs []error
 	for _, e := range es {
-		if err := s.removeRunDir(filepath.Join(root, e.Name())); err != nil {
+		s.secretsMu.Lock()
+		known := s.runSecrets[e.Name()]
+		delete(s.runSecrets, e.Name())
+		s.secretsMu.Unlock()
+		if err := s.removeRunDir(filepath.Join(root, e.Name()), known); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -173,7 +190,7 @@ func (s *Store) ClearRuns() error {
 
 // removeRunDir overwrites the secret files (s-*) in dir/secret, then removes dir.
 // Links are removed themselves, never followed.
-func (s *Store) removeRunDir(dir string) error {
+func (s *Store) removeRunDir(dir string, known []fileKey) error {
 	fi, err := os.Lstat(dir)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -195,7 +212,7 @@ func (s *Store) removeRunDir(dir string) error {
 				if !strings.HasPrefix(e.Name(), "s-") {
 					continue
 				}
-				if err := overwriteSecretAndRemove(filepath.Join(sec, e.Name())); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if err := overwriteSecretAndRemove(filepath.Join(sec, e.Name()), known); err != nil && !errors.Is(err, os.ErrNotExist) {
 					errs = append(errs, err)
 				}
 			}
@@ -229,12 +246,14 @@ func reservedName(id string) bool {
 // before its name is removed.
 var removeSecret = os.Remove
 
-// overwriteSecretAndRemove is overwriteAndRemove for a run's secret file:
-// the zeros are written only when the file has this one name. A file with
-// another name (a hard link made to it, or a link in secret/ to some other
-// file) is removed, not overwritten, so no other file is zeroed through
-// it. A link or other non-file is removed itself.
-func overwriteSecretAndRemove(path string) error {
+// overwriteSecretAndRemove is overwriteAndRemove for a run's secret file.
+// A file WriteRunSecret made (its identity among known) is overwritten
+// whatever its link count: a hard link made to it later would otherwise
+// keep the secret. Any other file is overwritten only when it has this one
+// name: a link in secret/ to some other file is removed, not zeroed, so
+// no other file is zeroed through it. (After a restart nothing is known,
+// and the one-name rule holds.) A link or other non-file is removed itself.
+func overwriteSecretAndRemove(path string, known []fileKey) error {
 	f, err := openForOverwrite(path)
 	if errors.Is(err, errNotRegular) {
 		return removeSecret(path)
@@ -242,7 +261,13 @@ func overwriteSecretAndRemove(path string) error {
 	if err != nil {
 		return err
 	}
-	if n, err := linkCount(f); err != nil || n != 1 {
+	ours := false
+	if key, err := fileKeyOf(f); err == nil {
+		for _, k := range known {
+			ours = ours || k == key
+		}
+	}
+	if n, err := linkCount(f); !ours && (err != nil || n != 1) {
 		f.Close()
 		return removeSecret(path)
 	}

@@ -81,6 +81,13 @@ func Prepare(path, _ string) (*Program, error) {
 		return nil, err
 	}
 	if isBatch(path) {
+		// Renaming a folder above a held file was tried on NTFS only:
+		// ReFS isn't trusted for batch files, which cmd.exe reopens by
+		// path. (chosen; not in the spec)
+		if fs, err := volumeFileSystem(h); err != nil || !strings.EqualFold(fs, "NTFS") {
+			prog.Close()
+			return nil, notFound("%s is not on an NTFS volume; a batch file is run only from NTFS", path)
+		}
 		if err := batchMayRun(path); err != nil {
 			prog.Close()
 			return nil, err
@@ -601,35 +608,52 @@ func envBlock(env []string, secret *Secret) ([]uint16, error) {
 		es = append(es, entry{key: strings.ToUpper(secret.Name), secret: true})
 	}
 	sort.SliceStable(es, func(i, j int) bool { return es[i].key < es[j].key })
-	var b []uint16
+	// The block's size is known before anything is written, so it is
+	// allocated once: no reallocation leaves a copy of the secret behind.
+	size := 1 // the block's ending NUL
+	if len(es) == 0 {
+		size = 2 // an empty block is two NULs
+	}
+	for _, e := range es {
+		if e.secret {
+			size += utf16Len([]byte(secret.Name+"=")) + utf16Len(secret.Value) + 1
+		} else {
+			size += len(windows.StringToUTF16(e.kv))
+		}
+	}
+	b := make([]uint16, 0, size)
 	for _, e := range es {
 		if !e.secret {
 			b = append(b, windows.StringToUTF16(e.kv)...)
 			continue
 		}
-		// Grown in place where it fits; a copy left by a reallocation is
-		// cleared at once.
 		for _, r := range secret.Name + "=" {
-			b = appendUTF16(b, r)
+			b = utf16.AppendRune(b, r)
 		}
 		for rest := secret.Value; len(rest) > 0; {
 			r, n := utf8.DecodeRune(rest)
-			b = appendUTF16(b, r)
+			b = utf16.AppendRune(b, r)
 			rest = rest[n:]
 		}
-		b = appendUTF16(b, 0)
+		b = append(b, 0)
 	}
 	if len(b) == 0 {
 		b = append(b, 0)
 	}
-	return appendUTF16(b, 0), nil
+	return append(b, 0), nil
 }
 
-// appendUTF16 appends r to b, clearing b's old array if it had to grow.
-func appendUTF16(b []uint16, r rune) []uint16 {
-	n := utf16.AppendRune(b, r)
-	if len(b) > 0 && &n[0] != &b[0] {
-		clear(b[:cap(b)])
+// utf16Len is the number of UTF-16 units of the UTF-8 text b.
+func utf16Len(b []byte) int {
+	n := 0
+	for len(b) > 0 {
+		r, size := utf8.DecodeRune(b)
+		if utf16.RuneLen(r) == 2 {
+			n += 2
+		} else {
+			n++
+		}
+		b = b[size:]
 	}
 	return n
 }

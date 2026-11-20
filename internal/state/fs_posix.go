@@ -229,3 +229,19 @@ func linkCount(f *os.File) (uint64, error) {
 	}
 	return uint64(st.Nlink), nil
 }
+
+// fileKey names a file on this system: its device and inode.
+type fileKey struct{ dev, ino uint64 }
+
+// fileKeyOf is f's identity.
+func fileKeyOf(f *os.File) (fileKey, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return fileKey{}, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileKey{}, errors.New("state: no file identity")
+	}
+	return fileKey{uint64(st.Dev), uint64(st.Ino)}, nil
+}

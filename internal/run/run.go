@@ -113,6 +113,12 @@ func checkName(name string) error {
 	if err := checkBaseName(name); err != nil {
 		return err
 	}
+	// A request's or the secret's name: every system's minimal names too.
+	for _, f := range allMinimalNames {
+		if strings.EqualFold(f, name) {
+			return badRequest("variable name %q is not allowed", name)
+		}
+	}
 	for _, p := range loaderPrefixes {
 		if strings.HasPrefix(name, p) {
 			return badRequest("variable name %q is not allowed", name)
@@ -127,8 +133,8 @@ func checkName(name string) error {
 }
 
 // checkBaseName is the name rule of AGENT-PLAN §4.9 alone: it matches
-// ^[A-Z_][A-Z0-9_]{0,63}$, is not in any system's minimal set
-// (allMinimalNames), PATH, TMPDIR, TEMP or TMP, and does not start with LD_ or DYLD_. The operator's --run-env
+// ^[A-Z_][A-Z0-9_]{0,63}$, is not in this system's minimal set, PATH,
+// TMPDIR, TEMP or TMP, and does not start with LD_ or DYLD_. The operator's --run-env
 // names get this rule only, not the longer lists (owner decision,
 // 2026-11-05).
 func checkBaseName(name string) error {
@@ -199,17 +205,20 @@ var loaderNames = []string{
 	"__COMPAT_LAYER", "PROGRAMFILES", "COMMONPROGRAMFILES", "PROGRAMDATA",
 }
 
-// allMinimalNames are the minimal sets of every system, so that a name is
-// refused the same way whichever system the connector runs on, as the
-// vault refuses it (VAULT-MESSAGING §10.11).
+// allMinimalNames are the minimal sets of every system: a request's or the
+// secret's variable is refused the same way whichever system the
+// connector runs on, as the vault refuses it (VAULT-MESSAGING §10.11).
 var allMinimalNames = []string{
 	"HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
 	"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT",
 	"USERPROFILE", "USERNAME", "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
 }
 
+// forbiddenNames are this system's minimal set and the variables the
+// connector sets: refused for every name, the operator's --run-env
+// names included (AGENT-PLAN §4.9).
 func forbiddenNames() []string {
-	out := append([]string{}, allMinimalNames...)
+	out := append([]string{}, minimalNames...)
 	return append(out, "PATH", "TMPDIR", "TEMP", "TMP")
 }
 

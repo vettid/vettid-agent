@@ -482,8 +482,9 @@ func TestUnchangeableLevels(t *testing.T) {
 	}
 }
 
-// The name rule refuses every system's minimal names, on every system,
-// as the vault does.
+// A request's or the secret's name is refused for every system's minimal
+// names, on every system, as the vault does; an operator's --run-env name
+// only for this system's (AGENT-PLAN §4.9).
 func TestNameRuleAllSystems(t *testing.T) {
 	for _, n := range []string{"HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
 		"SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "PATHEXT",
@@ -492,8 +493,12 @@ func TestNameRuleAllSystems(t *testing.T) {
 		if ValidName(n) {
 			t.Errorf("%s is allowed", n)
 		}
-		if err := CheckRunEnv([]string{n}); err == nil {
-			t.Errorf("--run-env %s is allowed", n)
+		thisSystem := contains([]string{"PATH", "TMPDIR", "TEMP", "TMP"}, n)
+		for _, m := range minimalNames {
+			thisSystem = thisSystem || strings.EqualFold(m, n)
+		}
+		if err := CheckRunEnv([]string{n}); (err == nil) == thisSystem {
+			t.Errorf("--run-env %s: %v (this system's: %v)", n, err, thisSystem)
 		}
 	}
 	for _, n := range minimalNames {

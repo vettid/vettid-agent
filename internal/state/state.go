@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -152,6 +153,11 @@ type Store struct {
 	wrapped   []byte
 	dataKey   []byte
 	createdAt int64
+
+	// The run secret files WriteRunSecret made, by run id: zeroed by
+	// RemoveRun whatever their link count (run.go).
+	secretsMu  sync.Mutex
+	runSecrets map[string][]fileKey
 }
 
 // Open opens the state directory dir, creating it (and missing parents)

@@ -232,3 +232,26 @@ func skipIfElevated(t *testing.T) {
 		t.Skip("running as an administrator: every folder can be changed")
 	}
 }
+
+// Write-attributes or write-EA on the program or its own folder counts as
+// changing it: with the first a link can be set on the file.
+func TestChangesCountsWriteAttributes(t *testing.T) {
+	tok := windows.GetCurrentProcessToken()
+	u, err := tok.GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := u.User.Sid.String()
+	for _, c := range []struct {
+		mask string
+		want bool
+	}{{"0x100", true}, {"0x10", true}, {"0x1", false}} {
+		sd, err := windows.SecurityDescriptorFromString("O:SYG:SYD:(A;;" + c.mask + ";;;" + sid + ")")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := changes(sd, false); err != nil || got != c.want {
+			t.Errorf("mask %s: changes %v, %v; want %v", c.mask, got, err, c.want)
+		}
+	}
+}

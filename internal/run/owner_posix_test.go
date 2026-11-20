@@ -84,3 +84,17 @@ func TestCheckRunPathsChecksTheResolvedPath(t *testing.T) {
 		t.Fatalf("CheckRunPaths: %v", err)
 	}
 }
+
+// A secret holding a NUL, or that is not valid UTF-8, is refused before
+// anything starts.
+func TestStartRefusesABadSecretPOSIX(t *testing.T) {
+	for _, v := range [][]byte{{'a', 0, 'b'}, {'a', 0xff, 'b'}} {
+		err := checkSecret(&Secret{Name: "MY_SECRET", Value: v})
+		if !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+	if err := checkSecret(&Secret{Name: "MY_SECRET", Value: []byte("fine")}); err != nil {
+		t.Errorf("a plain value: %v", err)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"unicode/utf8"
 )
 
 // Program is a resolved program held so that exactly the bytes hashed are
@@ -67,8 +68,9 @@ type Secret struct {
 	Value []byte
 }
 
-// checkSecret refuses a secret value Start can't pass: one holding a NUL
-// byte (the message names nothing of it).
+// checkSecret refuses a secret value Start can't pass unchanged: one
+// holding a NUL byte, or that is not valid UTF-8 (the message names
+// nothing of it).
 func checkSecret(s *Secret) error {
 	if s == nil {
 		return nil
@@ -78,6 +80,10 @@ func checkSecret(s *Secret) error {
 	}
 	if bytes.IndexByte(s.Value, 0) >= 0 {
 		return badRequest("the secret's value holds a NUL byte")
+	}
+	// Not delivered changed (invalid bytes would become U+FFFD).
+	if !utf8.Valid(s.Value) {
+		return badRequest("the secret's value is not valid UTF-8")
 	}
 	return nil
 }

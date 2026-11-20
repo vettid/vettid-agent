@@ -190,3 +190,28 @@ func TestClearRunsAfterSimulatedCrash(t *testing.T) {
 		t.Errorf("PrepareRun after ClearRuns: %v", err)
 	}
 }
+
+// A hard link made to the secret file WriteRunSecret wrote doesn't keep
+// the secret: that file is zeroed whatever its link count.
+func TestRemoveRunZeroesItsSecretWithALink(t *testing.T) {
+	s := openTest(t)
+	d, _ := s.PrepareRun("r5")
+	path, err := s.WriteRunSecret(d, []byte("topsecretvalue"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "kept")
+	if err := os.Link(path, link); err != nil {
+		t.Skipf("hard links not available: %v", err)
+	}
+	if err := s.RemoveRun("r5"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(got, []byte("topsecret")) {
+		t.Error("the secret survived through a hard link")
+	}
+}

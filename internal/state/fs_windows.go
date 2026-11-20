@@ -512,3 +512,19 @@ func linkCount(f *os.File) (uint64, error) {
 	}
 	return uint64(bi.NumberOfLinks), nil
 }
+
+// fileKey names a file on this system: its volume serial number and file
+// index.
+type fileKey struct {
+	serial uint32
+	index  uint64
+}
+
+// fileKeyOf is f's identity.
+func fileKeyOf(f *os.File) (fileKey, error) {
+	var bi windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bi); err != nil {
+		return fileKey{}, err
+	}
+	return fileKey{bi.VolumeSerialNumber, uint64(bi.FileIndexHigh)<<32 | uint64(bi.FileIndexLow)}, nil
+}

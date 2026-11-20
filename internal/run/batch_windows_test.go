@@ -508,3 +508,70 @@ func TestStartRefusesDeviceAndRootCwd(t *testing.T) {
 		t.Errorf("root cwd: %v", err)
 	}
 }
+
+// A program planted beside a batch file under its name plus a PATHEXT
+// extension (foo.cmd.EXE, foo.cmd.COM) is not what cmd.exe runs: the
+// batch file itself runs, and the planted programs never start.
+func TestBatchPlantedExtensionsNotRun(t *testing.T) {
+	lookupOnly(t)
+	dir := t.TempDir()
+	bat := writeBatch(t, dir, "foo.cmd", "@echo off", "echo [the batch ran]")
+	marker := filepath.Join(t.TempDir(), "marker")
+	for _, planted := range []string{"foo.cmd.EXE", "foo.cmd.COM"} {
+		exe := helperCopy(t, dir, "planted")
+		if err := os.Rename(exe, filepath.Join(dir, planted)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := prepare(t, bat)
+	spec := helperSpec(t, bat, "marker", Var{"VETTID_RUN_TEST_MARKER", marker})
+	code, out := runOutput(t, p, spec)
+	if code != 0 || out != "[the batch ran]"+crlf {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("a planted program ran")
+	}
+	// The control: run directly, a planted program does leave the marker.
+	c := exec.Command(filepath.Join(dir, "foo.cmd.EXE"))
+	c.Env = append(os.Environ(), helperVar+"=marker", "VETTID_RUN_TEST_MARKER="+marker)
+	if err := c.Run(); err != nil {
+		t.Fatalf("the planted program can't be run directly: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the planted program run directly left no marker, so the check above shows nothing: %v", err)
+	}
+}
+
+// The block is allocated once: a large environment after the secret's
+// entry doesn't make it grow (which could leave a copy of the secret).
+func TestEnvBlockOneAllocation(t *testing.T) {
+	env := []string{"A=1"}
+	for i := 0; i < 200; i++ {
+		env = append(env, "Z"+strings.Repeat("Z", i%60)+"=value-"+strings.Repeat("v", 100))
+	}
+	b, err := envBlock(env, &Secret{Name: "B", Value: []byte("s3cr3t" + string(rune(0x1f600)))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(b) != len(b) {
+		t.Fatalf("the block grew past its first allocation: len %d, cap %d", len(b), cap(b))
+	}
+}
+
+// A secret that is not valid UTF-8, or holds a NUL, is refused, not
+// delivered changed.
+func TestStartRefusesABadSecret(t *testing.T) {
+	lookupOnly(t)
+	exe := helperCopy(t, t.TempDir(), "helper")
+	p := prepare(t, exe)
+	noStart(t)
+	for _, v := range [][]byte{{'a', 0xff, 'b'}, {'a', 0, 'b'}} {
+		spec := helperSpec(t, exe, "")
+		spec.Secret = &Secret{Name: "MY_SECRET", Value: v}
+		if _, err := p.Start(spec); !errors.Is(err, ErrBadRequest) {
+			t.Errorf("%q: %v", v, err)
+		}
+	}
+}

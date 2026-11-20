@@ -28,7 +28,13 @@ const (
 	fileDeleteChild     = 0x0040
 	maximumAllowed      = 0x02000000
 
-	dirRights = fileAddFile | fileAddSubdirectory | fileDeleteChild |
+	fileWriteEA         = 0x0010
+	fileWriteAttributes = 0x0100
+
+	// fileWriteAttributes and fileWriteEA too: with the first a link can be
+	// set on the file (where the user may make links), with the second its
+	// extended attributes changed. (chosen; not in the spec)
+	dirRights = fileAddFile | fileAddSubdirectory | fileDeleteChild | fileWriteEA | fileWriteAttributes |
 		windows.DELETE | windows.WRITE_DAC | windows.WRITE_OWNER
 	// For a parent, adding entries doesn't change this path (every user may
 	// create folders in C:\), but renaming or deleting one does.
