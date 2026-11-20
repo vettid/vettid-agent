@@ -238,7 +238,7 @@ func (p *Program) Start(s StartSpec) (*Process, error) {
 	image, imageID := p.plat.f, p.plat.id
 	if p.plat.cmd != nil {
 		// A batch file: cmd.exe runs it, with every part checked first.
-		if err := checkBatch(p.Path, s.Dir, s.Argv[1:]); err != nil {
+		if err := checkBatch(p.Path, s.Dir, s.Argv[1:], s.Env, s.Trusted); err != nil {
 			return nil, err
 		}
 		appPath, line = p.plat.cmd.Name(), batchCmdLine(p.plat.cmd.Name(), p.Path, s.Argv[1:])
@@ -597,11 +597,20 @@ func (p *platProcess) wait() (int, error) {
 	return int(code), nil
 }
 
+// kill ends the process; a held batch file is released once the process
+// is seen to have ended (within 5 s), whether or not Wait follows.
 func (p *platProcess) kill() error {
 	if p.h == 0 {
 		return nil
 	}
-	return windows.TerminateProcess(p.h, 1)
+	err := windows.TerminateProcess(p.h, 1)
+	if p.held != nil {
+		if ev, werr := windows.WaitForSingleObject(p.h, 5000); werr == nil && ev == windows.WAIT_OBJECT_0 {
+			p.held.Close()
+			p.held = nil
+		}
+	}
+	return err
 }
 
 // checkFormat accepts a Windows program only: an MZ header. Anything else

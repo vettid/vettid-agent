@@ -243,3 +243,70 @@ func TestBatchShim(t *testing.T) {
 		t.Errorf("a bare name found a batch file without its extension: %q, %v", got, err)
 	}
 }
+
+// The value of every environment variable the agent controls is checked
+// as an argument is (cmd.exe expands %NAME% before it parses a line); a
+// variable named as one of cmd.exe's own is refused whoever set it. The
+// connector's own variables and the trusted ones (the secret's, the
+// operator's) are not checked by value.
+func TestBatchEnvironment(t *testing.T) {
+	lookupOnly(t)
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off", `findstr /? >nul "%MYOPT%"`)
+	p := prepare(t, bat)
+	noStart(t)
+	for name, v := range map[string]string{
+		"quote and ampersand": `x" & whoami & "`,
+		"percent":             "%PATH%",
+		"trailing backslash":  "dir" + backslash,
+		"outside ASCII":       "caf" + string(rune(0xe9)),
+	} {
+		spec := helperSpec(t, bat, "", Var{"MYOPT", v})
+		_, err := p.Start(spec)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the environment variable MYOPT") {
+			t.Errorf("%s: %v", name, err)
+		}
+		if strings.Contains(err.Error(), v) {
+			t.Errorf("%s: the refusal repeats the value: %v", name, err)
+		}
+	}
+	for _, n := range []string{"ERRORLEVEL", "cd", "CMDCMDLINE"} {
+		spec := helperSpec(t, bat, "")
+		spec.Env = append(spec.Env, n+"=1")
+		spec.Trusted = []string{n}
+		if _, err := p.Start(spec); !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "one cmd.exe sets itself") {
+			t.Errorf("%s: %v", n, err)
+		}
+	}
+	startHook = nil
+	spec := helperSpec(t, bat, "")
+	spec.Env = append(spec.Env, `SECRET=pa%ss&wo"rd`)
+	spec.Trusted = []string{"SECRET"}
+	proc, err := p.Start(spec)
+	if err != nil {
+		t.Fatalf("a trusted variable was checked: %v", err)
+	}
+	proc.Wait()
+}
+
+// Kill releases the held batch file once the process has ended, even
+// without Wait.
+func TestBatchKillReleases(t *testing.T) {
+	lookupOnly(t)
+	dir := t.TempDir()
+	bat := writeBatch(t, dir, "t.cmd", "@echo off", ":loop", "goto loop")
+	p := prepare(t, bat)
+	proc, err := p.Start(helperSpec(t, bat, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+	if err := proc.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(bat, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("the batch file is still held after Kill: %v", err)
+	}
+	f.Close()
+	proc.Wait()
+}

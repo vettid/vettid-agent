@@ -34,7 +34,17 @@ import (
 //     argument would run into the next.
 //
 // The batch file's path and the working folder follow the same rule (the
-// path is on the command line; cmd.exe reads the folder for %cd%).
+// path is on the command line; cmd.exe reads the folder for %cd%), and so
+// does the value of every environment variable the agent controls:
+// cmd.exe expands %NAME% before it parses a line, so a value holding
+// " & is syntax wherever the batch uses it. A variable named as one of
+// cmd.exe's own dynamic variables (%CD%, %ERRORLEVEL%, ...) is refused:
+// it would replace what the batch reads there.
+//
+// The rule protects a batch file that quotes what it is given ("%~1",
+// "%NAME%") or passes %* on, as npm's shims do. A batch that uses %~1
+// bare, as in `if %~1==x`, can still be steered by spaces, which are
+// allowed: that is the batch file's own bug.
 
 // CodeArgumentNotAllowed is a batch run refused for an argument, its path
 // or its working folder.
@@ -45,10 +55,11 @@ var ErrArgumentNotAllowed error = &Error{Code: CodeArgumentNotAllowed}
 
 // TextArgumentNotAllowed is the refusal shown to the agent. (NEW text)
 const TextArgumentNotAllowed = "This program is a Windows batch file (.cmd or .bat), which runs through cmd.exe. " +
-	"Its arguments, its path and its working folder can't hold any of % & | < > ^ ( ) ! \" or a control character, " +
-	"or any character outside ASCII (so a file name in another alphabet can't be passed to it), " +
-	"and an argument can't end in a backslash: cmd.exe would read them as commands. " +
-	"Pass the value in a file or an environment variable instead."
+	"Its arguments, the environment variables the request sets, its path and its working folder can't hold any of " +
+	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII " +
+	"(so a file name in another alphabet can't be passed to it), and an argument or variable can't end in a backslash: " +
+	"cmd.exe would read them as commands. A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
+	"Pass the value in a file instead."
 
 // batchMeta are the ASCII characters cmd.exe reads as commands.
 const batchMeta = `%&|<>^()!"`
@@ -86,8 +97,45 @@ func batchText(s, what string) error {
 	return nil
 }
 
-// checkBatch checks a batch run's path, working folder and arguments.
-func checkBatch(path, dir string, args []string) error {
+// batchValue is batchText for a value cmd.exe puts between quotes it
+// doesn't control: it can't end in a backslash either.
+func batchValue(s, what string) error {
+	if err := batchText(s, what); err != nil {
+		return err
+	}
+	if strings.HasSuffix(s, `\`) {
+		return argNotAllowed("%s ends in a backslash", what)
+	}
+	return nil
+}
+
+// cmdDynamicNames are the variables cmd.exe sets itself; an environment
+// variable of the same name replaces what a batch reads there.
+var cmdDynamicNames = []string{"CD", "DATE", "TIME", "RANDOM", "ERRORLEVEL", "CMDEXTVERSION",
+	"CMDCMDLINE", "HIGHESTNUMANODENUMBER", "__CD__", "__APPDIR__"}
+
+// connectorSet reports whether the connector sets name itself from the
+// system or the operator's configuration (the minimal set, PATH, the temp
+// variables, NoDefaultCurrentDirectoryInExePath): its value is not the
+// agent's.
+func connectorSet(name string) bool {
+	for _, set := range [][]string{minimalNames, tempNames, {"PATH", noCwdExeName}} {
+		for _, n := range set {
+			if sameName(n, name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// checkBatch checks a batch run's path, working folder, arguments and
+// environment. Every variable's value is checked except the connector's
+// own (connectorSet) and those named in trusted (the secret's variable,
+// the operator's --run-env names): fail closed, a variable not known to
+// be trusted is the agent's. A refusal names the variable, never its
+// value.
+func checkBatch(path, dir string, args, env, trusted []string) error {
 	if err := batchText(path, "the program's path"); err != nil {
 		return err
 	}
@@ -95,15 +143,34 @@ func checkBatch(path, dir string, args []string) error {
 		return err
 	}
 	for i, a := range args {
-		what := fmt.Sprintf("argument %d", i+1)
-		if err := batchText(a, what); err != nil {
+		if err := batchValue(a, fmt.Sprintf("argument %d", i+1)); err != nil {
 			return err
 		}
-		if strings.HasSuffix(a, `\`) {
-			return argNotAllowed("%s ends in a backslash", what)
+	}
+	for _, kv := range env {
+		name, value, _ := strings.Cut(kv, "=")
+		for _, d := range cmdDynamicNames {
+			if sameName(d, name) {
+				return argNotAllowed("the environment variable %s is one cmd.exe sets itself", name)
+			}
+		}
+		if connectorSet(name) || containsName(trusted, name) {
+			continue
+		}
+		if err := batchValue(value, "the environment variable "+name); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func containsName(names []string, name string) bool {
+	for _, n := range names {
+		if sameName(n, name) {
+			return true
+		}
+	}
+	return false
 }
 
 func argNotAllowed(format string, a ...any) error {

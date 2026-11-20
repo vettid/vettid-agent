@@ -44,6 +44,12 @@ type StartSpec struct {
 	// Stdin, Stdout and Stderr are the process's standard files; nil is
 	// the null device. The output limits and redaction are the caller's.
 	Stdin, Stdout, Stderr *os.File
+	// Trusted names the variables in Env the agent does not control: the
+	// secret's variable and the operator's --run-env names. For a Windows
+	// batch file every other variable's value, beyond those the
+	// connector sets itself, is checked as an argument is; a variable not
+	// named here is taken for the agent's.
+	Trusted []string
 	// Log receives what Start logs (ids and errors, never values); nil
 	// discards it.
 	Log *slog.Logger
@@ -146,11 +152,13 @@ type Process struct {
 	plat platProcess
 }
 
-// Wait waits for the process to end and returns its exit code.
+// Wait waits for the process to end and returns its exit code. Keep the
+// Process, and call Wait, until the process has ended: on Windows it
+// holds a batch file unchanged while cmd.exe runs it.
 func (p *Process) Wait() (int, error) { return p.plat.wait() }
 
 // Kill ends the process (the process alone; groups and jobs are added
-// with the process limits).
+// with the process limits). Call Wait afterwards.
 func (p *Process) Kill() error { return p.plat.kill() }
 
 func digest(h hash.Hash) string { return hex.EncodeToString(h.Sum(nil)) }
