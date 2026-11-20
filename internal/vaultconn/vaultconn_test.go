@@ -1136,10 +1136,10 @@ func TestUnmatchedResponseZeroed(t *testing.T) {
 	var dropped [][]byte
 	old := dropResponse
 	dropResponse = func(b []byte) {
+		old(b) // zeroed before the test can see it
 		mu.Lock()
 		dropped = append(dropped, b)
 		mu.Unlock()
-		old(b)
 	}
 	t.Cleanup(func() { dropResponse = old })
 	o := e.open(nil)
@@ -1178,5 +1178,34 @@ func TestUnmatchedResponseZeroed(t *testing.T) {
 	}
 	if strings.Contains(e.out.String(), "s3cr3t") {
 		t.Error("the value reached the output")
+	}
+}
+
+// TestCallGivenUp: the race between a caller giving up and its response
+// arriving. A response that reached the call before the caller gave up
+// is zeroed by giveUp; one that arrives after is refused by deliver, and
+// the dispatcher drops (zeroes) it.
+func TestCallGivenUp(t *testing.T) {
+	value := func() *Response { return &Response{OK: true, Body: json.RawMessage(`{"value":"s3cr3t"}`)} }
+	zero := func(b []byte) bool { return len(b) > 0 && len(bytes.Trim(b, "\x00")) == 0 }
+
+	before := &call{done: make(chan result, 1)}
+	r := value()
+	if !before.deliver(r) {
+		t.Fatal("deliver to a waiting caller refused")
+	}
+	before.giveUp()
+	if !zero(r.Body) {
+		t.Errorf("a response that reached a caller who gave up was not zeroed: %q", r.Body)
+	}
+
+	after := &call{done: make(chan result, 1)}
+	after.giveUp()
+	r = value()
+	if after.deliver(r) {
+		t.Fatal("delivered to a caller who gave up")
+	}
+	if len(after.done) != 0 {
+		t.Error("a response was queued for a caller who gave up")
 	}
 }

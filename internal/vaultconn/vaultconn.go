@@ -163,6 +163,37 @@ type call struct {
 	body json.RawMessage
 	done chan result // buffered, 1
 	ctx  context.Context
+
+	mu   sync.Mutex
+	gone bool // the caller stopped waiting: a response for it is dropped
+}
+
+// deliver hands resp to the waiting caller and reports true, or reports
+// false if the caller already stopped waiting (the response is then the
+// dispatcher's to drop).
+func (cl *call) deliver(resp *Response) bool {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if cl.gone {
+		return false
+	}
+	cl.done <- result{resp: resp}
+	return true
+}
+
+// giveUp marks the caller gone and zeroes the body of a response that
+// reached it meanwhile, which nobody will read.
+func (cl *call) giveUp() {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.gone = true
+	select {
+	case r := <-cl.done:
+		if r.resp != nil {
+			dropResponse(r.resp.Body)
+		}
+	default:
+	}
 }
 
 // Conn is a running connection to the vault.
@@ -627,8 +658,9 @@ func (c *Conn) dispatch() {
 			}
 			if cl, ok := c.pending[in.Re]; ok {
 				delete(c.pending, in.Re)
-				cl.done <- result{resp: resp}
-				continue
+				if cl.deliver(resp) {
+					continue
+				}
 			}
 			// Nobody waits for it (its caller gave up, or it answers an
 			// inner id that a request replaced): it may carry a secret
@@ -703,6 +735,7 @@ func (c *Conn) request(ctx context.Context, id, typ string, body json.RawMessage
 	case r := <-cl.done:
 		return r.resp, r.err
 	case <-ctx.Done():
+		cl.giveUp()
 		return nil, ctx.Err()
 	case <-c.stopped:
 		select {
