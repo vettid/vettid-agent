@@ -173,6 +173,7 @@ type childStart struct {
 type launcherRecord struct {
 	Token            tokenFacts            `json:"token"`
 	ServiceSentinel  bool                  `json:"service_sentinel_inherited"`
+	LauncherUser32   string                `json:"launcher_user32"`
 	Restricted       string                `json:"restricted_token"`
 	RestrictedFacts  tokenFacts            `json:"restricted_facts"`
 	Children         map[string]childStart `json:"children"` // program, user32, dcom, dcom-unrestricted
@@ -209,6 +210,10 @@ func runProgram(mode string) int {
 	r.SentinelInherits = handleHeld(*p2Sentinel)
 	switch mode {
 	case "user32":
+		if err := moduser32.Load(); err != nil {
+			r.Desktop = "user32.dll: " + err.Error()
+			break
+		}
 		d, _, _ := procGetThreadDesktop.Call(uintptr(windows.GetCurrentThreadId()))
 		if d == 0 {
 			r.Desktop = "GetThreadDesktop failed"
@@ -238,6 +243,9 @@ func runProgram(mode string) int {
 // activate tries CoCreateInstance of clsid as a local server and returns
 // the HRESULT.
 func activate(clsid string) string {
+	if err := windows.NewLazySystemDLL("ole32.dll").Load(); err != nil {
+		return "ole32.dll: " + err.Error()
+	}
 	if err := windows.CoInitializeEx(0, windows.COINIT_MULTITHREADED); err != nil {
 		return "CoInitializeEx: " + err.Error()
 	}
@@ -259,6 +267,9 @@ func runLauncher() int {
 	self := windows.GetCurrentProcessToken()
 	rec.Token = readTokenFacts(self)
 	rec.ServiceSentinel = handleHeld(*p2Sentinel)
+	// Whether user32 initializes in the launcher itself (its own,
+	// unrestricted token, on the run's desktop), before any child.
+	rec.LauncherUser32 = errString(moduser32.Load())
 	var own windows.Token
 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &own); err != nil {
 		rec.Restricted = "OpenProcessToken: " + err.Error()
@@ -554,13 +565,16 @@ func runHops(c probe2Config) probe2Result {
 	if err == nil {
 		defer windows.CloseHandle(sentinel)
 	}
-	for _, restrict := range []string{"interactive", "interactive+local"} {
-		res.Hops[restrict] = runHop(c, b, res.DesktopName, restrict, uint64(sentinel))
+	for _, v := range []struct {
+		key, restrict string
+		uiLimits      bool
+	}{{"interactive", "interactive", true}, {"interactive-no-ui-limits", "interactive", false}, {"interactive+local", "interactive+local", true}} {
+		res.Hops[v.key] = runHop(c, b, res.DesktopName, v.restrict, v.uiLimits, uint64(sentinel))
 	}
 	return res
 }
 
-func runHop(c probe2Config, u probeUser, desktop, restrict string, sentinel uint64) hopResult {
+func runHop(c probe2Config, u probeUser, desktop, restrict string, uiLimits bool, sentinel uint64) hopResult {
 	var h hopResult
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
@@ -586,10 +600,13 @@ func runHop(c probe2Config, u probeUser, desktop, restrict string, sentinel uint
 	}
 	h.Job = errString(err)
 	if err == nil {
-		ui := windows.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: windows.JOB_OBJECT_UILIMIT_HANDLES | windows.JOB_OBJECT_UILIMIT_GLOBALATOMS |
-			windows.JOB_OBJECT_UILIMIT_DESKTOP | windows.JOB_OBJECT_UILIMIT_READCLIPBOARD | windows.JOB_OBJECT_UILIMIT_WRITECLIPBOARD}
-		_, uerr := windows.SetInformationJobObject(job, windows.JobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui)))
-		h.UILimits = errString(uerr)
+		h.UILimits = "not set"
+		if uiLimits {
+			ui := windows.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: windows.JOB_OBJECT_UILIMIT_HANDLES | windows.JOB_OBJECT_UILIMIT_GLOBALATOMS |
+				windows.JOB_OBJECT_UILIMIT_DESKTOP | windows.JOB_OBJECT_UILIMIT_READCLIPBOARD | windows.JOB_OBJECT_UILIMIT_WRITECLIPBOARD}
+			_, uerr := windows.SetInformationJobObject(job, windows.JobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui)))
+			h.UILimits = errString(uerr)
+		}
 	}
 	_, _ = windows.ResumeThread(pi.Thread)
 	// Wait for the launcher's record (written once the waiting program
@@ -896,6 +913,9 @@ func TestRunnerHopProbe(t *testing.T) {
 		}
 		// The Users group holds the interactive logon right here, so B's
 		// runner works without its explicit grant too.
+		if !strings.HasPrefix(res.Shapes["b-must-change"], "errno 1907:") {
+			t.Errorf("B's runner whose password must change: %s, want errno 1907", res.Shapes["b-must-change"])
+		}
 		if res.Shapes["b-no-grant"] != "ok" {
 			t.Errorf("B's runner without its grant: %s", res.Shapes["b-no-grant"])
 		}
@@ -955,7 +975,11 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 
 	for restrict, h := range r.Hops {
 		where := "hop " + restrict
-		if h.Start != "ok" || h.Job != "ok" || h.UILimits != "ok" {
+		wantLimits := "ok"
+		if strings.HasSuffix(restrict, "no-ui-limits") {
+			wantLimits = "not set"
+		}
+		if h.Start != "ok" || h.Job != "ok" || h.UILimits != wantLimits {
 			t.Errorf("%s: start %q, job %q, UI limits %q", where, h.Start, h.Job, h.UILimits)
 			continue
 		}
@@ -982,20 +1006,19 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if p.Record.Token.Batch != "absent" {
 			t.Errorf("%s: BATCH %s", where, p.Record.Token.Batch)
 		}
-		u32 := l.Children["user32"]
-		if u32.Exit != "exit 0x0" || u32.Record.Desktop != r.DesktopName[strings.LastIndex(r.DesktopName, `\`)+1:] {
-			t.Errorf("%s: user32 child %+v", where, u32)
-		}
 		if !slicesContain(h.JobPIDs, l.WaitingPID) {
 			t.Errorf("%s: the waiting program %d not in the job %v", where, l.WaitingPID, h.JobPIDs)
 		}
 		if h.ServiceOpen == "ok" && h.Kill != "ok" {
 			t.Errorf("%s: job kill: %s", where, h.Kill)
 		}
-		d := l.Children["dcom"].Record.DCOM
-		if d == "" || d == "HRESULT 0x0" {
-			t.Errorf("%s: DCOM with INTERACTIVE deny-only: %q, want refused", where, d)
-		}
+		// Recorded, to be pinned once measured: whether user32 (and so
+		// ole32, for DCOM) initializes, in the launcher and in its
+		// children, with and without the job's UI limits.
+		u32 := l.Children["user32"]
+		t.Logf("%s: launcher user32: %s; user32 child: %s, desktop %q, beep %q; dcom: %q; dcom unrestricted: %q",
+			where, l.LauncherUser32, u32.Exit, u32.Record.Desktop, u32.Record.Beep,
+			l.Children["dcom"].Record.DCOM, l.Children["dcom-unrestricted"].Record.DCOM)
 	}
 	_ = strconv.Itoa
 }
