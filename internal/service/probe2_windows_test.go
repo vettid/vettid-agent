@@ -670,6 +670,11 @@ func newShapedUser(t *testing.T, dir, svcSID string, grants, denies []string, mu
 	t.Helper()
 	u := newProbeUser(t, dir, svcSID, grants, denies)
 	if mustChange {
+		// "Password never expires" (set for every probe user) overrides
+		// "must change at next logon": it is turned off first.
+		if out, err := exec.Command("powershell", "-NoProfile", "-Command", "Set-LocalUser -Name '"+u.Name+"' -PasswordNeverExpires $false").CombinedOutput(); err != nil {
+			t.Fatalf("Set-LocalUser: %v %s", err, out)
+		}
 		if out, err := exec.Command("net", "user", u.Name, "/logonpasswordchg:yes").CombinedOutput(); err != nil {
 			t.Fatalf("net user: %v %s", err, out)
 		}
