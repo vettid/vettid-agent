@@ -83,7 +83,7 @@ jobs:
         run: |
           set -o pipefail
           go test -count=1 -v -run 'TestServiceAccountProbe$' ./internal/service | tee "$RUNNER_TEMP/probe.txt"
-          for t in default cut3 cut3+grant2 cut2+grant1 cut1; do t="TestServiceAccountProbe/$t"
+          for t in default cut3 cut3+grant2 cut2+grant1 cut1 cut1-seclogon-stopped; do t="TestServiceAccountProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # The runner's user is an administrator, for whom every folder can be

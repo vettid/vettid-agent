@@ -118,7 +118,11 @@ type probeUser struct {
 type probeConfig struct {
 	Out   string               `json:"out"`
 	Exe   string               `json:"exe"`
-	Users map[string]probeUser `json:"users"` // "plain", "denied"
+	Users map[string]probeUser `json:"users"` // probeUserKinds
+	// SeclogonStopped: the test stopped the secondary logon service first;
+	// the service tries CreateProcessWithLogonW, then to start seclogon
+	// itself, before the rest.
+	SeclogonStopped bool `json:"seclogon_stopped"`
 }
 
 // startResult is one way of starting a program as one user.
@@ -137,6 +141,8 @@ type probeResult struct {
 	TcbAbsent         bool                   `json:"tcb_absent"`
 	EnableAssign      string                 `json:"enable_assign_primary_token"`
 	EnableQuota       string                 `json:"enable_increase_quota"`
+	SeclogonBefore    *startResult           `json:"seclogon_stopped_withlogon,omitempty"`
+	SeclogonStart     string                 `json:"seclogon_start_by_service,omitempty"`
 	Starts            map[string]startResult `json:"starts"` // "<way>/<user>"
 	DPAPI             string                 `json:"dpapi"`
 }
@@ -195,7 +201,12 @@ func runProbe(c probeConfig) probeResult {
 	defer proc.Close()
 	res.EnableAssign = errString(setPrivilege(proc, "SeAssignPrimaryTokenPrivilege", true))
 	res.EnableQuota = errString(setPrivilege(proc, "SeIncreaseQuotaPrivilege", true))
-	for _, who := range []string{"plain", "denied"} {
+	if c.SeclogonStopped {
+		before := startWithLogon(c.Exe, c.Users["plain"], 0)
+		res.SeclogonBefore = &before
+		res.SeclogonStart = startSeclogon()
+	}
+	for _, who := range probeUserKinds {
 		u := c.Users[who]
 		res.Starts["asuser/"+who] = startAsUser(c.Exe, u)
 		res.Starts["withlogon/"+who] = startWithLogon(c.Exe, u, 0)
@@ -496,7 +507,7 @@ func deleteProfile(t *testing.T, sid string) {
 // newProbeUser makes a throwaway local user with the batch logon right
 // (and, if denied, denied interactive and remote logon), and a folder
 // only it can write; all removed when the test ends.
-func newProbeUser(t *testing.T, dir, svcSID string, denied bool) probeUser {
+func newProbeUser(t *testing.T, dir, svcSID string, deny []string) probeUser {
 	t.Helper()
 	name := "vtdp" + randHex(4)
 	pw := make([]byte, 18)
@@ -520,8 +531,8 @@ func newProbeUser(t *testing.T, dir, svcSID string, denied bool) probeUser {
 		}
 	})
 	rights := []string{"SeBatchLogonRight"}
-	if denied {
-		rights = append(rights, "SeDenyInteractiveLogonRight", "SeDenyRemoteInteractiveLogonRight")
+	if deny != nil {
+		rights = append(rights, deny...)
 	}
 	for _, right := range rights {
 		if err := lsaRight(sid, right, true); err != nil {
@@ -550,6 +561,9 @@ type probeVariant struct {
 	required []string
 	grant    []string
 	startErr error // the service must not start, with this error
+	// stopSeclogon stops the secondary logon service before the service
+	// starts (and starts it again after).
+	stopSeclogon bool
 	expect   func(t *testing.T, r probeResult, users map[string]probeUser)
 }
 
@@ -618,6 +632,12 @@ var probeVariants = []probeVariant{
 				}
 			}
 		}},
+	// The same, with the secondary logon service stopped first: whether
+	// CreateProcessWithLogonW still works, and whether the service can
+	// start seclogon itself with no rights granted on the SCM. Measured,
+	// then pinned. (The rdpdenied user in every variant measures a runner
+	// denied only remote interactive logon.)
+	{name: "cut1-seclogon-stopped", required: []string{"SeChangeNotifyPrivilege"}, stopSeclogon: true},
 }
 
 func checkStart(t *testing.T, variant, key string, s startResult, u probeUser) {
@@ -683,7 +703,13 @@ func probeOnce(t *testing.T, m *mgr.Mgr, v probeVariant) {
 	// The folder: administrators, SYSTEM and the service's account; the
 	// binary readable by Users, for the children.
 	protectDir(t, dir, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+svcSID.String()+")(A;OICI;0x1200a9;;;BU)")
-	users := map[string]probeUser{"plain": newProbeUser(t, dir, svcSID.String(), false), "denied": newProbeUser(t, dir, svcSID.String(), true)}
+	users := map[string]probeUser{}
+	for _, k := range probeUserKinds {
+		users[k] = newProbeUser(t, dir, svcSID.String(), probeUserDenials[k])
+	}
+	if v.stopSeclogon {
+		stopSeclogon(t, m)
+	}
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -700,7 +726,7 @@ func probeOnce(t *testing.T, m *mgr.Mgr, v probeVariant) {
 	// access list, administrators, SYSTEM and the service's account only.
 	cfgPath := filepath.Join(dir, "probe.json")
 	out := filepath.Join(dir, "result.json")
-	cfg, _ := json.Marshal(probeConfig{Out: out, Exe: exe, Users: users})
+	cfg, _ := json.Marshal(probeConfig{Out: out, Exe: exe, Users: users, SeclogonStopped: v.stopSeclogon})
 	if err := os.WriteFile(cfgPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -820,6 +846,72 @@ func tryDeleteProfile(sid string, d time.Duration) error {
 		}
 		if !errors.Is(e, windows.ERROR_SHARING_VIOLATION) || time.Now().After(end) {
 			return e
+		}
+	}
+}
+
+// probeUserKinds are the runner users, by the logon rights they are
+// denied: plain (none), denied (interactive and remote interactive, as
+// the plan's runners are), rdpdenied (remote interactive only).
+var probeUserKinds = []string{"plain", "denied", "rdpdenied"}
+
+var probeUserDenials = map[string][]string{
+	"plain":     nil,
+	"denied":    {"SeDenyInteractiveLogonRight", "SeDenyRemoteInteractiveLogonRight"},
+	"rdpdenied": {"SeDenyRemoteInteractiveLogonRight"},
+}
+
+// startSeclogon is the service trying to start the secondary logon
+// service itself, with no rights granted to it on the SCM: each step's
+// result.
+func startSeclogon() string {
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	if err != nil {
+		return "OpenSCManager(connect): " + err.Error()
+	}
+	defer windows.CloseServiceHandle(scm)
+	name, _ := windows.UTF16PtrFromString("seclogon")
+	h, err := windows.OpenService(scm, name, windows.SERVICE_START|windows.SERVICE_QUERY_STATUS)
+	if err != nil {
+		return "OpenService(start): " + err.Error()
+	}
+	defer windows.CloseServiceHandle(h)
+	if err := windows.StartService(h, 0, nil); err != nil {
+		return "StartService: " + err.Error()
+	}
+	for end := time.Now().Add(10 * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		var st windows.SERVICE_STATUS
+		if err := windows.QueryServiceStatus(h, &st); err == nil && st.CurrentState == windows.SERVICE_RUNNING {
+			return "ok"
+		}
+	}
+	return "started, not running within 10 s"
+}
+
+// stopSeclogon stops the secondary logon service for a variant, and
+// starts it again afterwards.
+func stopSeclogon(t *testing.T, m *mgr.Mgr) {
+	t.Helper()
+	s, err := m.OpenService("seclogon")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := s.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+			t.Errorf("restarting seclogon: %v", err)
+		}
+		s.Close()
+	})
+	if _, err := s.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		t.Fatalf("stopping seclogon: %v", err)
+	}
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		st, err := s.Query()
+		if err == nil && st.State == svc.Stopped {
+			return
+		}
+		if time.Now().After(end) {
+			t.Fatal("seclogon did not stop")
 		}
 	}
 }
