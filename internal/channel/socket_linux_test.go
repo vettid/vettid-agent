@@ -143,8 +143,12 @@ func TestListenChecksTheDescriptor(t *testing.T) {
 		t.Errorf("a TCP socket: %v", err)
 	}
 
-	if _, err := Listen(ListenConfig{Socket: path, MemberUID: 0, fd: 1}); err == nil {
-		t.Error("Listen took root as the member")
+	// Root as the member, on a socket that is otherwise good.
+	good := filepath.Join(d, "e.sock")
+	gfd := listenAt(t, good)
+	defer unix.Close(gfd)
+	if _, err := Listen(ListenConfig{Socket: good, MemberUID: 0, fd: gfd}); err == nil || errors.Is(err, ErrNotActivated) {
+		t.Errorf("Listen with root as the member: %v, want a refusal of the member", err)
 	}
 }
 
