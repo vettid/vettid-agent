@@ -163,6 +163,37 @@ type call struct {
 	body json.RawMessage
 	done chan result // buffered, 1
 	ctx  context.Context
+
+	mu   sync.Mutex
+	gone bool // the caller stopped waiting: a response for it is dropped
+}
+
+// deliver hands resp to the waiting caller and reports true, or reports
+// false if the caller already stopped waiting (the response is then the
+// dispatcher's to drop).
+func (cl *call) deliver(resp *Response) bool {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	if cl.gone {
+		return false
+	}
+	cl.done <- result{resp: resp}
+	return true
+}
+
+// giveUp marks the caller gone and zeroes the body of a response that
+// reached it meanwhile, which nobody will read.
+func (cl *call) giveUp() {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+	cl.gone = true
+	select {
+	case r := <-cl.done:
+		if r.resp != nil {
+			dropResponse(r.resp.Body)
+		}
+	default:
+	}
 }
 
 // Conn is a running connection to the vault.
@@ -396,6 +427,10 @@ func (c *Conn) persist(st []byte, evs []*envelope.Inner) error {
 // deviceRefused is (*client.Device).Refused; tests replace it.
 var deviceRefused = (*client.Device).Refused
 
+// dropResponse zeroes the body of a response nobody waits for; tests
+// wrap it.
+var dropResponse = func(body []byte) { clear(body) }
+
 // Pauses after failures; tests shorten them.
 var (
 	retryBase       = time.Second
@@ -611,20 +646,7 @@ func (c *Conn) dispatch() {
 	}
 	for _, in := range evs {
 		if in.Re != "" {
-			resp := &Response{Type: in.Type, OK: in.Status == envelope.StatusOK, Body: in.Body}
-			if in.Error != nil {
-				resp.ErrorCode = in.Error.Code
-			}
-			c.log.Info("response", "type", in.Type, "re", in.Re, "ok", resp.OK, "code", resp.ErrorCode)
-			if in.Re == c.statusID {
-				c.statusID = ""
-				c.readStatus(resp)
-				continue
-			}
-			if cl, ok := c.pending[in.Re]; ok {
-				delete(c.pending, in.Re)
-				cl.done <- result{resp: resp}
-			}
+			c.handResponse(in)
 			continue
 		}
 		c.log.Info("event", "type", in.Type, "id", in.ID)
@@ -635,6 +657,35 @@ func (c *Conn) dispatch() {
 			c.o.OnEvent(Event{ID: in.ID, Type: in.Type, Body: in.Body})
 		}
 	}
+}
+
+// handResponse hands a response to the call waiting for it; Run's
+// goroutine only. Every response is either handed over (the caller owns
+// its body from then on) or zeroed here: it may carry a secret value. The
+// zeroing clears the connector's copy, the body the vault client
+// decrypted; it cannot reach copies made before it.
+func (c *Conn) handResponse(in *envelope.Inner) {
+	resp := &Response{Type: in.Type, OK: in.Status == envelope.StatusOK, Body: in.Body}
+	if in.Error != nil {
+		resp.ErrorCode = in.Error.Code
+	}
+	c.log.Info("response", "type", in.Type, "re", in.Re, "ok", resp.OK, "code", resp.ErrorCode)
+	if in.Re == c.statusID {
+		c.statusID = ""
+		c.readStatus(resp)
+		dropResponse(in.Body)
+		return
+	}
+	if cl, ok := c.pending[in.Re]; ok {
+		delete(c.pending, in.Re)
+		if cl.deliver(resp) {
+			return
+		}
+	}
+	// Nobody waits for it: its caller gave up, or it answers an inner id
+	// that a request replaced.
+	c.log.Info("response dropped: nobody waits for it", "type", in.Type, "re", in.Re)
+	dropResponse(in.Body)
 }
 
 // readStatus keeps what vault.status says about the owner check.
@@ -692,6 +743,7 @@ func (c *Conn) request(ctx context.Context, id, typ string, body json.RawMessage
 	case r := <-cl.done:
 		return r.resp, r.err
 	case <-ctx.Done():
+		cl.giveUp()
 		return nil, ctx.Err()
 	case <-c.stopped:
 		select {
