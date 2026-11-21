@@ -70,6 +70,20 @@ jobs:
                    TestElevatedPairEndToEnd TestStubOverPipe; do
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
+      # The channel's Unix-socket end as root (AGENT-PLAN A5.6): throwaway
+      # users and groups and a transient systemd socket unit, removed in
+      # cleanup. The step fails unless each root test passed (not skipped).
+      - name: channel tests as root, with test users and a systemd socket
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          # Built as releases are (scripts/build-release): without cgo, so
+          # os/user reads /etc/passwd and /etc/group as it will there.
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/channel.test" ./internal/channel
+          sudo VETTID_TEST_LINUX_ROOT=1 "$RUNNER_TEMP/channel.test" -test.run '^TestRoot' -test.count=1 -test.v -test.timeout=300s | tee "$RUNNER_TEMP/channel-root.txt"
+          for t in TestRootChannel TestRootMemberIsAdmin TestRootHeldAdminGroup TestRootClientRefusesImpostors TestRootNotStarved; do
+            grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel-root.txt" || { echo "::error::$t did not pass"; exit 1; }
+          done
       # AGENT-PLAN A3.10b's first check, measured: what a virtual service
       # account (NT SERVICE\<name>) holds, and how it can start a program
       # as a runner, in five variants. It registers a throwaway service and two

@@ -3,7 +3,8 @@
 // §6 A3.10a; AGENT-SEPARATE-ACCOUNT §2, §4).
 //
 // On Windows it is a named pipe, \\.\pipe\vettid-agent-<n>-<random>
-// (pipe_windows.go). The Unix socket end comes with A5.6.
+// (pipe_windows.go); on Linux a Unix socket made by systemd,
+// /run/vettid-agent/<n>.sock (socket_linux.go, A5.6).
 //
 // A connection starts with a hello each way, one line of JSON: the
 // client names its operation (Op) and its version, the server answers
@@ -18,7 +19,9 @@ package channel
 import (
 	"bytes"
 	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -275,6 +278,28 @@ var nameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 // ValidName reports whether n can name a pairing.
 func ValidName(n string) bool { return nameRE.MatchString(n) }
 
+// AccountHash is the short hash in pairing n's account names: the first 8
+// hexadecimal digits of the SHA-256 of n (AGENT-PLAN §6 A3.10a (8)).
+func AccountHash(n string) string {
+	sum := sha256.Sum256([]byte(n))
+	return hex.EncodeToString(sum[:4])
+}
+
+// ConnectorUser is the Linux system user pairing n's connector service
+// runs as, vettid-c-<hash> (A5.6).
+func ConnectorUser(n string) string { return "vettid-c-" + AccountHash(n) }
+
+// RunnerUser is the Linux system user of pairing n's run slot (1 or 2),
+// vettid-r-<hash>-<slot> (A5.6).
+func RunnerUser(n string, slot int) string {
+	return fmt.Sprintf("vettid-r-%s-%d", AccountHash(n), slot)
+}
+
+// MemberGroup is the Linux group that holds only pairing n's member and
+// owns the channel's socket, vettid-m-<hash> (chosen; not in the spec;
+// AGENT-LINUX-RUNTIME §2).
+func MemberGroup(n string) string { return "vettid-m-" + AccountHash(n) }
+
 // ServiceName is the Windows service of pairing n.
 func ServiceName(n string) string { return "vettid-agent-" + n }
 
@@ -309,16 +334,19 @@ func validPipe(n, pipe string) bool {
 
 // DialConfig configures Dial.
 type DialConfig struct {
-	// Pipe is the pipe's name, without \\.\pipe\.
+	// Pipe is the channel's name (ReadPipe): on Windows the pipe's name,
+	// without \\.\pipe\; on Linux the socket's path.
 	Pipe string
-	// Service is the SID the pipe's owner must have: the connector
-	// service's (ServiceSID).
+	// Service is the account the channel's owner must be
+	// (ServiceAccount): on Windows the connector service's SID, on Linux
+	// the connector's system user.
 	Service string
 	Op      Op
 	Version string
 	// Wait bounds the wait for a free instance (default 5 s).
 	Wait time.Duration
 
-	anonymous bool   // tests only: allow the server only anonymous
-	server    string // tests only: open the pipe through this computer's name, as a remote client
+	dirUID    *uint32 // Linux tests only: the uid the socket's folder must have, in place of root
+	anonymous bool    // tests only: allow the server only anonymous
+	server    string  // tests only: open the pipe through this computer's name, as a remote client
 }

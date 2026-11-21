@@ -49,6 +49,11 @@ const (
 	integrityHigh       = 0x3000
 )
 
+// ServiceAccount is the account that must own pairing n's channel, as
+// the client checks it: the SID of the virtual service account
+// NT SERVICE\vettid-agent-<n>.
+func ServiceAccount(n string) string { return ServiceSID(ServiceName(n)) }
+
 // PipePath is the full path of the pipe named pipe.
 func PipePath(pipe string) string { return `\\.\pipe\` + pipe }
 
