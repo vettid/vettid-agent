@@ -9,13 +9,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
-
-var procAccessCheck = windows.NewLazySystemDLL("advapi32.dll").NewProc("AccessCheck")
 
 // maxConfig bounds the configuration file.
 const maxConfig = 64 << 10
@@ -42,12 +39,19 @@ func ConfigPath(n string) (string, error) {
 
 // ReadPipe returns pairing n's pipe name from its configuration file.
 // The stub reads only the name: the pairing's other settings are the
-// service's. The file must be one only an administrator can change: its
-// owner Administrators or SYSTEM, and this process's user, with its
-// groups, holding no right that changes it. A missing file, a file that
-// fails the check, and a name that isn't n's are ErrNoService: the stub
-// answers as when the service doesn't run. A changed name could only
-// point the stub at a pipe that the owner check then refuses.
+// service's. The file must be one only an administrator can change
+// (adminOnly), judged by its own security descriptor, whoever reads it:
+// the member, or an elevated administrator running pair or forget. A
+// missing file, a file that fails the check, and a name that isn't n's
+// are ErrNoService: the stub answers as when the service doesn't run.
+//
+// Only the file is checked, not the folders above it. A member who made
+// %ProgramData%\VettID before the install, or a junction there, could
+// put another file in its place, but not one owned by Administrators or
+// SYSTEM, which this refuses; and a name that leads elsewhere only
+// reaches a pipe that Dial's owner check refuses. Either way the cost is
+// a denial of service, not a disclosure. The installer makes the folders
+// with an access list of their own (A5.5).
 func ReadPipe(n string) (string, error) {
 	path, err := ConfigPath(n)
 	if err != nil {
@@ -86,16 +90,8 @@ func readPipeAt(path, n string) (string, error) {
 	if err != nil {
 		return "", noService("its access can't be read: %v", err)
 	}
-	owner, _, err := sd.Owner()
-	if err != nil || owner == nil || !(owner.IsWellKnown(windows.WinBuiltinAdministratorsSid) || owner.IsWellKnown(windows.WinLocalSystemSid)) {
-		return "", noService("is not owned by Administrators or SYSTEM")
-	}
-	granted, err := maxAllowed(sd)
-	if err != nil {
-		return "", noService("can't be checked: %v", err)
-	}
-	if granted&configChangeRights != 0 {
-		return "", noService("can be changed by this account (access %#x)", granted&configChangeRights)
+	if err := adminOnly(sd); err != nil {
+		return "", noService("%v", err)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxConfig+1))
 	if err != nil {
@@ -116,43 +112,48 @@ func readPipeAt(path, n string) (string, error) {
 	return c.Pipe, nil
 }
 
-// maxAllowed is what this process's user may do with an object of sd,
-// the owner's implicit rights included (AccessCheck with
-// MAXIMUM_ALLOWED and an impersonation token of this thread's user:
-// the process's, or the one a test impersonates).
-func maxAllowed(sd *windows.SECURITY_DESCRIPTOR) (uint32, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-	var tok windows.Token
-	if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &tok); err != nil {
-		if !errors.Is(err, windows.ERROR_NO_TOKEN) {
-			return 0, err
-		}
-		if err := windows.ImpersonateSelf(windows.SecurityImpersonation); err != nil {
-			return 0, err
-		}
-		defer windows.RevertToSelf()
-		if err := windows.OpenThreadToken(windows.CurrentThread(), windows.TOKEN_QUERY, true, &tok); err != nil {
-			return 0, err
-		}
+// trustedInstaller is NT SERVICE\TrustedInstaller.
+var trustedInstaller = ServiceSID("TrustedInstaller")
+
+// adminOnly reports whether an object of sd can be changed only by an
+// administrator: its owner is Administrators or SYSTEM, its access list
+// is present, and no entry that applies to the object itself allows a
+// right that changes it (configChangeRights, or GENERIC_WRITE or
+// GENERIC_ALL) to anyone but Administrators, SYSTEM or TrustedInstaller.
+// Deny entries can only take rights away; an entry of a type this check
+// doesn't know refuses the file. It reads the descriptor only, not any
+// token, so it gives the same answer to the member and to an elevated
+// administrator.
+func adminOnly(sd *windows.SECURITY_DESCRIPTOR) error {
+	owner, _, err := sd.Owner()
+	if err != nil || owner == nil || !(owner.IsWellKnown(windows.WinBuiltinAdministratorsSid) || owner.IsWellKnown(windows.WinLocalSystemSid)) {
+		return errors.New("is not owned by Administrators or SYSTEM")
 	}
-	defer tok.Close()
-	// The file object's GENERIC_MAPPING.
-	mapping := [4]uint32{0x120089, 0x120116, 0x1200a0, 0x1f01ff}
-	var privs [16]uint32
-	privLen := uint32(len(privs) * 4)
-	var granted uint32
-	var status int32
-	r, _, e := procAccessCheck.Call(
-		uintptr(unsafe.Pointer(sd)), uintptr(tok), windows.MAXIMUM_ALLOWED,
-		uintptr(unsafe.Pointer(&mapping)), uintptr(unsafe.Pointer(&privs[0])),
-		uintptr(unsafe.Pointer(&privLen)), uintptr(unsafe.Pointer(&granted)),
-		uintptr(unsafe.Pointer(&status)))
-	if r == 0 {
-		return 0, e
+	acl, _, err := sd.DACL()
+	if err != nil || acl == nil {
+		return errors.New("has no access list (anyone may change it)")
 	}
-	if status == 0 {
-		return 0, nil
+	const change = configChangeRights | windows.GENERIC_WRITE | windows.GENERIC_ALL
+	for i := uint32(0); i < uint32(acl.AceCount); i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(acl, i, &ace); err != nil {
+			return fmt.Errorf("its access list can't be read: %v", err)
+		}
+		switch ace.Header.AceType {
+		case windows.ACCESS_DENIED_ACE_TYPE:
+			continue
+		case windows.ACCESS_ALLOWED_ACE_TYPE:
+		default:
+			return fmt.Errorf("has an access entry of type %d, which this check doesn't know", ace.Header.AceType)
+		}
+		if ace.Header.AceFlags&windows.INHERIT_ONLY_ACE != 0 || uint32(ace.Mask)&change == 0 {
+			continue
+		}
+		sid := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) || sid.IsWellKnown(windows.WinLocalSystemSid) || sid.String() == trustedInstaller {
+			continue
+		}
+		return fmt.Errorf("can be changed by %s (access %#x)", sid, uint32(ace.Mask)&change)
 	}
-	return granted, nil
+	return nil
 }

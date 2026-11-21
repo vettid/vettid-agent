@@ -42,13 +42,9 @@ var (
 // §11, 0.1.16).
 const TextStubRunFlags = "--run-path and --run-env are set in the connector service's configuration by an administrator, not on this command."
 
-// TextNeedsAdmin answers `pair` or `forget` with --name run without
-// elevation, which the service refuses (chosen; not in the spec).
+// TextNeedsAdmin answers `pair` or `forget` with --name from the member's
+// normal process, which the service refuses (chosen; not in the spec).
 const TextNeedsAdmin = "This needs an administrator: start it as an administrator, as the README says."
-
-// TextNotThisAccount answers `status` or the stub run by an account the
-// channel refuses (chosen; not in the spec).
-const TextNotThisAccount = "This account can't use this pairing's connector service: it belongs to another user of this computer."
 
 // dialService opens pairing name's channel for op.
 func dialService(ctx context.Context, name string, op channel.Op) (io.ReadWriteCloser, error) {
@@ -76,9 +72,15 @@ func runStub(name string, verbose bool, stdout, stderr io.Writer) int {
 		return 1
 	case errors.Is(err, channel.ErrVersionsDiffer):
 		return serveUnavailable(ctx, mcp.VersionsDiffer(), err, logger, stdout, stderr)
+	case errors.Is(err, channel.ErrAccessDenied):
+		// Another user of the computer, or an administrator not elevated.
+		return serveUnavailable(ctx, mcp.AccessDenied(), err, logger, stdout, stderr)
 	case errors.Is(err, channel.ErrNotAllowed):
-		fmt.Fprintf(stderr, "vettid-agent mcp: %s\n", TextNotThisAccount)
-		return serveUnavailable(ctx, mcp.NoService(), err, logger, stdout, stderr)
+		// The service refused tools to this account: not the member.
+		return serveUnavailable(ctx, mcp.NotTheMember(), err, logger, stdout, stderr)
+	case errors.Is(err, channel.ErrBusy):
+		fmt.Fprintf(stderr, "vettid-agent mcp: %v\n", err)
+		return 1
 	default:
 		// No channel, a configuration file that fails its check, or a
 		// channel that isn't the service's: "No service". The connector
@@ -146,11 +148,13 @@ func runChannelCommand(cmd, name string, op channel.Op, req func() (channel.Requ
 	case err == nil:
 	case errors.Is(err, channel.ErrVersionsDiffer):
 		return fail(mcp.TextVersionsDiffer)
+	case errors.Is(err, channel.ErrAccessDenied):
+		return fail(mcp.TextAccessDenied)
 	case errors.Is(err, channel.ErrNotAllowed) && (op == channel.OpPair || op == channel.OpForget):
 		return fail(TextNeedsAdmin)
 	case errors.Is(err, channel.ErrNotAllowed):
-		return fail(TextNotThisAccount)
-	case errors.Is(err, channel.ErrInUse):
+		return fail(mcp.TextNotTheMember)
+	case errors.Is(err, channel.ErrInUse), errors.Is(err, channel.ErrBusy):
 		return fail(err.Error())
 	default:
 		fmt.Fprintf(stderr, "vettid-agent %s: %s (%v)\n", cmd, mcp.NoService().Text, err)

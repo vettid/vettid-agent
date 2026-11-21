@@ -176,7 +176,8 @@ func TestStubWithoutService(t *testing.T) {
 		{"no configuration", fmt.Errorf("%w: no file", channel.ErrNoService), nil, mcp.CodeServiceNotRunning, mcp.NoService().Text, ""},
 		{"no channel", nil, channel.ErrNoService, mcp.CodeServiceNotRunning, mcp.NoService().Text, ""},
 		{"squatted", nil, channel.ErrNotService, mcp.CodeServiceNotRunning, mcp.NoService().Text, ""},
-		{"another user", nil, channel.ErrNotAllowed, mcp.CodeServiceNotRunning, mcp.NoService().Text, TextNotThisAccount},
+		{"another user", nil, channel.ErrAccessDenied, mcp.CodeNotAllowed, mcp.TextAccessDenied, ""},
+		{"not the member", nil, channel.ErrNotAllowed, mcp.CodeNotAllowed, mcp.TextNotTheMember, ""},
 		{"versions differ", nil, channel.ErrVersionsDiffer, mcp.CodeVersionsDiffer, mcp.TextVersionsDiffer, ""},
 	}
 	for _, c := range cases {
@@ -319,7 +320,10 @@ func TestChannelCommands(t *testing.T) {
 	}{
 		{[]string{"pair", "--name", "work", "CODE"}, channel.ErrNotAllowed, TextNeedsAdmin},
 		{[]string{"forget", "--name", "work"}, channel.ErrNotAllowed, TextNeedsAdmin},
-		{[]string{"status", "--name", "work"}, channel.ErrNotAllowed, TextNotThisAccount},
+		{[]string{"status", "--name", "work"}, channel.ErrNotAllowed, mcp.TextNotTheMember},
+		{[]string{"status", "--name", "work"}, channel.ErrAccessDenied, mcp.TextAccessDenied},
+		{[]string{"pair", "--name", "work", "CODE"}, channel.ErrAccessDenied, mcp.TextAccessDenied},
+		{[]string{"status", "--name", "work"}, channel.ErrBusy, channel.ErrBusy.Error()},
 		{[]string{"status", "--name", "work"}, channel.ErrVersionsDiffer, mcp.TextVersionsDiffer},
 		{[]string{"status", "--name", "work"}, channel.ErrNoService, mcp.NoService().Text},
 		{[]string{"pair", "--name", "work", "CODE"}, channel.ErrNotService, mcp.NoService().Text},

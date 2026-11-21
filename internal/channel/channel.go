@@ -90,6 +90,7 @@ const (
 	codeVersionsDiffer = "versions_differ"
 	codeInUse          = "in_use"
 	codeBadHello       = "bad_hello"
+	codeBusy           = "busy"
 )
 
 // Errors a client or server sees.
@@ -103,7 +104,7 @@ var (
 	ErrNotService = errors.New("the channel is not the connector service's")
 	// ErrVersionsDiffer: the other end runs another version.
 	ErrVersionsDiffer = errors.New("the connector service and this program are different versions")
-	// ErrNotAllowed: this client may not run this operation.
+	// ErrNotAllowed: the service refused this operation to this account.
 	ErrNotAllowed = errors.New("this account may not do that on the connector's channel")
 	// ErrInUse: another agent app is using the pairing.
 	ErrInUse = errors.New("the pairing is in use by another agent app")
@@ -111,17 +112,25 @@ var (
 	ErrNameTaken = errors.New("another program took the connector's channel name")
 	// ErrBadHello: the peer did not speak the channel's hello.
 	ErrBadHello = errors.New("the other end of the connector's channel did not answer as expected")
+	// ErrBusy: the service has as many clients as it serves at once.
+	ErrBusy = errors.New("the connector service has too many connections open; try again when one has closed")
+	// ErrAccessDenied: the channel's access list refused this account at
+	// open: another user of the computer, or an administrator whose token
+	// is not elevated (ErrNotAllowed is the service refusing an operation).
+	ErrAccessDenied = errors.New("this account can't open the connector's channel")
 )
 
-// Refusal returns an error that the server's hello sends as a refusal:
-// ErrInUse, ErrNotAllowed or ErrVersionsDiffer (A3.10b's service uses
-// ErrInUse).
+// refusalCode is the code the server's hello sends for err: ErrInUse,
+// ErrVersionsDiffer, ErrBusy, ErrBadHello, or else not_allowed (A3.10b's
+// service sends ErrInUse).
 func refusalCode(err error) string {
 	switch {
 	case errors.Is(err, ErrInUse):
 		return codeInUse
 	case errors.Is(err, ErrVersionsDiffer):
 		return codeVersionsDiffer
+	case errors.Is(err, ErrBusy):
+		return codeBusy
 	case errors.Is(err, ErrBadHello):
 		return codeBadHello
 	default:
@@ -131,6 +140,8 @@ func refusalCode(err error) string {
 
 func refusalErr(code string) error {
 	switch code {
+	case codeBusy:
+		return ErrBusy
 	case codeInUse:
 		return ErrInUse
 	case codeVersionsDiffer:

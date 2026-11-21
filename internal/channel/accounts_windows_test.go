@@ -135,8 +135,8 @@ func TestOtherUserRefused(t *testing.T) {
 		cfg.Service = me
 		var err error
 		other.as(t, func() { _, err = Dial(context.Background(), cfg) })
-		if !errors.Is(err, ErrNotAllowed) {
-			t.Fatalf("%s as another user: %v, want ErrNotAllowed", op, err)
+		if !errors.Is(err, ErrAccessDenied) {
+			t.Fatalf("%s as another user: %v, want ErrAccessDenied", op, err)
 		}
 	}
 	var err error
@@ -263,5 +263,77 @@ func TestSquatterRefused(t *testing.T) {
 		if !errors.Is(err, ErrNotService) {
 			t.Fatalf("%s against a squatter: %v, want ErrNotService", op, err)
 		}
+	}
+}
+
+var procCreateRestrictedToken = windows.NewLazySystemDLL("advapi32.dll").NewProc("CreateRestrictedToken")
+
+// tokenIdentity counts an administrator as elevated only with the
+// Administrators group enabled and integrity at high or above. From this
+// (elevated) test's own token: as it is, elevated; at medium integrity,
+// not; with Administrators deny-only (as UAC's filtered token has it),
+// not.
+func TestTokenIdentityElevation(t *testing.T) {
+	requireElevated(t)
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proc windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY, &proc); err != nil {
+		t.Fatal(err)
+	}
+	defer proc.Close()
+	u, err := proc.GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	me := u.User.Sid
+	// identification makes an identification-level impersonation token of
+	// tok, as the server gets from a client.
+	identification := func(tok windows.Token) windows.Token {
+		var d windows.Token
+		if err := windows.DuplicateTokenEx(tok, windows.TOKEN_QUERY|windows.TOKEN_ADJUST_DEFAULT, nil,
+			windows.SecurityIdentification, windows.TokenImpersonation, &d); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { d.Close() })
+		return d
+	}
+
+	id, err := tokenIdentity(identification(proc), me, admins)
+	if err != nil || !id.ElevatedAdmin || !id.Member {
+		t.Fatalf("this elevated token: %+v, %v", id, err)
+	}
+
+	medium := identification(proc)
+	msid, err := windows.StringToSid("S-1-16-8192")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tml := windows.Tokenmandatorylabel{Label: windows.SIDAndAttributes{Sid: msid, Attributes: windows.SE_GROUP_INTEGRITY}}
+	if err := windows.SetTokenInformation(medium, windows.TokenIntegrityLevel, (*byte)(unsafe.Pointer(&tml)), tml.Size()); err != nil {
+		t.Fatal(err)
+	}
+	if il, err := integrity(medium); err != nil || il != 0x2000 {
+		t.Fatalf("medium token's integrity: %#x, %v", il, err)
+	}
+	if id, err := tokenIdentity(medium, me, admins); err != nil || id.ElevatedAdmin {
+		t.Fatalf("Administrators enabled at medium integrity: %+v, %v", id, err)
+	}
+
+	var restricted windows.Token
+	disable := windows.SIDAndAttributes{Sid: admins}
+	if r, _, e := procCreateRestrictedToken.Call(uintptr(proc), 0, 1, uintptr(unsafe.Pointer(&disable)), 0, 0, 0, 0,
+		uintptr(unsafe.Pointer(&restricted))); r == 0 {
+		t.Fatalf("CreateRestrictedToken: %v", e)
+	}
+	defer restricted.Close()
+	denyOnly := identification(restricted)
+	if il, err := integrity(denyOnly); err != nil || il < integrityHigh {
+		t.Fatalf("the restricted token's integrity: %#x, %v (it should stay high)", il, err)
+	}
+	if id, err := tokenIdentity(denyOnly, me, admins); err != nil || id.ElevatedAdmin {
+		t.Fatalf("Administrators deny-only at high integrity: %+v, %v", id, err)
 	}
 }

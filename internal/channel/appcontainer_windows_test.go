@@ -37,6 +37,7 @@ const (
 	acDialed     = 0
 	acNotAllowed = 3
 	acOther      = 4
+	acDenied     = 5 // refused by the access list at open
 )
 
 // TestAppContainerClientHelper is the client run inside an AppContainer
@@ -51,6 +52,8 @@ func TestAppContainerClientHelper(t *testing.T) {
 	case err == nil:
 		f.Close()
 		os.Exit(acDialed)
+	case errors.Is(err, ErrAccessDenied):
+		os.Exit(acDenied)
 	case errors.Is(err, ErrNotAllowed):
 		os.Exit(acNotAllowed)
 	default:
@@ -96,8 +99,12 @@ func TestAppContainerRefused(t *testing.T) {
 			t.Setenv("VETTID_TEST_AC_PIPE", s.pipe)
 			t.Setenv("VETTID_TEST_AC_OWNER", me)
 			code := runInAppContainer(t, sid, exe, "-test.run=^TestAppContainerClientHelper$")
-			if code != acNotAllowed {
-				t.Fatalf("the AppContainer client exited %#x, want %d (refused)", code, acNotAllowed)
+			want := uint32(acDenied)
+			if c.refusedByServer {
+				want = acNotAllowed
+			}
+			if code != want {
+				t.Fatalf("the AppContainer client exited %#x, want %d", code, want)
 			}
 			if c.refusedByServer {
 				got := s.refused.wait(t, 1)

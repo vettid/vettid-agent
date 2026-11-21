@@ -410,3 +410,196 @@ func TestListenerCloseEndsAccept(t *testing.T) {
 		t.Fatal("Close did not end Accept")
 	}
 }
+
+// A client that opens and closes before the server's connect fails the
+// waiting instance (ERROR_NO_DATA). Its replacement exists before it is
+// closed: at that moment nobody else can take the name.
+func TestPipeFailedInstanceKeepsName(t *testing.T) {
+	me := selfSID(t)
+	pipe := randomPipe(t)
+	l, err := Listen(ListenConfig{Pipe: pipe, Owner: me, Member: me, Version: testVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var takenErr error
+	replaced := make(chan struct{})
+	l.afterReplace = func() {
+		_, takenErr = Listen(ListenConfig{Pipe: pipe, Owner: me, Member: me, Version: testVersion})
+		close(replaced)
+	}
+	// Open and close before Accept connects.
+	p, _ := windows.UTF16PtrFromString(PipePath(pipe))
+	h, err := windows.CreateFile(p, clientAccess, 0, nil, windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	windows.CloseHandle(h)
+	refused := &refusals{}
+	l.cfg.OnRefused = refused.add
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	accepted := make(chan *ServerConn, 1)
+	go func() {
+		c, err := l.Accept(ctx)
+		if err == nil {
+			accepted <- c
+		}
+	}()
+	select {
+	case <-replaced:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the failed instance was not replaced")
+	}
+	if !errors.Is(takenErr, ErrNameTaken) {
+		t.Fatalf("while replacing, another Listen got %v: the name was free", takenErr)
+	}
+	// And the listener goes on: a client is served.
+	ch := dialAsync(DialConfig{Pipe: pipe, Service: me, Op: OpMCP, Version: testVersion})
+	select {
+	case c := <-accepted:
+		_ = c.Accept()
+		defer c.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("no client accepted after the failed instance")
+	}
+	if r := <-ch; r.err != nil {
+		t.Fatal(r.err)
+	} else {
+		r.f.Close()
+	}
+}
+
+// Beyond maxConns clients at once, the next is told the channel is busy,
+// and the listener goes on: once one closes, a client is served again.
+func TestPipeBusy(t *testing.T) {
+	me := selfSID(t)
+	s := listenN(t, me, maxConns+2)
+	var clients []io.Closer
+	defer func() {
+		for _, c := range clients {
+			c.Close()
+		}
+	}()
+	var held []*ServerConn
+	for i := 0; i < maxConns; i++ {
+		cfg := s.dial(OpMCP)
+		cfg.Service = me
+		ch := dialAsync(cfg)
+		c := s.accepted(t)
+		_ = c.Accept()
+		held = append(held, c)
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("client %d: %v", i, r.err)
+		}
+		clients = append(clients, r.f)
+	}
+	cfg := s.dial(OpMCP)
+	cfg.Service = me
+	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrBusy) {
+		t.Fatalf("client %d: %v, want ErrBusy", maxConns+1, err)
+	}
+	held[0].Close()
+	ch := dialAsync(cfg)
+	c := s.accepted(t)
+	_ = c.Accept()
+	if r := <-ch; r.err != nil {
+		t.Fatalf("after one closed: %v", r.err)
+	} else {
+		r.f.Close()
+	}
+}
+
+// Without the NETWORK deny, PIPE_REJECT_REMOTE_CLIENTS alone still
+// refuses a client through the computer's name: the flag is tested on
+// its own, not only through the access list.
+func TestPipeRejectRemoteFlag(t *testing.T) {
+	me := selfSID(t)
+	s := &server{pipe: randomPipe(t), conns: make(chan *ServerConn, 4), refused: &refusals{}}
+	l, err := Listen(ListenConfig{Pipe: s.pipe, Owner: me, Member: me, Version: testVersion, OnRefused: s.refused.add,
+		noNetworkDeny: true, extraSDDL: "(A;;0x120083;;;NU)"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.l = l
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer l.Close()
+	go func() {
+		for {
+			c, err := l.Accept(ctx)
+			if err != nil {
+				return
+			}
+			s.conns <- c
+		}
+	}()
+	cfg := s.dial(OpMCP)
+	cfg.Service = me
+	cfg.server = "localhost"
+	cfg.Wait = time.Second
+	_, err = Dial(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("a client through \\localhost was admitted")
+	}
+	if errors.Is(err, windows.ERROR_BAD_NETPATH) || strings.Contains(err.Error(), "network path was not found") {
+		t.Skipf("no file sharing on this computer: %v", err)
+	}
+	t.Logf("remote client, the flag alone: %v", err)
+	select {
+	case c := <-s.conns:
+		c.Close()
+		t.Fatal("the server accepted a remote client")
+	default:
+	}
+}
+
+// listenN is listen with room for n waiting connections.
+func listenN(t *testing.T, member string, n int) *server {
+	t.Helper()
+	s := &server{pipe: randomPipe(t), conns: make(chan *ServerConn, n), refused: &refusals{}}
+	l, err := Listen(ListenConfig{Pipe: s.pipe, Owner: selfSID(t), Member: member, Version: testVersion, OnRefused: s.refused.add})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.l = l
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			c, err := l.Accept(ctx)
+			if err != nil {
+				return
+			}
+			s.conns <- c
+		}
+	}()
+	t.Cleanup(func() {
+		cancel()
+		l.Close()
+		<-done
+	})
+	return s
+}
+
+// Close while no Accept waits closes the waiting instance; a later
+// Accept says the channel is closed.
+func TestListenerCloseIdle(t *testing.T) {
+	me := selfSID(t)
+	pipe := randomPipe(t)
+	l, err := Listen(ListenConfig{Pipe: pipe, Owner: me, Member: me, Version: testVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.Accept(context.Background()); !errors.Is(err, errClosed) {
+		t.Fatalf("Accept after Close: %v", err)
+	}
+	if _, err := Dial(context.Background(), DialConfig{Pipe: pipe, Service: me, Op: OpMCP, Version: testVersion}); !errors.Is(err, ErrNoService) {
+		t.Fatalf("Dial after Close: %v, want ErrNoService", err)
+	}
+}

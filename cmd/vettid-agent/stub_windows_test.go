@@ -8,6 +8,8 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"io"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -37,6 +39,20 @@ func TestStubOverPipe(t *testing.T) {
 	stubReadPipe = func(string) (string, error) { return pipe, nil }
 	stubService = func(string) string { return me }
 	t.Cleanup(func() { stubReadPipe, stubService, mcpIn = oldRead, oldService, oldIn })
+
+	// The stub holds no key or state: with every folder a state could be
+	// in made unreadable for this user, it still passes MCP messages.
+	denied := t.TempDir()
+	if out, err := exec.Command("icacls", denied, "/deny", "*"+me+":(OI)(CI)F").CombinedOutput(); err != nil {
+		t.Fatalf("icacls: %v: %s", err, out)
+	}
+	t.Cleanup(func() { _ = exec.Command("icacls", denied, "/remove:d", "*"+me).Run() })
+	if _, err := os.ReadDir(denied); err == nil {
+		t.Fatal("the denied folder can still be read")
+	}
+	for _, v := range []string{"USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "TEMP", "TMP"} {
+		t.Setenv(v, denied)
+	}
 
 	inR, inW := io.Pipe()
 	mcpIn = inR

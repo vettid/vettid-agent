@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -32,10 +33,14 @@ const (
 	// WRITE_DAC or WRITE_OWNER.
 	clientMask = clientAccess | windows.SYNCHRONIZE | windows.FILE_READ_ATTRIBUTES
 
-	// maxInstances bounds the pipe's instances, and so the clients
-	// connected at once (chosen; not in the spec).
-	maxInstances = 16
-	bufSize      = 64 << 10
+	// maxInstances: the pipe allows as many instances as Windows does,
+	// so that making the next one never fails for want of room; the
+	// clients served at once are bounded by maxConns instead.
+	maxInstances = windows.PIPE_UNLIMITED_INSTANCES
+	// maxConns bounds the clients connected at once; one beyond it is
+	// told the channel is busy (chosen; not in the spec).
+	maxConns = 16
+	bufSize  = 64 << 10
 
 	// helloWait bounds each end's hello (chosen; not in the spec).
 	helloWait = 10 * time.Second
@@ -73,10 +78,12 @@ type ListenConfig struct {
 	// block.
 	OnRefused func(op Op, err error)
 
-	extraSDDL string // tests only: more access entries
+	extraSDDL     string // tests only: more access entries
+	noNetworkDeny bool   // tests only: leave out the NETWORK deny, to test PIPE_REJECT_REMOTE_CLIENTS alone
 }
 
-// Listener is the server end: the service's.
+// Listener is the server end: the service's. Accept is called from one
+// goroutine at a time.
 type Listener struct {
 	cfg    ListenConfig
 	path   *uint16
@@ -87,10 +94,22 @@ type Listener struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu     sync.Mutex
-	next   windows.Handle // the instance waiting for a client
-	broken error
+	mu sync.Mutex
+	// next is the instance waiting for a client. While Accept waits on it
+	// (waiting), Accept alone may close it; otherwise Close does. There is
+	// always one while the listener is open, so the pipe's name is never
+	// free.
+	next    windows.Handle
+	waiting bool
+	closed  bool
+	broken  error
+	live    int // clients connected and not yet closed (maxConns)
+
+	afterReplace func() // tests only: runs once a failed instance is closed
 }
+
+// errClosed: the listener was closed.
+var errClosed = errors.New("the channel is closed")
 
 // Listen creates the pipe with FILE_FLAG_FIRST_PIPE_INSTANCE: if its
 // name is taken (another account made it first), it returns
@@ -107,7 +126,11 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	sd, err := windows.SecurityDescriptorFromString(pipeSDDL(cfg.Owner, cfg.Member, cfg.extraSDDL))
+	sddl := pipeSDDL(cfg.Owner, cfg.Member, cfg.extraSDDL)
+	if cfg.noNetworkDeny {
+		sddl = strings.Replace(sddl, "(D;;GA;;;NU)", "", 1)
+	}
+	sd, err := windows.SecurityDescriptorFromString(sddl)
 	if err != nil {
 		return nil, fmt.Errorf("the pipe's access: %w", err)
 	}
@@ -138,16 +161,15 @@ func (l *Listener) instance(first bool) (windows.Handle, error) {
 	return windows.CreateNamedPipe(l.path, flags, mode, maxInstances, bufSize, bufSize, 0, l.sa)
 }
 
-// Close stops Accept and closes the waiting instance. Connections
-// already accepted stay open.
+// Close stops Accept and closes the waiting instance (or has Accept
+// close it, if it is waiting on it). Connections already accepted stay
+// open.
 func (l *Listener) Close() error {
 	l.cancel()
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.broken == nil {
-		l.broken = errors.New("the channel is closed")
-	}
-	if l.next != 0 {
+	l.closed = true
+	if l.next != 0 && !l.waiting {
 		h := l.next
 		l.next = 0
 		return windows.CloseHandle(h)
@@ -162,6 +184,8 @@ type ServerConn struct {
 	Op       Op
 	Identity Identity
 	version  string
+	l        *Listener
+	once     sync.Once
 }
 
 // Accept answers the client's hello: the operation may start.
@@ -175,11 +199,23 @@ func (c *ServerConn) Refuse(err error) error {
 	return errors.Join(rerr, cerr)
 }
 
+// Close closes the connection, which then no longer counts toward
+// maxConns.
+func (c *ServerConn) Close() error {
+	err := c.File.Close()
+	c.once.Do(func() {
+		c.l.mu.Lock()
+		c.l.live--
+		c.l.mu.Unlock()
+	})
+	return err
+}
+
 // Accept waits for a client that names an operation it may run, from a
 // token the pipe can identify (Admit). Clients refused on the way are
 // told so and reported to OnRefused; Accept returns only an admitted
 // client, or an error once ctx ends, the listener is closed, or the pipe
-// can't go on (then no instance waits and the service should stop).
+// can't go on (then the service should stop).
 func (l *Listener) Accept(ctx context.Context) (*ServerConn, error) {
 	for {
 		c, err := l.acceptOne(ctx)
@@ -206,79 +242,97 @@ func (e *clientError) Error() string { return e.err.Error() }
 
 func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 	l.mu.Lock()
-	h, broken := l.next, l.broken
-	l.mu.Unlock()
-	if broken != nil {
-		return nil, broken
+	switch {
+	case l.closed:
+		l.mu.Unlock()
+		return nil, errClosed
+	case l.broken != nil:
+		l.mu.Unlock()
+		return nil, l.broken
+	case l.waiting:
+		l.mu.Unlock()
+		return nil, errors.New("the channel is already waiting for a client")
 	}
+	h := l.next
+	l.waiting = true
+	l.mu.Unlock()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	stop := context.AfterFunc(l.ctx, cancel)
 	defer stop()
-	if err := connect(ctx, h); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		// The instance failed: try a fresh one in its place.
-		return nil, l.replace(h, &clientError{err: err})
-	}
-	// The next instance exists before this one is handed out, so the
-	// pipe's name is never free while the service runs.
-	nh, err := l.instance(false)
+	cerr := connect(ctx, h)
+
 	l.mu.Lock()
-	if err != nil {
-		l.broken = fmt.Errorf("the channel can't make a new instance: %w", err)
+	l.waiting = false
+	if l.closed {
 		l.next = 0
-	} else if l.broken != nil { // closed meanwhile
-		windows.CloseHandle(nh)
+		l.mu.Unlock()
+		windows.CloseHandle(h)
+		return nil, errClosed
+	}
+	if cerr != nil && ctx.Err() != nil {
+		// Cancelled: h stays the waiting instance.
+		l.mu.Unlock()
+		return nil, ctx.Err()
+	}
+	// h is connected, or failed (a client that came and left before the
+	// connection, ERROR_NO_DATA): either way it is replaced. The next
+	// instance is made before h is handed out or closed, so the pipe's
+	// name is never free while the service runs.
+	nh, ierr := l.instance(false)
+	if ierr != nil {
+		// h still holds the name; the service must stop.
+		l.broken = fmt.Errorf("the channel can't make a new instance: %w", ierr)
+		if cerr != nil {
+			l.mu.Unlock()
+			return nil, l.broken
+		}
 		l.next = 0
 	} else {
 		l.next = nh
 	}
-	broken = l.broken
+	if cerr != nil {
+		l.mu.Unlock()
+		windows.CloseHandle(h)
+		if l.afterReplace != nil {
+			l.afterReplace()
+		}
+		return nil, &clientError{err: cerr}
+	}
+	l.live++
+	busy := l.live > maxConns
+	broken := l.broken
 	l.mu.Unlock()
-	f := os.NewFile(uintptr(h), PipePath(l.cfg.Pipe))
+
+	c := &ServerConn{File: os.NewFile(uintptr(h), PipePath(l.cfg.Pipe)), version: l.cfg.Version, l: l}
 	if broken != nil {
-		f.Close()
+		c.Close()
 		return nil, broken
 	}
-	_ = f.SetDeadline(time.Now().Add(helloWait))
-	op, err := readClientHello(f, l.cfg.Version)
+	_ = c.SetDeadline(time.Now().Add(helloWait))
+	op, err := readClientHello(c.File, l.cfg.Version)
 	if err != nil {
-		f.Close()
+		c.Close()
 		return nil, &clientError{op: op, err: err}
+	}
+	if busy {
+		_ = refuse(c.File, l.cfg.Version, ErrBusy)
+		c.Close()
+		return nil, &clientError{op: op, err: ErrBusy}
 	}
 	id, err := identify(h, l.member, l.admins)
 	if err == nil {
 		err = Admit(op, id)
 	}
 	if err != nil {
-		_ = refuse(f, l.cfg.Version, ErrNotAllowed)
-		f.Close()
+		_ = refuse(c.File, l.cfg.Version, ErrNotAllowed)
+		c.Close()
 		return nil, &clientError{op: op, err: err}
 	}
-	_ = f.SetDeadline(time.Time{})
-	return &ServerConn{File: f, Op: op, Identity: id, version: l.cfg.Version}, nil
-}
-
-// replace closes a failed waiting instance and makes another; err is
-// returned unless that fails too.
-func (l *Listener) replace(h windows.Handle, err error) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	windows.CloseHandle(h)
-	if l.broken != nil {
-		l.next = 0
-		return l.broken
-	}
-	nh, ierr := l.instance(false)
-	if ierr != nil {
-		l.broken = fmt.Errorf("the channel can't make a new instance: %w", ierr)
-		l.next = 0
-		return l.broken
-	}
-	l.next = nh
-	return err
+	_ = c.SetDeadline(time.Time{})
+	c.Op, c.Identity = op, id
+	return c, nil
 }
 
 // connect waits for a client on instance h until ctx ends.
@@ -457,7 +511,7 @@ func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 		case errors.Is(err, windows.ERROR_FILE_NOT_FOUND):
 			return nil, ErrNoService
 		case errors.Is(err, windows.ERROR_ACCESS_DENIED):
-			return nil, ErrNotAllowed
+			return nil, ErrAccessDenied
 		case errors.Is(err, windows.ERROR_PIPE_BUSY):
 			left := time.Until(deadline)
 			if left <= 0 || ctx.Err() != nil {

@@ -54,7 +54,7 @@ func TestReadPipeRefusals(t *testing.T) {
 	}
 	_, err := readPipeAt(p, "work")
 	if !errors.Is(err, ErrNoService) ||
-		!(strings.Contains(err.Error(), "not owned by Administrators or SYSTEM") || strings.Contains(err.Error(), "can be changed by this account")) {
+		!(strings.Contains(err.Error(), "not owned by Administrators or SYSTEM") || strings.Contains(err.Error(), "can be changed by ")) {
 		t.Fatalf("a file this user can change: %v", err)
 	}
 }
@@ -106,9 +106,50 @@ func TestReadPipeAdminOnly(t *testing.T) {
 			t.Fatalf("with %s: %v", ace, err)
 		}
 	}
-	// The elevated administrator itself may change the file, and is
-	// refused like anyone else who may.
-	if _, err := readPipeAt(ok, "work"); !errors.Is(err, ErrNoService) {
-		t.Fatalf("read by a user who can change it: %v", err)
+	// An elevated administrator (this test) reads the same file the same
+	// way: the check is of the file, not of who reads it.
+	if pipe, err := readPipeAt(ok, "work"); err != nil || pipe == "" {
+		t.Fatalf("read by an elevated administrator: %q, %v", pipe, err)
+	}
+}
+
+// adminOnly judges the descriptor alone: the same answer whoever reads.
+func TestAdminOnly(t *testing.T) {
+	const m = "S-1-5-21-1-2-3-1001" // a member
+	ti := ServiceSID("TrustedInstaller")
+	for _, c := range []struct {
+		sddl string
+		ok   bool
+	}{
+		{"O:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;" + m + ")", true},
+		{"O:SYD:P(A;;FA;;;SY)(A;;FR;;;BU)", true},
+		{"O:BAD:P(A;;FA;;;" + ti + ")(A;;FR;;;WD)", true},
+		{"O:BAD:P(A;;FA;;;BA)(D;;FA;;;" + m + ")", true},       // a deny takes away
+		{"O:BAD:P(A;;FA;;;BA)(A;OICIIO;FA;;;" + m + ")", true}, // inherit-only: not for this file
+		{"O:BAD:P(A;;FA;;;BA)(A;;0x1200a9;;;" + m + ")", true}, // read and execute
+		{"O:" + m + "D:P(A;;FA;;;BA)", false},                  // owned by the member
+		{"O:BUD:P(A;;FA;;;BA)", false},                         // owned by Users
+		{"O:BAD:P(A;;FA;;;BA)(A;;FW;;;" + m + ")", false},      // write
+		{"O:BAD:P(A;;FA;;;BA)(A;;0x4;;;" + m + ")", false},     // append
+		{"O:BAD:P(A;;FA;;;BA)(A;;0x10000;;;" + m + ")", false}, // delete
+		{"O:BAD:P(A;;FA;;;BA)(A;;WD;;;" + m + ")", false},      // change the access
+		{"O:BAD:P(A;;FA;;;BA)(A;;WO;;;" + m + ")", false},      // change the owner
+		{"O:BAD:P(A;;FA;;;BA)(A;;GW;;;" + m + ")", false},      // generic write
+		{"O:BAD:P(A;;FA;;;BA)(A;;GA;;;BU)", false},             // generic all, Users
+		{"O:BAD:P(A;;FA;;;BA)(A;;0x100;;;AU)", false},          // attributes, Authenticated Users
+		{"O:BAD:P(A;;FA;;;BA)(A;;FA;;;OW)", false},             // OWNER RIGHTS: not on the list
+		{"O:BAD:P(A;;FA;;;BA)(A;;FA;;;CO)", false},             // CREATOR OWNER, effective
+		{"O:BAD:", true}, // an empty access list: nobody but the owner
+		{"O:BA", false},  // no DACL: anyone
+		{"O:BAD:P(A;;FA;;;BA)(XA;;FW;;;" + m + ";(WIN://x))", false}, // a callback entry
+	} {
+		sd, err := windows.SecurityDescriptorFromString(c.sddl)
+		if err != nil {
+			t.Fatalf("%s: %v", c.sddl, err)
+		}
+		err = adminOnly(sd)
+		if (err == nil) != c.ok {
+			t.Errorf("%s: %v, want ok %v", c.sddl, err, c.ok)
+		}
 	}
 }

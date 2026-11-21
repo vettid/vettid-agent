@@ -31,6 +31,28 @@ const (
 	TextRunsOff = "Runs and proxies are off: the connector runs in this agent's account."
 )
 
+// The stub's refusals by account (chosen; not in the spec), under the
+// code not_allowed: the channel refused this account at open (another
+// user of the computer, or an administrator not running elevated), or
+// the service refused tools to an account that isn't the member.
+const (
+	CodeNotAllowed   = "not_allowed"
+	TextAccessDenied = "This account can't open this pairing's connector service: only the member it belongs to can, and an administrator running as administrator."
+	TextNotTheMember = "Only the member this pairing belongs to can use its tools; an administrator can only pair it, forget it or ask its status."
+)
+
+// AccessDenied is the stub's answer to every tool when the channel
+// refused this account at open.
+func AccessDenied() *request.Error {
+	return &request.Error{Code: CodeNotAllowed, Text: TextAccessDenied}
+}
+
+// NotTheMember is the stub's answer to every tool when the service
+// refused tools to this account.
+func NotTheMember() *request.Error {
+	return &request.Error{Code: CodeNotAllowed, Text: TextNotTheMember}
+}
+
 // NoService is the stub's answer to every tool when its channel is
 // missing, or isn't the service's.
 func NoService() *request.Error {
