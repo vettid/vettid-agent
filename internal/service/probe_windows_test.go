@@ -275,12 +275,10 @@ func startWithLogon(exe string, u probeUser, logonFlags uintptr) startResult {
 // closed, and checks it ended.
 func runChildren(exe string, u probeUser, start starter) startResult {
 	var res startResult
-	out := filepath.Join(u.OutDir, "user.txt")
-	// Nothing from an earlier start counts.
-	if err := os.Remove(out); err != nil && !errors.Is(err, os.ErrNotExist) {
-		res.Start = "removing an earlier record: " + err.Error()
-		return res
-	}
+	// A record of its own for each start, so nothing an earlier start
+	// wrote can count (the service may read the runner's folder, not
+	// delete in it).
+	out := filepath.Join(u.OutDir, "user-"+randHex(8)+".txt")
 	pi, err := start(`-test.run=^TestProbeChildHelper$ -probe-child-out="` + out + `"`)
 	if err != nil {
 		res.Start, res.Errno = err.Error(), errnoOf(err)
