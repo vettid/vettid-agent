@@ -294,3 +294,7 @@ func TestCheckOwnerOnlyHandleDeletedFile(t *testing.T) {
 		t.Fatalf("CheckOwnerOnlyHandle of a deleted file = %v", err)
 	}
 }
+
+func assertDirOwnerOnly(t *testing.T, dir string) { t.Helper(); assertOwnerOnly(t, dir) }
+
+func assertFileOwnerOnly(t *testing.T, path string) { t.Helper(); assertOwnerOnly(t, path) }

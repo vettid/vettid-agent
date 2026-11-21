@@ -503,3 +503,28 @@ func lockDir(path string) (io.Closer, error) {
 
 // flushRetries: FlushFileBuffers may be retried (see retryDurable).
 const flushRetries = 3
+
+// linkCount is the number of names f has.
+func linkCount(f *os.File) (uint64, error) {
+	var bi windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bi); err != nil {
+		return 0, err
+	}
+	return uint64(bi.NumberOfLinks), nil
+}
+
+// fileKey names a file on this system: its volume serial number and file
+// index.
+type fileKey struct {
+	serial uint32
+	index  uint64
+}
+
+// fileKeyOf is f's identity.
+func fileKeyOf(f *os.File) (fileKey, error) {
+	var bi windows.ByHandleFileInformation
+	if err := windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &bi); err != nil {
+		return fileKey{}, err
+	}
+	return fileKey{bi.VolumeSerialNumber, uint64(bi.FileIndexHigh)<<32 | uint64(bi.FileIndexLow)}, nil
+}

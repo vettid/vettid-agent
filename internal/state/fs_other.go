@@ -27,3 +27,11 @@ func syncDir(string) error                                        { return errUn
 func lockDir(string) (io.Closer, error)                           { return nil, errUnsupported }
 
 const flushRetries = 0
+
+// linkCount: unknown here, so never 1 (nothing is overwritten).
+func linkCount(*os.File) (uint64, error) { return 0, errors.New("state: no link count") }
+
+// fileKey: no file identity here.
+type fileKey struct{}
+
+func fileKeyOf(*os.File) (fileKey, error) { return fileKey{}, errors.New("state: no file identity") }

@@ -216,3 +216,32 @@ func lockDir(path string) (io.Closer, error) {
 // flushRetries: a failed fsync is not retried on POSIX (see
 // retryDurable).
 const flushRetries = 0
+
+// linkCount is the number of names f has.
+func linkCount(f *os.File) (uint64, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, errors.New("state: no link count")
+	}
+	return uint64(st.Nlink), nil
+}
+
+// fileKey names a file on this system: its device and inode.
+type fileKey struct{ dev, ino uint64 }
+
+// fileKeyOf is f's identity.
+func fileKeyOf(f *os.File) (fileKey, error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return fileKey{}, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileKey{}, errors.New("state: no file identity")
+	}
+	return fileKey{uint64(st.Dev), uint64(st.Ino)}, nil
+}
