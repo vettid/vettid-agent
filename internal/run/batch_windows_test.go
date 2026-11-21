@@ -108,7 +108,7 @@ func TestBatchPathAndFolderRefused(t *testing.T) {
 	spec = helperSpec(t, bat, "")
 	spec.Dir = dir
 	_, err := p.Start(spec)
-	if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), `the working folder holds a character that becomes " on this system`) {
+	if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), `the working folder holds U+FF02, which becomes " on this system`) {
 		t.Errorf("folder: %v", err)
 	}
 }
@@ -131,6 +131,7 @@ func TestBatchPathTextCodePages(t *testing.T) {
 		{932, "e acute becomes e", "caf" + u(0xe9)},
 		{932, "CJK in its own code page", u(0x4e2d, 0x6587)},
 		{936, "CJK in its own code page", u(0x4e2d, 0x6587)},
+		{949, "Hangul in its own code page", u(0xd55c, 0xae00)},
 		{65001, "UTF-8 gives no ASCII bytes", "a" + u(0xff02) + "b" + u(0xe9)},
 	}
 	for _, c := range ok {
@@ -155,10 +156,13 @@ func TestBatchPathTextCodePages(t *testing.T) {
 		{932, "DBCS second byte backslash (Cyrillic YERU)", "a" + u(0x042b) + "b", `becomes ` + backslash + ` on this system`},
 		{936, "DBCS second byte backslash", "a" + u(0x4e57) + "b", `becomes ` + backslash + ` on this system`},
 		{950, "DBCS second byte backslash", "a" + u(0x4e48) + "b", `becomes ` + backslash + ` on this system`},
+		{949, "won sign", "a" + u(0x20a9) + "b", `U+20A9, which becomes ` + backslash + ` on this system`},
+		{437, "a control byte (white smiling face becomes 0x01)", "a" + u(0x263a) + "b", "U+263A, which becomes a control character on this system"},
+		{1252, "the detail names the code point", "a" + u(0xff02) + "b", `U+FF02, which becomes " on this system`},
 		{1252, "an ASCII metacharacter still", "p(1)", "holds ("},
 		{1252, "an ASCII control character still", "a" + u(9) + "b", "holds a control character"},
-		{12345, "a code page that doesn't exist: the conversion fails", "caf" + u(0xe9), "can't convert"},
-		{1252, "bytes that aren't UTF-8", "a" + string([]byte{0xff}) + "b", "can't convert"},
+		{12345, "a code page that doesn't exist: the conversion fails", "caf" + u(0xe9), "U+00E9, which this system can't convert"},
+		{1252, "bytes that aren't UTF-8", "a" + string([]byte{0xff}) + "b", "bytes that aren't UTF-8"},
 	}
 	for _, c := range refused {
 		err := batchPathTextCP(c.s, "the program's path", c.cp)

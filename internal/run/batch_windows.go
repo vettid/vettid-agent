@@ -18,7 +18,7 @@ import (
 )
 
 // A Windows batch file (.cmd or .bat) runs through System32's cmd.exe
-// (AGENT-PLAN §4.9; owner decision b, GC #14880): cmd.exe /d /v:off /s /c
+// (AGENT-PLAN §4.9; owner decision b, GC #14880): cmd.exe /d /e:on /v:off /s /c
 // with the batch file and each argument in double quotes. cmd.exe reads
 // the command line again, and the batch file may read an argument again
 // (%~1 strips our quotes; %* puts the arguments on a line it parses), so
@@ -48,6 +48,9 @@ import (
 // starts that reads its command line in the ANSI code page, and an
 // account name such as José must not keep every npm tool from running. A
 // character that has no mapping becomes ? there, which is no command.
+// The console (OEM) code page, which cmd.exe uses for `for /f` and pipes,
+// is not checked: what a batch file does with its own output is beyond
+// what this guards.
 // Arguments and the value of every environment variable the agent
 // controls keep the full rule:
 // cmd.exe expands %NAME% before it parses a line, so a value holding
@@ -109,8 +112,14 @@ func batchText(s, what string) error {
 
 // batchPathText checks the batch file's path or the working folder:
 // ASCII by batchText's rule, and a character outside ASCII by what this
-// system's ANSI code page turns it into, read now (never cached: an
-// administrator can change it).
+// system's ANSI code page turns it into, read at each run, never cached
+// (it changes only with a reboot, but the connector may run across one).
+//
+// GetACP gives the system's code page, the one a program the batch starts
+// uses, only because the connector has no activeCodePage manifest: with a
+// UTF-8 one it would answer 65001 and pass everything. A test
+// (TestNoActiveCodePageManifest) fails if a manifest or resource file is
+// added.
 func batchPathText(s, what string) error {
 	return batchPathTextCP(s, what, windows.GetACP())
 }
@@ -124,7 +133,7 @@ func batchPathTextCP(s, what string, cp uint32) error {
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		if r == utf8.RuneError && size <= 1 {
-			return argNotAllowed("%s holds a character this system can't convert", what)
+			return argNotAllowed("%s holds bytes that aren't UTF-8", what)
 		}
 		i += size
 		if r < 0x80 {
@@ -133,16 +142,17 @@ func batchPathTextCP(s, what string, cp uint32) error {
 			}
 			continue
 		}
+		// A path is not secret, so the refusal names the code point.
 		b, ok := ansiBytes(cp, r)
 		if !ok {
-			return argNotAllowed("%s holds a character this system can't convert", what)
+			return argNotAllowed("%s holds U+%04X, which this system can't convert", what, r)
 		}
 		for _, c := range b {
 			switch {
 			case c < 0x20 || c == 0x7f:
-				return argNotAllowed("%s holds a character that becomes a control character on this system", what)
+				return argNotAllowed("%s holds U+%04X, which becomes a control character on this system", what, r)
 			case c == '\\' || strings.IndexByte(batchMeta, c) >= 0:
-				return argNotAllowed("%s holds a character that becomes %c on this system", what, c)
+				return argNotAllowed("%s holds U+%04X, which becomes %c on this system", what, r, c)
 			}
 		}
 	}
@@ -155,6 +165,10 @@ var procWideCharToMultiByte = windows.NewLazySystemDLL("kernel32.dll").NewProc("
 // flags (best fit on, the code page's default character for what has no
 // mapping). false if the conversion fails.
 func ansiBytes(cp uint32, r rune) ([]byte, bool) {
+	// Call panics if the procedure can't be found: refuse instead.
+	if procWideCharToMultiByte.Find() != nil {
+		return nil, false
+	}
 	w := utf16.Encode([]rune{r})
 	var buf [16]byte
 	n, _, _ := procWideCharToMultiByte.Call(uintptr(cp), 0, uintptr(unsafe.Pointer(&w[0])), uintptr(len(w)),
