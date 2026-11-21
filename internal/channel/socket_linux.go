@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -43,10 +44,12 @@ const (
 )
 
 // adminGroups are the groups that make the member an administrator on
-// Linux (AGENT-LINUX-RUNTIME §11, proposed and open for the owner): the
-// member then gets member_is_admin for every tool, as on Windows. Until
-// the owner decides, this fails closed.
-var adminGroups = []string{"sudo", "wheel", "admin"}
+// Linux (AGENT-LINUX-RUNTIME §11, proposed and open for the owner): sudo's
+// usual groups, and the groups that give root in all but name (a
+// container or VM manager, raw disks). The member then gets
+// member_is_admin for every tool, as on Windows. Until the owner decides,
+// this fails closed.
+var adminGroups = []string{"sudo", "wheel", "admin", "docker", "lxd", "incus-admin", "libvirt", "disk"}
 
 // ErrNotActivated: the service was not started by its systemd socket.
 var ErrNotActivated = errors.New("the connector service must be started by its systemd socket, not by hand")
@@ -88,8 +91,9 @@ type ListenConfig struct {
 	// block.
 	OnRefused func(op Op, err error)
 
-	fd       int                                     // tests only: the listening descriptor, in place of systemd's
-	groupsOf func(uid, gid uint32) ([]string, error) // tests only: the member's groups
+	fd        int                                     // tests only: the listening descriptor, in place of systemd's
+	groupsOf  func(uid, gid uint32) ([]string, error) // tests only: the member's groups in the group database
+	peerNames func(gids []uint32) ([]string, error)   // tests only: the names of the groups the client holds
 }
 
 // Listener is the server end: the service's. Accept is called from one
@@ -129,6 +133,9 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 	unix.CloseOnExec(fd)
 	if cfg.groupsOf == nil {
 		cfg.groupsOf = userGroups
+	}
+	if cfg.peerNames == nil {
+		cfg.peerNames = groupNames
 	}
 	return &Listener{cfg: cfg, f: os.NewFile(uintptr(fd), cfg.Socket)}, nil
 }
@@ -302,6 +309,10 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 	// The credentials the kernel recorded when the client connected:
 	// they can't be changed by the client afterwards.
 	cred, cerr := unix.GetsockoptUcred(nfd, unix.SOL_SOCKET, unix.SO_PEERCRED)
+	var gids []uint32
+	if cerr == nil {
+		gids, cerr = peerGroups(nfd)
+	}
 
 	l.mu.Lock()
 	if l.closed {
@@ -328,7 +339,7 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 	var id Identity
 	if cerr != nil {
 		err = fmt.Errorf("the client's credentials can't be read: %w", cerr)
-	} else if id, err = l.identify(cred); err == nil {
+	} else if id, err = l.identify(cred, gids); err == nil {
 		err = Admit(op, id)
 	}
 	if err != nil {
@@ -348,10 +359,11 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 
 // identify maps a client's uid to who it is: the member, or root (a
 // command under sudo, the only elevated administrator on Linux). Anyone
-// else holds nothing, and Admit refuses them. The member's
-// administrator groups are read at each connection; if they can't be,
-// the client is refused.
-func (l *Listener) identify(cred *unix.Ucred) (Identity, error) {
+// else holds nothing, and Admit refuses them. The member is an
+// administrator if the group database or the groups the client holds
+// (gids, SO_PEERGROUPS) name one of adminGroups: both are read at each
+// connection, and if either can't be, the client is refused.
+func (l *Listener) identify(cred *unix.Ucred, gids []uint32) (Identity, error) {
 	id := Identity{Member: cred.Uid == l.cfg.MemberUID, ElevatedAdmin: cred.Uid == 0}
 	if !id.Member {
 		return id, nil
@@ -364,6 +376,11 @@ func (l *Listener) identify(cred *unix.Ucred) (Identity, error) {
 	if err != nil {
 		return Identity{}, fmt.Errorf("the member's groups can't be read: %w", err)
 	}
+	held, err := l.cfg.peerNames(gids)
+	if err != nil {
+		return Identity{}, fmt.Errorf("the client's groups can't be named: %w", err)
+	}
+	groups = append(groups, held...)
 	id.HoldsAdmins = slices.ContainsFunc(groups, func(g string) bool { return slices.Contains(adminGroups, g) })
 	return id, nil
 }
@@ -380,6 +397,19 @@ func userGroups(uid, gid uint32) ([]string, error) {
 		return nil, err
 	}
 	ids = append(ids, strconv.FormatUint(uint64(gid), 10))
+	return lookupGroups(ids)
+}
+
+// groupNames names the groups gids.
+func groupNames(gids []uint32) ([]string, error) {
+	ids := make([]string, len(gids))
+	for i, g := range gids {
+		ids[i] = strconv.FormatUint(uint64(g), 10)
+	}
+	return lookupGroups(ids)
+}
+
+func lookupGroups(ids []string) ([]string, error) {
 	var names []string
 	for _, id := range ids {
 		g, err := user.LookupGroupId(id)
@@ -395,12 +425,32 @@ func userGroups(uid, gid uint32) ([]string, error) {
 	return names, nil
 }
 
+// peerGroups reads the supplementary groups the client held when it
+// connected (SO_PEERGROUPS, Linux 4.13).
+func peerGroups(fd int) ([]uint32, error) {
+	n := 64
+	for {
+		buf := make([]uint32, n)
+		size := uint32(4 * n)
+		_, _, errno := unix.Syscall6(unix.SYS_GETSOCKOPT, uintptr(fd), unix.SOL_SOCKET, unix.SO_PEERGROUPS,
+			uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0)
+		switch {
+		case errno == unix.ERANGE && int(size)/4 > n:
+			n = int(size) / 4
+			continue
+		case errno != 0:
+			return nil, errno
+		}
+		return buf[:size/4], nil
+	}
+}
+
 // Dial checks the socket and its folder, connects, checks the server's
 // uid, and runs the hello:
 //   - the socket must be a socket, not a link, owned by cfg.Service;
-//   - its folder must be a folder owned by root with no group or other
-//     write, so nobody else can swap the socket between the check and
-//     the connection;
+//   - its folder, and every folder above it up to /, must be a folder
+//     owned by root with no group or other write, so nobody else can
+//     swap the socket between the check and the connection;
 //   - the server's uid (SO_PEERCRED: with socket activation, the uid
 //     that called listen, systemd's) must be root or cfg.Service.
 //
@@ -417,11 +467,11 @@ func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: the connector account's uid: %v", ErrNoService, err)
 	}
-	dirUID := uint32(0)
+	dirUID, walk := uint32(0), true
 	if cfg.dirUID != nil {
-		dirUID = *cfg.dirUID
+		dirUID, walk = *cfg.dirUID, false
 	}
-	if err := checkSocket(cfg.Pipe, uint32(svcUID), dirUID); err != nil {
+	if err := checkSocket(cfg.Pipe, uint32(svcUID), dirUID, walk); err != nil {
 		return nil, err
 	}
 	f, err := connectUnix(ctx, cfg.Pipe, cfg.Wait)
@@ -447,8 +497,10 @@ func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 }
 
 // checkSocket checks the socket at path (owner svcUID) and its folder
-// (owner dirUID, no group or other write).
-func checkSocket(path string, svcUID, dirUID uint32) error {
+// (owner dirUID, no group or other write); with walk, every folder above
+// it too, up to /, each owned by root with no group or other write, so
+// no other account can replace any of them.
+func checkSocket(path string, svcUID, dirUID uint32, walk bool) error {
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
 		if errors.Is(err, unix.ENOENT) {
@@ -466,13 +518,28 @@ func checkSocket(path string, svcUID, dirUID uint32) error {
 		return fmt.Errorf("%w: %s is owned by uid %d", ErrNotService, path, st.Uid)
 	}
 	dir := filepath.Dir(path)
+	for {
+		if err := checkFolder(dir, dirUID); err != nil {
+			return err
+		}
+		if !walk || dir == "/" {
+			return nil
+		}
+		dir, dirUID = filepath.Dir(dir), 0
+	}
+}
+
+// checkFolder checks that dir is a folder (not a link) owned by uid with
+// no group or other write.
+func checkFolder(dir string, uid uint32) error {
+	var st unix.Stat_t
 	if err := unix.Lstat(dir, &st); err != nil {
 		return fmt.Errorf("%w: %v", ErrNotService, err)
 	}
 	switch {
 	case st.Mode&unix.S_IFMT != unix.S_IFDIR:
 		return fmt.Errorf("%w: %s is not a folder", ErrNotService, dir)
-	case st.Uid != dirUID:
+	case st.Uid != uid:
 		return fmt.Errorf("%w: %s is owned by uid %d", ErrNotService, dir, st.Uid)
 	case st.Mode&0o022 != 0:
 		return fmt.Errorf("%w: other accounts can change %s", ErrNotService, dir)

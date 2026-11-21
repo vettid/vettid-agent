@@ -365,6 +365,26 @@ func TestRootClientRefusesImpostors(t *testing.T) {
 		t.Errorf("a socket of another owner: %q, want not_service", got)
 	}
 
+	// A good folder under one other users can change (/tmp): every
+	// folder up to / counts.
+	under := "/tmp/vtw" + randHex(t, 3)
+	if err := os.Mkdir(under, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(under) })
+	deep := filepath.Join(under, "s.sock")
+	dl, err := net.Listen("unix", deep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { dl.Close() })
+	if err := os.Chown(deep, int(connUID), -1); err != nil {
+		t.Fatal(err)
+	}
+	if got := dialResult(deep, e.conn, OpStatus); got != "not_service" {
+		t.Errorf("a folder under /tmp: %q, want not_service", got)
+	}
+
 	// A socket owned by the connector's account but listened on by
 	// another user: only the server's uid gives it away.
 	tmp := "/run/vettid-test-" + randHex(t, 3)

@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -63,6 +64,20 @@ func shortDir(t *testing.T) string {
 	}
 	t.Cleanup(func() { os.RemoveAll(d) })
 	return d
+}
+
+// recv takes the next value from ch, failing the test after 5 s, so a
+// client the server didn't see fails rather than hangs.
+func recv[T any](t *testing.T, ch chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		t.Fatal("the server saw no client")
+		var zero T
+		return zero
+	}
 }
 
 func TestSocketNames(t *testing.T) {
@@ -169,6 +184,11 @@ func serve(t *testing.T, cfg ListenConfig) (path string, s served) {
 	path = filepath.Join(d, "s.sock")
 	cfg.fd = listenAt(t, path)
 	cfg.Socket = path
+	if cfg.peerNames == nil {
+		// This test user's real groups (which may hold sudo) don't decide
+		// here; TestRootMemberIsAdmin runs the real lookup.
+		cfg.peerNames = func([]uint32) ([]string, error) { return nil, nil }
+	}
 	s = served{ids: make(chan Identity, 8), refused: make(chan error, 8)}
 	cfg.OnRefused = func(_ Op, err error) { s.refused <- err }
 	if cfg.Version == "" {
@@ -214,19 +234,19 @@ func TestAcceptKnowsTheMember(t *testing.T) {
 	if err := dialAs(t, path, OpMCP); err != nil {
 		t.Fatalf("the member's tools: %v", err)
 	}
-	if id := <-s.ids; !id.Member || id.ElevatedAdmin || id.HoldsAdmins {
+	if id := recv(t, s.ids); !id.Member || id.ElevatedAdmin || id.HoldsAdmins {
 		t.Errorf("identity %+v, want the member only", id)
 	}
 	if err := dialAs(t, path, OpStatus); err != nil {
 		t.Errorf("the member's status: %v", err)
 	}
-	<-s.ids
+	recv(t, s.ids)
 	// pair and forget from the member's normal process: refused.
 	for _, op := range []Op{OpPair, OpForget} {
 		if err := dialAs(t, path, op); !errors.Is(err, ErrNotAllowed) {
 			t.Errorf("%s from the member: %v, want ErrNotAllowed", op, err)
 		}
-		if err := <-s.refused; !errors.Is(err, ErrNotAllowed) {
+		if err := recv(t, s.refused); !errors.Is(err, ErrNotAllowed) {
 			t.Errorf("OnRefused got %v", err)
 		}
 	}
@@ -239,7 +259,7 @@ func TestAcceptRefusesAnotherUser(t *testing.T) {
 		if err := dialAs(t, path, op); !errors.Is(err, ErrNotAllowed) {
 			t.Errorf("%s from another user: %v, want ErrNotAllowed", op, err)
 		}
-		<-s.refused
+		recv(t, s.refused)
 	}
 }
 
@@ -251,11 +271,11 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 		if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
 			t.Errorf("a member in %s: %v, want ErrMemberIsAdmin", g, err)
 		}
-		<-s.refused
+		recv(t, s.refused)
 		if err := dialAs(t, path, OpStatus); err != nil {
 			t.Errorf("a member in %s, status: %v", g, err)
 		}
-		if id := <-s.ids; !id.HoldsAdmins {
+		if id := recv(t, s.ids); !id.HoldsAdmins {
 			t.Errorf("a member in %s: %+v", g, id)
 		}
 	}
@@ -265,14 +285,58 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
 		t.Errorf("MemberAdmin: %v, want ErrMemberIsAdmin", err)
 	}
-	<-s.refused
+	recv(t, s.refused)
+	// A group the client holds, though the group database doesn't list it.
+	held := func([]uint32) ([]string, error) { return []string{"docker"}, nil }
+	path, s = serve(t, ListenConfig{MemberUID: uid, groupsOf: none, peerNames: held})
+	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
+		t.Errorf("a group the client holds: %v, want ErrMemberIsAdmin", err)
+	}
+	recv(t, s.refused)
+	unnamed := func([]uint32) ([]string, error) { return nil, errors.New("no group database") }
+	path, s = serve(t, ListenConfig{MemberUID: uid, groupsOf: none, peerNames: unnamed})
+	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrNotAllowed) {
+		t.Errorf("unnamed client groups: %v, want ErrNotAllowed", err)
+	}
+	recv(t, s.refused)
 	// Groups that can't be read: refused, not admitted.
 	broken := func(uint32, uint32) ([]string, error) { return nil, errors.New("no group database") }
 	path, s = serve(t, ListenConfig{MemberUID: uid, groupsOf: broken})
 	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrNotAllowed) {
 		t.Errorf("unreadable groups: %v, want ErrNotAllowed", err)
 	}
-	<-s.refused
+	recv(t, s.refused)
+}
+
+// peerGroups reads what the client holds: this process's own groups.
+func TestPeerGroups(t *testing.T) {
+	a, b, err := socketpair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(a)
+	defer unix.Close(b)
+	got, err := peerGroups(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := unix.Getgroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("peerGroups = %v, Getgroups = %v", got, want)
+	}
+	for _, g := range want {
+		if !slices.Contains(got, uint32(g)) {
+			t.Errorf("peerGroups = %v, missing %d", got, g)
+		}
+	}
+}
+
+func socketpair() (int, int, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	return fds[0], fds[1], err
 }
 
 func TestUserGroups(t *testing.T) {
@@ -307,7 +371,7 @@ func TestDialChecksTheSocket(t *testing.T) {
 		f, err := Dial(context.Background(), DialConfig{Pipe: p, Service: service, Op: OpStatus, Version: "v1", dirUID: &dirUID})
 		if err == nil {
 			f.Close()
-			<-s.ids
+			recv(t, s.ids)
 		}
 		return err
 	}
