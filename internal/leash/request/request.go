@@ -856,9 +856,13 @@ func handedBack(err error) bool {
 // may not ask again (ErrWithheld); otherwise answer returns true, and e
 // is to be asked again.
 func (c *Client) answer(e *entry, resp *vaultconn.Response, mayAskAgain bool) bool {
-	defer clear(resp.Body)
+	// Zeroed as soon as it is parsed, before finish hands the outcome on:
+	// once a caller has its answer, the body holds nothing. parse copies
+	// what it keeps (a json.RawMessage field is a copy), so nothing of the
+	// result shares the body's memory.
 	if resp.OK {
 		res, err := parse(e, resp.Body)
+		clear(resp.Body)
 		switch {
 		case errors.Is(err, errWithheld) && mayAskAgain:
 			c.log.Info("agent.request answered without the value", "op", e.op, "id", e.id, "inner_id", e.wire)
@@ -876,6 +880,7 @@ func (c *Client) answer(e *entry, resp *vaultconn.Response, mayAskAgain bool) bo
 		c.finish(e, res, nil)
 		return false
 	}
+	clear(resp.Body)
 	code := resp.ErrorCode
 	c.log.Info("agent.request refused", "op", e.op, "id", e.id, "code", code)
 	switch code {
