@@ -31,10 +31,11 @@ var ErrArgumentNotAllowed error = &Error{Code: CodeArgumentNotAllowed}
 
 // TextArgumentNotAllowed is the refusal shown to the agent. (NEW text)
 const TextArgumentNotAllowed = "This program is a Windows batch file (.cmd or .bat), which runs through cmd.exe. " +
-	"Its arguments, the environment variables the request sets, its path and its working folder can't hold any of " +
-	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII " +
-	"(so a file name in another alphabet can't be passed to it), and an argument or variable can't end in a backslash: " +
-	"cmd.exe would read them as commands. A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
+	"Its arguments and the environment variables the request sets can't hold any of " +
+	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII, and can't end in a backslash. " +
+	"Its path and its working folder can't hold those characters, or a character Windows would turn into one of them " +
+	"(such as a full-width ＂): cmd.exe would read them as commands. " +
+	"A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
 	"Pass the value in a file instead."
 
 // TextSecretNotForBatch refuses a secret given to a batch file in an

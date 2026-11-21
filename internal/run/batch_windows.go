@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -36,9 +38,18 @@ import (
 //     command line by the C runtime's rules takes \" for a quote, so the
 //     argument would run into the next.
 //
-// The batch file's path and the working folder follow the same rule (the
-// path is on the command line; cmd.exe reads the folder for %cd%), and so
-// does the value of every environment variable the agent controls:
+// The batch file's path and the working folder (the path is on the
+// command line; cmd.exe reads the folder for %cd%) follow the same rule
+// for ASCII, but a character outside ASCII is refused only if this
+// system's ANSI code page, read at each run, turns it into one of the
+// refused characters, a backslash or a control character, DBCS second
+// bytes included (owner decision b, GC #15715; batchPathText). cmd.exe
+// itself keeps such a path as it is; the risk is a program the batch
+// starts that reads its command line in the ANSI code page, and an
+// account name such as José must not keep every npm tool from running. A
+// character that has no mapping becomes ? there, which is no command.
+// Arguments and the value of every environment variable the agent
+// controls keep the full rule:
 // cmd.exe expands %NAME% before it parses a line, so a value holding
 // " & is syntax wherever the batch uses it. A variable named as one of
 // cmd.exe's own dynamic variables (%CD%, %ERRORLEVEL%, ...) is refused:
@@ -96,6 +107,64 @@ func batchText(s, what string) error {
 	return nil
 }
 
+// batchPathText checks the batch file's path or the working folder:
+// ASCII by batchText's rule, and a character outside ASCII by what this
+// system's ANSI code page turns it into, read now (never cached: an
+// administrator can change it).
+func batchPathText(s, what string) error {
+	return batchPathTextCP(s, what, windows.GetACP())
+}
+
+// batchPathTextCP is batchPathText for code page cp (tests give it one;
+// the system's can't be switched for a test). Each character outside
+// ASCII is converted on its own with Windows's default best fit, so a
+// DBCS second byte is seen as the byte it is. A conversion that fails
+// refuses, fail closed.
+func batchPathTextCP(s, what string, cp uint32) error {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size <= 1 {
+			return argNotAllowed("%s holds a character this system can't convert", what)
+		}
+		i += size
+		if r < 0x80 {
+			if err := batchText(string(r), what); err != nil {
+				return err
+			}
+			continue
+		}
+		b, ok := ansiBytes(cp, r)
+		if !ok {
+			return argNotAllowed("%s holds a character this system can't convert", what)
+		}
+		for _, c := range b {
+			switch {
+			case c < 0x20 || c == 0x7f:
+				return argNotAllowed("%s holds a character that becomes a control character on this system", what)
+			case c == '\\' || strings.IndexByte(batchMeta, c) >= 0:
+				return argNotAllowed("%s holds a character that becomes %c on this system", what, c)
+			}
+		}
+	}
+	return nil
+}
+
+var procWideCharToMultiByte = windows.NewLazySystemDLL("kernel32.dll").NewProc("WideCharToMultiByte")
+
+// ansiBytes is r in code page cp, as WideCharToMultiByte gives it with no
+// flags (best fit on, the code page's default character for what has no
+// mapping). false if the conversion fails.
+func ansiBytes(cp uint32, r rune) ([]byte, bool) {
+	w := utf16.Encode([]rune{r})
+	var buf [16]byte
+	n, _, _ := procWideCharToMultiByte.Call(uintptr(cp), 0, uintptr(unsafe.Pointer(&w[0])), uintptr(len(w)),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, 0)
+	if n == 0 || int(n) > len(buf) {
+		return nil, false
+	}
+	return buf[:n], true
+}
+
 // batchValue is batchText for a value cmd.exe puts between quotes it
 // doesn't control: it can't end in a backslash either.
 func batchValue(s, what string) error {
@@ -138,10 +207,10 @@ func connectorSet(name string) bool {
 // be trusted is the agent's. A refusal names the variable, never its
 // value.
 func checkBatch(path, dir string, args, env, trusted []string) error {
-	if err := batchText(path, "the program's path"); err != nil {
+	if err := batchPathText(path, "the program's path"); err != nil {
 		return err
 	}
-	if err := batchText(dir, "the working folder"); err != nil {
+	if err := batchPathText(dir, "the working folder"); err != nil {
 		return err
 	}
 	if filepath.Dir(dir) == dir {

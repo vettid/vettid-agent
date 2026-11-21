@@ -79,7 +79,8 @@ func TestBatchArgumentRefused(t *testing.T) {
 }
 
 // The batch file's path and the working folder are checked by the same
-// rule.
+// rule for ASCII; outside ASCII, by what the system's code page makes of
+// the character (TestBatchPathTextCodePages).
 func TestBatchPathAndFolderRefused(t *testing.T) {
 	lookupOnly(t)
 	odd := filepath.Join(t.TempDir(), "p(1)")
@@ -94,16 +95,104 @@ func TestBatchPathAndFolderRefused(t *testing.T) {
 		t.Errorf("path: %v", err)
 	}
 
+	if windows.GetACP() != 1252 {
+		t.Skipf("the working-folder case needs code page 1252 (this system: %d)", windows.GetACP())
+	}
 	bat = writeBatch(t, t.TempDir(), "t.cmd", "@echo off")
 	p = prepare(t, bat)
-	dir := filepath.Join(t.TempDir(), "caf"+string(rune(0xe9)))
+	// U+FF02, a full-width quotation mark: code page 1252 turns it into ".
+	dir := filepath.Join(t.TempDir(), "a"+string(rune(0xff02))+"b")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	spec = helperSpec(t, bat, "")
 	spec.Dir = dir
-	if _, err := p.Start(spec); !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the working folder") {
+	_, err := p.Start(spec)
+	if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), `the working folder holds a character that becomes " on this system`) {
 		t.Errorf("folder: %v", err)
+	}
+}
+
+// Outside ASCII, the path and working folder refuse a character only if
+// the code page turns it into a refused byte (a DBCS second byte
+// included), a backslash or a control character; one that becomes ? is
+// fine. The code page is a parameter here: the system's can't be switched.
+func TestBatchPathTextCodePages(t *testing.T) {
+	u := func(rs ...rune) string { return string(rs) }
+	ok := []struct {
+		cp   uint32
+		name string
+		s    string
+	}{
+		{1252, "e acute, u umlaut", `C:` + backslash + "Users" + backslash + "Jos" + u(0xe9) + " Zo" + u(0xeb) + backslash + "npm"},
+		{1252, "CJK becomes ?", "x" + u(0x4e2d) + "y"},
+		{1252, "the replacement character becomes ?", "x" + u(0xfffd) + "y"},
+		{1252, "outside the BMP", "x" + u(0x1f600) + "y"},
+		{932, "e acute becomes e", "caf" + u(0xe9)},
+		{932, "CJK in its own code page", u(0x4e2d, 0x6587)},
+		{936, "CJK in its own code page", u(0x4e2d, 0x6587)},
+		{65001, "UTF-8 gives no ASCII bytes", "a" + u(0xff02) + "b" + u(0xe9)},
+	}
+	for _, c := range ok {
+		if err := batchPathTextCP(c.s, "the program's path", c.cp); err != nil {
+			t.Errorf("cp%d %s: refused: %v", c.cp, c.name, err)
+		}
+	}
+	refused := []struct {
+		cp   uint32
+		name string
+		s    string
+		want string
+	}{
+		{1252, "full-width quotation mark", "a" + u(0xff02) + "b", `becomes " on this system`},
+		{1252, "full-width reverse solidus", "a" + u(0xff3c) + "b", `becomes ` + backslash + ` on this system`},
+		{1252, "full-width percent sign", "a" + u(0xff05) + "b", "becomes % on this system"},
+		{1252, "full-width ampersand", "a" + u(0xff06) + "b", "becomes & on this system"},
+		{1252, "full-width vertical line", "a" + u(0xff5c) + "b", "becomes | on this system"},
+		{1252, "full-width left parenthesis", "a" + u(0xff08) + "b", "becomes ( on this system"},
+		{932, "yen sign", "a" + u(0xa5) + "b", `becomes ` + backslash + ` on this system`},
+		{932, "DBCS second byte ^ (katakana TA)", "a" + u(0x30bf) + "b", "becomes ^ on this system"},
+		{932, "DBCS second byte backslash (Cyrillic YERU)", "a" + u(0x042b) + "b", `becomes ` + backslash + ` on this system`},
+		{936, "DBCS second byte backslash", "a" + u(0x4e57) + "b", `becomes ` + backslash + ` on this system`},
+		{950, "DBCS second byte backslash", "a" + u(0x4e48) + "b", `becomes ` + backslash + ` on this system`},
+		{1252, "an ASCII metacharacter still", "p(1)", "holds ("},
+		{1252, "an ASCII control character still", "a" + u(9) + "b", "holds a control character"},
+		{12345, "a code page that doesn't exist: the conversion fails", "caf" + u(0xe9), "can't convert"},
+		{1252, "bytes that aren't UTF-8", "a" + string([]byte{0xff}) + "b", "can't convert"},
+	}
+	for _, c := range refused {
+		err := batchPathTextCP(c.s, "the program's path", c.cp)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the program's path holds") || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("cp%d %s: %v (want %q)", c.cp, c.name, err, c.want)
+		}
+	}
+	// Backslashes as separators and plain ASCII pass.
+	if err := batchPathTextCP(`C:`+backslash+"x"+backslash+"y.cmd", "the program's path", 1252); err != nil {
+		t.Errorf("an ASCII path: %v", err)
+	}
+}
+
+// A batch file in a folder whose name is outside ASCII (an account name
+// such as José), with that folder as the working folder, runs, and its
+// arguments arrive whole. An argument outside ASCII is still refused
+// (TestBatchArgumentRefused).
+func TestBatchNonASCIIPathRuns(t *testing.T) {
+	lookupOnly(t)
+	if windows.GetACP() != 1252 {
+		t.Skipf("needs code page 1252 (this system: %d)", windows.GetACP())
+	}
+	dir := filepath.Join(t.TempDir(), "Jos"+string(rune(0xe9))+" Zo"+string(rune(0xeb))+" "+string(rune(0x4e2d)), "npm")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bat := writeBatch(t, dir, "t.cmd", "@echo off", "echo [%~1]", "exit /b 3")
+	p := prepare(t, bat)
+	spec := helperSpec(t, bat, "")
+	spec.Argv = []string{bat, "plain ascii"}
+	spec.Dir = evalAbs(t, dir)
+	code, out := runOutput(t, p, spec)
+	if code != 3 || out != "[plain ascii]"+crlf {
+		t.Fatalf("exit %d, output %q", code, out)
 	}
 }
 
