@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -583,8 +584,11 @@ func TestAcceptBusy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer l.Close()
+	var mu sync.Mutex
 	var held []*ServerConn
 	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
 		for _, c := range held {
 			c.Close()
 		}
@@ -596,7 +600,9 @@ func TestAcceptBusy(t *testing.T) {
 				return
 			}
 			_ = c.Accept()
+			mu.Lock()
 			held = append(held, c) // kept open: each counts toward maxConns
+			mu.Unlock()
 		}
 	}()
 	var clients []*os.File
