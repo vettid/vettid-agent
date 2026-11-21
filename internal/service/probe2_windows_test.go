@@ -165,6 +165,7 @@ type childStart struct {
 	ImageName string        `json:"image_name"` // read by the launcher while suspended
 	Exit      string        `json:"exit"`
 	Record    programRecord `json:"record"`
+	Output    string        `json:"output,omitempty"` // what it wrote, when it wrote no record
 	PID       uint32        `json:"pid,omitempty"`
 }
 
@@ -294,7 +295,7 @@ func runLauncher() int {
 	} {
 		out := filepath.Join(dir, "child-"+c.name+"-"+randHex(4)+".json")
 		args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=%s -p2-out="%s" -p2-sentinel=%d%s`, c.mode, out, uint64(sentinel), c.extra)
-		cs := startChild(c.tok, *p2Exe, args, 60*time.Second)
+		cs := startChild(c.tok, *p2Exe, args, filepath.Join(dir, "child-"+c.name+"-"+randHex(4)+".log"), 60*time.Second)
 		if b, err := os.ReadFile(out); err == nil {
 			_ = json.Unmarshal(b, &cs.Record)
 		}
@@ -302,7 +303,7 @@ func runLauncher() int {
 	}
 	// A program that waits: the service finds it in the job and kills it
 	// by closing the job.
-	pi, err := startSuspended(restricted, *p2Exe, `-test.run=^TestProbe2ChildHelper$ -p2-mode=wait`)
+	pi, err := startSuspended(restricted, *p2Exe, `-test.run=^TestProbe2ChildHelper$ -p2-mode=wait`, "")
 	if err == nil {
 		_, _ = windows.ResumeThread(pi.Thread)
 		rec.WaitingPID = pi.ProcessId
@@ -335,38 +336,52 @@ func restrictToken(tok windows.Token, kind string) (windows.Token, error) {
 }
 
 // startSuspended starts exe with args as tok's user, suspended, with only
-// its standard handles (NUL) inherited.
-func startSuspended(tok windows.Token, exe, args string) (windows.ProcessInformation, error) {
+// its standard handles inherited: NUL for input, and logPath (when given)
+// for its output, so that a child that fails at start says why.
+func startSuspended(tok windows.Token, exe, args, logPath string) (windows.ProcessInformation, error) {
 	var pi windows.ProcessInformation
-	nulName, _ := windows.UTF16PtrFromString("NUL")
 	sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), InheritHandle: 1}
+	nulName, _ := windows.UTF16PtrFromString("NUL")
 	nul, err := windows.CreateFile(nulName, windows.GENERIC_READ|windows.GENERIC_WRITE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, sa, windows.OPEN_EXISTING, 0, 0)
 	if err != nil {
 		return pi, fmt.Errorf("NUL: %w", err)
 	}
 	defer windows.CloseHandle(nul)
+	out := nul
+	if logPath != "" {
+		lp, _ := windows.UTF16PtrFromString(logPath)
+		lh, err := windows.CreateFile(lp, windows.GENERIC_WRITE, windows.FILE_SHARE_READ, sa, windows.CREATE_ALWAYS, windows.FILE_ATTRIBUTE_NORMAL, 0)
+		if err != nil {
+			return pi, fmt.Errorf("log file: %w", err)
+		}
+		defer windows.CloseHandle(lh)
+		out = lh
+	}
 	al, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return pi, err
 	}
 	defer al.Delete()
 	handles := []windows.Handle{nul}
+	if out != nul {
+		handles = append(handles, out)
+	}
 	if err := al.Update(windows.PROC_THREAD_ATTRIBUTE_HANDLE_LIST, unsafe.Pointer(&handles[0]), unsafe.Sizeof(handles[0])*uintptr(len(handles))); err != nil {
 		return pi, fmt.Errorf("handle list: %w", err)
 	}
 	si := &windows.StartupInfoEx{ProcThreadAttributeList: al.List()}
 	si.Cb = uint32(unsafe.Sizeof(*si))
 	si.Flags = windows.STARTF_USESTDHANDLES
-	si.StdInput, si.StdOutput, si.StdErr = nul, nul, nul
+	si.StdInput, si.StdOutput, si.StdErr = nul, out, out
 	cl, _ := windows.UTF16PtrFromString(`"` + exe + `" ` + args)
 	err = windows.CreateProcessAsUser(tok, nil, cl, nil, nil, true,
 		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW|windows.EXTENDED_STARTUPINFO_PRESENT, nil, nil, &si.StartupInfo, &pi)
 	return pi, err
 }
 
-func startChild(tok windows.Token, exe, args string, wait time.Duration) childStart {
+func startChild(tok windows.Token, exe, args, logPath string, wait time.Duration) childStart {
 	var cs childStart
-	pi, err := startSuspended(tok, exe, args)
+	pi, err := startSuspended(tok, exe, args, logPath)
 	if err != nil {
 		cs.Start, cs.Errno = err.Error(), errnoOf(err)
 		return cs
@@ -381,6 +396,12 @@ func startChild(tok windows.Token, exe, args string, wait time.Duration) childSt
 	}
 	_, _ = windows.ResumeThread(pi.Thread)
 	cs.Exit = waitExit(pi, wait)
+	if b, err := os.ReadFile(logPath); err == nil && len(b) > 0 {
+		if len(b) > 2000 {
+			b = b[:2000]
+		}
+		cs.Output = string(b)
+	}
 	return cs
 }
 
@@ -949,8 +970,9 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			!sameSet(p.Record.Token.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
 			t.Errorf("%s: program's token %+v, launcher handle inherited %v", where, p.Record.Token, p.Record.SentinelInherits)
 		}
-		if restrict == "interactive+local" && p.Record.Token.Local != "deny-only" {
-			t.Errorf("%s: LOCAL %s", where, p.Record.Token.Local)
+		// LOCAL can only be made deny-only if the runner's token holds it.
+		if restrict == "interactive+local" && l.Token.Local != "absent" && p.Record.Token.Local != "deny-only" {
+			t.Errorf("%s: LOCAL %s (the launcher's: %s)", where, p.Record.Token.Local, l.Token.Local)
 		}
 		if p.Record.Token.Batch != "absent" {
 			t.Errorf("%s: BATCH %s", where, p.Record.Token.Batch)
