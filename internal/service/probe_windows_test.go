@@ -2,25 +2,30 @@
 
 package service
 
-// The first check of AGENT-PLAN §6 A3.10b, measured: can a virtual service
-// account (NT SERVICE\<name>, SidType unrestricted) hold and use
-// SeAssignPrimaryTokenPrivilege, which CreateProcessAsUser needs to start
-// a run as a runner account? The answer decides between the virtual
-// account and a local user with the service logon right.
+// The first check of AGENT-PLAN §6 A3.10b, measured: what a virtual
+// service account (NT SERVICE\<name>, SidType unrestricted) holds, and
+// how it can start a program as a runner account.
 //
 // TestServiceAccountProbe registers a throwaway service that runs a copy of
-// this test binary as such an account, three ways: as it is by default;
-// with the service's required privileges cut to SeChangeNotifyPrivilege,
-// SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege; and with
-// that cut and the last two granted to the account through LSA. A service
-// that does not start is recorded, not failed. Inside, the service records
-// its token's privileges, whether SeImpersonatePrivilege and
-// SeTcbPrivilege are absent, whether CreateProcessAsUser starts a program
-// as a throwaway user (batch logon) with SeAssignPrimaryTokenPrivilege
-// alone and with SeIncreaseQuotaPrivilege too, and a DPAPI round trip;
-// the test prints the record.
+// this test binary as such an account, in the variants of probeVariants:
+// by default; with its required privileges cut, with and without
+// SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege granted
+// through LSA; with only SeAssignPrimaryTokenPrivilege; and with
+// SeChangeNotifyPrivilege alone. Inside, the service records its token's
+// privileges and tries to start this binary as two throwaway users (one
+// with the batch logon right only, one also denied interactive and
+// remote logon, as a runner is) two ways: CreateProcessAsUser with a
+// batch logon token, and CreateProcessWithLogonW (the secondary logon
+// service), without and with the user's profile. Each child records its
+// own user; each is started suspended and put in a job that kills it on
+// close, and a second child, which waits, shows that closing the job ends
+// it. The test checks each variant's outcome where it is known (expect)
+// and prints the whole record.
+//
 // It runs only with VETTID_AGENT_TEST_OTHER_USER=1 (the elevated Windows CI
-// step) and removes everything it made.
+// step). It removes the service, its account's profile, the rights it
+// granted, the users and their profiles, and the folder, and reports what
+// of that fails.
 
 import (
 	"crypto/rand"
@@ -28,10 +33,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode/utf16"
@@ -47,42 +55,85 @@ import (
 const otherUserEnv = "VETTID_AGENT_TEST_OTHER_USER"
 
 var (
-	modadvapi32               = windows.NewLazySystemDLL("advapi32.dll")
-	procLsaOpenPolicy         = modadvapi32.NewProc("LsaOpenPolicy")
-	procLsaAddAccountRights   = modadvapi32.NewProc("LsaAddAccountRights")
-	procLsaRemoveAccountRight = modadvapi32.NewProc("LsaRemoveAccountRights")
-	procLsaClose              = modadvapi32.NewProc("LsaClose")
-	procLogonUserW            = modadvapi32.NewProc("LogonUserW")
-	procLookupPrivilegeNameW  = modadvapi32.NewProc("LookupPrivilegeNameW")
-	modnetapi32               = windows.NewLazySystemDLL("netapi32.dll")
-	procNetUserAdd            = modnetapi32.NewProc("NetUserAdd")
-	procNetUserDel            = modnetapi32.NewProc("NetUserDel")
+	modadvapi32                 = windows.NewLazySystemDLL("advapi32.dll")
+	procLsaOpenPolicy           = modadvapi32.NewProc("LsaOpenPolicy")
+	procLsaAddAccountRights     = modadvapi32.NewProc("LsaAddAccountRights")
+	procLsaRemoveAccountRights  = modadvapi32.NewProc("LsaRemoveAccountRights")
+	procLsaClose                = modadvapi32.NewProc("LsaClose")
+	procLogonUserW              = modadvapi32.NewProc("LogonUserW")
+	procLookupPrivilegeNameW    = modadvapi32.NewProc("LookupPrivilegeNameW")
+	procCreateProcessWithLogonW = modadvapi32.NewProc("CreateProcessWithLogonW")
+	procAdjustTokenPrivileges   = modadvapi32.NewProc("AdjustTokenPrivileges")
+	modnetapi32                 = windows.NewLazySystemDLL("netapi32.dll")
+	procNetUserAdd              = modnetapi32.NewProc("NetUserAdd")
+	procNetUserDel              = modnetapi32.NewProc("NetUserDel")
+	procDeleteProfileW          = windows.NewLazySystemDLL("userenv.dll").NewProc("DeleteProfileW")
 )
 
-// probeConfig is what the test hands the service, in a file next to its
-// binary that only the service's account and administrators can read.
+// errServicePrivilege: a privilege the service requires isn't in its
+// account's configuration (ERROR_SERVICE_... 1297).
+const errServicePrivilege = syscall.Errno(1297)
+
+// The child's flags (TestProbeChildHelper).
+var (
+	childOut  = flag.String("probe-child-out", "", "probe child: write this process's user SID here")
+	childWait = flag.Bool("probe-child-wait", false, "probe child: wait until killed")
+)
+
+// TestProbeChildHelper is the program the service starts as a runner: it
+// writes its own user's SID, or waits to be killed.
+func TestProbeChildHelper(t *testing.T) {
+	if *childOut == "" && !*childWait {
+		t.Skip("started by the probe's service")
+	}
+	if *childWait {
+		time.Sleep(5 * time.Minute)
+		os.Exit(9)
+	}
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		os.Exit(4)
+	}
+	if os.WriteFile(*childOut, []byte(u.User.Sid.String()), 0o600) != nil {
+		os.Exit(5)
+	}
+	os.Exit(0)
+}
+
+// probeUser is a throwaway runner the service starts programs as.
+type probeUser struct {
+	Name     string `json:"name"`
+	SID      string `json:"sid"`
+	Password string `json:"password"` // throwaway, deleted with the user
+	OutDir   string `json:"out_dir"`  // writable by this user only
+}
+
+// probeConfig is what the test hands the service, in a file only the
+// service's account and administrators can read.
 type probeConfig struct {
-	Out      string `json:"out"`
-	User     string `json:"user"`
-	Password string `json:"password"` // a throwaway user's, deleted with it
-	Child    string `json:"child"`
+	Out   string               `json:"out"`
+	Exe   string               `json:"exe"`
+	Users map[string]probeUser `json:"users"` // "plain", "denied"
+}
+
+// startResult is one way of starting a program as one user.
+type startResult struct {
+	Start     string `json:"start"`      // "ok" or the error
+	ChildUser string `json:"child_user"` // the SID the child wrote, or why not
+	Exit      string `json:"exit"`
+	JobKill   string `json:"job_kill"` // "ok": closing the job ended a waiting child
 }
 
 // probeResult is what the service records.
 type probeResult struct {
-	User              string   `json:"user"`
-	Privileges        []string `json:"privileges"` // name, then "+" if enabled
-	ImpersonateAbsent bool     `json:"impersonate_absent"`
-	TcbAbsent         bool     `json:"tcb_absent"`
-	EnableAssign      string   `json:"enable_assign_primary_token"`
-	LogonBatch        string   `json:"logon_batch"`
-	// CreateAsUser is CreateProcessAsUser with SeAssignPrimaryTokenPrivilege
-	// enabled and SeIncreaseQuotaPrivilege not; CreateAsUserQuota with both.
-	CreateAsUser      string `json:"create_process_as_user_assign_only"`
-	EnableQuota       string `json:"enable_increase_quota"`
-	CreateAsUserQuota string `json:"create_process_as_user_assign_and_quota"`
-	ChildExit         string `json:"child_exit"`
-	DPAPI             string `json:"dpapi"`
+	User              string                 `json:"user"`
+	Privileges        []string               `json:"privileges"` // name, "+" if enabled
+	ImpersonateAbsent bool                   `json:"impersonate_absent"`
+	TcbAbsent         bool                   `json:"tcb_absent"`
+	EnableAssign      string                 `json:"enable_assign_primary_token"`
+	EnableQuota       string                 `json:"enable_increase_quota"`
+	Starts            map[string]startResult `json:"starts"` // "<way>/<user>"
+	DPAPI             string                 `json:"dpapi"`
 }
 
 // TestServiceAccountProbeHelper is the service's side, run by the SCM.
@@ -106,8 +157,8 @@ func TestServiceAccountProbeHelper(t *testing.T) {
 
 type probeService struct{ c probeConfig }
 
-func (p *probeService) Execute(_ []string, r <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
-	s <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop}
+func (p *probeService) Execute(_ []string, _ <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
+	s <- svc.Status{State: svc.Running}
 	res := runProbe(p.c)
 	b, _ := json.MarshalIndent(res, "", "  ")
 	_ = os.WriteFile(p.c.Out, b, 0o600)
@@ -116,7 +167,7 @@ func (p *probeService) Execute(_ []string, r <-chan svc.ChangeRequest, s chan<- 
 }
 
 func runProbe(c probeConfig) probeResult {
-	var res probeResult
+	res := probeResult{Starts: map[string]startResult{}}
 	tok := windows.GetCurrentProcessToken()
 	if u, err := tok.GetTokenUser(); err == nil {
 		res.User = u.User.Sid.String()
@@ -138,41 +189,15 @@ func runProbe(c probeConfig) probeResult {
 	}
 	defer proc.Close()
 	res.EnableAssign = errString(setPrivilege(proc, "SeAssignPrimaryTokenPrivilege", true))
-	// SeIncreaseQuotaPrivilege off for the first try.
-	_ = setPrivilege(proc, "SeIncreaseQuotaPrivilege", false)
-	var user windows.Token
-	n, _ := windows.UTF16PtrFromString(c.User)
-	dot, _ := windows.UTF16PtrFromString(".")
-	pw, _ := windows.UTF16PtrFromString(c.Password)
-	if r, _, e := procLogonUserW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
-		4 /* LOGON32_LOGON_BATCH */, 0, uintptr(unsafe.Pointer(&user))); r == 0 {
-		res.LogonBatch = e.Error()
-	} else {
-		res.LogonBatch = "ok"
-		defer user.Close()
-		res.CreateAsUser, _ = startAs(user, c.Child)
-		res.EnableQuota = errString(setPrivilege(proc, "SeIncreaseQuotaPrivilege", true))
-		res.CreateAsUserQuota, res.ChildExit = startAs(user, c.Child)
+	res.EnableQuota = errString(setPrivilege(proc, "SeIncreaseQuotaPrivilege", true))
+	for _, who := range []string{"plain", "denied"} {
+		u := c.Users[who]
+		res.Starts["asuser/"+who] = startAsUser(c.Exe, u)
+		res.Starts["withlogon/"+who] = startWithLogon(c.Exe, u, 0)
+		res.Starts["withlogon-profile/"+who] = startWithLogon(c.Exe, u, 1 /* LOGON_WITH_PROFILE */)
 	}
 	res.DPAPI = errString(dpapiRoundTrip())
 	return res
-}
-
-// startAs starts child as the user of tok (CreateProcessAsUser) and waits
-// for it.
-func startAs(tok windows.Token, child string) (result, exit string) {
-	cl, _ := windows.UTF16PtrFromString(`"` + child + `" -test.run=^$`)
-	si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{}))}
-	var pi windows.ProcessInformation
-	if err := windows.CreateProcessAsUser(tok, nil, cl, nil, nil, false, windows.CREATE_NO_WINDOW, nil, nil, si, &pi); err != nil {
-		return err.Error(), ""
-	}
-	ev, _ := windows.WaitForSingleObject(pi.Process, 30000)
-	var code uint32
-	_ = windows.GetExitCodeProcess(pi.Process, &code)
-	windows.CloseHandle(pi.Process)
-	windows.CloseHandle(pi.Thread)
-	return "ok", fmt.Sprintf("wait %#x, exit %#x", ev, code)
 }
 
 func errString(err error) string {
@@ -180,6 +205,146 @@ func errString(err error) string {
 		return "ok"
 	}
 	return err.Error()
+}
+
+// starter starts the probe's binary suspended with these arguments and
+// returns its process information.
+type starter func(args string) (windows.ProcessInformation, error)
+
+// startAsUser uses CreateProcessAsUser with a batch logon token of u.
+func startAsUser(exe string, u probeUser) startResult {
+	var tok windows.Token
+	n, _ := windows.UTF16PtrFromString(u.Name)
+	dot, _ := windows.UTF16PtrFromString(".")
+	pw, _ := windows.UTF16PtrFromString(u.Password)
+	if r, _, e := procLogonUserW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
+		4 /* LOGON32_LOGON_BATCH */, 0, uintptr(unsafe.Pointer(&tok))); r == 0 {
+		return startResult{Start: "batch logon: " + e.Error()}
+	}
+	defer tok.Close()
+	return runChildren(exe, u, func(args string) (windows.ProcessInformation, error) {
+		cl, _ := windows.UTF16PtrFromString(`"` + exe + `" ` + args)
+		si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{}))}
+		var pi windows.ProcessInformation
+		err := windows.CreateProcessAsUser(tok, nil, cl, nil, nil, false, windows.CREATE_NO_WINDOW|windows.CREATE_SUSPENDED, nil, nil, si, &pi)
+		return pi, err
+	})
+}
+
+// startWithLogon uses CreateProcessWithLogonW (the secondary logon
+// service), which logs the user on interactively.
+func startWithLogon(exe string, u probeUser, logonFlags uintptr) startResult {
+	return runChildren(exe, u, func(args string) (windows.ProcessInformation, error) {
+		n, _ := windows.UTF16PtrFromString(u.Name)
+		dot, _ := windows.UTF16PtrFromString(".")
+		pw, _ := windows.UTF16PtrFromString(u.Password)
+		cl, _ := windows.UTF16FromString(`"` + exe + `" ` + args) // writable, as the API needs
+		dir, _ := windows.UTF16PtrFromString(filepath.Dir(exe))
+		si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{}))}
+		var pi windows.ProcessInformation
+		r, _, e := procCreateProcessWithLogonW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
+			logonFlags, 0, uintptr(unsafe.Pointer(&cl[0])), uintptr(windows.CREATE_NO_WINDOW|windows.CREATE_SUSPENDED), 0,
+			uintptr(unsafe.Pointer(dir)), uintptr(unsafe.Pointer(si)), uintptr(unsafe.Pointer(&pi)))
+		if r == 0 {
+			return pi, e
+		}
+		return pi, nil
+	})
+}
+
+// runChildren starts a child that writes its user, in a job that kills on
+// close, and waits for it; then a child that waits, in a job that is then
+// closed, and checks it ended.
+func runChildren(exe string, u probeUser, start starter) startResult {
+	var res startResult
+	out := filepath.Join(u.OutDir, "user.txt")
+	pi, err := start(`-test.run=^TestProbeChildHelper$ -probe-child-out="` + out + `"`)
+	if err != nil {
+		res.Start = err.Error()
+		return res
+	}
+	res.Start = "ok"
+	job, jerr := killOnCloseJob()
+	if jerr == nil {
+		jerr = windows.AssignProcessToJobObject(job, pi.Process)
+	}
+	if jerr != nil {
+		res.JobKill = "job: " + jerr.Error()
+	}
+	if _, err := windows.ResumeThread(pi.Thread); err != nil {
+		res.Exit = "resume: " + err.Error()
+	}
+	res.Exit = waitExit(pi, 60*time.Second)
+	if b, err := os.ReadFile(out); err == nil {
+		res.ChildUser = string(b)
+	} else {
+		res.ChildUser = "not written: " + err.Error()
+	}
+	if job != 0 {
+		windows.CloseHandle(job)
+	}
+	if res.JobKill != "" {
+		return res
+	}
+	// A waiting child, killed by closing its job.
+	pi, err = start(`-test.run=^TestProbeChildHelper$ -probe-child-wait`)
+	if err != nil {
+		res.JobKill = "start: " + err.Error()
+		return res
+	}
+	job, jerr = killOnCloseJob()
+	if jerr == nil {
+		jerr = windows.AssignProcessToJobObject(job, pi.Process)
+	}
+	if jerr != nil {
+		res.JobKill = "job: " + jerr.Error()
+		_ = windows.TerminateProcess(pi.Process, 1)
+		waitExit(pi, 10*time.Second)
+		return res
+	}
+	_, _ = windows.ResumeThread(pi.Thread)
+	time.Sleep(500 * time.Millisecond)
+	windows.CloseHandle(job)
+	if ev, err := windows.WaitForSingleObject(pi.Process, 10000); err != nil || ev != windows.WAIT_OBJECT_0 {
+		res.JobKill = "still running 10 s after its job was closed"
+		_ = windows.TerminateProcess(pi.Process, 1)
+	} else {
+		res.JobKill = "ok"
+	}
+	waitExit(pi, 10*time.Second)
+	return res
+}
+
+// waitExit waits for the process, ends it if it doesn't end in time, and
+// closes its handles; it returns how it ended.
+func waitExit(pi windows.ProcessInformation, d time.Duration) string {
+	defer windows.CloseHandle(pi.Process)
+	defer windows.CloseHandle(pi.Thread)
+	ev, err := windows.WaitForSingleObject(pi.Process, uint32(d.Milliseconds()))
+	if err != nil || ev != windows.WAIT_OBJECT_0 {
+		_ = windows.TerminateProcess(pi.Process, 1)
+		return fmt.Sprintf("did not end within %s; terminated", d)
+	}
+	var code uint32
+	if err := windows.GetExitCodeProcess(pi.Process, &code); err != nil {
+		return "exit code: " + err.Error()
+	}
+	return fmt.Sprintf("exit %#x", code)
+}
+
+func killOnCloseJob() (windows.Handle, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(job, windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)), uint32(unsafe.Sizeof(info))); err != nil {
+		windows.CloseHandle(job)
+		return 0, err
+	}
+	return job, nil
 }
 
 // tokenPrivileges lists the token's privileges by name, "+" marking an
@@ -211,11 +376,11 @@ func tokenPrivileges(tok windows.Token) []string {
 	return out
 }
 
-var procAdjustTokenPrivileges = modadvapi32.NewProc("AdjustTokenPrivileges")
-
 // setPrivilege enables or disables a privilege of tok. A privilege the
 // token lacks is ERROR_NOT_ALL_ASSIGNED, which AdjustTokenPrivileges
-// reports with success, read here from the same call.
+// reports together with success; x/sys's wrapper returns an error only
+// when the call fails, so the call is made here and its error read from
+// the same call.
 func setPrivilege(tok windows.Token, name string, enable bool) error {
 	var luid windows.LUID
 	n, _ := windows.UTF16PtrFromString(name)
@@ -262,11 +427,6 @@ type lsaUnicode struct {
 	Buffer                *uint16
 }
 
-func lsaString(s string) lsaUnicode {
-	u, _ := windows.UTF16FromString(s)
-	return lsaUnicode{Length: uint16(2 * (len(u) - 1)), MaximumLength: uint16(2 * len(u)), Buffer: &u[0]}
-}
-
 // lsaRight adds (or removes) an account right for sid.
 func lsaRight(sid *windows.SID, right string, add bool) error {
 	var attrs [12]uintptr // LSA_OBJECT_ATTRIBUTES, zeroed
@@ -275,15 +435,16 @@ func lsaRight(sid *windows.SID, right string, add bool) error {
 		return fmt.Errorf("LsaOpenPolicy: NTSTATUS %#x", st)
 	}
 	defer procLsaClose.Call(policy)
-	r := lsaString(right)
+	u, _ := windows.UTF16FromString(right)
+	r := lsaUnicode{Length: uint16(2 * (len(u) - 1)), MaximumLength: uint16(2 * len(u)), Buffer: &u[0]}
 	var st uintptr
 	if add {
 		st, _, _ = procLsaAddAccountRights.Call(policy, uintptr(unsafe.Pointer(sid)), uintptr(unsafe.Pointer(&r)), 1)
 	} else {
-		st, _, _ = procLsaRemoveAccountRight.Call(policy, uintptr(unsafe.Pointer(sid)), 0, uintptr(unsafe.Pointer(&r)), 1)
+		st, _, _ = procLsaRemoveAccountRights.Call(policy, uintptr(unsafe.Pointer(sid)), 0, uintptr(unsafe.Pointer(&r)), 1)
 	}
 	if st != 0 {
-		return fmt.Errorf("LSA account rights: NTSTATUS %#x", st)
+		return fmt.Errorf("LSA account right %s: NTSTATUS %#x", right, st)
 	}
 	return nil
 }
@@ -304,6 +465,140 @@ func randHex(n int) string {
 	return hex.EncodeToString(b)
 }
 
+// protectDir gives path a protected access list from sddl.
+func protectDir(t *testing.T, path, sddl string) {
+	t.Helper()
+	sd, err := windows.SecurityDescriptorFromString(sddl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dacl, _, _ := sd.DACL()
+	if err := windows.SetNamedSecurityInfo(path, windows.SE_FILE_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// deleteProfile removes the profile Windows made for sid, if any.
+func deleteProfile(t *testing.T, sid string) {
+	p, _ := windows.UTF16PtrFromString(sid)
+	if r, _, e := procDeleteProfileW.Call(uintptr(unsafe.Pointer(p)), 0, 0); r == 0 && !errors.Is(e, windows.ERROR_FILE_NOT_FOUND) {
+		t.Errorf("DeleteProfile %s: %v", sid, e)
+	}
+}
+
+// newProbeUser makes a throwaway local user with the batch logon right
+// (and, if denied, denied interactive and remote logon), and a folder
+// only it can write; all removed when the test ends.
+func newProbeUser(t *testing.T, dir string, denied bool) probeUser {
+	t.Helper()
+	name := "vtdp" + randHex(4)
+	pw := make([]byte, 18)
+	_, _ = rand.Read(pw)
+	pass := base64.RawURLEncoding.EncodeToString(pw) + "Aa1!"
+	un, _ := windows.UTF16PtrFromString(name)
+	up, _ := windows.UTF16PtrFromString(pass)
+	info := userInfo1{name: un, password: up, priv: 1, flags: 0x1 | 0x10000}
+	var parm uint32
+	if r, _, _ := procNetUserAdd.Call(0, 1, uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&parm))); r != 0 {
+		t.Fatalf("NetUserAdd: %d", r)
+	}
+	sid, _, _, err := windows.LookupSID("", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		deleteProfile(t, sid.String())
+		if r, _, _ := procNetUserDel.Call(0, uintptr(unsafe.Pointer(un))); r != 0 {
+			t.Errorf("NetUserDel %s: %d", name, r)
+		}
+	})
+	rights := []string{"SeBatchLogonRight"}
+	if denied {
+		rights = append(rights, "SeDenyInteractiveLogonRight", "SeDenyRemoteInteractiveLogonRight")
+	}
+	for _, right := range rights {
+		if err := lsaRight(sid, right, true); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := lsaRight(sid, right, false); err != nil {
+				t.Errorf("removing %s: %v", right, err)
+			}
+		})
+	}
+	out := filepath.Join(dir, "out-"+name)
+	if err := os.Mkdir(out, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	protectDir(t, out, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+sid.String()+")")
+	return probeUser{Name: name, SID: sid.String(), Password: pass, OutDir: out}
+}
+
+// probeVariant: the service's required privileges (none: the default
+// set), and the rights granted to its account through LSA first. expect
+// checks the record where the outcome is known; nil records only.
+type probeVariant struct {
+	name     string
+	required []string
+	grant    []string
+	startErr error // the service must not start, with this error
+	expect   func(t *testing.T, r probeResult, users map[string]probeUser)
+}
+
+var probeVariants = []probeVariant{
+	{name: "default", expect: func(t *testing.T, r probeResult, _ map[string]probeUser) {
+		if r.ImpersonateAbsent {
+			t.Error("default: SeImpersonatePrivilege absent; expected present")
+		}
+		for _, k := range []string{"asuser/plain", "asuser/denied"} {
+			if r.Starts[k].Start == "ok" {
+				t.Errorf("default: %s started; expected refused", k)
+			}
+		}
+		if r.DPAPI != "ok" {
+			t.Errorf("default: DPAPI: %s", r.DPAPI)
+		}
+	}},
+	{name: "cut3", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
+		startErr: errServicePrivilege},
+	{name: "cut3+grant2", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
+		grant: []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
+		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
+			want := []string{"SeAssignPrimaryTokenPrivilege+", "SeIncreaseQuotaPrivilege+", "SeChangeNotifyPrivilege+"}
+			if !sameSet(r.Privileges, want) {
+				t.Errorf("cut3+grant2: privileges %v, want %v (enabled by the probe)", r.Privileges, want)
+			}
+			if !r.ImpersonateAbsent || !r.TcbAbsent {
+				t.Error("cut3+grant2: SeImpersonatePrivilege or SeTcbPrivilege held")
+			}
+			for _, who := range []string{"plain", "denied"} {
+				checkStart(t, "cut3+grant2", "asuser/"+who, r.Starts["asuser/"+who], users[who])
+			}
+			if r.DPAPI != "ok" {
+				t.Errorf("cut3+grant2: DPAPI: %s", r.DPAPI)
+			}
+		}},
+	// (4) and (5): measured, then pinned.
+	{name: "cut2+grant1", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege"},
+		grant: []string{"SeAssignPrimaryTokenPrivilege"}},
+	{name: "cut1", required: []string{"SeChangeNotifyPrivilege"}},
+}
+
+func checkStart(t *testing.T, variant, key string, s startResult, u probeUser) {
+	t.Helper()
+	if s.Start != "ok" || s.ChildUser != u.SID || s.Exit != "exit 0x0" || s.JobKill != "ok" {
+		t.Errorf("%s: %s: %+v, want started, child running as %s, exit 0, killed with its job", variant, key, s, u.SID)
+	}
+}
+
+func sameSet(a, b []string) bool {
+	a, b = slices.Clone(a), slices.Clone(b)
+	slices.Sort(a)
+	slices.Sort(b)
+	return slices.Equal(a, b)
+}
+
 // TestServiceAccountProbe: see the file's comment.
 func TestServiceAccountProbe(t *testing.T) {
 	if os.Getenv(otherUserEnv) != "1" {
@@ -312,76 +607,48 @@ func TestServiceAccountProbe(t *testing.T) {
 	if !windows.GetCurrentProcessToken().IsElevated() {
 		t.Fatalf("%s=1 needs an elevated (administrator) process", otherUserEnv)
 	}
-	for _, v := range []probeVariant{
-		{name: "default"},
-		{name: "required", required: true},
-		{name: "required+granted", required: true, grant: true},
-	} {
-		t.Run(v.name, func(t *testing.T) { probeOnce(t, v) })
+	// The secondary logon service, for CreateProcessWithLogonW.
+	m, err := mgr.Connect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Disconnect()
+	if s, err := m.OpenService("seclogon"); err == nil {
+		if c, err := s.Config(); err == nil && c.StartType == mgr.StartDisabled {
+			c.StartType = mgr.StartManual
+			_ = s.UpdateConfig(c)
+		}
+		_ = s.Start()
+		s.Close()
+	}
+	for _, v := range probeVariants {
+		t.Run(v.name, func(t *testing.T) { probeOnce(t, m, v) })
 	}
 }
 
-// probeVariant: required cuts the service's privileges to the three the
-// plan names (SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO); grant gives the
-// account SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege
-// through LSA first. "default" shows what a virtual account holds when
-// nothing is set.
-type probeVariant struct {
-	name            string
-	required, grant bool
-}
-
-var grantedRights = []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"}
-
-func probeOnce(t *testing.T, v probeVariant) {
+func probeOnce(t *testing.T, m *mgr.Mgr, v probeVariant) {
 	name := "vettid-probe-" + randHex(4)
 	svcSID, err := windows.StringToSid(channel.ServiceSID(name))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The throwaway user the service starts a program as, with the batch
-	// logon right only.
-	user := "vtdp" + randHex(4)
-	pw := make([]byte, 18)
-	_, _ = rand.Read(pw)
-	pass := base64.RawURLEncoding.EncodeToString(pw) + "Aa1!"
-	un, _ := windows.UTF16PtrFromString(user)
-	up, _ := windows.UTF16PtrFromString(pass)
-	info := userInfo1{name: un, password: up, priv: 1, flags: 0x1 | 0x10000}
-	var parm uint32
-	if r, _, _ := procNetUserAdd.Call(0, 1, uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&parm))); r != 0 {
-		t.Fatalf("NetUserAdd: %d", r)
-	}
-	t.Cleanup(func() { procNetUserDel.Call(0, uintptr(unsafe.Pointer(un))) })
-	userSID, _, _, err := windows.LookupSID("", user)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := lsaRight(userSID, "SeBatchLogonRight", true); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = lsaRight(userSID, "SeBatchLogonRight", false) })
-
-	// The service's folder: its binary, its configuration and its record,
-	// for the service's account and administrators; the binary readable
-	// by Users too, for the child the service starts as the user.
 	pd, err := windows.KnownFolderPath(windows.FOLDERID_ProgramData, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := filepath.Join(pd, name)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	sd, err := windows.SecurityDescriptorFromString("D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;" + svcSID.String() + ")(A;OICI;0x1200a9;;;BU)")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dacl, _, _ := sd.DACL()
-	if err := windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, dacl, nil); err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Errorf("removing %s: %v", dir, err)
+		}
+	})
+	// The folder: administrators, SYSTEM and the service's account; the
+	// binary readable by Users, for the children.
+	protectDir(t, dir, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+svcSID.String()+")(A;OICI;0x1200a9;;;BU)")
+	users := map[string]probeUser{"plain": newProbeUser(t, dir, false), "denied": newProbeUser(t, dir, true)}
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -394,25 +661,29 @@ func probeOnce(t *testing.T, v probeVariant) {
 	if err := os.WriteFile(exe, b, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// The configuration holds the users' passwords: its own protected
+	// access list, administrators, SYSTEM and the service's account only.
+	cfgPath := filepath.Join(dir, "probe.json")
 	out := filepath.Join(dir, "result.json")
-	cfg, _ := json.Marshal(probeConfig{Out: out, User: user, Password: pass, Child: exe})
-	if err := os.WriteFile(filepath.Join(dir, "probe.json"), cfg, 0o600); err != nil {
+	cfg, _ := json.Marshal(probeConfig{Out: out, Exe: exe, Users: users})
+	if err := os.WriteFile(cfgPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if v.grant {
-		for _, right := range grantedRights {
-			if err := lsaRight(svcSID, right, true); err != nil {
-				t.Fatal(err)
-			}
-			t.Cleanup(func() { _ = lsaRight(svcSID, right, false) })
+	protectDir(t, cfgPath, "D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FR;;;"+svcSID.String()+")")
+	if err := os.WriteFile(cfgPath, cfg, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, right := range v.grant {
+		if err := lsaRight(svcSID, right, true); err != nil {
+			t.Fatal(err)
 		}
+		t.Cleanup(func() {
+			if err := lsaRight(svcSID, right, false); err != nil {
+				t.Errorf("removing %s: %v", right, err)
+			}
+		})
 	}
 
-	m, err := mgr.Connect()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer m.Disconnect()
 	s, err := m.CreateService(name, exe, mgr.Config{
 		DisplayName:      name,
 		StartType:        mgr.StartManual,
@@ -422,30 +693,31 @@ func probeOnce(t *testing.T, v probeVariant) {
 	if err != nil {
 		t.Fatalf("CreateService: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = s.Control(svc.Stop)
-		_ = s.Delete()
-		s.Close()
-	})
-	if v.required {
-		// Only these three, so the token holds no others
-		// (SeImpersonatePrivilege in particular). A multi-string: each
-		// name NUL-terminated, then one more NUL (UTF16FromString refuses
-		// a string with NULs in it).
-		privs := utf16.Encode([]rune("SeChangeNotifyPrivilege\x00SeAssignPrimaryTokenPrivilege\x00SeIncreaseQuotaPrivilege\x00\x00"))
+	t.Cleanup(func() { removeService(t, m, s, name, svcSID.String()) })
+	if v.required != nil {
+		// A multi-string: each name NUL-terminated, then one more NUL
+		// (UTF16FromString refuses a string with NULs in it).
+		privs := utf16.Encode([]rune(strings.Join(v.required, "\x00") + "\x00\x00"))
 		type requiredPrivilegesInfo struct{ privileges *uint16 }
 		rp := requiredPrivilegesInfo{&privs[0]}
 		if err := windows.ChangeServiceConfig2(s.Handle, windows.SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, (*byte)(unsafe.Pointer(&rp))); err != nil {
 			t.Fatalf("required privileges: %v", err)
 		}
 	}
-	if err := s.Start(); err != nil {
-		// A finding, not a test failure: recorded and shown.
-		t.Logf("%s: service %s (%s) did not start: %v (%d)", v.name, name, svcSID, err, err)
+	err = s.Start()
+	if v.startErr != nil {
+		if !errors.Is(err, v.startErr) {
+			t.Errorf("%s: start: %v, want %v", v.name, err, v.startErr)
+		} else {
+			t.Logf("%s: service %s did not start, as expected: %v (%d)", v.name, name, err, err)
+		}
 		return
 	}
+	if err != nil {
+		t.Fatalf("%s: start: %v (%d)", v.name, err, err)
+	}
 	var rec []byte
-	for end := time.Now().Add(60 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+	for end := time.Now().Add(4 * time.Minute); ; time.Sleep(200 * time.Millisecond) {
 		if rec, err = os.ReadFile(out); err == nil && len(rec) > 0 {
 			break
 		}
@@ -454,12 +726,48 @@ func probeOnce(t *testing.T, v probeVariant) {
 			t.Fatalf("no record from the service (state %d, exit %d, service exit %d)", st.State, st.Win32ExitCode, st.ServiceSpecificExitCode)
 		}
 	}
-	t.Logf("%s: service %s (%s)\n%s", v.name, name, svcSID, rec)
+	t.Logf("%s: service %s (%s), users plain %s, denied %s\n%s", v.name, name, svcSID, users["plain"].SID, users["denied"].SID, rec)
 	var res probeResult
 	if err := json.Unmarshal(rec, &res); err != nil {
 		t.Fatal(err)
 	}
-	if v.required && !res.ImpersonateAbsent {
-		t.Error("the service holds SeImpersonatePrivilege despite its required privileges")
+	if v.expect != nil {
+		v.expect(t, res, users)
 	}
+}
+
+// removeService stops the service, waits until it has stopped, deletes it,
+// checks it is gone, and removes the profile Windows made for its account.
+func removeService(t *testing.T, m *mgr.Mgr, s *mgr.Service, name, sid string) {
+	if st, err := s.Query(); err == nil && st.State != svc.Stopped {
+		if _, err := s.Control(svc.Stop); err != nil {
+			t.Logf("stopping %s: %v", name, err)
+		}
+		for end := time.Now().Add(30 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+			st, err := s.Query()
+			if err != nil || st.State == svc.Stopped {
+				break
+			}
+			if time.Now().After(end) {
+				t.Errorf("%s did not stop", name)
+				break
+			}
+		}
+	}
+	if err := s.Delete(); err != nil {
+		t.Errorf("deleting %s: %v", name, err)
+	}
+	s.Close()
+	for end := time.Now().Add(30 * time.Second); ; time.Sleep(200 * time.Millisecond) {
+		s2, err := m.OpenService(name)
+		if err != nil {
+			break // gone
+		}
+		s2.Close()
+		if time.Now().After(end) {
+			t.Errorf("%s is still registered after its deletion", name)
+			break
+		}
+	}
+	deleteProfile(t, sid)
 }

@@ -71,10 +71,10 @@ jobs:
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # AGENT-PLAN A3.10b's first check, measured: what a virtual service
-      # account (NT SERVICE\<name>) holds and can do: by default, with its
-      # privileges cut, and cut with two granted. It registers a throwaway
-      # service and user, prints what the service recorded, and removes
-      # them.
+      # account (NT SERVICE\<name>) holds, and how it can start a program
+      # as a runner, in five variants. It registers a throwaway service and two
+      # users, checks what is known, prints what the service recorded, and
+      # removes them.
       - name: service account probe, verbose
         if: runner.os == 'Windows'
         shell: bash
@@ -83,7 +83,7 @@ jobs:
         run: |
           set -o pipefail
           go test -count=1 -v -run 'TestServiceAccountProbe$' ./internal/service | tee "$RUNNER_TEMP/probe.txt"
-          for t in 'TestServiceAccountProbe/default' 'TestServiceAccountProbe/required' 'TestServiceAccountProbe/required+granted'; do
+          for t in default cut3 cut3+grant2 cut2+grant1 cut1; do t="TestServiceAccountProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # The runner's user is an administrator, for whom every folder can be
