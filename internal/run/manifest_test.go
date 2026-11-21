@@ -27,8 +27,12 @@ func TestNoActiveCodePageManifest(t *testing.T) {
 	self = filepath.Clean(self)
 	root := filepath.Join(filepath.Dir(self), "..", "..")
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
-		// The binary runs where its sources aren't: the go test runs on
-		// every platform check the repository.
+		// The binary runs where its sources aren't (-trimpath, or a copy
+		// elsewhere). In CI that must not pass unseen: there the sources
+		// are always checked out next to it.
+		if os.Getenv("CI") != "" {
+			t.Fatalf("the sources aren't at %s: %v", root, err)
+		}
 		t.Skipf("the sources aren't at %s: %v", root, err)
 	}
 	// The element, not the word: comments name it.

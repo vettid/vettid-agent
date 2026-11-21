@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -432,9 +433,23 @@ func CheckRunPaths(paths []string) ([]string, error) {
 		if err := checkAbsDir(real); err != nil {
 			return nil, fmt.Errorf("--run-path %q resolves to %q, which %w", p, real, err)
 		}
+		if err := checkNotRoot(real); err != nil {
+			return nil, fmt.Errorf("--run-path %q: %w", p, err)
+		}
 		out = append(out, real)
 	}
 	return out, nil
+}
+
+// checkNotRoot refuses a drive's or a share's root on Windows: as the
+// last run path it would end PATH in a backslash, which a batch run
+// refuses (batch_windows.go), so every batch run would fail far from the
+// cause. A POSIX root ends no PATH in a backslash and stays allowed.
+func checkNotRoot(dir string) error {
+	if runtime.GOOS == "windows" && filepath.Dir(dir) == dir {
+		return errors.New("a drive's root can't be a run path; name a folder on it")
+	}
+	return nil
 }
 
 // checkNotWritable refuses a --run-path directory that the connector's own

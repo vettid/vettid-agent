@@ -198,9 +198,55 @@ func TestBatchPathTextCodePages(t *testing.T) {
 	}
 	// A trailing backslash refuses, in both forms.
 	for _, ascii := range []bool{true, false} {
-		err := batchPathVar("USERPROFILE", `C:`+backslash+"Users"+backslash+"x"+backslash, ascii)
+		err := batchPathVar("USERPROFILE", `C:`+backslash+"Users"+backslash+"x"+backslash, ascii, 1252)
 		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "ends in a backslash") {
 			t.Errorf("trailing backslash (ascii rule %v): %v", ascii, err)
+		}
+	}
+}
+
+// A domain account whose home folder is a mapped drive has HOMEDRIVE=H:
+// and HOMEPATH=\ : that exact HOMEPATH is allowed, any other HOMEPATH and
+// every other variable keep the rule (a trailing backslash refuses).
+func TestBatchHomePathRoot(t *testing.T) {
+	lookupOnly(t)
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off", "echo [%HOMEDRIVE%%HOMEPATH%]")
+	p := prepare(t, bat)
+	spec := helperSpec(t, bat, "")
+	spec.Env = setVar(spec.Env, "HOMEDRIVE", "H:")
+	spec.Env = setVar(spec.Env, "homepath", backslash) // names compare without case
+	code, out := runOutput(t, p, spec)
+	if code != 0 || out != "[H:"+backslash+"]"+crlf {
+		t.Fatalf("HOMEPATH=\\: exit %d, output %q", code, out)
+	}
+
+	p = prepare(t, bat) // the run above used the first one
+	noStart(t)
+	for name, value := range map[string]string{
+		"HOMEPATH":    backslash + "Users" + backslash,
+		"USERPROFILE": `C:` + backslash,
+		"APPDATA":     backslash,
+	} {
+		spec := helperSpec(t, bat, "")
+		spec.Env = setVar(spec.Env, name, value)
+		_, err := p.Start(spec)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the environment variable "+name+" ends in a backslash") {
+			t.Errorf("%s=%q: %v", name, value, err)
+		}
+	}
+}
+
+// A drive's or a share's root can't be a run path on Windows: as the
+// last one it would end PATH in a backslash.
+func TestCheckNotRoot(t *testing.T) {
+	for _, root := range []string{`C:` + backslash, `D:` + backslash, backslash + backslash + "server" + backslash + "share" + backslash} {
+		if err := checkNotRoot(root); err == nil || !strings.Contains(err.Error(), "a drive's root can't be a run path; name a folder on it") {
+			t.Errorf("%q: %v", root, err)
+		}
+	}
+	for _, dir := range []string{`C:` + backslash + "Program Files" + backslash + "nodejs", `D:` + backslash + "tools"} {
+		if err := checkNotRoot(dir); err != nil {
+			t.Errorf("%q: %v", dir, err)
 		}
 	}
 }

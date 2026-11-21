@@ -114,25 +114,12 @@ func batchText(s, what string) error {
 	return nil
 }
 
-// batchPathText checks the batch file's path or the working folder:
-// ASCII by batchText's rule, and a character outside ASCII by what this
-// system's ANSI code page turns it into, read at each run, never cached
-// (it changes only with a reboot, but the connector may run across one).
-//
-// GetACP gives the system's code page, the one a program the batch starts
-// uses, only because the connector has no activeCodePage manifest: with a
-// UTF-8 one it would answer 65001 and pass everything. A test
-// (TestNoActiveCodePageManifest) fails if a manifest or resource file is
-// added.
-func batchPathText(s, what string) error {
-	return batchPathTextCP(s, what, windows.GetACP())
-}
-
-// batchPathTextCP is batchPathText for code page cp (tests give it one;
-// the system's can't be switched for a test). Each character outside
-// ASCII is converted on its own with Windows's default best fit, so a
-// DBCS second byte is seen as the byte it is. A conversion that fails
-// refuses, fail closed.
+// batchPathTextCP checks the batch file's path or the working folder:
+// ASCII by batchText's rule, and a character outside ASCII by what code
+// page cp (the system's ANSI code page, which checkBatch reads; tests give
+// one) turns it into. Each character outside ASCII is converted on its own
+// with Windows's default best fit, so a DBCS second byte is seen as the
+// byte it is. A conversion that fails refuses, fail closed.
 func batchPathTextCP(s, what string, cp uint32) error {
 	return batchPathCheck(s, what, cp, true)
 }
@@ -150,9 +137,9 @@ func batchNonASCIICP(s, what string, cp uint32) error {
 // connector's PATH, TEMP or TMP (ascii false) with the code-page check
 // only; neither may end in a backslash, which would escape cmd.exe's
 // closing quote where the batch puts the variable in quotes.
-func batchPathVar(name, value string, ascii bool) error {
+func batchPathVar(name, value string, ascii bool, cp uint32) error {
 	what := "the environment variable " + name
-	if err := batchPathCheck(value, what, windows.GetACP(), ascii); err != nil {
+	if err := batchPathCheck(value, what, cp, ascii); err != nil {
 		return err
 	}
 	if strings.HasSuffix(value, `\`) {
@@ -260,10 +247,18 @@ func connectorSet(name string) bool {
 // operator's --run-env names): fail closed, a variable not known to be
 // trusted is the agent's. A refusal names the variable, never its value.
 func checkBatch(path, dir string, args, env, trusted []string) error {
-	if err := batchPathText(path, "the program's path"); err != nil {
+	// The system's ANSI code page, read once per run, never cached (it
+	// changes only with a reboot, but the connector may run across one).
+	// GetACP gives the system's code page, the one a program the batch
+	// starts uses, only because the connector has no activeCodePage
+	// manifest: with a UTF-8 one it would answer 65001 and pass everything.
+	// TestNoActiveCodePageManifest and scripts/check-release-binaries fail
+	// if one is added.
+	cp := windows.GetACP()
+	if err := batchPathTextCP(path, "the program's path", cp); err != nil {
 		return err
 	}
-	if err := batchPathText(dir, "the working folder"); err != nil {
+	if err := batchPathTextCP(dir, "the working folder", cp); err != nil {
 		return err
 	}
 	if filepath.Dir(dir) == dir {
@@ -286,14 +281,21 @@ func checkBatch(path, dir string, args, env, trusted []string) error {
 		case sameName(name, "PATH") || containsName(tempNames, name):
 			// The connector's own, from its configuration and the run:
 			// the code-page check only (batchNonASCIICP).
-			err = batchPathVar(name, value, false)
+			err = batchPathVar(name, value, false, cp)
 		case connectorSet(name) || containsName(trusted, name):
 			continue
 		case containsName(copiedNames, name):
 			// The member's own account folders, copied from the
 			// connector's environment: the path rule (owner decision a,
 			// GC #15728), so an account name such as José runs.
-			err = batchPathVar(name, value, true)
+			if sameName(name, "HOMEPATH") && value == `\` {
+				// A domain account whose home folder is a mapped drive
+				// (HOMEDRIVE=H:) has HOMEPATH=\, the drive's root. Allowed
+				// exactly so (owner decision a, GC #15742); any other
+				// value, and every other variable, keeps the rule.
+				continue
+			}
+			err = batchPathVar(name, value, true, cp)
 		default:
 			err = batchValue(value, "the environment variable "+name)
 		}

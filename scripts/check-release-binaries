@@ -11,6 +11,8 @@
 #     build accepts a plain-HTTP relay on a loopback address),
 #   - no -gcflags, -asmflags, GOEXPERIMENT or GOFIPS140, and no VCS stamp
 #     (release builds use -buildvcs=false),
+#   - for Windows, no activeCodePage manifest (the batch-run path check
+#     reads the system's code page through GetACP),
 #   - exactly one release stamp, vettid-agent-release/<version>/<commit>,
 #     matching -v and -c when given.
 #
@@ -90,6 +92,12 @@ for f in "${files[@]}"; do
     if printf '%s\n' "$info" | grep -q "^"$'\tbuild\t'"$k="; then bad "built with $k=$(setting "$k")"; fi
   done
   if printf '%s\n' "$info" | grep -q $'^\tbuild\tvcs'; then bad "carries a VCS stamp (not -buildvcs=false)"; fi
+  # A Windows binary carries no activeCodePage manifest: with a UTF-8 one,
+  # GetACP answers 65001 and the batch-run path check passes every path
+  # (internal/run/batch_windows.go).
+  if [ "$(setting GOOS)" = windows ] && LC_ALL=C grep -aqi 'activeCodePage' "$f"; then
+    bad "carries an activeCodePage manifest; batch runs rely on there being none"
+  fi
 
   stamps="$(LC_ALL=C grep -aoE "$stampre" "$f" | LC_ALL=C sort -u || true)"
   case "$(printf '%s' "$stamps" | grep -c . || true)" in
