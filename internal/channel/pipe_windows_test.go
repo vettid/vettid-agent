@@ -309,8 +309,13 @@ func TestPipeAccessList(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := sd.String()
-	want := "O:" + me + "D:P(D;;FA;;;NU)(A;;FA;;;" + me + ")(A;;0x120083;;;" + me + ")(A;;0x120083;;;BA)"
-	if got != want {
+	// Written out, then put in Windows' own form (which abbreviates some
+	// accounts, such as the built-in Administrator as LA).
+	wantSD, err := windows.SecurityDescriptorFromString("O:" + me + "D:P(D;;FA;;;NU)(A;;FA;;;" + me + ")(A;;0x120083;;;" + me + ")(A;;0x120083;;;BA)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := wantSD.String(); got != want {
 		t.Fatalf("pipe security\n got %s\nwant %s", got, want)
 	}
 	if clientMask != 0x120083 {

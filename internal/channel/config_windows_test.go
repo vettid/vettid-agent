@@ -45,14 +45,23 @@ func TestReadPipeRefusals(t *testing.T) {
 	if _, err := readPipeAt(filepath.Join(dir, "none.json"), "work"); !errors.Is(err, ErrNoService) {
 		t.Fatalf("missing file: %v", err)
 	}
-	// A file this user owns (and can change).
+	// A file this user made, and can change. A normal user owns it; an
+	// elevated administrator's is owned by Administrators, and refused
+	// because this user can change it.
 	p := filepath.Join(dir, "work.json")
 	if err := os.WriteFile(p, []byte(pipeConfig("work")), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := readPipeAt(p, "work")
-	if !errors.Is(err, ErrNoService) || !strings.Contains(err.Error(), "not owned by Administrators or SYSTEM") {
-		t.Fatalf("a file the member owns: %v", err)
+	if !errors.Is(err, ErrNoService) {
+		t.Fatalf("a file this user can change: %v", err)
+	}
+	want := "not owned by Administrators or SYSTEM"
+	if windows.GetCurrentProcessToken().IsElevated() {
+		want = "can be changed by this account"
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("a file this user can change: %v, want %q", err, want)
 	}
 }
 
