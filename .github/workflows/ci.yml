@@ -99,7 +99,7 @@ jobs:
         run: |
           set -o pipefail
           go test -count=1 -v -timeout 30m -run 'TestRunnerHopProbe$' ./internal/service | tee "$RUNNER_TEMP/probe2.txt"
-          for t in hop shapes seclogon-disabled; do t="TestRunnerHopProbe/$t"
+          for t in hop route-a shapes seclogon-disabled; do t="TestRunnerHopProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe2.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # The runner's user is an administrator, for whom every folder can be

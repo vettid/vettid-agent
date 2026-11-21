@@ -84,6 +84,7 @@ var (
 	p2Restrict = flag.String("p2-restrict", "", "probe2 launcher: interactive, interactive+local")
 	p2Sentinel = flag.Uint64("p2-sentinel", 0, "probe2 child: a handle value to check for")
 	p2CLSID    = flag.String("p2-clsid", "", "probe2 dcom: the class to activate")
+	p2Tools    = flag.String("p2-tools", "", "probe2 launcher: a JSON file of tools to start")
 )
 
 // tokenFacts is what a process reads of its own token.
@@ -171,8 +172,13 @@ type childStart struct {
 
 // launcherRecord is what the launcher writes.
 type launcherRecord struct {
-	Token            tokenFacts            `json:"token"`
-	ServiceSentinel  bool                  `json:"service_sentinel_inherited"`
+	Token           tokenFacts `json:"token"`
+	ServiceSentinel bool       `json:"service_sentinel_inherited"`
+	// LogonSID is the runner's logon SID (S-1-5-5-…), which the service
+	// compares with the window station's access list.
+	LogonSID string `json:"logon_sid"`
+	// Tools are real programs started as the run's program would be.
+	Tools            map[string]childStart `json:"tools,omitempty"`
 	LauncherUser32   string                `json:"launcher_user32"`
 	Restricted       string                `json:"restricted_token"`
 	RestrictedFacts  tokenFacts            `json:"restricted_facts"`
@@ -270,6 +276,7 @@ func runLauncher() int {
 	// Whether user32 initializes in the launcher itself (its own,
 	// unrestricted token, on the run's desktop), before any child.
 	rec.LauncherUser32 = errString(moduser32.Load())
+	rec.LogonSID = logonSID(self)
 	var own windows.Token
 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &own); err != nil {
 		rec.Restricted = "OpenProcessToken: " + err.Error()
@@ -312,6 +319,7 @@ func runLauncher() int {
 		}
 		rec.Children[c.name] = cs
 	}
+	rec.Tools = runTools(restricted, dir)
 	// A program that waits: the service finds it in the job and kills it
 	// by closing the job.
 	pi, err := startSuspended(restricted, *p2Exe, `-test.run=^TestProbe2ChildHelper$ -p2-mode=wait`, "")
@@ -384,6 +392,9 @@ func startSuspended(tok windows.Token, exe, args, logPath string) (windows.Proce
 	si.Cb = uint32(unsafe.Sizeof(*si))
 	si.Flags = windows.STARTF_USESTDHANDLES
 	si.StdInput, si.StdOutput, si.StdErr = nul, out, out
+	if startDesktop != "" {
+		si.Desktop, _ = windows.UTF16PtrFromString(startDesktop)
+	}
 	cl, _ := windows.UTF16PtrFromString(`"` + exe + `" ` + args)
 	err = windows.CreateProcessAsUser(tok, nil, cl, nil, nil, true,
 		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW|windows.EXTENDED_STARTUPINFO_PRESENT, nil, nil, &si.StartupInfo, &pi)
@@ -420,12 +431,15 @@ func startChild(tok windows.Token, exe, args, logPath string, wait time.Duration
 
 // probe2Config is what the test hands the service.
 type probe2Config struct {
-	Out    string               `json:"out"`
-	Exe    string               `json:"exe"`
-	CLSID  string               `json:"clsid"`
-	Mode   string               `json:"mode"`  // "hop", "shapes"
-	Users  map[string]probeUser `json:"users"` // hop: "b"; shapes: the shapes
-	Shapes []string             `json:"shapes,omitempty"`
+	Out       string               `json:"out"`
+	Exe       string               `json:"exe"`
+	CLSID     string               `json:"clsid"`
+	Mode      string               `json:"mode"`  // "hop", "shapes"
+	Users     map[string]probeUser `json:"users"` // hop: "b"; shapes: the shapes
+	Shapes    []string             `json:"shapes,omitempty"`
+	ToolsFile string               `json:"tools_file,omitempty"` // real tools for the launcher to start
+	// Required is the service's required privileges (nil: ChangeNotify only).
+	Required []string `json:"-"`
 }
 
 // hopResult is one launcher run.
@@ -449,10 +463,12 @@ type probe2Result struct {
 	ServiceWindowStation string               `json:"service_window_station,omitempty"`
 	WindowStationACE     string               `json:"window_station_ace,omitempty"`
 	NullDesktop          string               `json:"null_desktop,omitempty"`
+	WindowStationSDDL    string               `json:"window_station_and_desktop_sddl,omitempty"`
 	Desktop              string               `json:"desktop"`
 	DesktopName          string               `json:"desktop_name"`
 	Hops                 map[string]hopResult `json:"hops"`   // "interactive", "interactive+local"
 	Shapes               map[string]string    `json:"shapes"` // shape: "ok" or "errno N: text"
+	RouteA               *routeAResult        `json:"route_a,omitempty"`
 }
 
 // TestRunnerHopProbeHelper is the service, run by the SCM.
@@ -479,7 +495,9 @@ type probe2Service struct{ c probe2Config }
 func (p *probe2Service) Execute(_ []string, _ <-chan svc.ChangeRequest, s chan<- svc.Status) (bool, uint32) {
 	s <- svc.Status{State: svc.Running}
 	var res probe2Result
-	if p.c.Mode == "shapes" {
+	if p.c.Mode == "route-a" {
+		res.RouteA = runRouteA(p.c)
+	} else if p.c.Mode == "shapes" {
 		res.Shapes = map[string]string{}
 		for _, shape := range p.c.Shapes {
 			st := startWithLogon(p.c.Exe, p.c.Users[shape], 0)
@@ -582,29 +600,69 @@ func runHops(c probe2Config) probe2Result {
 			res.NullDesktop = "CreateDesktop: " + e.Error()
 		}
 	}
-	for _, v := range []struct {
-		key, restrict, desktop string
-		uiLimits               bool
-	}{
-		{"interactive", "interactive", res.DesktopName, true},
-		{"interactive-no-ui-limits", "interactive", res.DesktopName, false},
-		{"interactive+local", "interactive+local", res.DesktopName, true},
-		{"null-dacl-desktop", "interactive", wsName + `\` + nullName, true},
-		{"seclogon-default-desktop", "interactive", "", true},
+	// What the runner may do with the window station and desktop, as
+	// their access lists say (the runner's logon SID is in each
+	// launcher's record).
+	wsh := ws
+	if wsh == 0 {
+		wsh, _, _ = procGetProcessWindowStation.Call()
+	}
+	res.WindowStationSDDL = objectSDDL(windows.Handle(wsh), windows.Handle(desk))
+	for _, v := range []hopOpts{
+		{key: "interactive", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, tools: true},
+		{key: "interactive-no-ui-limits", restrict: "interactive", desktop: res.DesktopName},
+		{key: "interactive+local", restrict: "interactive+local", desktop: res.DesktopName, uiLimits: true},
+		{key: "null-dacl-desktop", restrict: "interactive", desktop: wsName + `\` + nullName, uiLimits: true},
+		{key: "seclogon-default-desktop", restrict: "interactive", uiLimits: true},
+		// No job at all, and CREATE_NO_WINDOW left out: whether either
+		// is what stops user32.
+		{key: "no-job-with-window", restrict: "interactive", desktop: res.DesktopName, noJob: true, withWindow: true},
 	} {
 		if v.key == "null-dacl-desktop" && nullDesk == 0 {
 			continue
 		}
-		res.Hops[v.key] = runHop(c, b, v.desktop, v.restrict, v.uiLimits, uint64(sentinel))
+		res.Hops[v.key] = runHop(c, b, v, uint64(sentinel))
 	}
 	return res
 }
 
-func runHop(c probe2Config, u probeUser, desktop, restrict string, uiLimits bool, sentinel uint64) hopResult {
+// hopOpts is one way of starting the launcher.
+type hopOpts struct {
+	key, restrict, desktop string // desktop "": seclogon's own choice (a contrast only)
+	uiLimits               bool
+	noJob, withWindow      bool
+	tools                  bool // the launcher also starts the real tools
+}
+
+// objectSDDL is the window station's (and desktop's) access list in SDDL.
+func objectSDDL(ws, desk windows.Handle) string {
+	s := ""
+	for _, o := range []struct {
+		name string
+		h    windows.Handle
+	}{{"window station", ws}, {"desktop", desk}} {
+		if o.h == 0 {
+			continue
+		}
+		sd, err := windows.GetSecurityInfo(o.h, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION)
+		if err != nil {
+			s += o.name + ": " + err.Error() + "; "
+			continue
+		}
+		s += o.name + ": " + sd.String() + "; "
+	}
+	return s
+}
+
+func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
 	var h hopResult
+	desktop, restrict := o.desktop, o.restrict
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
 		out, c.Exe, restrict, sentinel, c.CLSID)
+	if o.tools && c.ToolsFile != "" {
+		args += fmt.Sprintf(` -p2-tools="%s"`, c.ToolsFile)
+	}
 	n, _ := windows.UTF16PtrFromString(u.Name)
 	dot, _ := windows.UTF16PtrFromString(".")
 	pw, _ := windows.UTF16PtrFromString(u.Password)
@@ -615,22 +673,30 @@ func runHop(c probe2Config, u probeUser, desktop, restrict string, uiLimits bool
 		dsk, _ = windows.UTF16PtrFromString(desktop)
 	}
 	si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{})), Desktop: dsk}
+	flags := uintptr(windows.CREATE_SUSPENDED)
+	if !o.withWindow {
+		flags |= windows.CREATE_NO_WINDOW
+	}
 	var pi windows.ProcessInformation
 	if r, _, e := procCreateProcessWithLogonW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
-		0, 0, uintptr(unsafe.Pointer(&cl[0])), uintptr(windows.CREATE_NO_WINDOW|windows.CREATE_SUSPENDED), 0,
+		0, 0, uintptr(unsafe.Pointer(&cl[0])), flags, 0,
 		uintptr(unsafe.Pointer(dir)), uintptr(unsafe.Pointer(si)), uintptr(unsafe.Pointer(&pi))); r == 0 {
 		h.Start, h.Errno = e.Error(), errnoOf(e)
 		return h
 	}
 	h.Start = "ok"
-	job, err := killOnCloseJob()
-	if err == nil {
-		err = windows.AssignProcessToJobObject(job, pi.Process)
+	var job windows.Handle
+	err := errors.New("no job (this variant)")
+	if !o.noJob {
+		job, err = killOnCloseJob()
+		if err == nil {
+			err = windows.AssignProcessToJobObject(job, pi.Process)
+		}
 	}
 	h.Job = errString(err)
+	h.UILimits = "not set"
 	if err == nil {
-		h.UILimits = "not set"
-		if uiLimits {
+		if o.uiLimits {
 			ui := windows.JOBOBJECT_BASIC_UI_RESTRICTIONS{UIRestrictionsClass: windows.JOB_OBJECT_UILIMIT_HANDLES | windows.JOB_OBJECT_UILIMIT_GLOBALATOMS |
 				windows.JOB_OBJECT_UILIMIT_DESKTOP | windows.JOB_OBJECT_UILIMIT_READCLIPBOARD | windows.JOB_OBJECT_UILIMIT_WRITECLIPBOARD}
 			_, uerr := windows.SetInformationJobObject(job, windows.JobObjectBasicUIRestrictions, uintptr(unsafe.Pointer(&ui)), uint32(unsafe.Sizeof(ui)))
@@ -682,6 +748,18 @@ func runHop(c probe2Config, u probeUser, desktop, restrict string, uiLimits bool
 				h.Kill = "not observed (the service could not open the program)"
 			}
 		}
+	}
+	if job == 0 {
+		// No job: the service ends the waiting program and the launcher
+		// itself.
+		h.Kill = "no job"
+		if h.Launcher.WaitingPID != 0 {
+			if p, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, h.Launcher.WaitingPID); err == nil {
+				_ = windows.TerminateProcess(p, 1)
+				windows.CloseHandle(p)
+			}
+		}
+		_ = windows.TerminateProcess(pi.Process, 1)
 	}
 	if ev, _ := windows.WaitForSingleObject(pi.Process, 10000); ev != windows.WAIT_OBJECT_0 {
 		_ = windows.TerminateProcess(pi.Process, 1)
@@ -807,7 +885,11 @@ func runProbe2Service(t *testing.T, m *mgr.Mgr, name string, svcSID *windows.SID
 	}
 	t.Cleanup(func() { removeService(t, m, s, name, svcSID.String()) })
 	privs := []uint16{}
-	for _, r := range "SeChangeNotifyPrivilege\x00\x00" {
+	req := cfg.Required
+	if req == nil {
+		req = []string{"SeChangeNotifyPrivilege"}
+	}
+	for _, r := range strings.Join(req, "\x00") + "\x00\x00" {
 		privs = append(privs, uint16(r))
 	}
 	type requiredPrivilegesInfo struct{ privileges *uint16 }
@@ -903,8 +985,8 @@ func TestRunnerHopProbe(t *testing.T) {
 	})
 	// The three services (hop, shapes, seclogon disabled) may read and
 	// write here; Users may read the binary.
-	hSID, sSID, dSID := channel.ServiceSID(name+"h"), channel.ServiceSID(name+"s"), channel.ServiceSID(name+"d")
-	protectDir(t, dir, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+hSID+")(A;OICI;0x1301bf;;;"+sSID+")(A;OICI;0x1301bf;;;"+dSID+")(A;OICI;0x1200a9;;;BU)")
+	hSID, sSID, dSID, aSID := channel.ServiceSID(name+"h"), channel.ServiceSID(name+"s"), channel.ServiceSID(name+"d"), channel.ServiceSID(name+"a")
+	protectDir(t, dir, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+hSID+")(A;OICI;0x1301bf;;;"+sSID+")(A;OICI;0x1301bf;;;"+dSID+")(A;OICI;0x1301bf;;;"+aSID+")(A;OICI;0x1200a9;;;BU)")
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -924,8 +1006,31 @@ func TestRunnerHopProbe(t *testing.T) {
 	t.Run("hop", func(t *testing.T) {
 		users := map[string]probeUser{"b": newShapedUser(t, dir, hSID, bGrants, bDenies, false)}
 		res := runProbe2Service(t, m, name+"h", mustSID(t, hSID), dir, exe,
-			probe2Config{Exe: exe, CLSID: clsid, Mode: "hop", Users: users})
+			probe2Config{Exe: exe, CLSID: clsid, Mode: "hop", Users: users, ToolsFile: writeTools(t, dir)})
 		probe2ExpectHop(t, res, users["b"], exe)
+	})
+	// Route A, as a contrast: the service holds SeAssignPrimaryTokenPrivilege
+	// and starts the user32 child itself with CreateProcessAsUser.
+	t.Run("route-a", func(t *testing.T) {
+		users := map[string]probeUser{"a": newShapedUser(t, dir, aSID, []string{"SeBatchLogonRight"}, bDenies, false)}
+		sid := mustSID(t, aSID)
+		if err := lsaRight(sid, "SeAssignPrimaryTokenPrivilege", true); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := lsaRight(sid, "SeAssignPrimaryTokenPrivilege", false); err != nil {
+				t.Errorf("removing SeAssignPrimaryTokenPrivilege: %v", err)
+			}
+		})
+		res := runProbe2Service(t, m, name+"a", sid, dir, exe, probe2Config{Exe: exe, Mode: "route-a", Users: users,
+			Required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege"}})
+		if res.RouteA == nil {
+			t.Fatal("no route A record")
+		}
+		t.Logf("route A: assign %s, station entry %s, desktop %s, logon %s", res.RouteA.EnableAssign, res.RouteA.WindowStationACE, res.RouteA.Desktop, res.RouteA.Logon)
+		for k, s := range res.RouteA.Starts {
+			t.Logf("route A %s: start %s, exit %s, desktop %q, beep %q, output %.300s", k, s.Start, s.Exit, s.Record.Desktop, s.Record.Beep, s.Output)
+		}
 	})
 	t.Run("shapes", func(t *testing.T) {
 		users := map[string]probeUser{
@@ -1004,11 +1109,15 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 
 	for restrict, h := range r.Hops {
 		where := "hop " + restrict
-		wantLimits := "ok"
-		if strings.HasSuffix(restrict, "no-ui-limits") {
+		wantLimits, wantJob := "ok", "ok"
+		noJob := restrict == "no-job-with-window"
+		if strings.HasSuffix(restrict, "no-ui-limits") || noJob {
 			wantLimits = "not set"
 		}
-		if h.Start != "ok" || h.Job != "ok" || h.UILimits != wantLimits {
+		if noJob {
+			wantJob = "no job (this variant)"
+		}
+		if h.Start != "ok" || h.Job != wantJob || h.UILimits != wantLimits {
 			t.Errorf("%s: start %q, job %q, UI limits %q", where, h.Start, h.Job, h.UILimits)
 			continue
 		}
@@ -1035,7 +1144,7 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if p.Record.Token.Batch != "absent" {
 			t.Errorf("%s: BATCH %s", where, p.Record.Token.Batch)
 		}
-		if !slicesContain(h.JobPIDs, l.WaitingPID) {
+		if !noJob && !slicesContain(h.JobPIDs, l.WaitingPID) {
 			t.Errorf("%s: the waiting program %d not in the job %v", where, l.WaitingPID, h.JobPIDs)
 		}
 		if h.ServiceOpen == "ok" && h.Kill != "ok" {
@@ -1045,10 +1154,14 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		// ole32, for DCOM) initializes, in the launcher and in its
 		// children, with and without the job's UI limits.
 		u32 := l.Children["user32"]
-		t.Logf("%s: launcher user32: %s; user32 child: %s, desktop %q, beep %q; dcom: %q; dcom unrestricted: %q",
+		t.Logf("%s: launcher user32: %s; user32 child: %s, desktop %q, beep %q; dcom: %q; dcom unrestricted: %q; the runner's logon SID %s",
 			where, l.LauncherUser32, u32.Exit, u32.Record.Desktop, u32.Record.Beep,
-			l.Children["dcom"].Record.DCOM, l.Children["dcom-unrestricted"].Record.DCOM)
+			l.Children["dcom"].Record.DCOM, l.Children["dcom-unrestricted"].Record.DCOM, l.LogonSID)
+		for name, tl := range l.Tools {
+			t.Logf("%s: tool %s: start %s, exit %s", where, name, tl.Start, tl.Exit)
+		}
 	}
+	t.Logf("window station and desktop access: %s", r.WindowStationSDDL)
 	_ = strconv.Itoa
 }
 
@@ -1077,7 +1190,7 @@ func grantWindowStation(ws windows.Handle, runner string) error {
 		return err
 	}
 	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: 0x37f, // WINSTA_ALL_ACCESS
+		AccessPermissions: 0xf037f, // WINSTA_ALL_ACCESS and the standard rights
 		AccessMode:        windows.GRANT_ACCESS,
 		Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(sid)},
 	}}, old)
@@ -1088,4 +1201,151 @@ func grantWindowStation(ws windows.Handle, runner string) error {
 		return fmt.Errorf("setting its access: %w", err)
 	}
 	return nil
+}
+
+// probeTool is a real program to start as the run's program would be.
+type probeTool struct {
+	Name string `json:"name"`
+	Exe  string `json:"exe"`
+	Args string `json:"args"`
+}
+
+// runTools starts each tool of the -p2-tools file with the restricted
+// token, as the run's program, and records how it ended (0xC0000142: a
+// DLL, user32 or ole32, could not initialize).
+func runTools(tok windows.Token, dir string) map[string]childStart {
+	if *p2Tools == "" {
+		return nil
+	}
+	b, err := os.ReadFile(*p2Tools)
+	if err != nil {
+		return map[string]childStart{"(tools)": {Start: err.Error()}}
+	}
+	var tools []probeTool
+	if err := json.Unmarshal(b, &tools); err != nil {
+		return map[string]childStart{"(tools)": {Start: err.Error()}}
+	}
+	out := map[string]childStart{}
+	for _, tl := range tools {
+		out[tl.Name] = startChild(tok, tl.Exe, tl.Args, filepath.Join(dir, "tool-"+tl.Name+"-"+randHex(4)+".log"), 60*time.Second)
+	}
+	return out
+}
+
+// logonSID is the token's logon SID (the group with SE_GROUP_LOGON_ID).
+func logonSID(tok windows.Token) string {
+	g, err := tok.GetTokenGroups()
+	if err != nil {
+		return err.Error()
+	}
+	for _, x := range g.AllGroups() {
+		if x.Attributes&windows.SE_GROUP_LOGON_ID != 0 {
+			return x.Sid.String()
+		}
+	}
+	return "none"
+}
+
+// startDesktop, when set, is the desktop startSuspended starts on
+// (route A's explicit desktop).
+var startDesktop string
+
+// routeAResult is route A: the service holding SeAssignPrimaryTokenPrivilege
+// starts the user32 child with CreateProcessAsUser and a batch logon token,
+// as a contrast with the secondary logon route.
+type routeAResult struct {
+	EnableAssign     string                `json:"enable_assign_primary_token"`
+	WindowStationACE string                `json:"window_station_ace"`
+	Desktop          string                `json:"desktop"`
+	Logon            string                `json:"batch_logon"`
+	Starts           map[string]childStart `json:"starts"` // explicit-desktop, inherited-desktop
+}
+
+func runRouteA(c probe2Config) *routeAResult {
+	r := &routeAResult{Starts: map[string]childStart{}}
+	var proc windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &proc); err != nil {
+		r.EnableAssign = err.Error()
+		return r
+	}
+	defer proc.Close()
+	r.EnableAssign = errString(setPrivilege(proc, "SeAssignPrimaryTokenPrivilege", true))
+	a := c.Users["a"]
+	cur, _, _ := procGetProcessWindowStation.Call()
+	name := make([]uint16, 256)
+	var n uint32
+	procGetUserObjectInformation.Call(cur, 2, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)*2), uintptr(unsafe.Pointer(&n)))
+	ws := windows.UTF16ToString(name)
+	r.WindowStationACE = errString(grantWindowStation(windows.Handle(cur), a.SID))
+	sa, err := userObjectSA(a.SID)
+	if err != nil {
+		r.Desktop = err.Error()
+		return r
+	}
+	deskName := "runa-" + randHex(4)
+	dn, _ := windows.UTF16PtrFromString(deskName)
+	desk, _, e := procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
+	if desk == 0 {
+		r.Desktop = "CreateDesktop: " + e.Error()
+		return r
+	}
+	defer procCloseDesktop.Call(desk)
+	r.Desktop = "ok"
+	var tok windows.Token
+	un, _ := windows.UTF16PtrFromString(a.Name)
+	dot, _ := windows.UTF16PtrFromString(".")
+	pw, _ := windows.UTF16PtrFromString(a.Password)
+	if ok, _, e := procLogonUserW.Call(uintptr(unsafe.Pointer(un)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
+		4 /* LOGON32_LOGON_BATCH */, 0, uintptr(unsafe.Pointer(&tok))); ok == 0 {
+		r.Logon = e.Error()
+		return r
+	}
+	defer tok.Close()
+	r.Logon = "ok"
+	for _, d := range []struct{ key, desktop string }{{"explicit-desktop", ws + `\` + deskName}, {"inherited-desktop", ""}} {
+		out := filepath.Join(a.OutDir, "routea-"+randHex(4)+".json")
+		startDesktop = d.desktop
+		cs := startChild(tok, c.Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=user32 -p2-out="%s"`, out),
+			filepath.Join(a.OutDir, "routea-"+randHex(4)+".log"), 60*time.Second)
+		startDesktop = ""
+		if b, err := os.ReadFile(out); err == nil {
+			_ = json.Unmarshal(b, &cs.Record)
+		}
+		r.Starts[d.key] = cs
+	}
+	return r
+}
+
+// writeTools writes the real tools this runner has (git, node, npm, ssh,
+// python), for the launcher to start as the run's program; npm's .cmd
+// through cmd.exe, as a batch run would be.
+func writeTools(t *testing.T, dir string) string {
+	t.Helper()
+	var tools []probeTool
+	for _, c := range []struct{ name, file, args string }{
+		{"git", "git.exe", "--version"},
+		{"node", "node.exe", "-e 0"},
+		{"npm", "npm.cmd", "--version"},
+		{"ssh", "ssh.exe", "-V"},
+		{"python", "python.exe", "-c 0"},
+	} {
+		p, err := exec.LookPath(c.file)
+		if err != nil {
+			t.Logf("no %s on this runner", c.file)
+			continue
+		}
+		if strings.HasSuffix(strings.ToLower(p), ".cmd") {
+			cmdExe := filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe")
+			tools = append(tools, probeTool{Name: c.name, Exe: cmdExe, Args: `/d /c ""` + p + `" ` + c.args + `"`})
+			continue
+		}
+		tools = append(tools, probeTool{Name: c.name, Exe: p, Args: c.args})
+	}
+	path := filepath.Join(dir, "tools.json")
+	b, _ := json.Marshal(tools)
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("tools: %s", b)
+	return path
 }
