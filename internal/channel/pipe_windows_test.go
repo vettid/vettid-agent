@@ -211,8 +211,10 @@ func TestPipeOwnerChecked(t *testing.T) {
 	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrNotService) {
 		t.Fatalf("Dial = %v, want ErrNotService", err)
 	}
+	// No hello reached the server: it saw the client leave, either before
+	// its connect completed (ERROR_NO_DATA) or before a whole hello line.
 	got := s.refused.wait(t, 1)
-	if !errors.Is(got[0], ErrBadHello) {
+	if !errors.Is(got[0], ErrBadHello) && !errors.Is(got[0], windows.ERROR_NO_DATA) {
 		t.Fatalf("the server got %v, want no hello at all", got[0])
 	}
 }
