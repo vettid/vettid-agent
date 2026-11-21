@@ -448,6 +448,7 @@ type probe2Result struct {
 	// desktop in the service's own, with the runner added to it.
 	ServiceWindowStation string               `json:"service_window_station,omitempty"`
 	WindowStationACE     string               `json:"window_station_ace,omitempty"`
+	NullDesktop          string               `json:"null_desktop,omitempty"`
 	Desktop              string               `json:"desktop"`
 	DesktopName          string               `json:"desktop_name"`
 	Hops                 map[string]hopResult `json:"hops"`   // "interactive", "interactive+local"
@@ -565,11 +566,36 @@ func runHops(c probe2Config) probe2Result {
 	if err == nil {
 		defer windows.CloseHandle(sentinel)
 	}
+	// Contrasts, to tell what stops user32 starting: a second desktop in
+	// the same window station with a NULL DACL (anyone: the access entries
+	// can't be the cause), and seclogon's own choice (lpDesktop null,
+	// which the plan rules out; measured only).
+	nullName := "open-" + randHex(4)
+	nn, _ := windows.UTF16PtrFromString(nullName)
+	var nullDesk uintptr
+	if nsd, err := windows.SecurityDescriptorFromString("D:NO_ACCESS_CONTROL"); err == nil {
+		nsa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: nsd}
+		nullDesk, _, e = procCreateDesktopW.Call(uintptr(unsafe.Pointer(nn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(nsa)))
+		if nullDesk != 0 {
+			defer procCloseDesktop.Call(nullDesk)
+		} else {
+			res.NullDesktop = "CreateDesktop: " + e.Error()
+		}
+	}
 	for _, v := range []struct {
-		key, restrict string
-		uiLimits      bool
-	}{{"interactive", "interactive", true}, {"interactive-no-ui-limits", "interactive", false}, {"interactive+local", "interactive+local", true}} {
-		res.Hops[v.key] = runHop(c, b, res.DesktopName, v.restrict, v.uiLimits, uint64(sentinel))
+		key, restrict, desktop string
+		uiLimits               bool
+	}{
+		{"interactive", "interactive", res.DesktopName, true},
+		{"interactive-no-ui-limits", "interactive", res.DesktopName, false},
+		{"interactive+local", "interactive+local", res.DesktopName, true},
+		{"null-dacl-desktop", "interactive", wsName + `\` + nullName, true},
+		{"seclogon-default-desktop", "interactive", "", true},
+	} {
+		if v.key == "null-dacl-desktop" && nullDesk == 0 {
+			continue
+		}
+		res.Hops[v.key] = runHop(c, b, v.desktop, v.restrict, v.uiLimits, uint64(sentinel))
 	}
 	return res
 }
@@ -584,7 +610,10 @@ func runHop(c probe2Config, u probeUser, desktop, restrict string, uiLimits bool
 	pw, _ := windows.UTF16PtrFromString(u.Password)
 	cl, _ := windows.UTF16FromString(`"` + c.Exe + `" ` + args)
 	dir, _ := windows.UTF16PtrFromString(filepath.Dir(c.Exe))
-	dsk, _ := windows.UTF16PtrFromString(desktop)
+	var dsk *uint16 // null: seclogon's own choice (a contrast only)
+	if desktop != "" {
+		dsk, _ = windows.UTF16PtrFromString(desktop)
+	}
 	si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{})), Desktop: dsk}
 	var pi windows.ProcessInformation
 	if r, _, e := procCreateProcessWithLogonW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
