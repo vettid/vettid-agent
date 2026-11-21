@@ -515,10 +515,10 @@ func deleteProfile(t *testing.T, sid string) {
 	}
 }
 
-// newProbeUser makes a throwaway local user with the batch logon right
-// (and, if denied, denied interactive and remote logon), and a folder
-// only it can write; all removed when the test ends.
-func newProbeUser(t *testing.T, dir, svcSID string, deny []string) probeUser {
+// newProbeUser makes a throwaway local user with the logon rights in
+// grants and those in deny denied, and a folder only it can write (the
+// service of svcSID may read it); all removed when the test ends.
+func newProbeUser(t *testing.T, dir, svcSID string, grants, deny []string) probeUser {
 	t.Helper()
 	name := "vtdp" + randHex(4)
 	pw := make([]byte, 18)
@@ -541,10 +541,7 @@ func newProbeUser(t *testing.T, dir, svcSID string, deny []string) probeUser {
 			t.Errorf("NetUserDel %s: %d", name, r)
 		}
 	})
-	rights := []string{"SeBatchLogonRight"}
-	if deny != nil {
-		rights = append(rights, deny...)
-	}
+	rights := append(append([]string(nil), grants...), deny...)
 	for _, right := range rights {
 		if err := lsaRight(sid, right, true); err != nil {
 			t.Fatal(err)
@@ -751,7 +748,7 @@ func probeOnce(t *testing.T, m *mgr.Mgr, v probeVariant) {
 	protectDir(t, dir, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+svcSID.String()+")(A;OICI;0x1200a9;;;BU)")
 	users := map[string]probeUser{}
 	for _, k := range probeUserKinds {
-		users[k] = newProbeUser(t, dir, svcSID.String(), probeUserDenials[k])
+		users[k] = newProbeUser(t, dir, svcSID.String(), []string{"SeBatchLogonRight"}, probeUserDenials[k])
 	}
 	if v.stopSeclogon {
 		stopSeclogon(t, m)
