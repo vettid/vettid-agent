@@ -105,7 +105,9 @@ jobs:
       # verbosely, with GOTRACEBACK=crash, so a crash says where; the
       # whole output is kept as an artifact.
       - name: internal/state repeated, verbose (crash hunt)
-        if: runner.os == 'Windows'
+        # It runs whatever an earlier step did, so a flaky test there
+        # doesn't hide it.
+        if: runner.os == 'Windows' && !cancelled()
         shell: bash
         env:
           GOTRACEBACK: crash
