@@ -79,7 +79,8 @@ func TestBatchArgumentRefused(t *testing.T) {
 }
 
 // The batch file's path and the working folder are checked by the same
-// rule.
+// rule for ASCII; outside ASCII, by what the system's code page makes of
+// the character (TestBatchPathTextCodePages).
 func TestBatchPathAndFolderRefused(t *testing.T) {
 	lookupOnly(t)
 	odd := filepath.Join(t.TempDir(), "p(1)")
@@ -94,16 +95,214 @@ func TestBatchPathAndFolderRefused(t *testing.T) {
 		t.Errorf("path: %v", err)
 	}
 
+	if windows.GetACP() != 1252 {
+		t.Skipf("the working-folder case needs code page 1252 (this system: %d)", windows.GetACP())
+	}
 	bat = writeBatch(t, t.TempDir(), "t.cmd", "@echo off")
 	p = prepare(t, bat)
-	dir := filepath.Join(t.TempDir(), "caf"+string(rune(0xe9)))
+	// U+FF02, a full-width quotation mark: code page 1252 turns it into ".
+	dir := filepath.Join(t.TempDir(), "a"+string(rune(0xff02))+"b")
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	spec = helperSpec(t, bat, "")
 	spec.Dir = dir
-	if _, err := p.Start(spec); !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the working folder") {
+	_, err := p.Start(spec)
+	if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), `the working folder holds U+FF02, which becomes " on this system`) {
 		t.Errorf("folder: %v", err)
+	}
+}
+
+// Outside ASCII, the path and working folder refuse a character only if
+// the code page turns it into a refused byte (a DBCS second byte
+// included), a backslash or a control character; one that becomes ? is
+// fine. The code page is a parameter here: the system's can't be switched.
+func TestBatchPathTextCodePages(t *testing.T) {
+	u := func(rs ...rune) string { return string(rs) }
+	ok := []struct {
+		cp   uint32
+		name string
+		s    string
+	}{
+		{1252, "e acute, u umlaut", `C:` + backslash + "Users" + backslash + "Jos" + u(0xe9) + " Zo" + u(0xeb) + backslash + "npm"},
+		{1252, "CJK becomes ?", "x" + u(0x4e2d) + "y"},
+		{1252, "the replacement character becomes ?", "x" + u(0xfffd) + "y"},
+		{1252, "outside the BMP", "x" + u(0x1f600) + "y"},
+		{932, "e acute becomes e", "caf" + u(0xe9)},
+		{932, "CJK in its own code page", u(0x4e2d, 0x6587)},
+		{936, "CJK in its own code page", u(0x4e2d, 0x6587)},
+		{949, "Hangul in its own code page", u(0xd55c, 0xae00)},
+		{65001, "UTF-8 gives no ASCII bytes", "a" + u(0xff02) + "b" + u(0xe9)},
+	}
+	for _, c := range ok {
+		if err := batchPathTextCP(c.s, "the program's path", c.cp); err != nil {
+			t.Errorf("cp%d %s: refused: %v", c.cp, c.name, err)
+		}
+	}
+	refused := []struct {
+		cp   uint32
+		name string
+		s    string
+		want string
+	}{
+		{1252, "full-width quotation mark", "a" + u(0xff02) + "b", `becomes " on this system`},
+		{1252, "full-width reverse solidus", "a" + u(0xff3c) + "b", `becomes ` + backslash + ` on this system`},
+		{1252, "full-width percent sign", "a" + u(0xff05) + "b", "becomes % on this system"},
+		{1252, "full-width ampersand", "a" + u(0xff06) + "b", "becomes & on this system"},
+		{1252, "full-width vertical line", "a" + u(0xff5c) + "b", "becomes | on this system"},
+		{1252, "full-width left parenthesis", "a" + u(0xff08) + "b", "becomes ( on this system"},
+		{932, "yen sign", "a" + u(0xa5) + "b", `becomes ` + backslash + ` on this system`},
+		{932, "DBCS second byte ^ (katakana TA)", "a" + u(0x30bf) + "b", "becomes ^ on this system"},
+		{932, "DBCS second byte backslash (Cyrillic YERU)", "a" + u(0x042b) + "b", `becomes ` + backslash + ` on this system`},
+		{936, "DBCS second byte backslash", "a" + u(0x4e57) + "b", `becomes ` + backslash + ` on this system`},
+		{950, "DBCS second byte backslash", "a" + u(0x4e48) + "b", `becomes ` + backslash + ` on this system`},
+		{949, "won sign", "a" + u(0x20a9) + "b", `U+20A9, which becomes ` + backslash + ` on this system`},
+		{437, "a control byte (white smiling face becomes 0x01)", "a" + u(0x263a) + "b", "U+263A, which becomes a control character on this system"},
+		{1252, "the detail names the code point", "a" + u(0xff02) + "b", `U+FF02, which becomes " on this system`},
+		{1252, "fraction slash becomes /", "a" + u(0x2044) + "b", "U+2044, which becomes / on this system"},
+		{1252, "division slash becomes /", "a" + u(0x2215) + "b", "U+2215, which becomes / on this system"},
+		{1252, "Armenian full stop becomes :", "a" + u(0x0589) + "b", "U+0589, which becomes : on this system"},
+		{1252, "an ASCII metacharacter still", "p(1)", "holds ("},
+		{1252, "an ASCII control character still", "a" + u(9) + "b", "holds a control character"},
+		{12345, "a code page that doesn't exist: the conversion fails", "caf" + u(0xe9), "U+00E9, which this system can't convert"},
+		{1252, "bytes that aren't UTF-8", "a" + string([]byte{0xff}) + "b", "bytes that aren't UTF-8"},
+	}
+	for _, c := range refused {
+		err := batchPathTextCP(c.s, "the program's path", c.cp)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the program's path holds") || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("cp%d %s: %v (want %q)", c.cp, c.name, err, c.want)
+		}
+	}
+	// Backslashes as separators, ASCII / and :, and plain ASCII pass.
+	if err := batchPathTextCP(`C:`+backslash+"x"+backslash+"y/z.cmd", "the program's path", 1252); err != nil {
+		t.Errorf("an ASCII path: %v", err)
+	}
+
+	// PATH, TEMP and TMP: the code-page check only, so a --run-path under
+	// "Program Files (x86)" passes; a lookalike still refuses.
+	x86 := `C:` + backslash + "Program Files (x86)" + backslash + "nodejs;C:" + backslash + "Windows"
+	if err := batchNonASCIICP(x86, "the environment variable PATH", 1252); err != nil {
+		t.Errorf("PATH with (x86): %v", err)
+	}
+	for _, r := range []rune{0xff02, 0x2215, 0x00a5} {
+		err := batchNonASCIICP(x86+";a"+u(r)+"b", "the environment variable PATH", 1252)
+		if r == 0x00a5 { // the yen sign is itself in code page 1252
+			if err != nil {
+				t.Errorf("PATH with U+00A5 under 1252: %v", err)
+			}
+			continue
+		}
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the environment variable PATH holds U+") {
+			t.Errorf("PATH with U+%04X: %v", r, err)
+		}
+	}
+	// A trailing backslash refuses, in both forms.
+	for _, ascii := range []bool{true, false} {
+		err := batchPathVar("USERPROFILE", `C:`+backslash+"Users"+backslash+"x"+backslash, ascii, 1252)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "ends in a backslash") {
+			t.Errorf("trailing backslash (ascii rule %v): %v", ascii, err)
+		}
+	}
+}
+
+// A domain account whose home folder is a mapped drive has HOMEDRIVE=H:
+// and HOMEPATH=\ : that exact HOMEPATH is allowed, any other HOMEPATH and
+// every other variable keep the rule (a trailing backslash refuses).
+func TestBatchHomePathRoot(t *testing.T) {
+	lookupOnly(t)
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off", "echo [%HOMEDRIVE%%HOMEPATH%]")
+	p := prepare(t, bat)
+	spec := helperSpec(t, bat, "")
+	spec.Env = setVar(spec.Env, "HOMEDRIVE", "H:")
+	spec.Env = setVar(spec.Env, "homepath", backslash) // names compare without case
+	code, out := runOutput(t, p, spec)
+	if code != 0 || out != "[H:"+backslash+"]"+crlf {
+		t.Fatalf("HOMEPATH=\\: exit %d, output %q", code, out)
+	}
+
+	p = prepare(t, bat) // the run above used the first one
+	noStart(t)
+	for name, value := range map[string]string{
+		"HOMEPATH":    backslash + "Users" + backslash,
+		"USERPROFILE": `C:` + backslash,
+		"APPDATA":     backslash,
+	} {
+		spec := helperSpec(t, bat, "")
+		spec.Env = setVar(spec.Env, name, value)
+		_, err := p.Start(spec)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the environment variable "+name+" ends in a backslash") {
+			t.Errorf("%s=%q: %v", name, value, err)
+		}
+	}
+}
+
+// A drive's or a share's root can't be a run path on Windows: as the
+// last one it would end PATH in a backslash.
+func TestCheckNotRoot(t *testing.T) {
+	for _, root := range []string{`C:` + backslash, `D:` + backslash, backslash + backslash + "server" + backslash + "share" + backslash} {
+		if err := checkNotRoot(root); err == nil || !strings.Contains(err.Error(), "a drive's root can't be a run path; name a folder on it") {
+			t.Errorf("%q: %v", root, err)
+		}
+	}
+	for _, dir := range []string{`C:` + backslash + "Program Files" + backslash + "nodejs", `D:` + backslash + "tools"} {
+		if err := checkNotRoot(dir); err != nil {
+			t.Errorf("%q: %v", dir, err)
+		}
+	}
+}
+
+// A batch file in a folder whose name is outside ASCII (an account name
+// such as José), with that folder as the working folder and the account's
+// folders in USERPROFILE and APPDATA (and a PATH under
+// "Program Files (x86)"), runs, and its arguments arrive whole. An argument
+// outside ASCII is still refused (TestBatchArgumentRefused).
+func TestBatchNonASCIIPathRuns(t *testing.T) {
+	lookupOnly(t)
+	if windows.GetACP() != 1252 {
+		t.Skipf("needs code page 1252 (this system: %d)", windows.GetACP())
+	}
+	profile := filepath.Join(t.TempDir(), "Jos"+string(rune(0xe9))+" Zo"+string(rune(0xeb))+" "+string(rune(0x4e2d)))
+	dir := filepath.Join(profile, "AppData", "Roaming", "npm")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	bat := writeBatch(t, dir, "t.cmd", "@echo off", "echo [%~1]", "exit /b 3")
+	p := prepare(t, bat)
+	spec := helperSpec(t, bat, "")
+	spec.Argv = []string{bat, "plain ascii"}
+	spec.Dir = evalAbs(t, dir)
+	spec.Env = setVar(spec.Env, "USERPROFILE", profile)
+	spec.Env = setVar(spec.Env, "APPDATA", filepath.Join(profile, "AppData", "Roaming"))
+	spec.Env = setVar(spec.Env, "PATH", os.Getenv("SystemRoot")+backslash+"System32;C:"+backslash+"Program Files (x86)"+backslash+"nodejs;"+dir)
+	code, out := runOutput(t, p, spec)
+	if code != 3 || out != "[plain ascii]"+crlf {
+		t.Fatalf("exit %d, output %q", code, out)
+	}
+}
+
+// The account folders and PATH refuse a character the code page turns
+// into a metacharacter, naming the variable.
+func TestBatchAccountFoldersRefused(t *testing.T) {
+	lookupOnly(t)
+	if windows.GetACP() != 1252 {
+		t.Skipf("needs code page 1252 (this system: %d)", windows.GetACP())
+	}
+	bat := writeBatch(t, t.TempDir(), "t.cmd", "@echo off")
+	p := prepare(t, bat)
+	noStart(t)
+	quote := string(rune(0xff02)) // a full-width quotation mark: " under 1252
+	for name, value := range map[string]string{
+		"APPDATA":     `C:` + backslash + "Users" + backslash + "a" + quote + "b" + backslash + "AppData" + backslash + "Roaming",
+		"USERPROFILE": `C:` + backslash + "Users" + backslash + "a" + quote + "b",
+		"PATH":        `C:` + backslash + "Windows;C:" + backslash + "a" + quote + "b",
+		"TEMP":        `C:` + backslash + "a" + quote + "b",
+	} {
+		spec := helperSpec(t, bat, "")
+		spec.Env = setVar(spec.Env, name, value)
+		_, err := p.Start(spec)
+		if !errors.Is(err, ErrArgumentNotAllowed) || !strings.Contains(err.Error(), "the environment variable "+name+` holds U+FF02, which becomes " on this system`) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }
 

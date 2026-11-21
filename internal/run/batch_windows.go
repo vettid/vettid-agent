@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -16,7 +18,7 @@ import (
 )
 
 // A Windows batch file (.cmd or .bat) runs through System32's cmd.exe
-// (AGENT-PLAN §4.9; owner decision b, GC #14880): cmd.exe /d /v:off /s /c
+// (AGENT-PLAN §4.9; owner decision b, GC #14880): cmd.exe /d /e:on /v:off /s /c
 // with the batch file and each argument in double quotes. cmd.exe reads
 // the command line again, and the batch file may read an argument again
 // (%~1 strips our quotes; %* puts the arguments on a line it parses), so
@@ -36,9 +38,25 @@ import (
 //     command line by the C runtime's rules takes \" for a quote, so the
 //     argument would run into the next.
 //
-// The batch file's path and the working folder follow the same rule (the
-// path is on the command line; cmd.exe reads the folder for %cd%), and so
-// does the value of every environment variable the agent controls:
+// The batch file's path and the working folder (the path is on the
+// command line; cmd.exe reads the folder for %cd%) follow the same rule
+// for ASCII, but a character outside ASCII is refused only if this
+// system's ANSI code page, read at each run, turns it into one of the
+// refused characters, a backslash or a control character, DBCS second
+// bytes included (owner decision b, GC #15715; batchPathText). cmd.exe
+// itself keeps such a path as it is; the risk is a program the batch
+// starts that reads its command line in the ANSI code page, and an
+// account name such as José must not keep every npm tool from running. A
+// character that has no mapping becomes ? there, which is no command.
+// The member's account folders the run is given (USERPROFILE, APPDATA,
+// ...; copiedNames) get the same path rule, and the connector's own PATH,
+// TEMP and TMP the code-page part of it (owner decision a, GC #15728);
+// none may end in a backslash.
+// The console (OEM) code page, which cmd.exe uses for `for /f` and pipes,
+// is not checked: what a batch file does with its own output is beyond
+// what this guards.
+// Arguments and the value of every environment variable the agent
+// controls keep the full rule:
 // cmd.exe expands %NAME% before it parses a line, so a value holding
 // " & is syntax wherever the batch uses it. A variable named as one of
 // cmd.exe's own dynamic variables (%CD%, %ERRORLEVEL%, ...) is refused:
@@ -96,6 +114,96 @@ func batchText(s, what string) error {
 	return nil
 }
 
+// batchPathTextCP checks the batch file's path or the working folder:
+// ASCII by batchText's rule, and a character outside ASCII by what code
+// page cp (the system's ANSI code page, which checkBatch reads; tests give
+// one) turns it into. Each character outside ASCII is converted on its own
+// with Windows's default best fit, so a DBCS second byte is seen as the
+// byte it is. A conversion that fails refuses, fail closed.
+func batchPathTextCP(s, what string, cp uint32) error {
+	return batchPathCheck(s, what, cp, true)
+}
+
+// batchNonASCIICP is batchPathTextCP without the ASCII rule, for the
+// connector's own PATH, TEMP and TMP: a --run-path under
+// `C:\Program Files (x86)` puts ( and ) in PATH, so only what the code page
+// makes of a character outside ASCII is checked there.
+func batchNonASCIICP(s, what string, cp uint32) error {
+	return batchPathCheck(s, what, cp, false)
+}
+
+// batchPathVar checks the value of one of the member's account folders
+// (copiedNames: USERPROFILE, APPDATA, ...) with the path rule, or of the
+// connector's PATH, TEMP or TMP (ascii false) with the code-page check
+// only; neither may end in a backslash, which would escape cmd.exe's
+// closing quote where the batch puts the variable in quotes.
+func batchPathVar(name, value string, ascii bool, cp uint32) error {
+	what := "the environment variable " + name
+	if err := batchPathCheck(value, what, cp, ascii); err != nil {
+		return err
+	}
+	if strings.HasSuffix(value, `\`) {
+		return argNotAllowed("%s ends in a backslash", what)
+	}
+	return nil
+}
+
+// batchPathCheck: see batchPathTextCP. ascii false skips the ASCII rule.
+// A character outside ASCII is also refused if it becomes / or :, which
+// would change a path an ANSI program reads (U+2215 and U+2044 become /,
+// U+0589 becomes : under code page 1252); ASCII / and : stay as they are.
+func batchPathCheck(s, what string, cp uint32, ascii bool) error {
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size <= 1 {
+			return argNotAllowed("%s holds bytes that aren't UTF-8", what)
+		}
+		i += size
+		if r < 0x80 {
+			if ascii {
+				if err := batchText(string(r), what); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		// A path is not secret, so the refusal names the code point.
+		b, ok := ansiBytes(cp, r)
+		if !ok {
+			return argNotAllowed("%s holds U+%04X, which this system can't convert", what, r)
+		}
+		for _, c := range b {
+			switch {
+			case c < 0x20 || c == 0x7f:
+				return argNotAllowed("%s holds U+%04X, which becomes a control character on this system", what, r)
+			case c == '\\' || c == '/' || c == ':' || strings.IndexByte(batchMeta, c) >= 0:
+				return argNotAllowed("%s holds U+%04X, which becomes %c on this system", what, r, c)
+			}
+		}
+	}
+	return nil
+}
+
+var procWideCharToMultiByte = windows.NewLazySystemDLL("kernel32.dll").NewProc("WideCharToMultiByte")
+
+// ansiBytes is r in code page cp, as WideCharToMultiByte gives it with no
+// flags (best fit on, the code page's default character for what has no
+// mapping). false if the conversion fails.
+func ansiBytes(cp uint32, r rune) ([]byte, bool) {
+	// Call panics if the procedure can't be found: refuse instead.
+	if procWideCharToMultiByte.Find() != nil {
+		return nil, false
+	}
+	w := utf16.Encode([]rune{r})
+	var buf [16]byte
+	n, _, _ := procWideCharToMultiByte.Call(uintptr(cp), 0, uintptr(unsafe.Pointer(&w[0])), uintptr(len(w)),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)), 0, 0)
+	if n == 0 || int(n) > len(buf) {
+		return nil, false
+	}
+	return buf[:n], true
+}
+
 // batchValue is batchText for a value cmd.exe puts between quotes it
 // doesn't control: it can't end in a backslash either.
 func batchValue(s, what string) error {
@@ -132,16 +240,25 @@ func connectorSet(name string) bool {
 }
 
 // checkBatch checks a batch run's path, working folder, arguments and
-// environment. Every variable's value is checked except the connector's
-// own (connectorSet) and those named in trusted (the secret's variable,
-// the operator's --run-env names): fail closed, a variable not known to
-// be trusted is the agent's. A refusal names the variable, never its
-// value.
+// environment. PATH, TEMP and TMP get the code-page check; the member's
+// account folders (copiedNames) the path rule; every other variable's
+// value the full rule, except the connector's other own variables
+// (connectorSet) and those named in trusted (the secret's variable, the
+// operator's --run-env names): fail closed, a variable not known to be
+// trusted is the agent's. A refusal names the variable, never its value.
 func checkBatch(path, dir string, args, env, trusted []string) error {
-	if err := batchText(path, "the program's path"); err != nil {
+	// The system's ANSI code page, read once per run, never cached (it
+	// changes only with a reboot, but the connector may run across one).
+	// GetACP gives the system's code page, the one a program the batch
+	// starts uses, only because the connector has no activeCodePage
+	// manifest: with a UTF-8 one it would answer 65001 and pass everything.
+	// TestNoActiveCodePageManifest and scripts/check-release-binaries fail
+	// if one is added.
+	cp := windows.GetACP()
+	if err := batchPathTextCP(path, "the program's path", cp); err != nil {
 		return err
 	}
-	if err := batchText(dir, "the working folder"); err != nil {
+	if err := batchPathTextCP(dir, "the working folder", cp); err != nil {
 		return err
 	}
 	if filepath.Dir(dir) == dir {
@@ -159,10 +276,30 @@ func checkBatch(path, dir string, args, env, trusted []string) error {
 				return argNotAllowed("the environment variable %s is one cmd.exe sets itself", name)
 			}
 		}
-		if connectorSet(name) || containsName(trusted, name) {
+		var err error
+		switch {
+		case sameName(name, "PATH") || containsName(tempNames, name):
+			// The connector's own, from its configuration and the run:
+			// the code-page check only (batchNonASCIICP).
+			err = batchPathVar(name, value, false, cp)
+		case connectorSet(name) || containsName(trusted, name):
 			continue
+		case containsName(copiedNames, name):
+			// The member's own account folders, copied from the
+			// connector's environment: the path rule (owner decision a,
+			// GC #15728), so an account name such as José runs.
+			if sameName(name, "HOMEPATH") && value == `\` {
+				// A domain account whose home folder is a mapped drive
+				// (HOMEDRIVE=H:) has HOMEPATH=\, the drive's root. Allowed
+				// exactly so (owner decision a, GC #15742); any other
+				// value, and every other variable, keeps the rule.
+				continue
+			}
+			err = batchPathVar(name, value, true, cp)
+		default:
+			err = batchValue(value, "the environment variable "+name)
 		}
-		if err := batchValue(value, "the environment variable "+name); err != nil {
+		if err != nil {
 			return err
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 )
 
@@ -31,11 +32,13 @@ var ErrArgumentNotAllowed error = &Error{Code: CodeArgumentNotAllowed}
 
 // TextArgumentNotAllowed is the refusal shown to the agent. (NEW text)
 const TextArgumentNotAllowed = "This program is a Windows batch file (.cmd or .bat), which runs through cmd.exe. " +
-	"Its arguments, the environment variables the request sets, its path and its working folder can't hold any of " +
-	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII " +
-	"(so a file name in another alphabet can't be passed to it), and an argument or variable can't end in a backslash: " +
-	"cmd.exe would read them as commands. A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
-	"Pass the value in a file instead."
+	"Its arguments and the environment variables the request sets can't hold any of " +
+	"% & | < > ^ ( ) ! \" or a control character, or any character outside ASCII, and can't end in a backslash. " +
+	"Its path, its working folder and the folders from your account it is given (such as APPDATA) can't hold those " +
+	"ASCII characters or a control character, and none of the folders it gets, the PATH it searches included, can hold " +
+	"a character this system turns into one of them or into a slash, backslash or colon (such as a full-width quotation mark). " +
+	"A variable can't be named as one cmd.exe sets itself, such as CD or ERRORLEVEL. " +
+	"Pass a value in a file instead, or move the program to another folder."
 
 // TextSecretNotForBatch refuses a secret given to a batch file in an
 // environment variable when cmd.exe would read some of its characters:
@@ -430,9 +433,23 @@ func CheckRunPaths(paths []string) ([]string, error) {
 		if err := checkAbsDir(real); err != nil {
 			return nil, fmt.Errorf("--run-path %q resolves to %q, which %w", p, real, err)
 		}
+		if err := checkNotRoot(real); err != nil {
+			return nil, fmt.Errorf("--run-path %q: %w", p, err)
+		}
 		out = append(out, real)
 	}
 	return out, nil
+}
+
+// checkNotRoot refuses a drive's or a share's root on Windows: as the
+// last run path it would end PATH in a backslash, which a batch run
+// refuses (batch_windows.go), so every batch run would fail far from the
+// cause. A POSIX root ends no PATH in a backslash and stays allowed.
+func checkNotRoot(dir string) error {
+	if runtime.GOOS == "windows" && filepath.Dir(dir) == dir {
+		return errors.New("a drive's root can't be a run path; name a folder on it")
+	}
+	return nil
 }
 
 // checkNotWritable refuses a --run-path directory that the connector's own
