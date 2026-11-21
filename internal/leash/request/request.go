@@ -860,6 +860,7 @@ func (c *Client) answer(e *entry, resp *vaultconn.Response, mayAskAgain bool) bo
 	// once a caller has its answer, the body holds nothing. parse copies
 	// what it keeps (a json.RawMessage field is a copy), so nothing of the
 	// result shares the body's memory.
+	defer clear(resp.Body) // a backstop, for a panic on the way
 	if resp.OK {
 		res, err := parse(e, resp.Body)
 		clear(resp.Body)
@@ -925,6 +926,9 @@ func (c *Client) finish(e *entry, res *Result, err *Error) {
 	defer c.mu.Unlock()
 	clear(e.body)
 	e.done, e.res, e.err = true, res, err
+	if finishHook != nil {
+		finishHook()
+	}
 	close(e.finished)
 	switch {
 	case e.abandoned || c.closed:
@@ -960,3 +964,8 @@ func sanitize(s string) string {
 	}
 	return string(b)
 }
+
+// finishHook, set only by tests, runs in finish just before a request's
+// waiter is woken (internal/leash/request's tests check that the vault's
+// response body is already zero then).
+var finishHook func()
