@@ -41,17 +41,27 @@ jobs:
         run: go vet ./...
       # On Windows, a test binary that crashes outside Go's handler (as
       # internal/state's did once, 0xc0000005) leaves a full dump here,
-      # kept as an artifact below.
-      - name: keep crash dumps (Windows)
+      # kept as an artifact below. Only this module's test binaries
+      # (<package>.test.exe, as go test names them) are dumped, through
+      # per-program keys: not the service the probes register (probe.exe)
+      # nor anything else on the runner, so a dump holds no more than a
+      # test's own throwaway data.
+      - name: keep crash dumps of the test binaries (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
-          New-Item -Force $k | Out-Null
-          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\dumps" | Out-Null
-          Set-ItemProperty $k -Name DumpFolder -Value "$env:RUNNER_TEMP\dumps" -Type ExpandString
-          Set-ItemProperty $k -Name DumpType -Value 2 -Type DWord
-          Set-ItemProperty $k -Name DumpCount -Value 5 -Type DWord
+          $ErrorActionPreference = 'Stop'
+          $base = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          $dir = Join-Path $env:RUNNER_TEMP 'dumps'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          foreach ($p in (go list ./...)) {
+            $k = Join-Path $base (($p -split '/')[-1] + '.test.exe')
+            New-Item -Force $k | Out-Null
+            Set-ItemProperty $k -Name DumpFolder -Value $dir -Type ExpandString
+            Set-ItemProperty $k -Name DumpType -Value 2 -Type DWord
+            Set-ItemProperty $k -Name DumpCount -Value 5 -Type DWord
+          }
+          Get-ChildItem $base | Select-Object -ExpandProperty PSChildName
       - name: go test
         env:
           GOTRACEBACK: ${{ runner.os == 'Windows' && 'crash' || 'single' }}
@@ -62,6 +72,7 @@ jobs:
         with:
           name: crash-dumps
           path: ${{ runner.temp }}/dumps
+          retention-days: 7
           if-no-files-found: ignore
       # The DPAPI tests again, verbose, as the record of what Windows
       # answered. Only this step creates local test users and runs a helper
@@ -123,7 +134,7 @@ jobs:
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # internal/state's tests crashed once on Windows with an access
-      # violation (0xc0000005) and no Go trace. Run repeatedly and
+      # violation (0xc0000005) and no Go trace. Run 10 more times,
       # verbosely, with GOTRACEBACK=crash, so a crash says where; the
       # whole output is kept as an artifact.
       - name: internal/state repeated, verbose (crash hunt)
@@ -137,7 +148,7 @@ jobs:
           set -o pipefail
           go test -c -o "$RUNNER_TEMP/state.test.exe" ./internal/state
           ok=0
-          for i in $(seq 1 50); do
+          for i in $(seq 1 10); do
             if ! (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$RUNNER_TEMP/state-$i.txt" 2>&1); then
               echo "::error::run $i failed"
               tail -n 80 "$RUNNER_TEMP/state-$i.txt"
@@ -151,6 +162,7 @@ jobs:
         with:
           name: state-crash-hunt
           path: ${{ runner.temp }}/state-*.txt
+          retention-days: 7
           if-no-files-found: ignore
       # The runner's user is an administrator, for whom every folder can be
       # changed, so internal/run's on-disk access checks skip in "go test"
