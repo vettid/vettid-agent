@@ -39,8 +39,30 @@ jobs:
         run: go mod verify
       - name: go vet
         run: go vet ./...
+      # On Windows, a test binary that crashes outside Go's handler (as
+      # internal/state's did once, 0xc0000005) leaves a full dump here,
+      # kept as an artifact below.
+      - name: keep crash dumps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          New-Item -Force $k | Out-Null
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\dumps" | Out-Null
+          Set-ItemProperty $k -Name DumpFolder -Value "$env:RUNNER_TEMP\dumps" -Type ExpandString
+          Set-ItemProperty $k -Name DumpType -Value 2 -Type DWord
+          Set-ItemProperty $k -Name DumpCount -Value 5 -Type DWord
       - name: go test
+        env:
+          GOTRACEBACK: ${{ runner.os == 'Windows' && 'crash' || 'single' }}
         run: go test ${{ matrix.race }} -count=1 ./...
+      - name: keep any crash dump (Windows)
+        if: runner.os == 'Windows' && always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crash-dumps
+          path: ${{ runner.temp }}/dumps
+          if-no-files-found: ignore
       # The DPAPI tests again, verbose, as the record of what Windows
       # answered. Only this step creates local test users and runs a helper
       # as them (internal/protect/dpapi_otheruser_windows_test.go), so that
