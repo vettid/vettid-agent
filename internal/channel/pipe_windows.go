@@ -178,7 +178,10 @@ func (l *Listener) Close() error {
 }
 
 // ServerConn is an admitted client, waiting for the service's answer:
-// Accept (the operation's bytes follow) or Refuse.
+// Accept (the operation's bytes follow) or Refuse. Close it with
+// ServerConn.Close (or Refuse), never through the embedded File: only
+// ServerConn.Close gives its place back to the maxConns count, and a
+// connection closed otherwise keeps it for good.
 type ServerConn struct {
 	*os.File
 	Op       Op
@@ -486,9 +489,11 @@ func integrity(tok windows.Token) (uint32, error) {
 // server that is not the service can't act as this user; then it checks
 // that the pipe's owner is the service, through the open handle, before
 // anything is sent; then the hellos. Errors: ErrNoService (no such
-// pipe), ErrNotService (another owner: a squatted name), ErrNotAllowed
-// (the access list or the service refused this account), ErrInUse,
-// ErrVersionsDiffer.
+// pipe), ErrNotService (another owner: a squatted name), ErrAccessDenied
+// (the pipe's access list refused this account at open, or a remote
+// client), ErrNotAllowed (the service refused this operation to this
+// account), ErrMemberIsAdmin (tools refused to a member who is an
+// administrator), ErrBusy, ErrInUse, ErrVersionsDiffer.
 func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 	want, err := windows.StringToSid(cfg.Service)
 	if err != nil {

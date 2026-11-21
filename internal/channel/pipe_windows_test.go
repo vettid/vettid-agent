@@ -379,6 +379,11 @@ func TestPipeRemoteRefused(t *testing.T) {
 	if errors.Is(err, windows.ERROR_BAD_NETPATH) || strings.Contains(err.Error(), "network path was not found") {
 		t.Skipf("no file sharing on this computer: %v", err)
 	}
+	// Refused at open (the flag), not later by the service: a member who
+	// is an administrator would be refused tools anyway.
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("remote client: %v, want ErrAccessDenied", err)
+	}
 	t.Logf("remote client: %v", err)
 	select {
 	case c := <-s.conns:
@@ -424,6 +429,9 @@ func TestPipeFailedInstanceKeepsName(t *testing.T) {
 	defer l.Close()
 	var takenErr error
 	replaced := make(chan struct{})
+	// afterReplace runs right after the failed instance is closed. A
+	// regression that closes it before making the replacement fails this
+	// test only if the hook stays next to the close: keep them together.
 	l.afterReplace = func() {
 		_, takenErr = Listen(ListenConfig{Pipe: pipe, Owner: me, Member: me, Version: testVersion})
 		close(replaced)
@@ -545,6 +553,11 @@ func TestPipeRejectRemoteFlag(t *testing.T) {
 	}
 	if errors.Is(err, windows.ERROR_BAD_NETPATH) || strings.Contains(err.Error(), "network path was not found") {
 		t.Skipf("no file sharing on this computer: %v", err)
+	}
+	// Refused at open (the flag), not later by the service: a member who
+	// is an administrator would be refused tools anyway.
+	if !errors.Is(err, ErrAccessDenied) {
+		t.Fatalf("remote client: %v, want ErrAccessDenied", err)
 	}
 	t.Logf("remote client, the flag alone: %v", err)
 	select {
