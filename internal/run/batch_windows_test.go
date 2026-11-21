@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 	"unicode/utf16"
+
+	"golang.org/x/sys/windows"
 )
 
 var (
@@ -179,13 +181,38 @@ func TestBatchThatIsAProgram(t *testing.T) {
 	lookupOnly(t)
 	dir := t.TempDir()
 	exe := helperCopy(t, dir, "helper")
-	bat := filepath.Join(dir, "helper.cmd")
+	bat := filepath.Join(filepath.Dir(exe), "helper.cmd")
 	if err := os.Rename(exe, bat); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Prepare(bat, ""); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "named as a batch file") {
 		t.Fatalf("Prepare: %v", err)
 	}
+}
+
+// A path with an 8.3 short name in it is not the held file's final name,
+// so Prepare refuses it; Resolve gives the long name, which Prepare holds.
+func TestShortNamePathResolvedFirst(t *testing.T) {
+	lookupOnly(t)
+	long := writeBatch(t, t.TempDir(), "a-long-batch-file-name.cmd", "@echo off")
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n, err := windows.GetShortPathName(windows.StringToUTF16Ptr(long), &buf[0], uint32(len(buf)))
+	short := windows.UTF16ToString(buf[:n])
+	if err != nil || short == long {
+		t.Skipf("no 8.3 names on this volume: %v", err)
+	}
+	if _, err := Prepare(short, ""); !errors.Is(err, ErrProgramNotFound) || !strings.Contains(err.Error(), "link or junction") {
+		t.Errorf("Prepare(short): %v", err)
+	}
+	resolved, err := Resolve(short, nil)
+	if err != nil || resolved != long {
+		t.Fatalf("Resolve(short) = %q, %v; want %q", resolved, err, long)
+	}
+	p, err := Prepare(resolved, "")
+	if err != nil {
+		t.Fatalf("Prepare(resolved): %v", err)
+	}
+	p.Close()
 }
 
 // cmd.exe's own limit on a command line (8,191 characters) applies.

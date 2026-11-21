@@ -62,7 +62,9 @@ func allowedFileSystem(name string) bool {
 // network path), a file on a volume that is not NTFS or ReFS, a file that
 // another process has open for writing or deleting (the open with
 // read-only sharing fails then), and a script (#!). It hashes the file
-// through the held handle. binDir is not used on Windows.
+// through the held handle. binDir is not used on Windows. path is
+// Resolve's result: the held file's final name must be it exactly, so a
+// path with a short (8.3) name or a junction in it is refused.
 //
 // A batch file (.cmd, .bat) is held and hashed the same way (it must not
 // be a Windows program), and System32's cmd.exe, which runs it, is
