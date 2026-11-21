@@ -450,6 +450,7 @@ type hopResult struct {
 	UILimits    string         `json:"ui_limits"`
 	Launcher    launcherRecord `json:"launcher"`
 	JobPIDs     []uint32       `json:"job_pids"`
+	Desktop     string         `json:"desktop"` // the launcher's, as asked ("": seclogon's choice)
 	ServiceOpen string         `json:"service_opens_program"`
 	ServiceName string         `json:"service_reads_image_name"`
 	Kill        string         `json:"job_kill"`
@@ -655,7 +656,7 @@ func objectSDDL(ws, desk windows.Handle) string {
 }
 
 func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
-	var h hopResult
+	h := hopResult{Desktop: o.desktop}
 	desktop, restrict := o.desktop, o.restrict
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
@@ -749,7 +750,7 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
 			}
 		}
 	}
-	if job == 0 {
+	if o.noJob {
 		// No job: the service ends the waiting program and the launcher
 		// itself.
 		h.Kill = "no job"
@@ -979,7 +980,14 @@ func TestRunnerHopProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := os.RemoveAll(dir); err != nil {
+		// A process that just ended may still hold its image for a moment.
+		var err error
+		for end := time.Now().Add(20 * time.Second); ; time.Sleep(500 * time.Millisecond) {
+			if err = os.RemoveAll(dir); err == nil || time.Now().After(end) {
+				break
+			}
+		}
+		if err != nil {
 			t.Errorf("removing %s: %v", dir, err)
 		}
 	})
@@ -1071,7 +1079,8 @@ func TestRunnerHopProbe(t *testing.T) {
 				t.Errorf("seclogon back to Manual: %v", err)
 			}
 		})
-		if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+		// 1052 (not valid now): seclogon is already stopping.
+		if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) && !errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) {
 			t.Fatalf("stopping seclogon: %v", err)
 		}
 		for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
@@ -1150,15 +1159,47 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if h.ServiceOpen == "ok" && h.Kill != "ok" {
 			t.Errorf("%s: job kill: %s", where, h.Kill)
 		}
-		// Recorded, to be pinned once measured: whether user32 (and so
-		// ole32, for DCOM) initializes, in the launcher and in its
-		// children, with and without the job's UI limits.
 		u32 := l.Children["user32"]
-		t.Logf("%s: launcher user32: %s; user32 child: %s, desktop %q, beep %q; dcom: %q; dcom unrestricted: %q; the runner's logon SID %s",
-			where, l.LauncherUser32, u32.Exit, u32.Record.Desktop, u32.Record.Beep,
-			l.Children["dcom"].Record.DCOM, l.Children["dcom-unrestricted"].Record.DCOM, l.LogonSID)
+		dcom, dcomOpen := l.Children["dcom"].Record.DCOM, l.Children["dcom-unrestricted"].Record.DCOM
+		t.Logf("%s: launcher user32: %s; user32 child: %s, desktop %q, beep %q; dcom: %q; dcom with INTERACTIVE: %q; the runner's logon SID %s",
+			where, l.LauncherUser32, u32.Exit, u32.Record.Desktop, u32.Record.Beep, dcom, dcomOpen, l.LogonSID)
+		if h.Desktop == "" {
+			// seclogon's own desktop (lpDesktop null; the plan rules it
+			// out): user32 does not initialize there.
+			if !strings.Contains(l.LauncherUser32, "initialization routine failed") {
+				t.Errorf("%s: user32 on seclogon's own desktop: %s, want the DLL initialization failure", where, l.LauncherUser32)
+			}
+		} else {
+			// On a desktop of the run's own, with the runner's entry on the
+			// window station including the standard rights (0xF037F),
+			// user32 and so ole32 initialize, in the launcher and its
+			// restricted children.
+			want := h.Desktop[strings.LastIndex(h.Desktop, `\`)+1:]
+			if l.LauncherUser32 != "ok" || u32.Exit != "exit 0x0" || u32.Record.Desktop != want || u32.Record.Beep != "ok" {
+				t.Errorf("%s: user32: launcher %s; child %+v, want it on %q", where, l.LauncherUser32, u32, want)
+			}
+			// DCOM: a class run as the Interactive User that only INTERACTIVE
+			// may launch is refused (E_ACCESSDENIED) to a program holding
+			// INTERACTIVE deny-only, and passes the launch check for one
+			// holding it enabled (its throwaway server then never registers).
+			if dcom != "HRESULT 0x80070005" {
+				t.Errorf("%s: DCOM with INTERACTIVE deny-only: %q, want HRESULT 0x80070005", where, dcom)
+			}
+			if dcomOpen == "" || dcomOpen == "HRESULT 0x80070005" || strings.HasPrefix(dcomOpen, "ole32") {
+				t.Errorf("%s: DCOM with INTERACTIVE enabled: %q, want past the launch check", where, dcomOpen)
+			}
+		}
+		if l.Token.Local != "absent" || p.Record.Token.Local != "absent" {
+			t.Errorf("%s: LOCAL: launcher %s, program %s; measured absent from the runner's token", where, l.Token.Local, p.Record.Token.Local)
+		}
 		for name, tl := range l.Tools {
 			t.Logf("%s: tool %s: start %s, exit %s", where, name, tl.Start, tl.Exit)
+			if tl.Start != "ok" || tl.Exit != "exit 0x0" {
+				t.Errorf("%s: %s as the run's program: %+v", where, name, tl)
+			}
+		}
+		if restrict == "interactive" && len(l.Tools) == 0 {
+			t.Errorf("%s: no tools were started", where)
 		}
 	}
 	t.Logf("window station and desktop access: %s", r.WindowStationSDDL)
@@ -1306,7 +1347,7 @@ func runRouteA(c probe2Config) *routeAResult {
 		out := filepath.Join(a.OutDir, "routea-"+randHex(4)+".json")
 		startDesktop = d.desktop
 		cs := startChild(tok, c.Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=user32 -p2-out="%s"`, out),
-			filepath.Join(a.OutDir, "routea-"+randHex(4)+".log"), 60*time.Second)
+			filepath.Join(filepath.Dir(c.Exe), "routea-"+randHex(4)+".log"), 60*time.Second)
 		startDesktop = ""
 		if b, err := os.ReadFile(out); err == nil {
 			_ = json.Unmarshal(b, &cs.Record)
