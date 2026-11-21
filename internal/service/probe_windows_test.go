@@ -480,17 +480,26 @@ func protectDir(t *testing.T, path, sddl string) {
 }
 
 // deleteProfile removes the profile Windows made for sid, if any.
+// A profile is unloaded a little after its last process ends; until then
+// DeleteProfile says it is in use, so it is tried for a minute.
 func deleteProfile(t *testing.T, sid string) {
 	p, _ := windows.UTF16PtrFromString(sid)
-	if r, _, e := procDeleteProfileW.Call(uintptr(unsafe.Pointer(p)), 0, 0); r == 0 && !errors.Is(e, windows.ERROR_FILE_NOT_FOUND) {
-		t.Errorf("DeleteProfile %s: %v", sid, e)
+	for end := time.Now().Add(time.Minute); ; time.Sleep(time.Second) {
+		r, _, e := procDeleteProfileW.Call(uintptr(unsafe.Pointer(p)), 0, 0)
+		if r != 0 || errors.Is(e, windows.ERROR_FILE_NOT_FOUND) {
+			return
+		}
+		if !errors.Is(e, windows.ERROR_SHARING_VIOLATION) || time.Now().After(end) {
+			t.Errorf("DeleteProfile %s: %v", sid, e)
+			return
+		}
 	}
 }
 
 // newProbeUser makes a throwaway local user with the batch logon right
 // (and, if denied, denied interactive and remote logon), and a folder
 // only it can write; all removed when the test ends.
-func newProbeUser(t *testing.T, dir string, denied bool) probeUser {
+func newProbeUser(t *testing.T, dir, svcSID string, denied bool) probeUser {
 	t.Helper()
 	name := "vtdp" + randHex(4)
 	pw := make([]byte, 18)
@@ -531,7 +540,8 @@ func newProbeUser(t *testing.T, dir string, denied bool) probeUser {
 	if err := os.Mkdir(out, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	protectDir(t, out, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+sid.String()+")")
+	// The user writes here; the service reads what its child wrote.
+	protectDir(t, out, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+sid.String()+")(A;OICI;FR;;;"+svcSID+")")
 	return probeUser{Name: name, SID: sid.String(), Password: pass, OutDir: out}
 }
 
@@ -565,9 +575,9 @@ var probeVariants = []probeVariant{
 	{name: "cut3+grant2", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
 		grant: []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
 		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
-			want := []string{"SeAssignPrimaryTokenPrivilege+", "SeIncreaseQuotaPrivilege+", "SeChangeNotifyPrivilege+"}
+			want := []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege", "SeChangeNotifyPrivilege+"}
 			if !sameSet(r.Privileges, want) {
-				t.Errorf("cut3+grant2: privileges %v, want %v (enabled by the probe)", r.Privileges, want)
+				t.Errorf("cut3+grant2: privileges %v, want %v (as the service starts, before the probe enables them)", r.Privileges, want)
 			}
 			if !r.ImpersonateAbsent || !r.TcbAbsent {
 				t.Error("cut3+grant2: SeImpersonatePrivilege or SeTcbPrivilege held")
@@ -579,10 +589,38 @@ var probeVariants = []probeVariant{
 				t.Errorf("cut3+grant2: DPAPI: %s", r.DPAPI)
 			}
 		}},
-	// (4) and (5): measured, then pinned.
+	// SeAssignPrimaryTokenPrivilege alone is enough for CreateProcessAsUser
+	// with a batch logon token.
 	{name: "cut2+grant1", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege"},
-		grant: []string{"SeAssignPrimaryTokenPrivilege"}},
-	{name: "cut1", required: []string{"SeChangeNotifyPrivilege"}},
+		grant: []string{"SeAssignPrimaryTokenPrivilege"},
+		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
+			if !sameSet(r.Privileges, []string{"SeAssignPrimaryTokenPrivilege", "SeChangeNotifyPrivilege+"}) || !r.ImpersonateAbsent || !r.TcbAbsent {
+				t.Errorf("cut2+grant1: privileges %v", r.Privileges)
+			}
+			for _, who := range []string{"plain", "denied"} {
+				checkStart(t, "cut2+grant1", "asuser/"+who, r.Starts["asuser/"+who], users[who])
+			}
+		}},
+	// With no special privilege, CreateProcessAsUser is refused, and
+	// CreateProcessWithLogonW (an interactive logon) works only for a user
+	// who may log on interactively: not for a runner denied it.
+	{name: "cut1", required: []string{"SeChangeNotifyPrivilege"},
+		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
+			if !sameSet(r.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
+				t.Errorf("cut1: privileges %v", r.Privileges)
+			}
+			for _, who := range []string{"plain", "denied"} {
+				if r.Starts["asuser/"+who].Start == "ok" {
+					t.Errorf("cut1: asuser/%s started", who)
+				}
+			}
+			for _, way := range []string{"withlogon", "withlogon-profile"} {
+				checkStart(t, "cut1", way+"/plain", r.Starts[way+"/plain"], users["plain"])
+				if s := r.Starts[way+"/denied"]; !strings.Contains(s.Start, "logon type") {
+					t.Errorf("cut1: %s/denied: %+v, want refused for the logon type", way, s)
+				}
+			}
+		}},
 }
 
 func checkStart(t *testing.T, variant, key string, s startResult, u probeUser) {
@@ -648,7 +686,7 @@ func probeOnce(t *testing.T, m *mgr.Mgr, v probeVariant) {
 	// The folder: administrators, SYSTEM and the service's account; the
 	// binary readable by Users, for the children.
 	protectDir(t, dir, "D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)(A;OICI;0x1301bf;;;"+svcSID.String()+")(A;OICI;0x1200a9;;;BU)")
-	users := map[string]probeUser{"plain": newProbeUser(t, dir, false), "denied": newProbeUser(t, dir, true)}
+	users := map[string]probeUser{"plain": newProbeUser(t, dir, svcSID.String(), false), "denied": newProbeUser(t, dir, svcSID.String(), true)}
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
