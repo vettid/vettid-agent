@@ -48,7 +48,12 @@ func TestStubOverPipe(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = exec.Command("icacls", denied, "/remove:d", "*"+me).Run() })
 	if _, err := os.ReadDir(denied); err == nil {
-		t.Fatal("the denied folder can still be read")
+		// An elevated administrator reads past a deny entry (backup
+		// semantics); the unreadable case is the normal user's run.
+		if !windows.GetCurrentProcessToken().IsElevated() {
+			t.Fatal("the denied folder can still be read")
+		}
+		t.Log("elevated: the denied folder stays readable; the unreadable case runs as a normal user")
 	}
 	for _, v := range []string{"USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "TEMP", "TMP"} {
 		t.Setenv(v, denied)
