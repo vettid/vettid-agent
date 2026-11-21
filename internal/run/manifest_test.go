@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -17,17 +18,22 @@ import (
 // activeCodePage element (as a manifest would declare it) is added to the
 // repository.
 func TestNoActiveCodePageManifest(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
+	// From this file's own location, not the working directory: CI also
+	// runs a copy of the test binary from another folder.
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("no source location for this test")
 	}
+	self = filepath.Clean(self)
+	root := filepath.Join(filepath.Dir(self), "..", "..")
 	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
-		t.Fatalf("the repository root isn't %s: %v", root, err)
+		// The binary runs where its sources aren't: the go test runs on
+		// every platform check the repository.
+		t.Skipf("the sources aren't at %s: %v", root, err)
 	}
-	self, _ := filepath.Abs("manifest_test.go")
 	// The element, not the word: comments name it.
 	needle := []byte(strings.ToLower("<" + "activeCodePage"))
-	err = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -42,7 +48,7 @@ func TestNoActiveCodePageManifest(t *testing.T) {
 			t.Errorf("%s: a Windows manifest or resource; check its activeCodePage first (batchPathText)", p)
 			return nil
 		}
-		if p == self {
+		if filepath.Clean(p) == self {
 			return nil
 		}
 		b, err := os.ReadFile(p)
