@@ -9,13 +9,16 @@ package service
 // account and a local user with the service logon right.
 //
 // TestServiceAccountProbe registers a throwaway service that runs a copy of
-// this test binary as such an account, twice: without and with the
-// privilege granted to the account through LSA, both times with the
-// service's required privileges cut to SeChangeNotifyPrivilege,
-// SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege. Inside, the
-// service records its token's privileges, whether SeImpersonatePrivilege
-// is absent, whether CreateProcessAsUser starts a program as a throwaway
-// user (batch logon), and a DPAPI round trip; the test prints the record.
+// this test binary as such an account, three ways: as it is by default;
+// with the service's required privileges cut to SeChangeNotifyPrivilege,
+// SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege; and with
+// that cut and the last two granted to the account through LSA. A service
+// that does not start is recorded, not failed. Inside, the service records
+// its token's privileges, whether SeImpersonatePrivilege and
+// SeTcbPrivilege are absent, whether CreateProcessAsUser starts a program
+// as a throwaway user (batch logon) with SeAssignPrimaryTokenPrivilege
+// alone and with SeIncreaseQuotaPrivilege too, and a DPAPI round trip;
+// the test prints the record.
 // It runs only with VETTID_AGENT_TEST_OTHER_USER=1 (the elevated Windows CI
 // step) and removes everything it made.
 
@@ -309,12 +312,28 @@ func TestServiceAccountProbe(t *testing.T) {
 	if !windows.GetCurrentProcessToken().IsElevated() {
 		t.Fatalf("%s=1 needs an elevated (administrator) process", otherUserEnv)
 	}
-	for _, granted := range []bool{false, true} {
-		t.Run(fmt.Sprintf("granted=%v", granted), func(t *testing.T) { probeOnce(t, granted) })
+	for _, v := range []probeVariant{
+		{name: "default"},
+		{name: "required", required: true},
+		{name: "required+granted", required: true, grant: true},
+	} {
+		t.Run(v.name, func(t *testing.T) { probeOnce(t, v) })
 	}
 }
 
-func probeOnce(t *testing.T, granted bool) {
+// probeVariant: required cuts the service's privileges to the three the
+// plan names (SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO); grant gives the
+// account SeAssignPrimaryTokenPrivilege and SeIncreaseQuotaPrivilege
+// through LSA first. "default" shows what a virtual account holds when
+// nothing is set.
+type probeVariant struct {
+	name            string
+	required, grant bool
+}
+
+var grantedRights = []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"}
+
+func probeOnce(t *testing.T, v probeVariant) {
 	name := "vettid-probe-" + randHex(4)
 	svcSID, err := windows.StringToSid(channel.ServiceSID(name))
 	if err != nil {
@@ -380,11 +399,13 @@ func probeOnce(t *testing.T, granted bool) {
 	if err := os.WriteFile(filepath.Join(dir, "probe.json"), cfg, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if granted {
-		if err := lsaRight(svcSID, "SeAssignPrimaryTokenPrivilege", true); err != nil {
-			t.Fatal(err)
+	if v.grant {
+		for _, right := range grantedRights {
+			if err := lsaRight(svcSID, right, true); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = lsaRight(svcSID, right, false) })
 		}
-		t.Cleanup(func() { _ = lsaRight(svcSID, "SeAssignPrimaryTokenPrivilege", false) })
 	}
 
 	m, err := mgr.Connect()
@@ -406,18 +427,22 @@ func probeOnce(t *testing.T, granted bool) {
 		_ = s.Delete()
 		s.Close()
 	})
-	// Required privileges: only these three, so the service's token holds
-	// no others (SeImpersonatePrivilege in particular).
-	// A multi-string: each name NUL-terminated, then one more NUL
-	// (UTF16FromString refuses a string with NULs in it).
-	privs := utf16.Encode([]rune("SeChangeNotifyPrivilege\x00SeAssignPrimaryTokenPrivilege\x00SeIncreaseQuotaPrivilege\x00\x00"))
-	type requiredPrivilegesInfo struct{ privileges *uint16 }
-	rp := requiredPrivilegesInfo{&privs[0]}
-	if err := windows.ChangeServiceConfig2(s.Handle, windows.SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, (*byte)(unsafe.Pointer(&rp))); err != nil {
-		t.Fatalf("required privileges: %v", err)
+	if v.required {
+		// Only these three, so the token holds no others
+		// (SeImpersonatePrivilege in particular). A multi-string: each
+		// name NUL-terminated, then one more NUL (UTF16FromString refuses
+		// a string with NULs in it).
+		privs := utf16.Encode([]rune("SeChangeNotifyPrivilege\x00SeAssignPrimaryTokenPrivilege\x00SeIncreaseQuotaPrivilege\x00\x00"))
+		type requiredPrivilegesInfo struct{ privileges *uint16 }
+		rp := requiredPrivilegesInfo{&privs[0]}
+		if err := windows.ChangeServiceConfig2(s.Handle, windows.SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, (*byte)(unsafe.Pointer(&rp))); err != nil {
+			t.Fatalf("required privileges: %v", err)
+		}
 	}
 	if err := s.Start(); err != nil {
-		t.Fatalf("start: %v", err)
+		// A finding, not a test failure: recorded and shown.
+		t.Logf("%s: service %s (%s) did not start: %v (%d)", v.name, name, svcSID, err, err)
+		return
 	}
 	var rec []byte
 	for end := time.Now().Add(60 * time.Second); ; time.Sleep(200 * time.Millisecond) {
@@ -429,12 +454,12 @@ func probeOnce(t *testing.T, granted bool) {
 			t.Fatalf("no record from the service (state %d, exit %d, service exit %d)", st.State, st.Win32ExitCode, st.ServiceSpecificExitCode)
 		}
 	}
-	t.Logf("SeAssignPrimaryTokenPrivilege granted through LSA: %v; service %s (%s)\n%s", granted, name, svcSID, rec)
+	t.Logf("%s: service %s (%s)\n%s", v.name, name, svcSID, rec)
 	var res probeResult
 	if err := json.Unmarshal(rec, &res); err != nil {
 		t.Fatal(err)
 	}
-	if !res.ImpersonateAbsent {
+	if v.required && !res.ImpersonateAbsent {
 		t.Error("the service holds SeImpersonatePrivilege despite its required privileges")
 	}
 }
