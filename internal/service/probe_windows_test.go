@@ -564,7 +564,7 @@ type probeVariant struct {
 	// stopSeclogon stops the secondary logon service before the service
 	// starts (and starts it again after).
 	stopSeclogon bool
-	expect   func(t *testing.T, r probeResult, users map[string]probeUser)
+	expect       func(t *testing.T, r probeResult, users map[string]probeUser)
 }
 
 var probeVariants = []probeVariant{
