@@ -59,16 +59,25 @@ type Identity struct {
 	// ElevatedAdmin: the client's token has the Administrators group
 	// enabled and is at high integrity or above (System included).
 	ElevatedAdmin bool
+	// HoldsAdmins: the client's token holds the Administrators group at
+	// all, enabled or deny-only (an administrator's filtered token under
+	// UAC holds it deny-only).
+	HoldsAdmins bool
 }
 
-// Admit reports whether a client may run op: the member for tools and
-// status; an elevated administrator for pair, forget and status, never
-// for tools unless they are the member too (AGENT-PLAN §6 A3.10a, the
-// lead's call). pair and forget from the member's normal process are
-// refused whatever the client says.
+// Admit reports whether a client may run op: the member for tools, unless
+// the member is an administrator (ErrMemberIsAdmin: the connector's own
+// account protects its keys only from a standard account; owner decision
+// a, GC #15862); the member for status; an elevated administrator for
+// pair, forget and status, never for tools unless they are the member
+// too (AGENT-PLAN §6 A3.10a, the lead's call). pair and forget from the
+// member's normal process are refused whatever the client says.
 func Admit(op Op, id Identity) error {
 	switch op {
 	case OpMCP:
+		if id.Member && id.HoldsAdmins {
+			return ErrMemberIsAdmin
+		}
 		if id.Member {
 			return nil
 		}
@@ -91,6 +100,7 @@ const (
 	codeInUse          = "in_use"
 	codeBadHello       = "bad_hello"
 	codeBusy           = "busy"
+	codeMemberIsAdmin  = "member_is_admin"
 )
 
 // Errors a client or server sees.
@@ -118,6 +128,9 @@ var (
 	// open: another user of the computer, or an administrator whose token
 	// is not elevated (ErrNotAllowed is the service refusing an operation).
 	ErrAccessDenied = errors.New("this account can't open the connector's channel")
+	// ErrMemberIsAdmin: the member's token holds Administrators, so the
+	// service gives it no tools.
+	ErrMemberIsAdmin = errors.New("the member is an administrator on this computer, so the connector service gives it no tools")
 )
 
 // refusalCode is the code the server's hello sends for err: ErrInUse,
@@ -129,6 +142,8 @@ func refusalCode(err error) string {
 		return codeInUse
 	case errors.Is(err, ErrVersionsDiffer):
 		return codeVersionsDiffer
+	case errors.Is(err, ErrMemberIsAdmin):
+		return codeMemberIsAdmin
 	case errors.Is(err, ErrBusy):
 		return codeBusy
 	case errors.Is(err, ErrBadHello):
@@ -140,6 +155,8 @@ func refusalCode(err error) string {
 
 func refusalErr(code string) error {
 	switch code {
+	case codeMemberIsAdmin:
+		return ErrMemberIsAdmin
 	case codeBusy:
 		return ErrBusy
 	case codeInUse:

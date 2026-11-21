@@ -10,12 +10,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/windows"
 
 	"github.com/vettid/vettid-agent/internal/channel"
+	"github.com/vettid/vettid-agent/internal/mcp"
 )
 
 // The stub against a real channel (a pipe this test's user owns, standing
@@ -65,6 +67,37 @@ func TestStubOverPipe(t *testing.T) {
 	done := make(chan int, 1)
 	go func() { done <- run([]string{"mcp", "--name", "work"}, &out, &errOut) }()
 
+	if holdsAdministrators(t) {
+		// A member who is an administrator (the CI runner's account):
+		// the service refuses tools, and the stub answers every tool
+		// with member_is_admin, end to end.
+		actx, acancel := context.WithCancel(context.Background())
+		defer acancel()
+		go func() {
+			for {
+				c, err := l.Accept(actx)
+				if err != nil {
+					return
+				}
+				c.Close()
+				t.Error("the service admitted an administrator member for tools")
+			}
+		}()
+		go func() { _, _ = io.WriteString(inW, msgInit+"\n"+msgCall+"\n") }()
+		for end := time.Now().Add(10 * time.Second); strings.Count(out.String(), "\n") < 2; time.Sleep(10 * time.Millisecond) {
+			if time.Now().After(end) {
+				t.Fatalf("stdout %q, stderr %q", out.String(), errOut.String())
+			}
+		}
+		if !strings.Contains(out.String(), `"code":"`+mcp.CodeMemberIsAdmin+`"`) {
+			t.Fatalf("stdout %q", out.String())
+		}
+		inW.Close()
+		if rc := <-done; rc != 1 {
+			t.Fatalf("exit %d", rc)
+		}
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	c, err := l.Accept(ctx)
@@ -102,4 +135,20 @@ func TestStubOverPipe(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the stub did not exit when the client closed standard input")
 	}
+}
+
+// holdsAdministrators: this test's token holds Administrators, enabled
+// or deny-only.
+func holdsAdministrators(t *testing.T) bool {
+	t.Helper()
+	groups, err := windows.GetCurrentProcessToken().GetTokenGroups()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range groups.AllGroups() {
+		if g.Sid.IsWellKnown(windows.WinBuiltinAdministratorsSid) {
+			return true
+		}
+	}
+	return false
 }

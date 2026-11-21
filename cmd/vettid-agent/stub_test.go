@@ -178,6 +178,7 @@ func TestStubWithoutService(t *testing.T) {
 		{"squatted", nil, channel.ErrNotService, mcp.CodeServiceNotRunning, mcp.NoService().Text, ""},
 		{"another user", nil, channel.ErrAccessDenied, mcp.CodeNotAllowed, mcp.TextAccessDenied, ""},
 		{"not the member", nil, channel.ErrNotAllowed, mcp.CodeNotAllowed, mcp.TextNotTheMember, ""},
+		{"administrator member", nil, channel.ErrMemberIsAdmin, mcp.CodeMemberIsAdmin, mcp.TextMemberIsAdmin, ""},
 		{"versions differ", nil, channel.ErrVersionsDiffer, mcp.CodeVersionsDiffer, mcp.TextVersionsDiffer, ""},
 	}
 	for _, c := range cases {

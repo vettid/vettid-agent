@@ -23,8 +23,9 @@ func TestServiceSIDTrustedInstaller(t *testing.T) {
 
 func TestAdmit(t *testing.T) {
 	member := Identity{Member: true}
-	admin := Identity{ElevatedAdmin: true}
-	both := Identity{Member: true, ElevatedAdmin: true}
+	admin := Identity{ElevatedAdmin: true, HoldsAdmins: true}
+	both := Identity{Member: true, ElevatedAdmin: true, HoldsAdmins: true} // the member, elevated
+	memberAdmin := Identity{Member: true, HoldsAdmins: true}               // the member, an administrator not elevated
 	nobody := Identity{}
 	cases := []struct {
 		op   Op
@@ -32,8 +33,12 @@ func TestAdmit(t *testing.T) {
 		want bool
 	}{
 		{OpMCP, member, true},
-		{OpMCP, admin, false}, // an administrator who is not the member: no tools
-		{OpMCP, both, true},
+		{OpMCP, admin, false},       // an administrator who is not the member: no tools
+		{OpMCP, both, false},        // a member who is an administrator: no tools
+		{OpMCP, memberAdmin, false}, // also with Administrators deny-only
+		{OpStatus, memberAdmin, true},
+		{OpPair, memberAdmin, false},
+		{OpForget, both, true},
 		{OpMCP, nobody, false},
 		{OpStatus, member, true},
 		{OpStatus, admin, true},
@@ -52,8 +57,12 @@ func TestAdmit(t *testing.T) {
 		if (err == nil) != c.want {
 			t.Errorf("Admit(%q, %+v) = %v, want allowed %v", c.op, c.id, err, c.want)
 		}
-		if err != nil && !errors.Is(err, ErrNotAllowed) {
-			t.Errorf("Admit(%q, %+v) = %v, want ErrNotAllowed", c.op, c.id, err)
+		wantErr := ErrNotAllowed
+		if c.op == OpMCP && c.id.Member && c.id.HoldsAdmins {
+			wantErr = ErrMemberIsAdmin
+		}
+		if err != nil && !errors.Is(err, wantErr) {
+			t.Errorf("Admit(%q, %+v) = %v, want %v", c.op, c.id, err, wantErr)
 		}
 	}
 }

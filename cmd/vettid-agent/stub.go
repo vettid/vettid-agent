@@ -75,6 +75,8 @@ func runStub(name string, verbose bool, stdout, stderr io.Writer) int {
 	case errors.Is(err, channel.ErrAccessDenied):
 		// Another user of the computer, or an administrator not elevated.
 		return serveUnavailable(ctx, mcp.AccessDenied(), err, logger, stdout, stderr)
+	case errors.Is(err, channel.ErrMemberIsAdmin):
+		return serveUnavailable(ctx, mcp.MemberIsAdmin(), err, logger, stdout, stderr)
 	case errors.Is(err, channel.ErrNotAllowed):
 		// The service refused tools to this account: not the member.
 		return serveUnavailable(ctx, mcp.NotTheMember(), err, logger, stdout, stderr)

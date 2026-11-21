@@ -302,7 +302,7 @@ func TestTokenIdentityElevation(t *testing.T) {
 	}
 
 	id, err := tokenIdentity(identification(proc), me, admins)
-	if err != nil || !id.ElevatedAdmin || !id.Member {
+	if err != nil || !id.ElevatedAdmin || !id.Member || !id.HoldsAdmins {
 		t.Fatalf("this elevated token: %+v, %v", id, err)
 	}
 
@@ -318,7 +318,7 @@ func TestTokenIdentityElevation(t *testing.T) {
 	if il, err := integrity(medium); err != nil || il != 0x2000 {
 		t.Fatalf("medium token's integrity: %#x, %v", il, err)
 	}
-	if id, err := tokenIdentity(medium, me, admins); err != nil || id.ElevatedAdmin {
+	if id, err := tokenIdentity(medium, me, admins); err != nil || id.ElevatedAdmin || !id.HoldsAdmins {
 		t.Fatalf("Administrators enabled at medium integrity: %+v, %v", id, err)
 	}
 
@@ -333,7 +333,7 @@ func TestTokenIdentityElevation(t *testing.T) {
 	if il, err := integrity(denyOnly); err != nil || il < integrityHigh {
 		t.Fatalf("the restricted token's integrity: %#x, %v (it should stay high)", il, err)
 	}
-	if id, err := tokenIdentity(denyOnly, me, admins); err != nil || id.ElevatedAdmin {
+	if id, err := tokenIdentity(denyOnly, me, admins); err != nil || id.ElevatedAdmin || !id.HoldsAdmins {
 		t.Fatalf("Administrators deny-only at high integrity: %+v, %v", id, err)
 	}
 }

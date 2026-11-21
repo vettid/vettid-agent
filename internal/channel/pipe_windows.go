@@ -326,7 +326,12 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 		err = Admit(op, id)
 	}
 	if err != nil {
-		_ = refuse(c.File, l.cfg.Version, ErrNotAllowed)
+		// The client learns only not_allowed, or member_is_admin.
+		why := ErrNotAllowed
+		if errors.Is(err, ErrMemberIsAdmin) {
+			why = ErrMemberIsAdmin
+		}
+		_ = refuse(c.File, l.cfg.Version, why)
 		c.Close()
 		return nil, &clientError{op: op, err: err}
 	}
@@ -434,6 +439,11 @@ func tokenIdentity(tok windows.Token, member, admins *windows.SID) (Identity, er
 		return Identity{}, errors.New("the client is anonymous")
 	}
 	id := Identity{Member: windows.EqualSid(user.User.Sid, member)}
+	holds, err := holdsGroup(tok, admins)
+	if err != nil {
+		return Identity{}, fmt.Errorf("the client's token: %w", err)
+	}
+	id.HoldsAdmins = holds
 	admin, err := tok.IsMember(admins)
 	if err != nil {
 		return Identity{}, fmt.Errorf("the client's token: %w", err)
@@ -557,4 +567,19 @@ func checkOwner(h windows.Handle, want *windows.SID) error {
 		return ErrNotService
 	}
 	return nil
+}
+
+// holdsGroup reports whether the token lists group among its groups,
+// enabled or not, deny-only included.
+func holdsGroup(tok windows.Token, group *windows.SID) (bool, error) {
+	groups, err := tok.GetTokenGroups()
+	if err != nil {
+		return false, err
+	}
+	for _, g := range groups.AllGroups() {
+		if windows.EqualSid(g.Sid, group) {
+			return true, nil
+		}
+	}
+	return false, nil
 }

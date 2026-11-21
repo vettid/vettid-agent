@@ -151,11 +151,11 @@ func TestServiceSIDMatchesWindows(t *testing.T) {
 func TestPipeRoundTrip(t *testing.T) {
 	me := selfSID(t)
 	s := listen(t, me, "")
-	cfg := s.dial(OpMCP)
+	cfg := s.dial(memberOp(t))
 	cfg.Service = me
 	ch := dialAsync(cfg)
 	c := s.accepted(t)
-	if c.Op != OpMCP || !c.Identity.Member {
+	if c.Op != memberOp(t) || !c.Identity.Member {
 		t.Fatalf("server saw op %q identity %+v", c.Op, c.Identity)
 	}
 	if err := c.Accept(); err != nil {
@@ -189,7 +189,7 @@ func TestPipeRoundTrip(t *testing.T) {
 func TestPipeInUse(t *testing.T) {
 	me := selfSID(t)
 	s := listen(t, me, "")
-	cfg := s.dial(OpMCP)
+	cfg := s.dial(memberOp(t))
 	cfg.Service = me
 	ch := dialAsync(cfg)
 	if err := s.accepted(t).Refuse(ErrInUse); err != nil {
@@ -455,7 +455,7 @@ func TestPipeFailedInstanceKeepsName(t *testing.T) {
 		t.Fatalf("while replacing, another Listen got %v: the name was free", takenErr)
 	}
 	// And the listener goes on: a client is served.
-	ch := dialAsync(DialConfig{Pipe: pipe, Service: me, Op: OpMCP, Version: testVersion})
+	ch := dialAsync(DialConfig{Pipe: pipe, Service: me, Op: memberOp(t), Version: testVersion})
 	select {
 	case c := <-accepted:
 		_ = c.Accept()
@@ -483,7 +483,7 @@ func TestPipeBusy(t *testing.T) {
 	}()
 	var held []*ServerConn
 	for i := 0; i < maxConns; i++ {
-		cfg := s.dial(OpMCP)
+		cfg := s.dial(memberOp(t))
 		cfg.Service = me
 		ch := dialAsync(cfg)
 		c := s.accepted(t)
@@ -495,7 +495,7 @@ func TestPipeBusy(t *testing.T) {
 		}
 		clients = append(clients, r.f)
 	}
-	cfg := s.dial(OpMCP)
+	cfg := s.dial(memberOp(t))
 	cfg.Service = me
 	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrBusy) {
 		t.Fatalf("client %d: %v, want ErrBusy", maxConns+1, err)
@@ -601,5 +601,60 @@ func TestListenerCloseIdle(t *testing.T) {
 	}
 	if _, err := Dial(context.Background(), DialConfig{Pipe: pipe, Service: me, Op: OpMCP, Version: testVersion}); !errors.Is(err, ErrNoService) {
 		t.Fatalf("Dial after Close: %v, want ErrNoService", err)
+	}
+}
+
+// selfHoldsAdmins: this test's token holds Administrators (the CI
+// runner's does; a standard user's doesn't).
+func selfHoldsAdmins(t *testing.T) bool {
+	t.Helper()
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holds, err := holdsGroup(windows.GetCurrentProcessToken(), admins)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return holds
+}
+
+// memberOp is an operation the service admits for this test's account
+// as the member: tools, unless the account is an administrator
+// (TestPipeMemberIsAdmin); status always.
+func memberOp(t *testing.T) Op {
+	if selfHoldsAdmins(t) {
+		return OpStatus
+	}
+	return OpMCP
+}
+
+// A member whose token holds Administrators gets no tools, with its own
+// refusal (member_is_admin), but still gets status; a standard member
+// gets tools.
+func TestPipeMemberIsAdmin(t *testing.T) {
+	me := selfSID(t)
+	s := listen(t, me, "")
+	cfg := s.dial(OpMCP)
+	cfg.Service = me
+	if selfHoldsAdmins(t) {
+		if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrMemberIsAdmin) {
+			t.Fatalf("tools for an administrator member: %v, want ErrMemberIsAdmin", err)
+		}
+		if got := s.refused.wait(t, 1); !errors.Is(got[0], ErrMemberIsAdmin) {
+			t.Fatalf("server refused with %v", got[0])
+		}
+		cfg.Op = OpStatus
+	}
+	ch := dialAsync(cfg)
+	c := s.accepted(t)
+	if !c.Identity.Member || c.Identity.HoldsAdmins != selfHoldsAdmins(t) {
+		t.Fatalf("server saw %+v", c.Identity)
+	}
+	_ = c.Accept()
+	if r := <-ch; r.err != nil {
+		t.Fatalf("%s for the member: %v", cfg.Op, r.err)
+	} else {
+		r.f.Close()
 	}
 }

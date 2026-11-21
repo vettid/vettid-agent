@@ -41,6 +41,20 @@ const (
 	TextNotTheMember = "Only the member this pairing belongs to can use its tools; an administrator can only pair it, forget it or ask its status."
 )
 
+// The administrator member (AGENT-PLAN §11 "Administrator member", 0.1.17;
+// owner decision a, GC #15862): a member whose account holds
+// Administrators gets no tools from the service.
+const (
+	CodeMemberIsAdmin = "member_is_admin"
+	TextMemberIsAdmin = "Your account is an administrator on this computer, so the connector in its own account does not work for it: it cannot protect its keys from an administrator's programs. Use a standard account for the agent, or use the connector in your own account, as the README says (it can use secrets, but not run programs or open proxies)."
+)
+
+// MemberIsAdmin is the stub's answer to every tool when the service
+// refused tools to a member who is an administrator.
+func MemberIsAdmin() *request.Error {
+	return &request.Error{Code: CodeMemberIsAdmin, Text: TextMemberIsAdmin}
+}
+
 // AccessDenied is the stub's answer to every tool when the channel
 // refused this account at open.
 func AccessDenied() *request.Error {
