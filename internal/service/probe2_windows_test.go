@@ -85,6 +85,7 @@ var (
 	p2Sentinel = flag.Uint64("p2-sentinel", 0, "probe2 child: a handle value to check for")
 	p2CLSID    = flag.String("p2-clsid", "", "probe2 dcom: the class to activate")
 	p2Tools    = flag.String("p2-tools", "", "probe2 launcher: a JSON file of tools to start")
+	p2Quick    = flag.Bool("p2-quick", false, "probe2 launcher: check user32 only, in itself and one restricted child")
 )
 
 // tokenFacts is what a process reads of its own token.
@@ -277,6 +278,26 @@ func runLauncher() int {
 	// unrestricted token, on the run's desktop), before any child.
 	rec.LauncherUser32 = errString(moduser32.Load())
 	rec.LogonSID = logonSID(self)
+	if *p2Quick {
+		var own windows.Token
+		if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &own); err != nil {
+			rec.Restricted = "OpenProcessToken: " + err.Error()
+			_ = writeJSON(*p2Out, rec)
+			return 0
+		}
+		defer own.Close()
+		if r, err := restrictToken(own, "interactive"); err == nil {
+			out := filepath.Join(filepath.Dir(*p2Out), "child-quick-"+randHex(4)+".json")
+			cs := startChild(r, *p2Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=user32 -p2-out="%s"`, out), "", 60*time.Second)
+			if b, err := os.ReadFile(out); err == nil {
+				_ = json.Unmarshal(b, &cs.Record)
+			}
+			rec.Children["user32"] = cs
+			r.Close()
+		}
+		_ = writeJSON(*p2Out, rec)
+		return 0
+	}
 	var own windows.Token
 	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &own); err != nil {
 		rec.Restricted = "OpenProcessToken: " + err.Error()
@@ -461,15 +482,16 @@ type probe2Result struct {
 	WindowStation string `json:"window_station"`
 	// The fallback, when the service can make no window station: a
 	// desktop in the service's own, with the runner added to it.
-	ServiceWindowStation string               `json:"service_window_station,omitempty"`
-	WindowStationACE     string               `json:"window_station_ace,omitempty"`
-	NullDesktop          string               `json:"null_desktop,omitempty"`
-	WindowStationSDDL    string               `json:"window_station_and_desktop_sddl,omitempty"`
-	Desktop              string               `json:"desktop"`
-	DesktopName          string               `json:"desktop_name"`
-	Hops                 map[string]hopResult `json:"hops"`   // "interactive", "interactive+local"
-	Shapes               map[string]string    `json:"shapes"` // shape: "ok" or "errno N: text"
-	RouteA               *routeAResult        `json:"route_a,omitempty"`
+	ServiceWindowStation string                `json:"service_window_station,omitempty"`
+	WindowStationACE     string                `json:"window_station_ace,omitempty"`
+	NullDesktop          string                `json:"null_desktop,omitempty"`
+	WindowStationSDDL    string                `json:"window_station_and_desktop_sddl,omitempty"`
+	Desktop              string                `json:"desktop"`
+	DesktopName          string                `json:"desktop_name"`
+	Hops                 map[string]hopResult  `json:"hops"`   // "interactive", "interactive+local"
+	Shapes               map[string]string     `json:"shapes"` // shape: "ok" or "errno N: text"
+	RouteA               *routeAResult         `json:"route_a,omitempty"`
+	Masks                map[string]maskResult `json:"window_station_masks,omitempty"`
 }
 
 // TestRunnerHopProbeHelper is the service, run by the SCM.
@@ -624,7 +646,46 @@ func runHops(c probe2Config) probe2Result {
 		}
 		res.Hops[v.key] = runHop(c, b, v, uint64(sentinel))
 	}
+	// The narrowest entry on the window station that user32 needs: the
+	// runner's entry is set (not added to) to each mask in turn, and a
+	// quick launcher checks user32 in itself and in a restricted child.
+	res.Masks = map[string]maskResult{}
+	for _, mask := range probeMasks {
+		key := fmt.Sprintf("%#x", mask)
+		mr := maskResult{Set: errString(setWindowStationEntry(windows.Handle(wsh), b.SID, mask, windows.SET_ACCESS))}
+		if mr.Set == "ok" {
+			h := runHop(c, b, hopOpts{key: "mask " + key, restrict: "interactive", desktop: res.DesktopName, uiLimits: true, quick: true}, 0)
+			mr.Start, mr.Launcher = h.Start, h.Launcher.LauncherUser32
+			mr.Child = h.Launcher.Children["user32"].Record.Desktop
+		}
+		res.Masks[key] = mr
+	}
 	return res
+}
+
+// winstaWithout is WINSTA_ALL_ACCESS (0x37F) with READ_CONTROL (0x20000)
+// and without the rights given.
+func winstaWithout(drop uint32) uint32 { return 0x2037f &^ drop }
+
+// probeMasks: the specific rights alone (0x37F, which fails), with each
+// standard right on its own, with READ_CONTROL less each of the specific
+// rights the plan may not need, and less all of them.
+var probeMasks = []uint32{
+	0x37f, 0x1037f, 0x2037f, 0x4037f, 0x8037f,
+	winstaWithout(0x4),   // WINSTA_ACCESSCLIPBOARD
+	winstaWithout(0x1),   // WINSTA_ENUMDESKTOPS
+	winstaWithout(0x100), // WINSTA_ENUMERATE
+	winstaWithout(0x200), // WINSTA_READSCREEN
+	winstaWithout(0x40),  // WINSTA_EXITWINDOWS
+	winstaWithout(0x4 | 0x1 | 0x100 | 0x200 | 0x40),
+}
+
+// maskResult is one window station entry tried.
+type maskResult struct {
+	Set      string `json:"set"`
+	Start    string `json:"start,omitempty"`
+	Launcher string `json:"launcher_user32,omitempty"`
+	Child    string `json:"child_desktop,omitempty"` // the desktop's name, or why user32 failed
 }
 
 // hopOpts is one way of starting the launcher.
@@ -633,6 +694,7 @@ type hopOpts struct {
 	uiLimits               bool
 	noJob, withWindow      bool
 	tools                  bool // the launcher also starts the real tools
+	quick                  bool // the launcher checks user32 only (the mask variants)
 }
 
 // objectSDDL is the window station's (and desktop's) access list in SDDL.
@@ -661,6 +723,9 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
 		out, c.Exe, restrict, sentinel, c.CLSID)
+	if o.quick {
+		args += " -p2-quick"
+	}
 	if o.tools && c.ToolsFile != "" {
 		args += fmt.Sprintf(` -p2-tools="%s"`, c.ToolsFile)
 	}
@@ -1224,6 +1289,16 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		}
 	}
 	t.Logf("window station and desktop access: %s", r.WindowStationSDDL)
+	// The runner's entry on the window station, mask by mask: whether
+	// user32 initializes in the launcher and a restricted child.
+	for _, mask := range probeMasks {
+		key := fmt.Sprintf("%#x", mask)
+		m := r.Masks[key]
+		t.Logf("window station entry %s: set %s, start %s, launcher user32 %s, child %q", key, m.Set, m.Start, m.Launcher, m.Child)
+	}
+	if m := r.Masks["0x37f"]; m.Launcher == "ok" {
+		t.Errorf("window station entry 0x37f: user32 initialized; measured to fail")
+	}
 	_ = strconv.Itoa
 }
 
@@ -1239,6 +1314,12 @@ func slicesContain(s []uint32, v uint32) bool {
 // grantWindowStation adds an entry for the runner to the window station's
 // access list (it needs the window station to use a desktop in it).
 func grantWindowStation(ws windows.Handle, runner string) error {
+	return setWindowStationEntry(ws, runner, 0xf037f, windows.GRANT_ACCESS)
+}
+
+// setWindowStationEntry sets (SET_ACCESS) or adds to (GRANT_ACCESS) the
+// runner's entry on the window station's access list.
+func setWindowStationEntry(ws windows.Handle, runner string, mask uint32, mode windows.ACCESS_MODE) error {
 	sd, err := windows.GetSecurityInfo(ws, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
 		return fmt.Errorf("reading its access: %w", err)
@@ -1252,8 +1333,8 @@ func grantWindowStation(ws windows.Handle, runner string) error {
 		return err
 	}
 	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
-		AccessPermissions: 0xf037f, // WINSTA_ALL_ACCESS and the standard rights
-		AccessMode:        windows.GRANT_ACCESS,
+		AccessPermissions: windows.ACCESS_MASK(mask),
+		AccessMode:        mode,
 		Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(sid)},
 	}}, old)
 	if err != nil {
