@@ -31,6 +31,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -407,7 +408,9 @@ func probeOnce(t *testing.T, granted bool) {
 	})
 	// Required privileges: only these three, so the service's token holds
 	// no others (SeImpersonatePrivilege in particular).
-	privs, _ := windows.UTF16FromString("SeChangeNotifyPrivilege\x00SeAssignPrimaryTokenPrivilege\x00SeIncreaseQuotaPrivilege\x00")
+	// A multi-string: each name NUL-terminated, then one more NUL
+	// (UTF16FromString refuses a string with NULs in it).
+	privs := utf16.Encode([]rune("SeChangeNotifyPrivilege\x00SeAssignPrimaryTokenPrivilege\x00SeIncreaseQuotaPrivilege\x00\x00"))
 	type requiredPrivilegesInfo struct{ privileges *uint16 }
 	rp := requiredPrivilegesInfo{&privs[0]}
 	if err := windows.ChangeServiceConfig2(s.Handle, windows.SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, (*byte)(unsafe.Pointer(&rp))); err != nil {
