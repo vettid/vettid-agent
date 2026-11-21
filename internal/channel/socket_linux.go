@@ -569,9 +569,6 @@ func peerGroups(fd, n int) ([]uint32, error) {
 // of another uid, is ErrNotService; a socket the account may not open is
 // ErrAccessDenied. Nothing is sent before every check has passed.
 func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
-	if !cleanAbs(cfg.Pipe) {
-		return nil, fmt.Errorf("%w: the socket's path %q is not absolute and clean", ErrNotService, cfg.Pipe)
-	}
 	svc, err := user.Lookup(cfg.Service)
 	if err != nil {
 		// No connector account: the pairing isn't installed here.

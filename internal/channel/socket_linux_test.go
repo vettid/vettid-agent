@@ -830,3 +830,41 @@ func TestPathsAndNobody(t *testing.T) {
 		t.Error("Listen took uid 65534 as the member")
 	}
 }
+
+// A socket bound to an unclean path, named the same way: only the clean
+// path rule refuses it.
+func TestListenRefusesUncleanBoundPath(t *testing.T) {
+	uid, _ := me(t)
+	d := shortDir(t)
+	unclean := d + "/./u.sock"
+	fd := listenAt(t, unclean)
+	if _, err := Listen(ListenConfig{Socket: unclean, MemberUID: uid, fd: fd}); !errors.Is(err, ErrNotActivated) {
+		t.Errorf("an unclean bound path: %v, want ErrNotActivated", err)
+	}
+	unix.Close(fd)
+}
+
+// A connection accepted as the listener closes is closed at once, not
+// left waiting for a hello.
+func TestClosedAfterAcceptClosesAtOnce(t *testing.T) {
+	uid, _ := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "k.sock")
+	l, err := Listen(ListenConfig{Socket: path, MemberUID: uid, fd: listenAt(t, path), Version: "v1",
+		helloWait:   30 * time.Second,
+		afterAccept: func(l *Listener) { l.Close() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = l.Accept(context.Background()) }()
+	f, err := connectUnix(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	_ = f.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var b [1]byte
+	if _, err := f.Read(b[:]); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Error("a connection accepted as the listener closed was kept waiting for its hello")
+	}
+}
