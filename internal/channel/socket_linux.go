@@ -46,11 +46,12 @@ const (
 // adminGroups are the groups that make the member an administrator on
 // Linux (owner decision a, GC #15946; AGENT-LINUX-RUNTIME §11): sudo's
 // usual groups, and the groups that give root in all but name (a
-// container or VM manager, raw disks, the root group, the shadow file).
-// The member then gets member_is_admin for every tool, as on Windows. A
-// held gid 0 counts whatever its name.
+// container or VM manager, raw disks, the root group, the shadow file,
+// every log): groups that read what root reads. The member then gets
+// member_is_admin for every tool, as on Windows. A held gid 0 counts
+// whatever its name.
 var adminGroups = []string{"sudo", "wheel", "admin", "docker", "lxd", "incus-admin", "libvirt", "libvirtd",
-	"microk8s", "disk", "root", "shadow"}
+	"microk8s", "disk", "root", "shadow", "adm", "systemd-journal"}
 
 // ErrNotActivated: the service was not started by its systemd socket.
 var ErrNotActivated = errors.New("the connector service must be started by its systemd socket, not by hand")
