@@ -13,10 +13,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/vettid/vettid-agent/internal/access"
 	"github.com/vettid/vettid-agent/internal/leash"
 	"github.com/vettid/vettid-agent/internal/leash/request"
-	"github.com/vettid/vettid-agent/internal/mcp"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/state"
 	"github.com/vettid/vettid-agent/internal/vaultconn"
@@ -140,110 +138,18 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		level = slog.LevelInfo
 	}
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
-	// The access policy (AG8) and the agent's requests see each event,
-	// and the access policy each vault.status; they are created once the
-	// connection exists (the callbacks run only in Run).
-	var mgr *access.Manager
-	var reqs *request.Client
-	grants := newGrants(rec, logger, func(code string, sentWith pairing.Access) { mgr.OnAnswer(code, sentWith) })
-	o := vaultconn.Options{
-		Store:   store,
-		Resolve: resolve,
-		Record:  rec,
-		Out:     stderr,
-		Log:     logger,
-		OnEvent: func(ev vaultconn.Event) {
-			mgr.OnEvent(ev)
-			reqs.OnEvent(ev)
-		},
-		OnStatus: func(oc string) {
-			mgr.OnStatus(oc)
-			grants.OnStatus(oc)
-		},
-		Grants: grants,
-	}
-	if mcpOptions != nil {
-		mcpOptions(&o)
-	}
-	conn, err := vaultconn.New(o)
-	if err != nil {
-		return fail(err)
-	}
-	mgr = access.New(conn, *accessMinutes*60, nil)
-	// A vault.status sent while the vault is held (CheckHold) also ends
-	// the grants' hold.
-	mgr.SetStatusHook(grants.OnStatus)
-	// Every grant must name this device (the client's device id); without
-	// one nothing could be checked, so the connector does not run.
-	if err := grants.Bind(conn); err != nil {
-		return fail(err)
-	}
-	ro := request.Options{Log: logger, Suspended: grants.Suspended, OnForbidden: grants.Relist}
-	if mcpRequestOptions != nil {
-		mcpRequestOptions(&ro)
-	}
-	reqs = request.New(conn, mgr, ro)
-	// Closed last: it zeroes every result still kept.
-	defer reqs.Close()
-	held := func() bool { return mgr.Held() || grants.Held() }
-	srv := mcp.New(mcp.Options{
-		Requests: reqs,
-		Info:     grants.ConnectionInfo,
-		Held:     held,
-		// While the vault is held, a tool call asks it again whether it
-		// still is, at most once a minute (AGENT-PLAN §4.4).
-		BeforeCall: func() {
-			if held() {
-				mgr.CheckHold()
-			}
-		},
-		Version: readVersion().Version,
-		Log:     logger,
-	})
-
 	ctx, stop := mcpSignals(context.Background())
 	defer stop()
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	// The MCP session: standard input and output carry its messages and
-	// nothing else. The MCP client ends it by closing standard input.
-	serveDone := make(chan struct{})
-	go func() {
-		defer close(serveDone)
-		if err := srv.Serve(ctx, mcpIn, stdout); err != nil && ctx.Err() == nil {
-			logger.Warn("MCP input failed", "err", "read error")
-		}
-		cancel()
-	}()
-	// A saved session that has not expired is checked once at start
-	// (internal/access Start), through Run's goroutine.
-	startDone := make(chan struct{})
-	go func() {
-		defer close(startDone)
-		if err := mgr.Start(ctx); err != nil && ctx.Err() == nil {
-			logger.Warn("access session check at start failed", "err", err)
-		}
-	}()
-	// The grants' status statements are kept fresh (internal/leash Run).
-	grantsDone := make(chan struct{})
-	go func() {
-		defer close(grantsDone)
-		grants.Run(ctx)
-	}()
-	err = conn.Run(ctx)
-	// The check ends with Run (its request fails once Run stops); wait
-	// for it, and for the MCP session (whose tool calls end with ctx),
-	// so that nothing writes to standard output or error after return;
-	// except that a write to standard output that the MCP client does
-	// not read is abandoned after a bounded wait (stopSession), as the
-	// process then exits.
-	cancel()
-	<-startDone
-	stopSession(serveDone, stdout, logger)
-	<-grantsDone
-	// Requests the access manager still runs in the background end at
-	// once now that Run has (vaultconn answers ErrStopped).
-	mgr.Wait()
+	err = session{
+		Store:         store,
+		Resolve:       resolve,
+		Record:        rec,
+		AccessMinutes: *accessMinutes,
+		Log:           logger,
+		Notices:       stderr,
+		In:            mcpIn,
+		Out:           stdout,
+	}.run(ctx)
 	switch {
 	case errors.Is(err, context.Canceled):
 		return 0
