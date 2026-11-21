@@ -63,7 +63,12 @@ func me(t *testing.T) (uint32, string) {
 // other write.
 func shortDir(t *testing.T) string {
 	t.Helper()
-	d, err := os.MkdirTemp("/tmp", "vtch")
+	// TMPDIR if it is short enough for a socket's path, else /tmp.
+	base := os.TempDir()
+	if len(base) > 40 {
+		base = "/tmp"
+	}
+	d, err := os.MkdirTemp(base, "vtch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -657,5 +662,171 @@ func TestConnectFullQueue(t *testing.T) {
 	defer cancel()
 	if _, err := connectUnix(ctx, path, 10*time.Second); !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("a full queue with a context that ends: %v", err)
+	}
+}
+
+// A client that sends nothing doesn't hold up another (the hellos are
+// read on goroutines of their own).
+func TestSilentClientsDontBlock(t *testing.T) {
+	uid, _ := me(t)
+	path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: func(uint32, uint32) ([]string, error) { return nil, nil }})
+	for i := 0; i < 3; i++ {
+		f, err := connectUnix(context.Background(), path, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+	}
+	start := time.Now()
+	if err := dialAs(t, path, OpStatus); err != nil {
+		t.Fatalf("a client behind silent ones: %v", err)
+	}
+	recv(t, s.ids)
+	if time.Since(start) > 2*time.Second {
+		t.Errorf("a client behind silent ones waited %v", time.Since(start))
+	}
+}
+
+// A hello that never comes ends at the hello's limit.
+func TestHelloDeadline(t *testing.T) {
+	uid, _ := me(t)
+	path, s := serve(t, ListenConfig{MemberUID: uid, helloWait: 200 * time.Millisecond})
+	f, err := connectUnix(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	_ = f.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var b [1]byte
+	if _, err := f.Read(b[:]); err == nil {
+		t.Error("the server answered a hello that never came")
+	} else if errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("the server kept a silent client past its hello's limit")
+	}
+	if err := recv(t, s.refused); !errors.Is(err, ErrBadHello) {
+		t.Errorf("OnRefused got %v, want ErrBadHello", err)
+	}
+}
+
+// checkFolder refuses a link and a file, and takes a folder.
+func TestCheckFolder(t *testing.T) {
+	uid, _ := me(t)
+	d := shortDir(t)
+	if err := checkFolder(d, uid); err != nil {
+		t.Fatalf("a good folder: %v", err)
+	}
+	file := filepath.Join(d, "f")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkFolder(file, uid); !errors.Is(err, ErrNotService) {
+		t.Errorf("a file: %v, want ErrNotService", err)
+	}
+	link := filepath.Join(d, "l")
+	if err := os.Symlink(d, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkFolder(link, uid); !errors.Is(err, ErrNotService) {
+		t.Errorf("a link to a folder: %v, want ErrNotService", err)
+	}
+}
+
+// SO_PEERGROUPS that can't be read refuses the member.
+func TestPeerGroupsErrorRefuses(t *testing.T) {
+	uid, _ := me(t)
+	path, s := serve(t, ListenConfig{MemberUID: uid,
+		groupsOf:     func(uint32, uint32) ([]string, error) { return nil, nil },
+		peerGroupsOf: func(int, int) ([]uint32, error) { return nil, unix.ENOPROTOOPT }})
+	if err := dialAs(t, path, OpStatus); !errors.Is(err, ErrNotAllowed) {
+		t.Errorf("unreadable held groups: %v, want ErrNotAllowed", err)
+	}
+	recv(t, s.refused)
+}
+
+// A held gid 0 makes the member an administrator, whatever its name.
+func TestHeldRootGroupIsAdmin(t *testing.T) {
+	uid, _ := me(t)
+	path, s := serve(t, ListenConfig{MemberUID: uid,
+		groupsOf:     func(uint32, uint32) ([]string, error) { return nil, nil },
+		peerGroupsOf: func(int, int) ([]uint32, error) { return []uint32{0}, nil }})
+	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
+		t.Errorf("a held gid 0: %v, want ErrMemberIsAdmin", err)
+	}
+	recv(t, s.refused)
+}
+
+// A connection accepted as the listener closes is closed, not handed
+// out.
+func TestClosedAfterAccept(t *testing.T) {
+	uid, name := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "c.sock")
+	l, err := Listen(ListenConfig{Socket: path, MemberUID: uid, fd: listenAt(t, path), Version: "v1",
+		groupsOf:    func(uint32, uint32) ([]string, error) { return nil, nil },
+		peerNames:   func([]uint32) ([]string, error) { return nil, nil },
+		afterAccept: func(l *Listener) { l.Close() }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan error, 1)
+	go func() {
+		_, err := l.Accept(context.Background())
+		got <- err
+	}()
+	_, err = Dial(context.Background(), DialConfig{Pipe: path, Service: name, Op: OpStatus, Version: "v1", dirUID: &uid})
+	if err == nil {
+		t.Error("a client accepted as the listener closed was answered")
+	}
+	select {
+	case err := <-got:
+		if !errors.Is(err, errClosed) {
+			t.Errorf("Accept: %v, want errClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Accept didn't end")
+	}
+}
+
+// A seqpacket socket isn't the channel's.
+func TestListenRefusesSeqpacket(t *testing.T) {
+	uid, _ := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "q.sock")
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: path}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Listen(fd, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Listen(ListenConfig{Socket: path, MemberUID: uid, fd: fd}); !errors.Is(err, ErrNotActivated) {
+		t.Errorf("a seqpacket socket: %v, want ErrNotActivated", err)
+	}
+}
+
+// Paths must be absolute and clean; the overflow uid can't be the
+// member.
+func TestPathsAndNobody(t *testing.T) {
+	uid, name := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "p.sock")
+	fd := listenAt(t, path)
+	defer unix.Close(fd)
+	for _, p := range []string{"rel.sock", d + "/./p.sock", d + "//p.sock", d + "/../" + filepath.Base(d) + "/p.sock"} {
+		if _, err := Listen(ListenConfig{Socket: p, MemberUID: uid, fd: fd}); err == nil {
+			t.Errorf("Listen took %q", p)
+		}
+		if _, err := Dial(context.Background(), DialConfig{Pipe: p, Service: name, Op: OpStatus, Version: "v1", dirUID: &uid}); !errors.Is(err, ErrNotService) {
+			t.Errorf("Dial of %q: %v, want ErrNotService", p, err)
+		}
+		if err := checkSocket(p, uid, uid, false); !errors.Is(err, ErrNotService) {
+			t.Errorf("checkSocket of %q: %v, want ErrNotService", p, err)
+		}
+	}
+	if _, err := Listen(ListenConfig{Socket: path, MemberUID: nobodyUID, fd: fd}); err == nil {
+		t.Error("Listen took uid 65534 as the member")
 	}
 }

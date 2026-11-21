@@ -44,12 +44,13 @@ const (
 )
 
 // adminGroups are the groups that make the member an administrator on
-// Linux (AGENT-LINUX-RUNTIME §11, proposed and open for the owner): sudo's
+// Linux (owner decision a, GC #15946; AGENT-LINUX-RUNTIME §11): sudo's
 // usual groups, and the groups that give root in all but name (a
-// container or VM manager, raw disks). The member then gets
-// member_is_admin for every tool, as on Windows. Until the owner decides,
-// this fails closed.
-var adminGroups = []string{"sudo", "wheel", "admin", "docker", "lxd", "incus-admin", "libvirt", "disk"}
+// container or VM manager, raw disks, the root group, the shadow file).
+// The member then gets member_is_admin for every tool, as on Windows. A
+// held gid 0 counts whatever its name.
+var adminGroups = []string{"sudo", "wheel", "admin", "docker", "lxd", "incus-admin", "libvirt", "libvirtd",
+	"microk8s", "disk", "root", "shadow"}
 
 // ErrNotActivated: the service was not started by its systemd socket.
 var ErrNotActivated = errors.New("the connector service must be started by its systemd socket, not by hand")
@@ -91,42 +92,69 @@ type ListenConfig struct {
 	// block.
 	OnRefused func(op Op, err error)
 
-	fd        int                                     // tests only: the listening descriptor, in place of systemd's
-	groupsOf  func(uid, gid uint32) ([]string, error) // tests only: the member's groups in the group database
-	peerNames func(gids []uint32) ([]string, error)   // tests only: the names of the groups the client holds
+	fd           int                                     // tests only: the listening descriptor, in place of systemd's
+	groupsOf     func(uid, gid uint32) ([]string, error) // tests only: the member's groups in the group database
+	peerNames    func(gids []uint32) ([]string, error)   // tests only: the names of the groups the client holds
+	peerGroupsOf func(fd, n int) ([]uint32, error)       // tests only: SO_PEERGROUPS
+	peerInit     int                                     // tests only: peerGroups' first buffer, in groups (0: 64)
+	helloWait    time.Duration                           // tests only: the hello's limit (0: helloWait)
+	afterAccept  func(*Listener)                         // tests only: runs after each connection is accepted
 }
 
-// Listener is the server end: the service's. Accept is called from one
-// goroutine at a time.
+// Listener is the server end: the service's. One goroutine accepts
+// connections and drops at once any client that is neither the member,
+// root nor the connector's own account; each other client's hello is
+// read on a goroutine of its own, so a client that sends nothing holds
+// up nobody else. Accept may be called from any goroutine.
 type Listener struct {
 	cfg ListenConfig
 	f   *os.File
+	own uint32 // this process's uid: the connector's account
 
-	mu       sync.Mutex
-	closed   bool
-	live     int      // clients connected and not yet closed (maxConns)
-	inHello  *os.File // the connection whose hello Accept is reading, if any
-	peerInit int      // tests only: peerGroups' first buffer, in groups (0: 64)
+	once  sync.Once
+	ready chan *ServerConn // admitted clients, for Accept
+	fatal chan error       // why the accept loop ended by itself
+	done  chan struct{}    // closed by Close
+
+	mu      sync.Mutex
+	closed  bool
+	live    int                   // clients connected and not yet closed (maxConns)
+	inHello map[*os.File]struct{} // connections whose hello is being read
 }
 
 // errClosed: the listener was closed.
 var errClosed = errors.New("the channel is closed")
 
+// nobodyUID is the overflow uid a user namespace gives every user it
+// doesn't map. A member of that uid would be every such user.
+const nobodyUID = 65534
+
+// cleanAbs reports whether p is an absolute path in clean form.
+func cleanAbs(p string) bool { return filepath.IsAbs(p) && filepath.Clean(p) == p }
+
 // Listen takes the socket systemd passed (LISTEN_PID naming this
 // process, LISTEN_FDS exactly 1) and checks that it is a listening Unix
-// stream socket bound to cfg.Socket. It never makes a socket itself.
+// stream socket bound to cfg.Socket, made by root (systemd). It never
+// makes a socket itself.
 func Listen(cfg ListenConfig) (*Listener, error) {
-	if cfg.MemberUID == 0 {
+	switch cfg.MemberUID {
+	case 0:
 		return nil, errors.New("the member can't be root")
+	case nobodyUID:
+		return nil, errors.New("the member can't be uid 65534, which a user namespace gives every user it doesn't map")
+	}
+	if !cleanAbs(cfg.Socket) {
+		return nil, fmt.Errorf("%w: the socket's path %q is not absolute and clean", ErrNotActivated, cfg.Socket)
 	}
 	fd := cfg.fd
-	if fd == 0 {
+	activated := fd == 0
+	if activated {
 		var err error
 		if fd, err = takeActivationFD(); err != nil {
 			return nil, err
 		}
 	}
-	if err := checkListening(fd, cfg.Socket); err != nil {
+	if err := checkListening(fd, cfg.Socket, activated); err != nil {
 		unix.Close(fd)
 		return nil, err
 	}
@@ -141,7 +169,17 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 	if cfg.peerNames == nil {
 		cfg.peerNames = groupNames
 	}
-	return &Listener{cfg: cfg, f: os.NewFile(uintptr(fd), cfg.Socket)}, nil
+	if cfg.peerGroupsOf == nil {
+		cfg.peerGroupsOf = peerGroups
+	}
+	if cfg.helloWait == 0 {
+		cfg.helloWait = helloWait
+	}
+	return &Listener{
+		cfg: cfg, f: os.NewFile(uintptr(fd), cfg.Socket), own: uint32(os.Getuid()),
+		ready: make(chan *ServerConn), fatal: make(chan error, 1), done: make(chan struct{}),
+		inHello: map[*os.File]struct{}{},
+	}, nil
 }
 
 // takeActivationFD reads systemd's activation variables, removes them
@@ -158,8 +196,9 @@ func takeActivationFD() (int, error) {
 }
 
 // checkListening checks that fd is a listening AF_UNIX stream socket
-// bound to path.
-func checkListening(fd int, path string) error {
+// bound to path; with activated, also that root called listen on it
+// (systemd, which made it).
+func checkListening(fd int, path string, activated bool) error {
 	bad := func(what string) error {
 		return fmt.Errorf("%w: the descriptor systemd passed is %s", ErrNotActivated, what)
 	}
@@ -179,17 +218,27 @@ func checkListening(fd int, path string) error {
 	if u, ok := sa.(*unix.SockaddrUnix); !ok || u.Name != path {
 		return bad("bound to another path")
 	}
+	if activated {
+		if cred, err := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED); err != nil || cred.Uid != 0 {
+			return bad("not made by root")
+		}
+	}
 	return nil
 }
 
-// Close stops Accept. Connections already accepted stay open.
+// Close stops Accept, and ends every hello still being read.
+// Connections already accepted stay open.
 func (l *Listener) Close() error {
 	l.mu.Lock()
-	l.closed = true
-	if l.inHello != nil {
-		// A client still in its hello holds Accept; end it now.
-		_ = l.inHello.SetDeadline(longAgo)
+	if l.closed {
+		l.mu.Unlock()
+		return nil
 	}
+	l.closed = true
+	for f := range l.inHello {
+		_ = f.SetDeadline(longAgo)
+	}
+	close(l.done)
 	l.mu.Unlock()
 	return l.f.Close()
 }
@@ -230,7 +279,7 @@ func (c *ServerConn) Close() error {
 	return err
 }
 
-// clientError is one client's failure; Accept goes on to the next.
+// clientError is one client's failure; the loop goes on to the next.
 type clientError struct {
 	op  Op
 	err error
@@ -239,43 +288,58 @@ type clientError struct {
 func (e *clientError) Error() string { return e.err.Error() }
 
 // Accept waits for a client that names an operation it may run (Admit).
-// Clients refused on the way are told so and reported to OnRefused;
-// Accept returns only an admitted client, or an error once ctx ends or
-// the listener is closed.
+// Clients refused on the way are told so and reported to OnRefused,
+// which may then be called from several goroutines at once. Accept
+// returns only an admitted client, or an error once ctx ends, the
+// listener is closed, or the socket can't be used any more.
 func (l *Listener) Accept(ctx context.Context) (*ServerConn, error) {
-	for {
-		c, err := l.acceptOne(ctx)
-		if err == nil {
-			return c, nil
-		}
-		var ce *clientError
-		if !errors.As(err, &ce) {
-			return nil, err
-		}
-		if l.cfg.OnRefused != nil {
-			l.cfg.OnRefused(ce.op, ce.err)
-		}
+	l.once.Do(func() { go l.loop() })
+	select {
+	case c := <-l.ready:
+		return c, nil
+	case err := <-l.fatal:
+		l.fatal <- err // for the next call too
+		return nil, err
+	case <-l.done:
+		return nil, errClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
-// longAgo is a deadline in the past, which wakes a waiting accept.
+// longAgo is a deadline in the past, which wakes a waiting read.
 var longAgo = time.Unix(1, 0)
 
-// acceptFD waits for one connection until ctx ends.
-func (l *Listener) acceptFD(ctx context.Context) (int, error) {
-	if err := l.f.SetReadDeadline(time.Time{}); err != nil {
-		return 0, l.closedOr(err)
+func (l *Listener) refused(op Op, err error) {
+	if l.cfg.OnRefused != nil {
+		l.cfg.OnRefused(op, err)
 	}
-	fired := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		_ = l.f.SetReadDeadline(longAgo)
-		close(fired)
-	})
-	defer func() {
-		if !stop() {
-			<-fired
+}
+
+// loop accepts connections until the listener is closed.
+func (l *Listener) loop() {
+	for {
+		nfd, err := l.acceptFD()
+		if err != nil {
+			var ce *clientError
+			if errors.As(err, &ce) {
+				l.refused(ce.op, ce.err)
+				continue
+			}
+			if !errors.Is(err, errClosed) {
+				l.fatal <- err
+			}
+			return
 		}
-	}()
+		if l.cfg.afterAccept != nil {
+			l.cfg.afterAccept(l)
+		}
+		l.admit(nfd)
+	}
+}
+
+// acceptFD waits for one connection.
+func (l *Listener) acceptFD() (int, error) {
 	rc, err := l.f.SyscallConn()
 	if err != nil {
 		return 0, l.closedOr(err)
@@ -284,11 +348,10 @@ func (l *Listener) acceptFD(ctx context.Context) (int, error) {
 	var aerr error
 	err = rc.Read(func(fd uintptr) bool {
 		nfd, _, aerr = unix.Accept4(int(fd), unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
-		return aerr != unix.EAGAIN
+		// EAGAIN and EINTR: wait for the socket again, and retry.
+		return aerr != unix.EAGAIN && aerr != unix.EINTR
 	})
 	switch {
-	case err != nil && ctx.Err() != nil:
-		return 0, ctx.Err()
 	case err != nil:
 		return 0, l.closedOr(err)
 	case aerr == unix.ECONNABORTED, aerr == unix.EPROTO:
@@ -309,67 +372,78 @@ func (l *Listener) closedOr(err error) error {
 	return err
 }
 
-func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
-	nfd, err := l.acceptFD(ctx)
+// admit sorts a new connection before reading anything from it: by the
+// credentials the kernel recorded at connect, which the client can't
+// change afterwards.
+func (l *Listener) admit(nfd int) {
+	cred, err := unix.GetsockoptUcred(nfd, unix.SOL_SOCKET, unix.SO_PEERCRED)
 	if err != nil {
-		return nil, err
+		unix.Close(nfd)
+		l.refused("", fmt.Errorf("the client's credentials can't be read: %w", err))
+		return
 	}
-	// The credentials the kernel recorded when the client connected:
-	// they can't be changed by the client afterwards.
-	cred, cerr := unix.GetsockoptUcred(nfd, unix.SOL_SOCKET, unix.SO_PEERCRED)
+	if cred.Uid != l.cfg.MemberUID && cred.Uid != 0 && cred.Uid != l.own {
+		// Nobody else may use the channel: dropped before its hello.
+		unix.Close(nfd)
+		l.refused("", ErrNotAllowed)
+		return
+	}
 	var gids []uint32
-	if cerr == nil && cred.Uid == l.cfg.MemberUID {
-		gids, cerr = peerGroups(nfd, l.peerInit)
+	var gerr error
+	if cred.Uid == l.cfg.MemberUID {
+		gids, gerr = l.cfg.peerGroupsOf(nfd, l.cfg.peerInit)
 	}
-
+	f := os.NewFile(uintptr(nfd), l.cfg.Socket)
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
-		unix.Close(nfd)
-		return nil, errClosed
+		f.Close()
+		return
 	}
 	l.live++
+	// Past twice maxConns a client is dropped without an answer, so the
+	// goroutines reading hellos stay bounded; past maxConns it is told
+	// the channel is busy once its hello is read.
+	if l.live > 2*maxConns {
+		l.live--
+		l.mu.Unlock()
+		f.Close()
+		l.refused("", ErrBusy)
+		return
+	}
 	busy := l.live > maxConns
+	l.inHello[f] = struct{}{}
 	l.mu.Unlock()
+	c := &ServerConn{File: f, version: l.cfg.Version, l: l}
+	go l.hello(c, busy, cred, gids, gerr)
+}
 
-	c := &ServerConn{File: os.NewFile(uintptr(nfd), l.cfg.Socket), version: l.cfg.Version, l: l}
-	_ = c.SetDeadline(time.Now().Add(helloWait))
-	// ctx's end and Close end a hello in progress too, so a client that
-	// sends nothing holds Accept only until then.
-	l.mu.Lock()
-	l.inHello = c.File
-	l.mu.Unlock()
-	fired := make(chan struct{})
-	stop := context.AfterFunc(ctx, func() {
-		_ = c.SetDeadline(longAgo)
-		close(fired)
-	})
+// hello reads a client's hello, judges it, and hands an admitted client
+// to Accept.
+func (l *Listener) hello(c *ServerConn, busy bool, cred *unix.Ucred, gids []uint32, gerr error) {
+	_ = c.SetDeadline(time.Now().Add(l.cfg.helloWait))
 	op, err := readClientHello(c.File, l.cfg.Version)
-	if !stop() {
-		<-fired
-	}
 	l.mu.Lock()
-	l.inHello = nil
+	delete(l.inHello, c.File)
+	closed := l.closed
 	l.mu.Unlock()
-	if err == nil && ctx.Err() != nil {
-		err = ctx.Err()
-	}
-	if err != nil && ctx.Err() != nil {
+	switch {
+	case closed:
 		c.Close()
-		return nil, ctx.Err()
-	}
-	if err != nil {
+		return
+	case err != nil:
 		c.Close()
-		return nil, &clientError{op: op, err: err}
-	}
-	if busy {
+		l.refused(op, err)
+		return
+	case busy:
 		_ = refuse(c.File, l.cfg.Version, ErrBusy)
 		c.Close()
-		return nil, &clientError{op: op, err: ErrBusy}
+		l.refused(op, ErrBusy)
+		return
 	}
 	var id Identity
-	if cerr != nil {
-		err = fmt.Errorf("the client's credentials can't be read: %w", cerr)
+	if gerr != nil {
+		err = fmt.Errorf("the client's groups can't be read: %w", gerr)
 	} else if id, err = l.identify(cred, gids); err == nil {
 		err = Admit(op, id)
 	}
@@ -381,11 +455,16 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 		}
 		_ = refuse(c.File, l.cfg.Version, why)
 		c.Close()
-		return nil, &clientError{op: op, err: err}
+		l.refused(op, err)
+		return
 	}
 	_ = c.SetDeadline(time.Time{})
 	c.Op, c.Identity = op, id
-	return c, nil
+	select {
+	case l.ready <- c:
+	case <-l.done:
+		c.Close()
+	}
 }
 
 // identify maps a client's uid to who it is: the member, or root (a
@@ -399,7 +478,7 @@ func (l *Listener) identify(cred *unix.Ucred, gids []uint32) (Identity, error) {
 	if !id.Member {
 		return id, nil
 	}
-	if l.cfg.MemberAdmin {
+	if l.cfg.MemberAdmin || cred.Gid == 0 || slices.Contains(gids, 0) {
 		id.HoldsAdmins = true
 		return id, nil
 	}
@@ -490,6 +569,9 @@ func peerGroups(fd, n int) ([]uint32, error) {
 // of another uid, is ErrNotService; a socket the account may not open is
 // ErrAccessDenied. Nothing is sent before every check has passed.
 func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
+	if !cleanAbs(cfg.Pipe) {
+		return nil, fmt.Errorf("%w: the socket's path %q is not absolute and clean", ErrNotService, cfg.Pipe)
+	}
 	svc, err := user.Lookup(cfg.Service)
 	if err != nil {
 		// No connector account: the pairing isn't installed here.
@@ -521,6 +603,11 @@ func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 		close(fired)
 	})
 	err = clientHandshake(f, cfg.Op, cfg.Version)
+	if err != nil && !knownRefusal(err) {
+		// The server hung up mid-hello (a write's EPIPE, a read's reset):
+		// a client the service drops before its hello sees this.
+		err = fmt.Errorf("%w: %v", ErrBadHello, err)
+	}
 	if !stop() {
 		<-fired // the deadline it set is reset below, or f is closed
 		if err == nil {
@@ -537,11 +624,24 @@ func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 	return f, nil
 }
 
+// knownRefusal reports whether err is one of the hello's own outcomes.
+func knownRefusal(err error) bool {
+	for _, e := range []error{ErrBadHello, ErrVersionsDiffer, ErrNotAllowed, ErrInUse, ErrBusy, ErrMemberIsAdmin} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkSocket checks the socket at path (owner svcUID) and its folder
 // (owner dirUID, no group or other write); with walk, every folder above
 // it too, up to /, each owned by root with no group or other write, so
 // no other account can replace any of them.
 func checkSocket(path string, svcUID, dirUID uint32, walk bool) error {
+	if !cleanAbs(path) {
+		return fmt.Errorf("%w: the socket's path %q is not absolute and clean", ErrNotService, path)
+	}
 	var st unix.Stat_t
 	if err := unix.Lstat(path, &st); err != nil {
 		if errors.Is(err, unix.ENOENT) {

@@ -11,7 +11,10 @@ package channel
 // throwaway users and groups, the test binary copied to a root-owned
 // folder, and a transient systemd socket unit made with the same
 // settings as the real one (AGENT-LINUX-RUNTIME §3). Everything made is
-// removed in cleanup, even when a test fails.
+// removed in cleanup when a test fails, though not when the test binary
+// is killed or times out (Go runs no cleanup then): on a reused machine,
+// remove any vtm*, vto* and vettid-c-* users and vettid-agent-t* units
+// left by such a run (vti* too).
 
 import (
 	"bufio"
@@ -103,6 +106,7 @@ func dialResult(path, service string, op Op) string {
 		}{
 			{ErrNoService, "no_service"}, {ErrNotService, "not_service"}, {ErrAccessDenied, "access_denied"},
 			{ErrNotAllowed, "not_allowed"}, {ErrMemberIsAdmin, "member_is_admin"}, {ErrVersionsDiffer, "versions_differ"},
+			{ErrBadHello, "bad_hello"},
 		} {
 			if errors.Is(err, e.err) {
 				return e.name
@@ -123,6 +127,7 @@ type rootEnv struct {
 	conn     string // the connector's account
 	member   string
 	other    string
+	intruder string // in the member group, but not the member
 	unit     string
 	memberID uint32
 }
@@ -177,7 +182,18 @@ func uidOf(t *testing.T, name string) (uint32, uint32, []uint32) {
 // as runs the test binary as user, in role, with vars, and returns its
 // output.
 func (e *rootEnv) as(name, role string, vars ...string) *exec.Cmd {
+	return e.asWith(name, nil, nil, role, vars...)
+}
+
+// asWith is as, with the primary group replaced (gid, as newgrp would)
+// and more supplementary groups held (extra) than the group database
+// lists.
+func (e *rootEnv) asWith(name string, gidOver *uint32, extra []uint32, role string, vars ...string) *exec.Cmd {
 	uid, gid, groups := uidOf(e.t, name)
+	if gidOver != nil {
+		gid = *gidOver
+	}
+	groups = append(groups, extra...)
 	c := exec.Command(e.bin, "-test.run=^TestRootHelper", "-test.count=1", "-test.v")
 	c.Env = append([]string{"PATH=/usr/bin:/bin", roleVar + "=" + role}, vars...)
 	c.Dir = "/"
@@ -188,7 +204,12 @@ func (e *rootEnv) as(name, role string, vars ...string) *exec.Cmd {
 // clientAs dials as user and returns its result.
 func (e *rootEnv) clientAs(name string, op Op) string {
 	e.t.Helper()
-	out, err := e.as(name, "client", "VETTID_TEST_SOCKET="+e.sock, "VETTID_TEST_SERVICE="+e.conn, "VETTID_TEST_OP="+string(op)).CombinedOutput()
+	return e.clientWith(name, nil, nil, op)
+}
+
+func (e *rootEnv) clientWith(name string, gid *uint32, extra []uint32, op Op) string {
+	e.t.Helper()
+	out, err := e.asWith(name, gid, extra, "client", "VETTID_TEST_SOCKET="+e.sock, "VETTID_TEST_SERVICE="+e.conn, "VETTID_TEST_OP="+string(op)).CombinedOutput()
 	for _, l := range strings.Split(string(out), "\n") {
 		if r, ok := strings.CutPrefix(l, "result "); ok {
 			return r
@@ -204,11 +225,11 @@ func setupRoot(t *testing.T) *rootEnv {
 	}
 	r := randHex(t, 3)
 	e := &rootEnv{t: t, name: "t" + r}
-	e.conn, e.member, e.other = ConnectorUser(e.name), "vtm"+r, "vto"+r
+	e.conn, e.member, e.other, e.intruder = ConnectorUser(e.name), "vtm"+r, "vto"+r, "vti"+r
 	e.sock, e.unit = SocketPath(e.name), "vettid-agent-"+e.name
 	group := MemberGroup(e.name)
 
-	for _, u := range []string{e.conn, e.member, e.other} {
+	for _, u := range []string{e.conn, e.member, e.other, e.intruder} {
 		args := []string{"useradd", "--no-create-home", "--shell", "/usr/sbin/nologin", "--user-group"}
 		if u == e.conn {
 			args = append(args, "--system")
@@ -219,6 +240,7 @@ func setupRoot(t *testing.T) *rootEnv {
 	e.cmd("groupadd", "--system", group)
 	e.later("groupdel", group)
 	e.cmd("gpasswd", "-a", e.member, group)
+	e.cmd("gpasswd", "-a", e.intruder, group)
 	e.memberID, _, _ = uidOf(t, e.member)
 
 	// The test binary, where the connector's account and the clients can
@@ -280,14 +302,18 @@ func TestRootChannel(t *testing.T) {
 		"member forget": "not_allowed",
 		"other mcp":     "access_denied", // the socket's mode keeps another user out
 		"other status":  "access_denied",
+		// Another user who could open the socket (put in the member group
+		// by mistake) is dropped before its hello: no answer at all.
+		"intruder status": "bad_hello",
 	}
 	got := map[string]string{
-		"member mcp":    e.clientAs(e.member, OpMCP),
-		"member status": e.clientAs(e.member, OpStatus),
-		"member pair":   e.clientAs(e.member, OpPair),
-		"member forget": e.clientAs(e.member, OpForget),
-		"other mcp":     e.clientAs(e.other, OpMCP),
-		"other status":  e.clientAs(e.other, OpStatus),
+		"member mcp":      e.clientAs(e.member, OpMCP),
+		"member status":   e.clientAs(e.member, OpStatus),
+		"member pair":     e.clientAs(e.member, OpPair),
+		"member forget":   e.clientAs(e.member, OpForget),
+		"other mcp":       e.clientAs(e.other, OpMCP),
+		"other status":    e.clientAs(e.other, OpStatus),
+		"intruder status": e.clientAs(e.intruder, OpStatus),
 	}
 	// Root (a command under sudo): pair, forget and status, never tools.
 	for _, op := range []Op{OpStatus, OpPair, OpForget} {
@@ -330,6 +356,28 @@ func TestRootMemberIsAdmin(t *testing.T) {
 	}
 }
 
+// A group the client holds counts though the group database doesn't
+// list the member in it: as a supplementary group (SO_PEERGROUPS), and
+// as the primary group of the process (newgrp's, SO_PEERCRED's gid).
+func TestRootHeldAdminGroup(t *testing.T) {
+	e := setupRoot(t)
+	g, err := user.LookupGroup("sudo")
+	if err != nil {
+		t.Skip("no sudo group here")
+	}
+	gid, _ := strconv.ParseUint(g.Gid, 10, 32)
+	sudo := uint32(gid)
+	if got := e.clientWith(e.member, nil, nil, OpMCP); got != "ok member=true admin=false holds=false" {
+		t.Fatalf("the member, not in sudo: %q", got)
+	}
+	if got := e.clientWith(e.member, nil, []uint32{sudo}, OpMCP); got != "member_is_admin" {
+		t.Errorf("sudo held as a supplementary group: %q, want member_is_admin", got)
+	}
+	if got := e.clientWith(e.member, &sudo, nil, OpMCP); got != "member_is_admin" {
+		t.Errorf("sudo as the process's primary group: %q, want member_is_admin", got)
+	}
+}
+
 // The client refuses a link, a socket of another owner, and a server of
 // another uid, before sending anything.
 func TestRootClientRefusesImpostors(t *testing.T) {
@@ -363,6 +411,17 @@ func TestRootClientRefusesImpostors(t *testing.T) {
 	}
 	if got := dialResult(squat, e.conn, OpStatus); got != "not_service" {
 		t.Errorf("a socket of another owner: %q, want not_service", got)
+	}
+
+	// A link to the socket's folder, in a root-owned folder: every
+	// folder in the chain must be one, not a link to one.
+	linkDir := "/run/vtl" + randHex(t, 3)
+	if err := os.Symlink(SocketDir, linkDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(linkDir) })
+	if got := dialResult(filepath.Join(linkDir, e.name+".sock"), e.conn, OpStatus); got != "not_service" {
+		t.Errorf("a linked folder: %q, want not_service", got)
 	}
 
 	// A good folder under one other users can change (/tmp): every
