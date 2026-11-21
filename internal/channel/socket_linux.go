@@ -102,9 +102,11 @@ type Listener struct {
 	cfg ListenConfig
 	f   *os.File
 
-	mu     sync.Mutex
-	closed bool
-	live   int // clients connected and not yet closed (maxConns)
+	mu       sync.Mutex
+	closed   bool
+	live     int      // clients connected and not yet closed (maxConns)
+	inHello  *os.File // the connection whose hello Accept is reading, if any
+	peerInit int      // tests only: peerGroups' first buffer, in groups (0: 64)
 }
 
 // errClosed: the listener was closed.
@@ -125,9 +127,11 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 		}
 	}
 	if err := checkListening(fd, cfg.Socket); err != nil {
+		unix.Close(fd)
 		return nil, err
 	}
 	if err := unix.SetNonblock(fd, true); err != nil {
+		unix.Close(fd)
 		return nil, err
 	}
 	unix.CloseOnExec(fd)
@@ -182,6 +186,10 @@ func checkListening(fd int, path string) error {
 func (l *Listener) Close() error {
 	l.mu.Lock()
 	l.closed = true
+	if l.inHello != nil {
+		// A client still in its hello holds Accept; end it now.
+		_ = l.inHello.SetDeadline(longAgo)
+	}
 	l.mu.Unlock()
 	return l.f.Close()
 }
@@ -310,8 +318,8 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 	// they can't be changed by the client afterwards.
 	cred, cerr := unix.GetsockoptUcred(nfd, unix.SOL_SOCKET, unix.SO_PEERCRED)
 	var gids []uint32
-	if cerr == nil {
-		gids, cerr = peerGroups(nfd)
+	if cerr == nil && cred.Uid == l.cfg.MemberUID {
+		gids, cerr = peerGroups(nfd, l.peerInit)
 	}
 
 	l.mu.Lock()
@@ -326,7 +334,30 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 
 	c := &ServerConn{File: os.NewFile(uintptr(nfd), l.cfg.Socket), version: l.cfg.Version, l: l}
 	_ = c.SetDeadline(time.Now().Add(helloWait))
+	// ctx's end and Close end a hello in progress too, so a client that
+	// sends nothing holds Accept only until then.
+	l.mu.Lock()
+	l.inHello = c.File
+	l.mu.Unlock()
+	fired := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = c.SetDeadline(longAgo)
+		close(fired)
+	})
 	op, err := readClientHello(c.File, l.cfg.Version)
+	if !stop() {
+		<-fired
+	}
+	l.mu.Lock()
+	l.inHello = nil
+	l.mu.Unlock()
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if err != nil && ctx.Err() != nil {
+		c.Close()
+		return nil, ctx.Err()
+	}
 	if err != nil {
 		c.Close()
 		return nil, &clientError{op: op, err: err}
@@ -414,11 +445,10 @@ func lookupGroups(ids []string) ([]string, error) {
 	for _, id := range ids {
 		g, err := user.LookupGroupId(id)
 		if err != nil {
-			var unknown user.UnknownGroupIdError
-			if errors.As(err, &unknown) {
-				continue // a gid without a name can't be one of adminGroups
-			}
-			return nil, err
+			// A gid this lookup can't name may be an administrator's group
+			// from NSS (LDAP, sssd), which a build without cgo doesn't read:
+			// fail closed (chosen; not in the spec).
+			return nil, fmt.Errorf("group %s has no name in the local group database: %w", id, err)
 		}
 		names = append(names, g.Name)
 	}
@@ -427,8 +457,10 @@ func lookupGroups(ids []string) ([]string, error) {
 
 // peerGroups reads the supplementary groups the client held when it
 // connected (SO_PEERGROUPS, Linux 4.13).
-func peerGroups(fd int) ([]uint32, error) {
-	n := 64
+func peerGroups(fd, n int) ([]uint32, error) {
+	if n <= 0 {
+		n = 64
+	}
 	for {
 		buf := make([]uint32, n)
 		size := uint32(4 * n)
@@ -483,10 +515,19 @@ func Dial(ctx context.Context, cfg DialConfig) (*os.File, error) {
 		return nil, err
 	}
 	_ = f.SetDeadline(time.Now().Add(helloWait))
-	stop := context.AfterFunc(ctx, func() { _ = f.SetDeadline(longAgo) })
+	fired := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		_ = f.SetDeadline(longAgo)
+		close(fired)
+	})
 	err = clientHandshake(f, cfg.Op, cfg.Version)
-	if !stop() && err != nil {
-		err = errors.Join(ctx.Err(), err)
+	if !stop() {
+		<-fired // the deadline it set is reset below, or f is closed
+		if err == nil {
+			err = ctx.Err()
+		} else {
+			err = errors.Join(ctx.Err(), err)
+		}
 	}
 	if err != nil {
 		f.Close()
@@ -509,7 +550,7 @@ func checkSocket(path string, svcUID, dirUID uint32, walk bool) error {
 		if errors.Is(err, unix.EACCES) {
 			return ErrAccessDenied
 		}
-		return fmt.Errorf("%w: %v", ErrNoService, err)
+		return fmt.Errorf("%w: %v", ErrNotService, err)
 	}
 	switch {
 	case st.Mode&unix.S_IFMT != unix.S_IFSOCK:
@@ -570,7 +611,10 @@ func connectUnix(ctx context.Context, path string, wait time.Duration) (*os.File
 		case errors.Is(err, unix.EACCES), errors.Is(err, unix.EPERM):
 			return nil, ErrAccessDenied
 		case errors.Is(err, unix.EAGAIN):
-			if time.Now().After(deadline) || ctx.Err() != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if time.Now().After(deadline) {
 				return nil, fmt.Errorf("%w: %v", ErrBusy, err)
 			}
 			select {

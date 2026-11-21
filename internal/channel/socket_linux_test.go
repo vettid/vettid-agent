@@ -50,6 +50,11 @@ func me(t *testing.T) (uint32, string) {
 		t.Fatal(err)
 	}
 	uid, _ := strconv.ParseUint(u.Uid, 10, 32)
+	if uid == 0 {
+		// These tests make this process's own uid the member, and root
+		// can't be the member. The root tests run the other accounts.
+		t.Skip("run as a normal user; as root, run the TestRoot tests")
+	}
 	return uint32(uid), u.Username
 }
 
@@ -111,7 +116,10 @@ func TestListenChecksTheDescriptor(t *testing.T) {
 	if _, err := Listen(ListenConfig{Socket: path, MemberUID: uid + 1, fd: fd}); !errors.Is(err, ErrNotActivated) {
 		t.Errorf("a socket bound to another path: %v, want ErrNotActivated", err)
 	}
-	unix.Close(fd)
+	// Listen closed the descriptor it refused.
+	if _, err := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TYPE); !errors.Is(err, unix.EBADF) {
+		t.Errorf("a refused descriptor is still open: %v", err)
+	}
 
 	// Not listening.
 	nl, _ := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM, 0)
@@ -119,7 +127,6 @@ func TestListenChecksTheDescriptor(t *testing.T) {
 	if _, err := Listen(ListenConfig{Socket: filepath.Join(d, "c.sock"), MemberUID: uid + 1, fd: nl}); !errors.Is(err, ErrNotActivated) {
 		t.Errorf("a socket not listening: %v", err)
 	}
-	unix.Close(nl)
 
 	// A datagram socket.
 	dg, _ := unix.Socket(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
@@ -127,7 +134,6 @@ func TestListenChecksTheDescriptor(t *testing.T) {
 	if _, err := Listen(ListenConfig{Socket: filepath.Join(d, "d.sock"), MemberUID: uid + 1, fd: dg}); !errors.Is(err, ErrNotActivated) {
 		t.Errorf("a datagram socket: %v", err)
 	}
-	unix.Close(dg)
 
 	// A TCP socket.
 	tcp, _ := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
@@ -136,7 +142,6 @@ func TestListenChecksTheDescriptor(t *testing.T) {
 	if _, err := Listen(ListenConfig{Socket: path, MemberUID: uid + 1, fd: tcp}); !errors.Is(err, ErrNotActivated) {
 		t.Errorf("a TCP socket: %v", err)
 	}
-	unix.Close(tcp)
 
 	if _, err := Listen(ListenConfig{Socket: path, MemberUID: 0, fd: 1}); err == nil {
 		t.Error("Listen took root as the member")
@@ -316,21 +321,35 @@ func TestPeerGroups(t *testing.T) {
 	}
 	defer unix.Close(a)
 	defer unix.Close(b)
-	got, err := peerGroups(a)
-	if err != nil {
-		t.Fatal(err)
-	}
 	want, err := unix.Getgroups()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != len(want) {
-		t.Fatalf("peerGroups = %v, Getgroups = %v", got, want)
-	}
-	for _, g := range want {
-		if !slices.Contains(got, uint32(g)) {
-			t.Errorf("peerGroups = %v, missing %d", got, g)
+	// From the usual buffer, and from one too small (the ERANGE retry).
+	for _, start := range []int{0, 1} {
+		got, err := peerGroups(a, start)
+		if err != nil {
+			t.Fatal(err)
 		}
+		if len(got) != len(want) {
+			t.Fatalf("peerGroups(start %d) = %v, Getgroups = %v", start, got, want)
+		}
+		for _, g := range want {
+			if !slices.Contains(got, uint32(g)) {
+				t.Errorf("peerGroups(start %d) = %v, missing %d", start, got, g)
+			}
+		}
+	}
+	if len(want) < 2 {
+		t.Log("this process holds fewer than 2 groups, so the ERANGE retry wasn't reached")
+	}
+}
+
+// A gid the local group database can't name fails closed: it may be an
+// administrator's group from NSS.
+func TestGroupNamesUnknownFails(t *testing.T) {
+	if _, err := groupNames([]uint32{4000000123}); err == nil {
+		t.Error("groupNames named a gid that has no name")
 	}
 }
 
@@ -395,7 +414,9 @@ func TestDialChecksTheSocket(t *testing.T) {
 		t.Errorf("a file: %v, want ErrNotService", err)
 	}
 	// Owned by an account that isn't the connector's.
-	if err := dial(path, "root", uid); uid != 0 && !errors.Is(err, ErrNotService) {
+	if uid == 0 {
+		t.Log("run as root: the \"another owner\" case needs another uid, so it is left to the root tests")
+	} else if err := dial(path, "root", uid); !errors.Is(err, ErrNotService) {
 		t.Errorf("another owner: %v, want ErrNotService", err)
 	}
 	// A folder owned by another uid.
@@ -476,5 +497,161 @@ func TestListenerClose(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Accept didn't end at Close")
+	}
+}
+
+// Accept ends at its context, waiting for a connection and waiting for a
+// hello that never comes; Close ends a hello in progress too.
+func TestAcceptEndsAtContextAndClose(t *testing.T) {
+	uid, _ := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "x.sock")
+	l, err := Listen(ListenConfig{Socket: path, MemberUID: uid, fd: listenAt(t, path)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	accept := func(ctx context.Context) chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := l.Accept(ctx)
+			done <- err
+		}()
+		return done
+	}
+	wait := func(done chan error, want error, what string) {
+		t.Helper()
+		select {
+		case err := <-done:
+			if !errors.Is(err, want) {
+				t.Errorf("%s: %v, want %v", what, err, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: Accept didn't end", what)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := accept(ctx)
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	wait(done, context.Canceled, "cancelled while waiting")
+
+	// A client that connects and says nothing.
+	silent := func() *os.File {
+		f, err := connectUnix(context.Background(), path, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	f := silent()
+	defer f.Close()
+	ctx, cancel = context.WithCancel(context.Background())
+	done = accept(ctx)
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	wait(done, context.Canceled, "cancelled during a hello")
+
+	g := silent()
+	defer g.Close()
+	done = accept(context.Background())
+	time.Sleep(100 * time.Millisecond)
+	l.Close()
+	wait(done, errClosed, "closed during a hello")
+}
+
+// A client beyond maxConns is told the channel is busy.
+func TestAcceptBusy(t *testing.T) {
+	uid, name := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "b.sock")
+	refused := make(chan error, 4)
+	l, err := Listen(ListenConfig{Socket: path, MemberUID: uid, fd: listenAt(t, path), Version: "v1",
+		groupsOf:  func(uint32, uint32) ([]string, error) { return nil, nil },
+		peerNames: func([]uint32) ([]string, error) { return nil, nil },
+		OnRefused: func(_ Op, err error) { refused <- err }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	var held []*ServerConn
+	defer func() {
+		for _, c := range held {
+			c.Close()
+		}
+	}()
+	go func() {
+		for {
+			c, err := l.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			_ = c.Accept()
+			held = append(held, c) // kept open: each counts toward maxConns
+		}
+	}()
+	var clients []*os.File
+	defer func() {
+		for _, f := range clients {
+			f.Close()
+		}
+	}()
+	for i := 0; i < maxConns; i++ {
+		f, err := Dial(context.Background(), DialConfig{Pipe: path, Service: name, Op: OpStatus, Version: "v1", dirUID: &uid})
+		if err != nil {
+			t.Fatalf("client %d: %v", i, err)
+		}
+		clients = append(clients, f)
+	}
+	_, err = Dial(context.Background(), DialConfig{Pipe: path, Service: name, Op: OpStatus, Version: "v1", dirUID: &uid})
+	if !errors.Is(err, ErrBusy) {
+		t.Errorf("client %d: %v, want ErrBusy", maxConns+1, err)
+	}
+	if err := recv(t, refused); !errors.Is(err, ErrBusy) {
+		t.Errorf("OnRefused got %v", err)
+	}
+}
+
+// A full queue is retried until Dial's wait ends, then is ErrBusy; a
+// context that ends first ends it.
+func TestConnectFullQueue(t *testing.T) {
+	d := shortDir(t)
+	path := filepath.Join(d, "f.sock")
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if err := unix.Bind(fd, &unix.SockaddrUnix{Name: path}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Listen(fd, 0); err != nil {
+		t.Fatal(err)
+	}
+	// Fill the queue: nobody accepts.
+	var fill []*os.File
+	defer func() {
+		for _, f := range fill {
+			f.Close()
+		}
+	}()
+	for i := 0; i < 8; i++ {
+		f, err := connectUnix(context.Background(), path, 10*time.Millisecond)
+		if err != nil {
+			break
+		}
+		fill = append(fill, f)
+	}
+	start := time.Now()
+	if _, err := connectUnix(context.Background(), path, 200*time.Millisecond); !errors.Is(err, ErrBusy) {
+		t.Fatalf("a full queue: %v, want ErrBusy", err)
+	}
+	if time.Since(start) < 150*time.Millisecond {
+		t.Error("a full queue wasn't retried until the wait ended")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, err := connectUnix(ctx, path, 10*time.Second); !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("a full queue with a context that ends: %v", err)
 	}
 }
