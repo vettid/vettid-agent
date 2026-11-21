@@ -1018,6 +1018,45 @@ func TestRunnerHopProbe(t *testing.T) {
 	bDenies := []string{"SeDenyRemoteInteractiveLogonRight", "SeDenyNetworkLogonRight"}
 	bGrants := []string{"SeInteractiveLogonRight"}
 
+	// First, while no process the secondary logon service started runs
+	// (it does not stop while one does).
+	t.Run("seclogon-disabled", func(t *testing.T) {
+		// seclogon does not stop while a process it started runs: any left		// from the hops is ended first (and named).		endProcessesUnder(t, dir)
+		users := map[string]probeUser{"b": newShapedUser(t, dir, dSID, bGrants, bDenies, false)}
+		c := c0
+		c.StartType = mgr.StartDisabled
+		if err := sl.UpdateConfig(c); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			c := c0
+			c.StartType = mgr.StartManual
+			if err := sl.UpdateConfig(c); err != nil {
+				t.Errorf("seclogon back to Manual: %v", err)
+			}
+		})
+		// 1052 (not valid now): seclogon is already stopping.
+		if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) && !errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) {
+			t.Fatalf("stopping seclogon: %v", err)
+		}
+		// Until it has stopped: a stop asked while seclogon is busy is
+		// refused (1052), so it is asked again.
+		for end := time.Now().Add(90 * time.Second); ; time.Sleep(time.Second) {
+			if st, err := sl.Query(); err == nil && st.State == svc.Stopped {
+				break
+			}
+			if time.Now().After(end) {
+				t.Fatal("seclogon did not stop; nothing measured")
+			}
+			_, _ = sl.Control(svc.Stop)
+		}
+		res := runProbe2Service(t, m, name+"d", mustSID(t, dSID), dir, exe,
+			probe2Config{Exe: exe, Mode: "shapes", Users: users, Shapes: []string{"b"}})
+		t.Logf("seclogon disabled: %v", res.Shapes)
+		if !strings.HasPrefix(res.Shapes["b"], "errno 1058:") {
+			t.Errorf("with seclogon disabled: %s, want errno 1058 (the service is disabled)", res.Shapes["b"])
+		}
+	})
 	t.Run("hop", func(t *testing.T) {
 		users := map[string]probeUser{"b": newShapedUser(t, dir, hSID, bGrants, bDenies, false)}
 		res := runProbe2Service(t, m, name+"h", mustSID(t, hSID), dir, exe,
@@ -1070,43 +1109,6 @@ func TestRunnerHopProbe(t *testing.T) {
 		}
 		if !strings.HasPrefix(res.Shapes["b-deny-console"], "errno 1385:") {
 			t.Errorf("B's runner denied the console: %s, want errno 1385", res.Shapes["b-deny-console"])
-		}
-	})
-	t.Run("seclogon-disabled", func(t *testing.T) {
-		// seclogon does not stop while a process it started runs: any left		// from the hops is ended first (and named).		endProcessesUnder(t, dir)
-		users := map[string]probeUser{"b": newShapedUser(t, dir, dSID, bGrants, bDenies, false)}
-		c := c0
-		c.StartType = mgr.StartDisabled
-		if err := sl.UpdateConfig(c); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() {
-			c := c0
-			c.StartType = mgr.StartManual
-			if err := sl.UpdateConfig(c); err != nil {
-				t.Errorf("seclogon back to Manual: %v", err)
-			}
-		})
-		// 1052 (not valid now): seclogon is already stopping.
-		if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) && !errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) {
-			t.Fatalf("stopping seclogon: %v", err)
-		}
-		// Until it has stopped: a stop asked while seclogon is busy is
-		// refused (1052), so it is asked again.
-		for end := time.Now().Add(90 * time.Second); ; time.Sleep(time.Second) {
-			if st, err := sl.Query(); err == nil && st.State == svc.Stopped {
-				break
-			}
-			if time.Now().After(end) {
-				t.Fatal("seclogon did not stop; nothing measured")
-			}
-			_, _ = sl.Control(svc.Stop)
-		}
-		res := runProbe2Service(t, m, name+"d", mustSID(t, dSID), dir, exe,
-			probe2Config{Exe: exe, Mode: "shapes", Users: users, Shapes: []string{"b"}})
-		t.Logf("seclogon disabled: %v", res.Shapes)
-		if !strings.HasPrefix(res.Shapes["b"], "errno 1058:") {
-			t.Errorf("with seclogon disabled: %s, want errno 1058 (the service is disabled)", res.Shapes["b"])
 		}
 	})
 }
