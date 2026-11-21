@@ -411,11 +411,15 @@ type hopResult struct {
 
 // probe2Result is what the service records.
 type probe2Result struct {
-	WindowStation string               `json:"window_station"`
-	Desktop       string               `json:"desktop"`
-	DesktopName   string               `json:"desktop_name"`
-	Hops          map[string]hopResult `json:"hops"`   // "interactive", "interactive+local"
-	Shapes        map[string]string    `json:"shapes"` // shape: "ok" or "errno N: text"
+	WindowStation string `json:"window_station"`
+	// The fallback, when the service can make no window station: a
+	// desktop in the service's own, with the runner added to it.
+	ServiceWindowStation string               `json:"service_window_station,omitempty"`
+	WindowStationACE     string               `json:"window_station_ace,omitempty"`
+	Desktop              string               `json:"desktop"`
+	DesktopName          string               `json:"desktop_name"`
+	Hops                 map[string]hopResult `json:"hops"`   // "interactive", "interactive+local"
+	Shapes               map[string]string    `json:"shapes"` // shape: "ok" or "errno N: text"
 }
 
 // TestRunnerHopProbeHelper is the service, run by the SCM.
@@ -480,32 +484,47 @@ func runHops(c probe2Config) probe2Result {
 		res.WindowStation = err.Error()
 		return res
 	}
+	deskName := "run-" + randHex(4)
 	wsName := "vettid-run-" + randHex(4)
 	wn, _ := windows.UTF16PtrFromString(wsName)
+	dn, _ := windows.UTF16PtrFromString(deskName)
 	ws, _, e := procCreateWindowStationW.Call(uintptr(unsafe.Pointer(wn)), 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
-	if ws == 0 {
+	var desk uintptr
+	if ws != 0 {
+		res.WindowStation = "ok: " + wsName
+		defer procCloseWindowStation.Call(ws)
+		// The desktop is made in the new window station: switch to it for
+		// the call, then back.
+		old, _, _ := procGetProcessWindowStation.Call()
+		if r, _, e := procSetProcessWindowStation.Call(ws); r == 0 {
+			res.Desktop = "SetProcessWindowStation: " + e.Error()
+			return res
+		}
+		desk, _, e = procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
+		procSetProcessWindowStation.Call(old)
+	} else {
+		// No window station of its own: a desktop of the run's own in the
+		// service's window station, which the runner is added to.
 		res.WindowStation = "CreateWindowStation: " + e.Error()
-		return res
+		cur, _, _ := procGetProcessWindowStation.Call()
+		name := make([]uint16, 256)
+		var n uint32
+		if ok, _, e := procGetUserObjectInformation.Call(cur, 2 /* UOI_NAME */, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)*2), uintptr(unsafe.Pointer(&n))); ok == 0 {
+			res.Desktop = "the service's window station's name: " + e.Error()
+			return res
+		}
+		wsName = windows.UTF16ToString(name)
+		res.ServiceWindowStation = wsName
+		res.WindowStationACE = errString(grantWindowStation(windows.Handle(cur), b.SID))
+		desk, _, e = procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
 	}
-	res.WindowStation = "ok: " + wsName
-	defer procCloseWindowStation.Call(ws)
-	// The desktop is made in the new window station: switch to it for the
-	// call, then back.
-	old, _, _ := procGetProcessWindowStation.Call()
-	if r, _, e := procSetProcessWindowStation.Call(ws); r == 0 {
-		res.Desktop = "SetProcessWindowStation: " + e.Error()
-		return res
-	}
-	dn, _ := windows.UTF16PtrFromString("run")
-	desk, _, e := procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
-	procSetProcessWindowStation.Call(old)
 	if desk == 0 {
 		res.Desktop = "CreateDesktop: " + e.Error()
 		return res
 	}
 	defer procCloseDesktop.Call(desk)
 	res.Desktop = "ok"
-	res.DesktopName = wsName + `\run`
+	res.DesktopName = wsName + `\` + deskName
 
 	// An inheritable handle of the service's, open while the launcher
 	// starts.
@@ -632,6 +651,14 @@ func newShapedUser(t *testing.T, dir, svcSID string, grants, denies []string, mu
 	if mustChange {
 		if out, err := exec.Command("net", "user", u.Name, "/logonpasswordchg:yes").CombinedOutput(); err != nil {
 			t.Fatalf("net user: %v %s", err, out)
+		}
+		// What Windows records for the user, as the measurement's context.
+		if out, err := exec.Command("net", "user", u.Name).CombinedOutput(); err == nil {
+			for _, l := range strings.Split(string(out), "\n") {
+				if strings.Contains(l, "assword") {
+					t.Logf("%s: %s", u.Name, strings.TrimSpace(l))
+				}
+			}
 		}
 	}
 	return u
@@ -841,6 +868,11 @@ func TestRunnerHopProbe(t *testing.T) {
 		if res.Shapes["b"] != "ok" {
 			t.Errorf("B's runner: %s", res.Shapes["b"])
 		}
+		// The Users group holds the interactive logon right here, so B's
+		// runner works without its explicit grant too.
+		if res.Shapes["b-no-grant"] != "ok" {
+			t.Errorf("B's runner without its grant: %s", res.Shapes["b-no-grant"])
+		}
 		if !strings.HasPrefix(res.Shapes["b-deny-console"], "errno 1385:") {
 			t.Errorf("B's runner denied the console: %s, want errno 1385", res.Shapes["b-deny-console"])
 		}
@@ -870,8 +902,8 @@ func TestRunnerHopProbe(t *testing.T) {
 		res := runProbe2Service(t, m, name+"d", mustSID(t, dSID), dir, exe,
 			probe2Config{Exe: exe, Mode: "shapes", Users: users, Shapes: []string{"b"}})
 		t.Logf("seclogon disabled: %v", res.Shapes)
-		if !strings.HasPrefix(res.Shapes["b"], "errno ") || res.Shapes["b"] == "ok" {
-			t.Errorf("with seclogon disabled: %s, want refused", res.Shapes["b"])
+		if !strings.HasPrefix(res.Shapes["b"], "errno 1058:") {
+			t.Errorf("with seclogon disabled: %s, want errno 1058 (the service is disabled)", res.Shapes["b"])
 		}
 	})
 }
@@ -888,9 +920,13 @@ func mustSID(t *testing.T, s string) *windows.SID {
 // probe2ExpectHop checks what the plan relies on; the rest is recorded.
 func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	t.Helper()
-	if !strings.HasPrefix(r.WindowStation, "ok") || r.Desktop != "ok" {
-		t.Errorf("window station %q, desktop %q", r.WindowStation, r.Desktop)
+	// A window station of the run's own, or (measured: the cut1 account
+	// may not make one) a desktop of its own in the service's window
+	// station, with the runner added to that.
+	if r.Desktop != "ok" || !(strings.HasPrefix(r.WindowStation, "ok") || r.WindowStationACE == "ok") {
+		t.Errorf("window station %q (fallback %q, entry %q), desktop %q", r.WindowStation, r.ServiceWindowStation, r.WindowStationACE, r.Desktop)
 	}
+
 	for restrict, h := range r.Hops {
 		where := "hop " + restrict
 		if h.Start != "ok" || h.Job != "ok" || h.UILimits != "ok" {
@@ -920,7 +956,7 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			t.Errorf("%s: BATCH %s", where, p.Record.Token.Batch)
 		}
 		u32 := l.Children["user32"]
-		if u32.Exit != "exit 0x0" || u32.Record.Desktop != "run" {
+		if u32.Exit != "exit 0x0" || u32.Record.Desktop != r.DesktopName[strings.LastIndex(r.DesktopName, `\`)+1:] {
 			t.Errorf("%s: user32 child %+v", where, u32)
 		}
 		if !slicesContain(h.JobPIDs, l.WaitingPID) {
@@ -944,4 +980,33 @@ func slicesContain(s []uint32, v uint32) bool {
 		}
 	}
 	return false
+}
+
+// grantWindowStation adds an entry for the runner to the window station's
+// access list (it needs the window station to use a desktop in it).
+func grantWindowStation(ws windows.Handle, runner string) error {
+	sd, err := windows.GetSecurityInfo(ws, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return fmt.Errorf("reading its access: %w", err)
+	}
+	old, _, err := sd.DACL()
+	if err != nil {
+		return fmt.Errorf("reading its access: %w", err)
+	}
+	sid, err := windows.StringToSid(runner)
+	if err != nil {
+		return err
+	}
+	acl, err := windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+		AccessPermissions: 0x37f, // WINSTA_ALL_ACCESS
+		AccessMode:        windows.GRANT_ACCESS,
+		Trustee:           windows.TRUSTEE{TrusteeForm: windows.TRUSTEE_IS_SID, TrusteeType: windows.TRUSTEE_IS_USER, TrusteeValue: windows.TrusteeValueFromSID(sid)},
+	}}, old)
+	if err != nil {
+		return err
+	}
+	if err := windows.SetSecurityInfo(ws, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil); err != nil {
+		return fmt.Errorf("setting its access: %w", err)
+	}
+	return nil
 }
