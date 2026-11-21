@@ -648,11 +648,9 @@ func registerInteractiveClass(t *testing.T, exe string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rel, err := sd.ToSelfRelative()
-	if err != nil {
-		t.Fatal(err)
-	}
-	perm := unsafe.Slice((*byte)(unsafe.Pointer(rel)), rel.Length())
+	// SecurityDescriptorFromString gives a self-relative descriptor, the
+	// form the registry values take, as it is.
+	perm := unsafe.Slice((*byte)(unsafe.Pointer(sd)), sd.Length())
 	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\AppID\`+appid, registry.ALL_ACCESS)
 	if err != nil {
 		t.Fatal(err)
