@@ -980,7 +980,10 @@ func TestRunnerHopProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		// A process that just ended may still hold its image for a moment.
+		// Any process still running from the folder (a child the test
+		// lost track of) is named and ended, then the folder removed; an
+		// image that just ended may be held a moment longer.
+		endProcessesUnder(t, dir)
 		var err error
 		for end := time.Now().Add(20 * time.Second); ; time.Sleep(500 * time.Millisecond) {
 			if err = os.RemoveAll(dir); err == nil || time.Now().After(end) {
@@ -1083,10 +1086,16 @@ func TestRunnerHopProbe(t *testing.T) {
 		if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) && !errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) {
 			t.Fatalf("stopping seclogon: %v", err)
 		}
-		for end := time.Now().Add(30 * time.Second); time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+		// Until it has stopped: a stop asked while seclogon is busy is
+		// refused (1052), so it is asked again.
+		for end := time.Now().Add(90 * time.Second); ; time.Sleep(time.Second) {
 			if st, err := sl.Query(); err == nil && st.State == svc.Stopped {
 				break
 			}
+			if time.Now().After(end) {
+				t.Fatal("seclogon did not stop; nothing measured")
+			}
+			_, _ = sl.Control(svc.Stop)
 		}
 		res := runProbe2Service(t, m, name+"d", mustSID(t, dSID), dir, exe,
 			probe2Config{Exe: exe, Mode: "shapes", Users: users, Shapes: []string{"b"}})
@@ -1189,7 +1198,9 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 				t.Errorf("%s: DCOM with INTERACTIVE enabled: %q, want past the launch check", where, dcomOpen)
 			}
 		}
-		if l.Token.Local != "absent" || p.Record.Token.Local != "absent" {
+		// LOCAL: absent from the runner's token with a desktop of the run's
+		// own; seclogon's own desktop gives it (recorded).
+		if h.Desktop != "" && (l.Token.Local != "absent" || p.Record.Token.Local != "absent") {
 			t.Errorf("%s: LOCAL: launcher %s, program %s; measured absent from the runner's token", where, l.Token.Local, p.Record.Token.Local)
 		}
 		for name, tl := range l.Tools {
@@ -1389,4 +1400,43 @@ func writeTools(t *testing.T, dir string) string {
 	}
 	t.Logf("tools: %s", b)
 	return path
+}
+
+// endProcessesUnder ends, and names, every process whose image is under
+// dir: one still running when the test ends is a finding (it was not
+// ended by its job or its parent), recorded here.
+func endProcessesUnder(t *testing.T, dir string) {
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		t.Logf("process snapshot: %v", err)
+		return
+	}
+	defer windows.CloseHandle(snap)
+	var e windows.ProcessEntry32
+	e.Size = uint32(unsafe.Sizeof(e))
+	for err = windows.Process32First(snap, &e); err == nil; err = windows.Process32Next(snap, &e) {
+		p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, e.ProcessID)
+		if err != nil {
+			continue
+		}
+		buf := make([]uint16, windows.MAX_LONG_PATH)
+		n := uint32(len(buf))
+		if windows.QueryFullProcessImageName(p, 0, &buf[0], &n) == nil {
+			img := windows.UTF16ToString(buf[:n])
+			if strings.HasPrefix(strings.ToLower(img), strings.ToLower(dir)+`\`) {
+				var user string
+				var tok windows.Token
+				if windows.OpenProcessToken(p, windows.TOKEN_QUERY, &tok) == nil {
+					if u, err := tok.GetTokenUser(); err == nil {
+						user = u.User.Sid.String()
+					}
+					tok.Close()
+				}
+				t.Logf("still running at the end: pid %d, %s, as %s; ended", e.ProcessID, img, user)
+				_ = windows.TerminateProcess(p, 1)
+				_, _ = windows.WaitForSingleObject(p, 5000)
+			}
+		}
+		windows.CloseHandle(p)
+	}
 }
