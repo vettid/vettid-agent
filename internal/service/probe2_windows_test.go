@@ -753,10 +753,14 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
 	if o.noJob {
 		// No job: the service ends the waiting program and the launcher
 		// itself.
-		h.Kill = "no job"
 		if h.Launcher.WaitingPID != 0 {
-			if p, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, h.Launcher.WaitingPID); err == nil {
-				_ = windows.TerminateProcess(p, 1)
+			// Without a job the service can only end the program itself: as
+			// the program's own access list allows, recorded.
+			p, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, h.Launcher.WaitingPID)
+			if err != nil {
+				h.Kill = "no job; the service may not end the program: " + err.Error()
+			} else {
+				h.Kill = "no job; " + errString(windows.TerminateProcess(p, 1))
 				windows.CloseHandle(p)
 			}
 		}
@@ -1069,6 +1073,7 @@ func TestRunnerHopProbe(t *testing.T) {
 		}
 	})
 	t.Run("seclogon-disabled", func(t *testing.T) {
+		// seclogon does not stop while a process it started runs: any left		// from the hops is ended first (and named).		endProcessesUnder(t, dir)
 		users := map[string]probeUser{"b": newShapedUser(t, dir, dSID, bGrants, bDenies, false)}
 		c := c0
 		c.StartType = mgr.StartDisabled
@@ -1161,6 +1166,9 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		}
 		if p.Record.Token.Batch != "absent" {
 			t.Errorf("%s: BATCH %s", where, p.Record.Token.Batch)
+		}
+		if noJob {
+			t.Logf("%s: %s", where, h.Kill)
 		}
 		if !noJob && !slicesContain(h.JobPIDs, l.WaitingPID) {
 			t.Errorf("%s: the waiting program %d not in the job %v", where, l.WaitingPID, h.JobPIDs)
