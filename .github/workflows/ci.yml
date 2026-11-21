@@ -50,6 +50,26 @@ jobs:
         env:
           VETTID_AGENT_TEST_OTHER_USER: "1"
         run: go test -count=1 -v -run "TestDPAPI|TestChooseProtectorWindows|TestClassifyDPAPI" ./internal/protect
+      # The local channel's tests with other accounts (AGENT-PLAN A3.10a):
+      # another user, an administrator who is not the member, a squatter,
+      # the configuration file read as the member, an elevated pair end to
+      # end through the real configuration file. They make throwaway
+      # local users, only in this step, which fails unless each passed.
+      - name: channel tests, verbose, with test users
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          VETTID_AGENT_TEST_OTHER_USER: "1"
+        run: |
+          set -o pipefail
+          go test -count=1 -v ./internal/channel | tee "$RUNNER_TEMP/channel.txt"
+          go test -count=1 -v -run "TestElevated|TestStubOverPipe" ./cmd/vettid-agent | tee -a "$RUNNER_TEMP/channel.txt"
+          for t in TestOtherUserRefused TestAdminWhoIsNotTheMember TestSquatterRefused TestReadPipeAdminOnly \
+                   TestAppContainerRefused TestPipeRemoteRefused TestPipeRejectRemoteFlag TestPipeAnonymousRefused \
+                   TestTokenIdentityElevation TestPipeFailedInstanceKeepsName TestPipeBusy \
+                   TestElevatedPairEndToEnd TestStubOverPipe; do
+            grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel.txt" || { echo "::error::$t did not pass"; exit 1; }
+          done
       # The runner's user is an administrator, for whom every folder can be
       # changed, so internal/run's on-disk access checks skip in "go test"
       # above. Here the package's tests run again as a new standard user,

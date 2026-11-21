@@ -79,6 +79,11 @@ type Options struct {
 	BeforeCall func()
 	// Version is the connector's version for serverInfo.
 	Version string
+	// Unavailable, if set, answers every tool call with this error, and
+	// nothing else is used (the stub without its service, AGENT-PLAN §6
+	// A3.10a: service_not_running, versions_differ). Requests, Info and
+	// Held may then be nil.
+	Unavailable *request.Error
 	// Log is for diagnostics; nil discards.
 	Log *slog.Logger
 	// Now, Rate, Burst and MaxLine default to time.Now, DefaultRate,
@@ -426,6 +431,14 @@ func (s *Server) call(ctx context.Context, id, params json.RawMessage) {
 	s.mu.Unlock()
 	if dup {
 		s.writeError(id, codeInvalidRequest, "a request with this id is in progress")
+		return
+	}
+	// Without the service, every tool gets the same answer, from the read
+	// loop (nothing runs).
+	if s.o.Unavailable != nil {
+		out := errorOut(s.o.Unavailable, time.Time{})
+		s.log.Info("tool call", "tool", t.def.Name, "outcome", out.logCode)
+		s.writeToolResult(id, out)
 		return
 	}
 	// The rate limit and the bound on calls in flight are applied here,

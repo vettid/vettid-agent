@@ -1,0 +1,83 @@
+package mcp
+
+import (
+	"runtime"
+
+	"github.com/vettid/vettid-agent/internal/leash/request"
+)
+
+// The separate-account mode's codes and texts (AGENT-PLAN §2 AG14, §11,
+// 0.1.16; the codes service_not_running and versions_differ are the
+// lead's call within §6 A3.10a).
+const (
+	CodeServiceNotRunning       = "service_not_running"
+	CodeVersionsDiffer          = "versions_differ"
+	CodeSeparateAccountRequired = "separate_account_required"
+
+	// TextNoServiceWindows and TextNoServicePOSIX: the stub, any tool
+	// when the channel is missing ("No service").
+	TextNoServiceWindows = "The connector service is not running. Start it from Services, or ask your administrator to run `vettid-agent install --upgrade`."
+	TextNoServicePOSIX   = "The connector service is not running. Tell your administrator."
+	// TextVersionsDiffer: the stub, when the service is another version.
+	TextVersionsDiffer = "The connector service and this program are different versions. Ask your administrator to run `vettid-agent install --upgrade`."
+	// TextSeparateAccountRequired: a run or proxy tool of the connector
+	// that runs in the agent's account, where the mode exists;
+	// TextSeparateAccountNotHere where it does not yet. The run and
+	// proxy tools come with A3.8b and A3.9.
+	TextSeparateAccountRequired = "Running programs and opening proxies with a secret need the connector installed in its own account. Ask your administrator to run `vettid-agent install`, then try again."
+	TextSeparateAccountNotHere  = "Running programs and opening proxies with a secret are not available on this system yet."
+	// TextRunsOff: status of the connector that runs in the agent's
+	// account.
+	TextRunsOff = "Runs and proxies are off: the connector runs in this agent's account."
+)
+
+// The stub's refusals by account (chosen; not in the spec), under the
+// code not_allowed: the channel refused this account at open (another
+// user of the computer, or an administrator not running elevated), or
+// the service refused tools to an account that isn't the member.
+const (
+	CodeNotAllowed   = "not_allowed"
+	TextAccessDenied = "This account can't open this pairing's connector service: only the member it belongs to can, and an administrator running as administrator."
+	TextNotTheMember = "Only the member this pairing belongs to can use its tools; an administrator can only pair it, forget it or ask its status."
+)
+
+// The administrator member (AGENT-PLAN §11 "Administrator member", 0.1.17;
+// owner decision a, GC #15862): a member whose account holds
+// Administrators gets no tools from the service.
+const (
+	CodeMemberIsAdmin = "member_is_admin"
+	TextMemberIsAdmin = "Your account is an administrator on this computer, so the connector in its own account does not work for it: it cannot protect its keys from an administrator's programs. Use a standard account for the agent, or use the connector in your own account, as the README says (it can use secrets, but not run programs or open proxies)."
+)
+
+// MemberIsAdmin is the stub's answer to every tool when the service
+// refused tools to a member who is an administrator.
+func MemberIsAdmin() *request.Error {
+	return &request.Error{Code: CodeMemberIsAdmin, Text: TextMemberIsAdmin}
+}
+
+// AccessDenied is the stub's answer to every tool when the channel
+// refused this account at open.
+func AccessDenied() *request.Error {
+	return &request.Error{Code: CodeNotAllowed, Text: TextAccessDenied}
+}
+
+// NotTheMember is the stub's answer to every tool when the service
+// refused tools to this account.
+func NotTheMember() *request.Error {
+	return &request.Error{Code: CodeNotAllowed, Text: TextNotTheMember}
+}
+
+// NoService is the stub's answer to every tool when its channel is
+// missing, or isn't the service's.
+func NoService() *request.Error {
+	if runtime.GOOS == "windows" {
+		return &request.Error{Code: CodeServiceNotRunning, Text: TextNoServiceWindows}
+	}
+	return &request.Error{Code: CodeServiceNotRunning, Text: TextNoServicePOSIX}
+}
+
+// VersionsDiffer is the stub's answer to every tool when the service
+// runs another version.
+func VersionsDiffer() *request.Error {
+	return &request.Error{Code: CodeVersionsDiffer, Text: TextVersionsDiffer}
+}

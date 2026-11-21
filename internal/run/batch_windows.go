@@ -293,6 +293,10 @@ func checkBatch(path, dir string, args, env, trusted []string) error {
 				// (HOMEDRIVE=H:) has HOMEPATH=\, the drive's root. Allowed
 				// exactly so (owner decision a, GC #15742); any other
 				// value, and every other variable, keeps the rule.
+				// Accepted with it: a batch file that writes
+				// "%HOMEDRIVE%%HOMEPATH%" gives "H:\", which a program
+				// using the C runtime's argument rules reads as an
+				// escaped quote. npm's shims don't write it.
 				continue
 			}
 			err = batchPathVar(name, value, true, cp)

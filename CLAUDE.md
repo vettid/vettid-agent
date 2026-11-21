@@ -9,8 +9,12 @@ to an AI agent, pairs with the member's vault as a device of role
 `agent` (VAULT-MESSAGING §6.7), acts within access sessions and approvals
 (§6.8) under LEASH grants (§10.11), and serves the agent as an **MCP
 server over stdio only**: one process started by the MCP client, no
-daemon, no local socket or named pipe, no network listener, no service
-files.
+daemon, no network listener. The one exception is the separate-account
+mode (AGENT-PLAN AG14): the connector runs as a service per pairing in
+an account of its own, and `vettid-agent mcp --name <n>` is a stub
+that passes MCP messages to it over a checked local channel
+(`internal/channel`; a named pipe on Windows). No other socket, pipe or
+listener.
 
 It is being rebuilt from scratch. The plan, its decisions (§2) and its
 phases (§6) are in

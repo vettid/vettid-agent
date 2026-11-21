@@ -72,7 +72,7 @@ func TestPairCommand(t *testing.T) {
 			t.Fatal(err)
 		}
 		dir := filepath.Join(t.TempDir(), "state")
-		args := []string{"pair", "--state-dir", dir, "--name", "CI agent"}
+		args := []string{"pair", "--state-dir", dir, "--label", "CI agent"}
 		stdin := ""
 		if viaStdin {
 			stdin = "Pair with this: vettid://connect#" + code + "\n"
@@ -120,7 +120,7 @@ func TestPairUsage(t *testing.T) {
 		}
 	}
 	var errOut bytes.Buffer
-	if rc := run([]string{"pair", "--state-dir", filepath.Join(t.TempDir(), "s"), "--name", " bad"}, &bytes.Buffer{}, &errOut); rc != 1 {
+	if rc := run([]string{"pair", "--state-dir", filepath.Join(t.TempDir(), "s"), "--label", " bad"}, &bytes.Buffer{}, &errOut); rc != 1 {
 		t.Errorf("bad name: exit %d", rc)
 	}
 }

@@ -240,7 +240,7 @@ func TestBatchHomePathRoot(t *testing.T) {
 // last one it would end PATH in a backslash.
 func TestCheckNotRoot(t *testing.T) {
 	for _, root := range []string{`C:` + backslash, `D:` + backslash, backslash + backslash + "server" + backslash + "share" + backslash} {
-		if err := checkNotRoot(root); err == nil || !strings.Contains(err.Error(), "a drive's root can't be a run path; name a folder on it") {
+		if err := checkNotRoot(root); err == nil || !strings.Contains(err.Error(), "a drive's or share's root can't be a run path; name a folder on it") {
 			t.Errorf("%q: %v", root, err)
 		}
 	}

@@ -447,7 +447,7 @@ func CheckRunPaths(paths []string) ([]string, error) {
 // cause. A POSIX root ends no PATH in a backslash and stays allowed.
 func checkNotRoot(dir string) error {
 	if runtime.GOOS == "windows" && filepath.Dir(dir) == dir {
-		return errors.New("a drive's root can't be a run path; name a folder on it")
+		return errors.New("a drive's or share's root can't be a run path; name a folder on it")
 	}
 	return nil
 }
