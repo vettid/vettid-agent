@@ -29,6 +29,7 @@ func parse(e *entry, body json.RawMessage) (*Result, error) {
 	var m struct {
 		Withheld json.RawMessage `json:"withheld"`
 	}
+	defer clear(m.Withheld) // a copy of part of the body
 	if json.Unmarshal(body, &m) != nil {
 		return nil, errParse
 	}
