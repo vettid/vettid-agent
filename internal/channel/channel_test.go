@@ -67,6 +67,27 @@ func TestAdmit(t *testing.T) {
 	}
 }
 
+// The account names of A3.10a (8): the first 8 hexadecimal digits of the
+// SHA-256 of the pairing's name (printf work | sha256sum).
+func TestAccountNames(t *testing.T) {
+	if got := AccountHash("work"); got != "00e13ed7" {
+		t.Errorf("AccountHash(work) = %s", got)
+	}
+	if got := AccountHash("a"); got != "ca978112" {
+		t.Errorf("AccountHash(a) = %s", got)
+	}
+	for got, want := range map[string]string{
+		ConnectorUser("work"): "vettid-c-00e13ed7",
+		RunnerUser("work", 1): "vettid-r-00e13ed7-1",
+		RunnerUser("work", 2): "vettid-r-00e13ed7-2",
+		MemberGroup("work"):   "vettid-m-00e13ed7",
+	} {
+		if got != want {
+			t.Errorf("got %s, want %s", got, want)
+		}
+	}
+}
+
 func TestNames(t *testing.T) {
 	for _, n := range []string{"a", "work", "claude-1", "0", strings.Repeat("a", 32)} {
 		if !ValidName(n) {

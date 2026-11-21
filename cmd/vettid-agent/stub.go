@@ -34,8 +34,9 @@ var (
 		}
 		return f, nil
 	}
-	// stubService is the SID the channel's owner must have.
-	stubService = func(name string) string { return channel.ServiceSID(channel.ServiceName(name)) }
+	// stubService is the account the channel's owner must be: on Windows
+	// the service's SID, on Linux the connector's system user.
+	stubService = channel.ServiceAccount
 )
 
 // TextStubRunFlags answers a stub given --run-path or --run-env (AGENT-PLAN
