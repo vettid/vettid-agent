@@ -874,3 +874,88 @@ func TestClosedAfterAcceptClosesAtOnce(t *testing.T) {
 		t.Error("a connection accepted as the listener closed was kept waiting for its hello")
 	}
 }
+
+// Past twice maxConns a connection is dropped at once, without an answer.
+func TestHardDropPastTwiceMaxConns(t *testing.T) {
+	uid, _ := me(t)
+	path, s := serve(t, ListenConfig{MemberUID: uid, helloWait: 30 * time.Second})
+	var silent []*os.File
+	defer func() {
+		for _, f := range silent {
+			f.Close()
+		}
+	}()
+	for i := 0; i < 2*maxConns; i++ {
+		f, err := connectUnix(context.Background(), path, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		silent = append(silent, f)
+	}
+	f, err := connectUnix(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	_ = f.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var b [1]byte
+	if _, err := f.Read(b[:]); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatal("a connection past twice maxConns was kept")
+	}
+	if err := recv(t, s.refused); !errors.Is(err, ErrBusy) {
+		t.Errorf("OnRefused got %v, want ErrBusy", err)
+	}
+}
+
+// Close ends a hello in progress: the silent client is closed at once.
+func TestCloseEndsHelloInProgress(t *testing.T) {
+	uid, _ := me(t)
+	d := shortDir(t)
+	path := filepath.Join(d, "h.sock")
+	l, err := Listen(ListenConfig{Socket: path, MemberUID: uid, fd: listenAt(t, path), helloWait: 30 * time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = l.Accept(context.Background()) }()
+	f, err := connectUnix(context.Background(), path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	time.Sleep(200 * time.Millisecond) // its hello is being read
+	l.Close()
+	_ = f.SetReadDeadline(time.Now().Add(3 * time.Second))
+	var b [1]byte
+	if _, err := f.Read(b[:]); errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Error("Close left a hello in progress waiting")
+	}
+}
+
+// An activated socket must have been listened on by root.
+func TestActivatedSocketMadeByRoot(t *testing.T) {
+	me(t) // as a normal user, this process's own socket isn't root's
+	d := shortDir(t)
+	path := filepath.Join(d, "r.sock")
+	fd := listenAt(t, path)
+	defer unix.Close(fd)
+	if err := checkListening(fd, path, false); err != nil {
+		t.Fatalf("not activated: %v", err)
+	}
+	if err := checkListening(fd, path, true); !errors.Is(err, ErrNotActivated) {
+		t.Errorf("activated, listened on by uid %d: %v, want ErrNotActivated", os.Getuid(), err)
+	}
+}
+
+// Groups not on the list don't make the member an administrator.
+func TestOtherGroupsAdmitted(t *testing.T) {
+	uid, _ := me(t)
+	groups := func(uint32, uint32) ([]string, error) { return []string{"users", "staff", "dialout", "video"}, nil }
+	path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups,
+		peerNames: func([]uint32) ([]string, error) { return []string{"plugdev", "audio"}, nil }})
+	if err := dialAs(t, path, OpMCP); err != nil {
+		t.Fatalf("a member in groups not on the list: %v", err)
+	}
+	if id := recv(t, s.ids); !id.Member || id.HoldsAdmins {
+		t.Errorf("identity %+v", id)
+	}
+}

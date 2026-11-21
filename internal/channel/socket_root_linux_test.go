@@ -58,7 +58,40 @@ func TestRootHelperServer(t *testing.T) {
 		}
 		_ = c.Accept()
 		fmt.Fprintf(c, "member=%v admin=%v holds=%v\n", c.Identity.Member, c.Identity.ElevatedAdmin, c.Identity.HoldsAdmins)
-		c.Close()
+		// Kept open until the client leaves, so held clients count.
+		go func() { _, _ = io.Copy(io.Discard, c); c.Close() }()
+	}
+}
+
+// TestRootHelperFlood fills the channel as the member: maxConns clients
+// admitted and held, then maxConns silent ones. It prints "ready" and
+// waits until its standard input closes.
+func TestRootHelperFlood(t *testing.T) {
+	if os.Getenv(roleVar) != "flood" {
+		t.Skip("a helper process of TestRootChannel")
+	}
+	path, service := os.Getenv("VETTID_TEST_SOCKET"), os.Getenv("VETTID_TEST_SERVICE")
+	var held []*os.File
+	for i := 0; i < maxConns; i++ {
+		f, err := Dial(context.Background(), DialConfig{Pipe: path, Service: service, Op: OpStatus, Version: "test"})
+		if err != nil {
+			fmt.Println("dial:", err)
+			os.Exit(3)
+		}
+		held = append(held, f)
+	}
+	for i := 0; i < maxConns; i++ {
+		f, err := connectUnix(context.Background(), path, time.Second)
+		if err != nil {
+			fmt.Println("connect:", err)
+			os.Exit(3)
+		}
+		held = append(held, f)
+	}
+	fmt.Println("ready")
+	_, _ = io.Copy(io.Discard, os.Stdin)
+	for _, f := range held {
+		f.Close()
 	}
 }
 
@@ -106,7 +139,7 @@ func dialResult(path, service string, op Op) string {
 		}{
 			{ErrNoService, "no_service"}, {ErrNotService, "not_service"}, {ErrAccessDenied, "access_denied"},
 			{ErrNotAllowed, "not_allowed"}, {ErrMemberIsAdmin, "member_is_admin"}, {ErrVersionsDiffer, "versions_differ"},
-			{ErrBadHello, "bad_hello"},
+			{ErrBadHello, "bad_hello"}, {ErrBusy, "busy"},
 		} {
 			if errors.Is(err, e.err) {
 				return e.name
@@ -492,5 +525,54 @@ func TestRootClientRefusesImpostors(t *testing.T) {
 	}
 	if got := dialResult(moved, e.conn, OpStatus); got != "not_service" {
 		t.Errorf("a server of another uid: %q, want not_service", got)
+	}
+}
+
+// Root's elevated commands get through while the member holds every
+// place the channel has (maxConns admitted, maxConns more silent).
+func TestRootNotStarved(t *testing.T) {
+	e := setupRoot(t)
+	fl := e.as(e.member, "flood", "VETTID_TEST_SOCKET="+e.sock, "VETTID_TEST_SERVICE="+e.conn)
+	in, err := fl.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := fl.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fl.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { in.Close(); fl.Process.Kill(); fl.Wait() })
+	ready := make(chan string, 1)
+	go func() {
+		s := bufio.NewScanner(out)
+		for s.Scan() {
+			if l := s.Text(); l == "ready" || strings.HasPrefix(l, "dial:") || strings.HasPrefix(l, "connect:") {
+				ready <- l
+				return
+			}
+		}
+		ready <- "ended"
+	}()
+	select {
+	case l := <-ready:
+		if l != "ready" {
+			t.Fatalf("the member's flood: %s", l)
+		}
+	case <-time.After(60 * time.Second):
+		t.Fatal("the member's flood didn't start")
+	}
+	// One more member client is past twice maxConns: dropped unanswered.
+	if got := e.clientAs(e.member, OpStatus); got != "bad_hello" {
+		t.Errorf("one more member client behind the flood: %q, want bad_hello", got)
+	}
+	start := time.Now()
+	if got := dialResult(e.sock, e.conn, OpStatus); got != "ok member=false admin=true holds=false" {
+		t.Errorf("root's status behind the member's flood: %q", got)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Errorf("root waited %v behind the flood", time.Since(start))
 	}
 }

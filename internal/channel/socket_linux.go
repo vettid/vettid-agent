@@ -255,6 +255,8 @@ type ServerConn struct {
 	version  string
 	l        *Listener
 	once     sync.Once
+	// uncounted: root's, which doesn't count toward maxConns.
+	uncounted bool
 }
 
 // Accept answers the client's hello: the operation may start.
@@ -273,6 +275,9 @@ func (c *ServerConn) Refuse(err error) error {
 func (c *ServerConn) Close() error {
 	err := c.File.Close()
 	c.once.Do(func() {
+		if c.uncounted {
+			return
+		}
 		c.l.mu.Lock()
 		c.l.live--
 		c.l.mu.Unlock()
@@ -297,6 +302,14 @@ func (l *Listener) Accept(ctx context.Context) (*ServerConn, error) {
 	l.once.Do(func() { go l.loop() })
 	select {
 	case c := <-l.ready:
+		l.mu.Lock()
+		closed := l.closed
+		l.mu.Unlock()
+		if closed {
+			// Never hand out a client once Close has begun.
+			c.Close()
+			return nil, errClosed
+		}
 		return c, nil
 	case err := <-l.fatal:
 		l.fatal <- err // for the next call too
@@ -348,9 +361,14 @@ func (l *Listener) acceptFD() (int, error) {
 	nfd := -1
 	var aerr error
 	err = rc.Read(func(fd uintptr) bool {
-		nfd, _, aerr = unix.Accept4(int(fd), unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
-		// EAGAIN and EINTR: wait for the socket again, and retry.
-		return aerr != unix.EAGAIN && aerr != unix.EINTR
+		for {
+			nfd, _, aerr = unix.Accept4(int(fd), unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+			if aerr != unix.EINTR {
+				break
+			}
+		}
+		// EAGAIN: wait for the socket again.
+		return aerr != unix.EAGAIN
 	})
 	switch {
 	case err != nil:
@@ -395,34 +413,43 @@ func (l *Listener) admit(nfd int) {
 		gids, gerr = l.cfg.peerGroupsOf(nfd, l.cfg.peerInit)
 	}
 	f := os.NewFile(uintptr(nfd), l.cfg.Socket)
+	// The hello's limit is set before Close can see the connection, so
+	// Close's deadline is never overwritten.
+	_ = f.SetDeadline(time.Now().Add(l.cfg.helloWait))
+	// Root (an elevated command) never counts against maxConns and
+	// always gets its hello read, so the member's connections can't keep
+	// status, pair or forget out (chosen; not in the spec).
+	counted := cred.Uid != 0
 	l.mu.Lock()
 	if l.closed {
 		l.mu.Unlock()
 		f.Close()
 		return
 	}
-	l.live++
-	// Past twice maxConns a client is dropped without an answer, so the
-	// goroutines reading hellos stay bounded; past maxConns it is told
-	// the channel is busy once its hello is read.
-	if l.live > 2*maxConns {
-		l.live--
-		l.mu.Unlock()
-		f.Close()
-		l.refused("", ErrBusy)
-		return
+	busy := false
+	if counted {
+		l.live++
+		// Past twice maxConns a client is dropped without an answer, so
+		// the goroutines reading hellos stay bounded; past maxConns it is
+		// told the channel is busy once its hello is read.
+		if l.live > 2*maxConns {
+			l.live--
+			l.mu.Unlock()
+			f.Close()
+			l.refused("", ErrBusy)
+			return
+		}
+		busy = l.live > maxConns
 	}
-	busy := l.live > maxConns
 	l.inHello[f] = struct{}{}
 	l.mu.Unlock()
-	c := &ServerConn{File: f, version: l.cfg.Version, l: l}
+	c := &ServerConn{File: f, version: l.cfg.Version, l: l, uncounted: !counted}
 	go l.hello(c, busy, cred, gids, gerr)
 }
 
 // hello reads a client's hello, judges it, and hands an admitted client
 // to Accept.
 func (l *Listener) hello(c *ServerConn, busy bool, cred *unix.Ucred, gids []uint32, gerr error) {
-	_ = c.SetDeadline(time.Now().Add(l.cfg.helloWait))
 	op, err := readClientHello(c.File, l.cfg.Version)
 	l.mu.Lock()
 	delete(l.inHello, c.File)

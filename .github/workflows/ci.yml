@@ -81,7 +81,7 @@ jobs:
           # os/user reads /etc/passwd and /etc/group as it will there.
           CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/channel.test" ./internal/channel
           sudo VETTID_TEST_LINUX_ROOT=1 "$RUNNER_TEMP/channel.test" -test.run '^TestRoot' -test.count=1 -test.v -test.timeout=300s | tee "$RUNNER_TEMP/channel-root.txt"
-          for t in TestRootChannel TestRootMemberIsAdmin TestRootHeldAdminGroup TestRootClientRefusesImpostors; do
+          for t in TestRootChannel TestRootMemberIsAdmin TestRootHeldAdminGroup TestRootClientRefusesImpostors TestRootNotStarved; do
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel-root.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # AGENT-PLAN A3.10b's first check, measured: what a virtual service
