@@ -26,7 +26,7 @@ var commands = []command{
 	{name: "pair", summary: "pair with your vault", run: runPair},
 	{name: "mcp", summary: "run as the MCP server of an MCP client, over standard input and output", run: runMCP},
 	{name: "status", summary: "show the saved pairing and access state", run: runStatus},
-	{name: "forget", summary: "delete this connector's keys and state (not yet available)"},
+	{name: "forget", summary: "delete this connector's keys and state (not yet available; with --name, a connector service's)", run: runForget},
 	{name: "version", summary: "print the version, commit and Go version", run: runVersion},
 }
 

@@ -25,6 +25,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 	"unicode/utf16"
 )
 
@@ -276,4 +277,20 @@ func validPipe(n, pipe string) bool {
 	p := `vettid-agent-` + regexp.QuoteMeta(n) + `-[0-9a-f]{32}`
 	ok, _ := regexp.MatchString(`^`+p+`$`, pipe)
 	return ValidName(n) && ok
+}
+
+// DialConfig configures Dial.
+type DialConfig struct {
+	// Pipe is the pipe's name, without \\.\pipe\.
+	Pipe string
+	// Service is the SID the pipe's owner must have: the connector
+	// service's (ServiceSID).
+	Service string
+	Op      Op
+	Version string
+	// Wait bounds the wait for a free instance (default 5 s).
+	Wait time.Duration
+
+	anonymous bool   // tests only: allow the server only anonymous
+	server    string // tests only: open the pipe through this computer's name, as a remote client
 }

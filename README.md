@@ -25,7 +25,10 @@ The rebuild follows the agent connector plan,
 [AGENT-PLAN](https://github.com/vettid/vettid.org/blob/master/docs/AGENT-PLAN.md),
 in small phases. Today the binary has `pair`, `version`, `status` and
 `mcp` (the MCP server with the five LEASH tools); `forget` is listed as
-not yet available.
+not yet available. Running programs and opening proxies with a secret
+are not available yet: they will need the connector installed as a
+service in an account of its own (below, "The connector in its own
+account").
 
 **It needs a staging vault.** Only vaults whose release channel lists the
 optional `leash` feature answer agent pairing. Staging images list it;
@@ -107,7 +110,7 @@ and so its own pairing, which your phone lists and removes separately.
 
 The connector shows a six-digit code: approve on your phone only if the
 phone shows the same one. It then waits up to 10 minutes for your
-decision. `--name` sets the name your phone shows (default "Agent on
+decision. `--label` sets the name your phone shows (default "Agent on
 <host name>"). Everything is written to standard error; the pairing code
 is never written anywhere, and the six-digit code only to your terminal.
 
@@ -171,6 +174,35 @@ the protectors of this version keep no key outside it). If the relay
 refuses the agent, it collects what is still waiting for up to a minute
 in case that notice is among it, then exits saying so and keeps its
 keys; `vettid-agent forget` (to come) deletes them.
+
+### The connector in its own account
+
+Programs run with a secret, and proxies, will work only when the
+connector runs as a service in an account of its own, so that the agent
+cannot read the connector's keys, a run's secret or a proxy's value. The
+service, its installer and its runs are being built; nothing installs it
+yet. Its parts in this version:
+
+- `vettid-agent mcp --name NAME` is what the MCP client starts in that
+  mode. It holds no keys, no state and no values: it passes the MCP
+  client's messages, unchanged, to the service of the pairing NAME and
+  its answers back, and exits when the client closes its standard
+  input. It takes only `--name` and `--verbose` (`--run-path` and
+  `--run-env` are the service's, set by an administrator). On Windows it
+  reaches the service through a named pipe only the member, the service
+  and an elevated administrator can open, and it checks that the pipe
+  belongs to the service before it sends anything. Without the service
+  it still answers the MCP client, with every tool saying that the
+  connector service is not running (`service_not_running`), or that the
+  service is another version (`versions_differ`).
+- `vettid-agent pair --name NAME`, `status --name NAME` and
+  `forget --name NAME` send their request to that service and show its
+  answer. `pair` and `forget` need an administrator; `status` does not.
+  An administrator who is not the member can use `pair`, `forget` and
+  `status`, never the tools.
+
+On Linux and macOS this mode is not built yet: `--name` finds no
+service.
 
 ## Configuring an MCP client
 
@@ -295,7 +327,8 @@ known, checks the same way before asking for access for the first time.
 
 `vettid-agent status --state-dir DIR` shows what is saved: whether the
 connector is paired (its name, device and vault ids), the access session
-and the grants as last saved, and how the keys are protected. It does not contact the
+and the grants as last saved, how the keys are protected, and that runs
+and proxies are off (the connector runs in the agent's account). It does not contact the
 vault or the relay and does not take the state directory's lock, so it
 can run next to `vettid-agent mcp` and then shows that process's last
 saved state. It shows no keys or tokens.

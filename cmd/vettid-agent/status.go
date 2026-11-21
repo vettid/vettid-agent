@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/vettid/vettid-agent/internal/access"
+	"github.com/vettid/vettid-agent/internal/channel"
+	"github.com/vettid/vettid-agent/internal/mcp"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/protect"
 	"github.com/vettid/vettid-agent/internal/state"
@@ -22,11 +24,15 @@ var statusResolve state.Resolver
 var statusDPAPINotices = protect.DPAPINotices
 
 const statusUsage = `Usage: vettid-agent status --state-dir DIR [--passphrase-fd N | --passphrase-file PATH]
+       vettid-agent status --name NAME
 
 Shows the pairing, access and grants saved in DIR. It does not contact your
 vault or its relay, and does not take the state directory's lock, so it
 can run while ` + "`vettid-agent mcp`" + ` runs for DIR; it then shows that
 process's last saved state.
+
+With --name, it asks the connector service of that pairing, which runs in
+an account of its own, and shows its answer.
 
 Flags:
 `
@@ -34,7 +40,8 @@ Flags:
 func runStatus(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("status", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	dir := fs.String("state-dir", "", "the state `DIR`ectory (required)")
+	name := fs.String("name", "", "the `NAME` of a pairing whose connector runs as a service (instead of --state-dir)")
+	dir := fs.String("state-dir", "", "the state `DIR`ectory (required without --name)")
 	prot := &pairing.Protectors{}
 	prot.Source.AddFlags(fs)
 	fs.Usage = func() {
@@ -46,6 +53,12 @@ func runStatus(args []string, stdout, stderr io.Writer) int {
 			return 0
 		}
 		return 2
+	}
+	if *name != "" {
+		if code := onlyName(fs, "status", *name, stderr, 0); code != 0 {
+			return code
+		}
+		return runChannelCommand("status", *name, channel.OpStatus, noRequest, stdout, stderr)
 	}
 	if *dir == "" || fs.NArg() != 0 {
 		fs.Usage()
@@ -120,6 +133,9 @@ func writeStatus(w io.Writer, dir string, v *state.View, rec *pairing.Record, no
 			}
 		}
 	}
+	// Runs and proxies need the separate-account mode (AGENT-PLAN §2
+	// AG14, §11).
+	fmt.Fprintln(w, mcp.TextRunsOff)
 	fmt.Fprintln(w, "Read without taking the state directory's lock: if `vettid-agent mcp` runs for it, this is its last saved state.")
 }
 

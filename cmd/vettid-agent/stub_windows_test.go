@@ -1,0 +1,84 @@
+//go:build windows
+
+package main
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"io"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/windows"
+
+	"github.com/vettid/vettid-agent/internal/channel"
+)
+
+// The stub against a real channel (a pipe this test's user owns, standing
+// in for the service's): it is admitted as the member, for MCP, and the
+// messages pass unchanged both ways.
+func TestStubOverPipe(t *testing.T) {
+	u, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		t.Fatal(err)
+	}
+	me := u.User.Sid.String()
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	pipe := "vettid-agent-work-" + hex.EncodeToString(b)
+	l, err := channel.Listen(channel.ListenConfig{Pipe: pipe, Owner: me, Member: me, Version: readVersion().Version})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	oldRead, oldService, oldIn := stubReadPipe, stubService, mcpIn
+	stubReadPipe = func(string) (string, error) { return pipe, nil }
+	stubService = func(string) string { return me }
+	t.Cleanup(func() { stubReadPipe, stubService, mcpIn = oldRead, oldService, oldIn })
+
+	inR, inW := io.Pipe()
+	mcpIn = inR
+	var out, errOut syncBuffer
+	done := make(chan int, 1)
+	go func() { done <- run([]string{"mcp", "--name", "work"}, &out, &errOut) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := l.Accept(ctx)
+	if err != nil {
+		t.Fatalf("Accept: %v (stub: %s)", err, errOut.String())
+	}
+	defer c.Close()
+	if c.Op != channel.OpMCP || !c.Identity.Member {
+		t.Fatalf("server saw %q %+v", c.Op, c.Identity)
+	}
+	if err := c.Accept(); err != nil {
+		t.Fatal(err)
+	}
+	req := `{"jsonrpc":"2.0","id":1,"method":"tools/list"}` + "\n"
+	go func() { _, _ = io.WriteString(inW, req) }()
+	got, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil || got != req {
+		t.Fatalf("service read %q, %v", got, err)
+	}
+	ans := `{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}` + "\n"
+	if _, err := io.WriteString(c, ans); err != nil {
+		t.Fatal(err)
+	}
+	for end := time.Now().Add(5 * time.Second); out.String() != ans; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("stdout %q", out.String())
+		}
+	}
+	inW.Close()
+	select {
+	case rc := <-done:
+		if rc != 0 || out.String() != ans {
+			t.Fatalf("exit %d, stdout %q, stderr %q", rc, out.String(), errOut.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stub did not exit when the client closed standard input")
+	}
+}

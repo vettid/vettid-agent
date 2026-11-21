@@ -418,22 +418,6 @@ func integrity(tok windows.Token) (uint32, error) {
 	return sid.SubAuthority(uint32(c - 1)), nil
 }
 
-// DialConfig configures Dial.
-type DialConfig struct {
-	// Pipe is the pipe's name, without \\.\pipe\.
-	Pipe string
-	// Service is the SID the pipe's owner must have: the connector
-	// service's (ServiceSID).
-	Service string
-	Op      Op
-	Version string
-	// Wait bounds the wait for a free instance (default 5 s).
-	Wait time.Duration
-
-	anonymous bool   // tests only: allow the server only anonymous
-	server    string // tests only: open the pipe through this computer's name, as a remote client
-}
-
 // Dial opens the channel as a client: at identification level, so a
 // server that is not the service can't act as this user; then it checks
 // that the pipe's owner is the service, through the open handle, before

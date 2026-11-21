@@ -42,6 +42,7 @@ var (
 )
 
 const mcpUsage = `Usage: vettid-agent mcp --state-dir DIR [--passphrase-fd N | --passphrase-file PATH]
+       vettid-agent mcp --name NAME
 
 Runs the connector as an MCP server for the MCP client that starts it,
 over standard input and output, with the pairing in DIR. It offers the
@@ -50,13 +51,19 @@ leash.execute_action, leash.check_status, leash.connection_info) and
 stays connected to your vault until the client closes standard input.
 Standard output carries only MCP messages; notices go to standard error.
 
+With --name, the connector runs as a service in an account of its own,
+installed by an administrator, and this command only passes the MCP
+client's messages to that service and its answers back. It holds no
+keys and no state.
+
 Flags:
 `
 
 func runMCP(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	dir := fs.String("state-dir", "", "the state `DIR`ectory of this MCP client's pairing (required)")
+	name := fs.String("name", "", "the `NAME` of a pairing whose connector runs as a service in its own account (instead of --state-dir)")
+	dir := fs.String("state-dir", "", "the state `DIR`ectory of this MCP client's pairing (required without --name)")
 	accessMinutes := fs.Int("access-minutes", 60, "how long an access session to ask your phone for, in `minutes` (1 to 1440)")
 	verbose := fs.Bool("verbose", false, "log each message type and id to standard error")
 	prot := &pairing.Protectors{NoPrompt: true}
@@ -65,11 +72,22 @@ func runMCP(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, mcpUsage)
 		fs.PrintDefaults()
 	}
+	if nameGiven(args) && runFlagGiven(args) {
+		fmt.Fprintf(stderr, "vettid-agent mcp: %s\n", TextStubRunFlags)
+		return 2
+	}
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return 0
 		}
 		return 2
+	}
+	if *name != "" {
+		// The stub: the pairing's name and --verbose only.
+		if code := onlyName(fs, "mcp", *name, stderr, 0, "verbose"); code != 0 {
+			return code
+		}
+		return runStub(*name, *verbose, stdout, stderr)
 	}
 	if *dir == "" || fs.NArg() != 0 || *accessMinutes < 1 || *accessMinutes > 1440 {
 		fs.Usage()
