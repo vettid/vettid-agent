@@ -131,6 +131,8 @@ type startResult struct {
 	ChildUser string `json:"child_user"` // the SID the child wrote, or why not
 	Exit      string `json:"exit"`
 	JobKill   string `json:"job_kill"` // "ok": closing the job ended a waiting child
+	// Errno is the Windows error of a refused start (0 if it started).
+	Errno uint32 `json:"errno,omitempty"`
 }
 
 // probeResult is what the service records.
@@ -235,7 +237,7 @@ func startAsUser(exe string, u probeUser) startResult {
 	pw, _ := windows.UTF16PtrFromString(u.Password)
 	if r, _, e := procLogonUserW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
 		4 /* LOGON32_LOGON_BATCH */, 0, uintptr(unsafe.Pointer(&tok))); r == 0 {
-		return startResult{Start: "batch logon: " + e.Error()}
+		return startResult{Start: "batch logon: " + e.Error(), Errno: errnoOf(e)}
 	}
 	defer tok.Close()
 	return runChildren(exe, u, func(args string) (windows.ProcessInformation, error) {
@@ -274,9 +276,14 @@ func startWithLogon(exe string, u probeUser, logonFlags uintptr) startResult {
 func runChildren(exe string, u probeUser, start starter) startResult {
 	var res startResult
 	out := filepath.Join(u.OutDir, "user.txt")
+	// Nothing from an earlier start counts.
+	if err := os.Remove(out); err != nil && !errors.Is(err, os.ErrNotExist) {
+		res.Start = "removing an earlier record: " + err.Error()
+		return res
+	}
 	pi, err := start(`-test.run=^TestProbeChildHelper$ -probe-child-out="` + out + `"`)
 	if err != nil {
-		res.Start = err.Error()
+		res.Start, res.Errno = err.Error(), errnoOf(err)
 		return res
 	}
 	res.Start = "ok"
@@ -320,6 +327,12 @@ func runChildren(exe string, u probeUser, start starter) startResult {
 	}
 	_, _ = windows.ResumeThread(pi.Thread)
 	time.Sleep(500 * time.Millisecond)
+	// It must still be running, or its end would prove nothing.
+	if ev, _ := windows.WaitForSingleObject(pi.Process, 0); ev != uint32(windows.WAIT_TIMEOUT) {
+		res.JobKill = "the waiting child had already ended"
+		waitExit(pi, time.Second)
+		return res
+	}
 	windows.CloseHandle(job)
 	if ev, err := windows.WaitForSingleObject(pi.Process, 10000); err != nil || ev != windows.WAIT_OBJECT_0 {
 		res.JobKill = "still running 10 s after its job was closed"
@@ -568,34 +581,36 @@ type probeVariant struct {
 }
 
 var probeVariants = []probeVariant{
-	{name: "default", expect: func(t *testing.T, r probeResult, _ map[string]probeUser) {
-		if r.ImpersonateAbsent {
-			t.Error("default: SeImpersonatePrivilege absent; expected present")
+	// By default a virtual account holds SeImpersonatePrivilege and can't
+	// use CreateProcessAsUser.
+	{name: "default", expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
+		if r.ImpersonateAbsent || !r.TcbAbsent {
+			t.Errorf("default: privileges %v; expected SeImpersonatePrivilege and no SeTcbPrivilege", r.Privileges)
 		}
-		for _, k := range []string{"asuser/plain", "asuser/denied"} {
-			if r.Starts[k].Start == "ok" {
-				t.Errorf("default: %s started; expected refused", k)
-			}
+		for _, who := range probeUserKinds {
+			checkRefused(t, "default", "asuser/"+who, r.Starts["asuser/"+who], errPrivilegeNotHeld)
 		}
+		checkWithLogon(t, "default", r, users)
 		if r.DPAPI != "ok" {
 			t.Errorf("default: DPAPI: %s", r.DPAPI)
 		}
 	}},
+	// Cut to three privileges the account doesn't hold: it doesn't start.
 	{name: "cut3", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
 		startErr: errServicePrivilege},
+	// The cut with both granted: exactly those privileges, and
+	// CreateProcessAsUser works for every runner.
 	{name: "cut3+grant2", required: []string{"SeChangeNotifyPrivilege", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
 		grant: []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"},
 		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
 			want := []string{"SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege", "SeChangeNotifyPrivilege+"}
-			if !sameSet(r.Privileges, want) {
-				t.Errorf("cut3+grant2: privileges %v, want %v (as the service starts, before the probe enables them)", r.Privileges, want)
+			if !sameSet(r.Privileges, want) || !r.ImpersonateAbsent || !r.TcbAbsent {
+				t.Errorf("cut3+grant2: privileges %v, want %v (as the service starts)", r.Privileges, want)
 			}
-			if !r.ImpersonateAbsent || !r.TcbAbsent {
-				t.Error("cut3+grant2: SeImpersonatePrivilege or SeTcbPrivilege held")
-			}
-			for _, who := range []string{"plain", "denied"} {
+			for _, who := range probeUserKinds {
 				checkStart(t, "cut3+grant2", "asuser/"+who, r.Starts["asuser/"+who], users[who])
 			}
+			checkWithLogon(t, "cut3+grant2", r, users)
 			if r.DPAPI != "ok" {
 				t.Errorf("cut3+grant2: DPAPI: %s", r.DPAPI)
 			}
@@ -608,36 +623,36 @@ var probeVariants = []probeVariant{
 			if !sameSet(r.Privileges, []string{"SeAssignPrimaryTokenPrivilege", "SeChangeNotifyPrivilege+"}) || !r.ImpersonateAbsent || !r.TcbAbsent {
 				t.Errorf("cut2+grant1: privileges %v", r.Privileges)
 			}
-			for _, who := range []string{"plain", "denied"} {
+			for _, who := range probeUserKinds {
 				checkStart(t, "cut2+grant1", "asuser/"+who, r.Starts["asuser/"+who], users[who])
 			}
+			checkWithLogon(t, "cut2+grant1", r, users)
 		}},
 	// With no special privilege, CreateProcessAsUser is refused, and
-	// CreateProcessWithLogonW (an interactive logon) works only for a user
-	// who may log on interactively: not for a runner denied it.
+	// CreateProcessWithLogonW (an interactive logon) works only for a
+	// runner allowed local interactive logon.
 	{name: "cut1", required: []string{"SeChangeNotifyPrivilege"},
 		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
 			if !sameSet(r.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
 				t.Errorf("cut1: privileges %v", r.Privileges)
 			}
-			for _, who := range []string{"plain", "denied"} {
-				if r.Starts["asuser/"+who].Start == "ok" {
-					t.Errorf("cut1: asuser/%s started", who)
-				}
+			for _, who := range probeUserKinds {
+				checkRefused(t, "cut1", "asuser/"+who, r.Starts["asuser/"+who], errPrivilegeNotHeld)
 			}
-			for _, way := range []string{"withlogon", "withlogon-profile"} {
-				checkStart(t, "cut1", way+"/plain", r.Starts[way+"/plain"], users["plain"])
-				if s := r.Starts[way+"/denied"]; !strings.Contains(s.Start, "logon type") {
-					t.Errorf("cut1: %s/denied: %+v, want refused for the logon type", way, s)
-				}
-			}
+			checkWithLogon(t, "cut1", r, users)
 		}},
-	// The same, with the secondary logon service stopped first: whether
-	// CreateProcessWithLogonW still works, and whether the service can
-	// start seclogon itself with no rights granted on the SCM. Measured,
-	// then pinned. (The rdpdenied user in every variant measures a runner
-	// denied only remote interactive logon.)
-	{name: "cut1-seclogon-stopped", required: []string{"SeChangeNotifyPrivilege"}, stopSeclogon: true},
+	// The same, with the secondary logon service stopped (start type
+	// Manual) first: CreateProcessWithLogonW starts it on demand, so it
+	// works with no rights granted to the service on the SCM (by the time
+	// the service tries StartService itself, seclogon is running).
+	{name: "cut1-seclogon-stopped", required: []string{"SeChangeNotifyPrivilege"}, stopSeclogon: true,
+		expect: func(t *testing.T, r probeResult, users map[string]probeUser) {
+			if r.SeclogonBefore == nil {
+				t.Fatal("cut1-seclogon-stopped: no start before seclogon was started")
+			}
+			checkStart(t, "cut1-seclogon-stopped", "withlogon with seclogon stopped/plain", *r.SeclogonBefore, users["plain"])
+			checkWithLogon(t, "cut1-seclogon-stopped", r, users)
+		}},
 }
 
 func checkStart(t *testing.T, variant, key string, s startResult, u probeUser) {
@@ -668,13 +683,46 @@ func TestServiceAccountProbe(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer m.Disconnect()
-	if s, err := m.OpenService("seclogon"); err == nil {
-		if c, err := s.Config(); err == nil && c.StartType == mgr.StartDisabled {
-			c.StartType = mgr.StartManual
-			_ = s.UpdateConfig(c)
+	// Its start type and state are put back afterwards; it is set to start
+	// on demand (Manual), as Windows ships it, and started.
+	sl, err := m.OpenService("seclogon")
+	if err != nil {
+		t.Fatalf("seclogon: %v", err)
+	}
+	defer sl.Close()
+	c0, err := sl.Config()
+	if err != nil {
+		t.Fatalf("seclogon's configuration: %v", err)
+	}
+	st0, err := sl.Query()
+	if err != nil {
+		t.Fatalf("seclogon's state: %v", err)
+	}
+	t.Logf("seclogon before the probe: start type %d, state %d", c0.StartType, st0.State)
+	defer func() {
+		c, err := sl.Config()
+		if err == nil && c.StartType != c0.StartType {
+			c.StartType = c0.StartType
+			err = sl.UpdateConfig(c)
 		}
-		_ = s.Start()
-		s.Close()
+		if err != nil {
+			t.Errorf("restoring seclogon's start type: %v", err)
+		}
+		if st0.State == svc.Stopped {
+			if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) {
+				t.Errorf("stopping seclogon again: %v", err)
+			}
+		}
+	}()
+	if c0.StartType != mgr.StartManual {
+		c := c0
+		c.StartType = mgr.StartManual
+		if err := sl.UpdateConfig(c); err != nil {
+			t.Fatalf("seclogon to Manual: %v", err)
+		}
+	}
+	if err := sl.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+		t.Fatalf("starting seclogon: %v", err)
 	}
 	for _, v := range probeVariants {
 		t.Run(v.name, func(t *testing.T) { probeOnce(t, m, v) })
@@ -822,7 +870,10 @@ func removeService(t *testing.T, m *mgr.Mgr, s *mgr.Service, name, sid string) {
 	for end := time.Now().Add(30 * time.Second); ; time.Sleep(200 * time.Millisecond) {
 		s2, err := m.OpenService(name)
 		if err != nil {
-			break // gone
+			if !errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST) {
+				t.Errorf("opening %s after its deletion: %v", name, err)
+			}
+			break
 		}
 		s2.Close()
 		if time.Now().After(end) {
@@ -857,8 +908,8 @@ var probeUserKinds = []string{"plain", "denied", "rdpdenied"}
 
 var probeUserDenials = map[string][]string{
 	"plain":     nil,
-	"denied":    {"SeDenyInteractiveLogonRight", "SeDenyRemoteInteractiveLogonRight"},
-	"rdpdenied": {"SeDenyRemoteInteractiveLogonRight"},
+	"denied":    {"SeDenyInteractiveLogonRight", "SeDenyRemoteInteractiveLogonRight", "SeDenyNetworkLogonRight"},
+	"rdpdenied": {"SeDenyRemoteInteractiveLogonRight", "SeDenyNetworkLogonRight"},
 }
 
 // startSeclogon is the service trying to start the secondary logon
@@ -913,5 +964,40 @@ func stopSeclogon(t *testing.T, m *mgr.Mgr) {
 		if time.Now().After(end) {
 			t.Fatal("seclogon did not stop")
 		}
+	}
+}
+
+// errnoOf is err's Windows error number, or 0.
+func errnoOf(err error) uint32 {
+	var e syscall.Errno
+	if errors.As(err, &e) {
+		return uint32(e)
+	}
+	return 0
+}
+
+// Refusal reasons the probe expects.
+const (
+	errPrivilegeNotHeld = 1314 // ERROR_PRIVILEGE_NOT_HELD
+	errLogonType        = 1385 // ERROR_LOGON_TYPE_NOT_GRANTED
+)
+
+// checkRefused: a start refused for this reason.
+func checkRefused(t *testing.T, variant, key string, s startResult, errno uint32) {
+	t.Helper()
+	if s.Start == "ok" || s.Errno != errno {
+		t.Errorf("%s: %s: %+v, want refused with error %d", variant, key, s, errno)
+	}
+}
+
+// checkWithLogon: CreateProcessWithLogonW works, with and without the
+// profile, for a runner allowed local interactive logon (plain,
+// rdpdenied), and is refused for one denied it (denied).
+func checkWithLogon(t *testing.T, variant string, r probeResult, users map[string]probeUser) {
+	t.Helper()
+	for _, way := range []string{"withlogon", "withlogon-profile"} {
+		checkStart(t, variant, way+"/plain", r.Starts[way+"/plain"], users["plain"])
+		checkStart(t, variant, way+"/rdpdenied", r.Starts[way+"/rdpdenied"], users["rdpdenied"])
+		checkRefused(t, variant, way+"/denied", r.Starts[way+"/denied"], errLogonType)
 	}
 }
