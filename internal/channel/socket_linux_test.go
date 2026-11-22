@@ -200,7 +200,7 @@ func serve(t *testing.T, cfg ListenConfig) (path string, s served) {
 	cfg.fd = listenAt(t, path)
 	cfg.Socket = path
 	if cfg.peerNames == nil {
-		// This test user's real groups (which may hold sudo) don't decide
+		// This test user's real groups (which may hold docker or adm) don't decide
 		// here; TestRootMemberIsAdmin runs the real lookup.
 		cfg.peerNames = func([]uint32) ([]string, error) { return nil, nil }
 	}
@@ -280,7 +280,14 @@ func TestAcceptRefusesAnotherUser(t *testing.T) {
 
 func TestAcceptMemberIsAdmin(t *testing.T) {
 	uid, _ := me(t)
-	for _, g := range adminGroups {
+	// The refusing groups of AGENT-LINUX-RUNTIME §11.1, named here so that
+	// dropping one from adminGroups fails.
+	refusing := []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "snap_microk8s",
+		"mock", "empower", "disk", "kmem", "root", "shadow", "input", "uinput", "src"}
+	if got, want := slices.Sorted(slices.Values(adminGroups)), slices.Sorted(slices.Values(refusing)); !slices.Equal(got, want) {
+		t.Errorf("adminGroups %v, want %v", got, want)
+	}
+	for _, g := range refusing {
 		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
 		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
 		if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
@@ -294,7 +301,21 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 			t.Errorf("a member in %s: %+v", g, id)
 		}
 	}
-	// install's sudo rule, whatever the groups.
+	// sudo's usual groups, and the log readers, alone don't count.
+	for _, g := range []string{"sudo", "wheel", "admin", "adm", "systemd-journal", "video", "lpadmin", "staff", "tty"} {
+		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
+		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
+		if err := dialAs(t, path, OpMCP); err != nil {
+			t.Errorf("a member in %s: %v, want its tools", g, err)
+			recv(t, s.refused)
+			continue
+		}
+		if id := recv(t, s.ids); id.HoldsAdmins {
+			t.Errorf("a member in %s: %+v", g, id)
+		}
+	}
+	// Root code's finding (a sudo rule asking for no password), whatever
+	// the groups.
 	none := func(uint32, uint32) ([]string, error) { return nil, nil }
 	path, s := serve(t, ListenConfig{MemberUID: uid, MemberAdmin: true, groupsOf: none})
 	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
@@ -949,7 +970,7 @@ func TestActivatedSocketMadeByRoot(t *testing.T) {
 // Groups not on the list don't make the member an administrator.
 func TestOtherGroupsAdmitted(t *testing.T) {
 	uid, _ := me(t)
-	groups := func(uint32, uint32) ([]string, error) { return []string{"users", "staff", "dialout", "video"}, nil }
+	groups := func(uint32, uint32) ([]string, error) { return []string{"users", "cdrom", "dialout", "video"}, nil }
 	path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups,
 		peerNames: func([]uint32) ([]string, error) { return []string{"plugdev", "audio"}, nil }})
 	if err := dialAs(t, path, OpMCP); err != nil {
@@ -957,5 +978,64 @@ func TestOtherGroupsAdmitted(t *testing.T) {
 	}
 	if id := recv(t, s.ids); !id.Member || id.HoldsAdmins {
 		t.Errorf("identity %+v", id)
+	}
+}
+
+// A refusing group counts by its gid, through userGroups and groupNames
+// themselves: gid 0 named otherwise, and a second name for docker's gid.
+// It replaces the package's group lookups: never t.Parallel.
+func TestAdminGroupsCountByGid(t *testing.T) {
+	db := map[string]string{"0": "wheel", "100": "users", "998": "containers"}
+	byName := map[string]string{"docker": "998", "users": "100"}
+	oldU, oldID, oldName := lookupUserID, lookupGroupID, lookupGroupName
+	t.Cleanup(func() { lookupUserID, lookupGroupID, lookupGroupName = oldU, oldID, oldName })
+	lookupGroupID = func(id string) (*user.Group, error) {
+		if n, ok := db[id]; ok {
+			return &user.Group{Gid: id, Name: n}, nil
+		}
+		return nil, user.UnknownGroupIdError(id)
+	}
+	lookupGroupName = func(name string) (*user.Group, error) {
+		if id, ok := byName[name]; ok {
+			return &user.Group{Gid: id, Name: name}, nil
+		}
+		return nil, user.UnknownGroupError(name)
+	}
+	for _, c := range []struct {
+		gids []uint32
+		want string
+	}{{[]uint32{100, 0}, "root"}, {[]uint32{100, 998}, "docker"}} {
+		got, err := groupNames(c.gids)
+		if err != nil || !slices.Contains(got, c.want) {
+			t.Errorf("groupNames(%v): %v, %v; want %s among them", c.gids, got, err, c.want)
+		}
+	}
+	if got, err := groupNames([]uint32{100}); err != nil || slices.ContainsFunc(got, func(g string) bool { return slices.Contains(adminGroups, g) }) {
+		t.Errorf("groupNames(users): %v, %v", got, err)
+	}
+	oldIDs := groupIDsOf
+	t.Cleanup(func() { groupIDsOf = oldIDs })
+	lookupUserID = func(id string) (*user.User, error) { return &user.User{Uid: id, Username: "member"}, nil }
+	groupIDsOf = func(*user.User) ([]string, error) { return []string{"100"}, nil }
+	// The primary gid the client connected with: docker's, by another name;
+	// then gid 0, named wheel.
+	for _, c := range []struct {
+		gid  uint32
+		want string
+	}{{998, "docker"}, {0, "root"}} {
+		if got, err := userGroups(1000, c.gid); err != nil || !slices.Contains(got, c.want) {
+			t.Errorf("userGroups(gid %d): %v, %v; want %s among them", c.gid, got, err, c.want)
+		}
+	}
+	if got, err := userGroups(1000, 100); err != nil || slices.ContainsFunc(got, func(g string) bool { return slices.Contains(adminGroups, g) }) {
+		t.Errorf("userGroups(users): %v, %v", got, err)
+	}
+	// A lookup that fails for another reason than "not found" refuses.
+	lookupGroupName = func(string) (*user.Group, error) { return nil, errors.New("/etc/group unreadable") }
+	if _, err := groupNames([]uint32{100}); err == nil {
+		t.Error("groupNames with a failing lookup: no error")
+	}
+	if _, err := userGroups(1000, 100); err == nil {
+		t.Error("userGroups with a failing lookup: no error")
 	}
 }
