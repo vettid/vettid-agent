@@ -280,7 +280,14 @@ func TestAcceptRefusesAnotherUser(t *testing.T) {
 
 func TestAcceptMemberIsAdmin(t *testing.T) {
 	uid, _ := me(t)
-	for _, g := range adminGroups {
+	// The refusing groups of AGENT-LINUX-RUNTIME §11.1, named here so that
+	// dropping one from adminGroups fails.
+	refusing := []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "mock",
+		"disk", "kmem", "root", "shadow", "input", "staff"}
+	if len(refusing) != len(adminGroups) {
+		t.Errorf("adminGroups %v, want %v", adminGroups, refusing)
+	}
+	for _, g := range refusing {
 		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
 		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
 		if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {

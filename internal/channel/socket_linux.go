@@ -546,7 +546,15 @@ func userGroups(uid, gid uint32) ([]string, error) {
 		return nil, err
 	}
 	ids = append(ids, strconv.FormatUint(uint64(gid), 10))
-	return lookupGroups(ids)
+	names, err := lookupGroups(ids)
+	if err != nil {
+		return nil, err
+	}
+	// gid 0 counts whatever its name (AGENT-LINUX-RUNTIME §11.1).
+	if slices.Contains(ids, "0") {
+		names = append(names, "root")
+	}
+	return names, nil
 }
 
 // groupNames names the groups gids.
