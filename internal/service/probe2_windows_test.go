@@ -194,8 +194,9 @@ type programRecord struct {
 	TargetIdentity string `json:"target_identity,omitempty"`
 	// JobProcs: every other process in the program's own job, as the
 	// program can reach it.
-	JobProcs map[uint32]reachable `json:"job_procs,omitempty"`
-	SelfPID  uint32               `json:"self_pid,omitempty"`
+	JobProcs map[uint32]reachable  `json:"job_procs,omitempty"`
+	SelfPID  uint32                `json:"self_pid,omitempty"`
+	Extra    map[uint32]extraReach `json:"extra,omitempty"`
 }
 
 // childStart is one program the launcher started.
@@ -229,16 +230,17 @@ type launcherRecord struct {
 	WaitingStartedOK bool                  `json:"waiting_started"`
 	// Handoff: the program started suspended, for the service to check
 	// and resume once this launcher has exited.
-	HandoffPID      uint32 `json:"handoff_pid,omitempty"`
-	HandoffTID      uint32 `json:"handoff_tid,omitempty"`
-	HandoffImage    string `json:"handoff_image,omitempty"` // as the launcher read it
-	HandoffRecord   string `json:"handoff_record,omitempty"`
-	ThreadDACL      string `json:"handoff_thread_dacl,omitempty"`
-	ThreadID        uint32 `json:"launcher_thread_id,omitempty"`
-	TokenLock       string `json:"token_lock,omitempty"`        // handoff with -p2-lock-token
-	TokenSDDL       string `json:"token_sddl,omitempty"`        // its token's owner and DACL after the lock
-	TokenSDDLBefore string `json:"token_sddl_before,omitempty"` // and before it
-	ProcessLock     string `json:"process_lock,omitempty"`      // its process DACL, likewise
+	HandoffPID      uint32     `json:"handoff_pid,omitempty"`
+	HandoffTID      uint32     `json:"handoff_tid,omitempty"`
+	HandoffImage    string     `json:"handoff_image,omitempty"` // as the launcher read it
+	HandoffRecord   string     `json:"handoff_record,omitempty"`
+	ThreadDACL      string     `json:"handoff_thread_dacl,omitempty"`
+	ThreadID        uint32     `json:"launcher_thread_id,omitempty"`
+	Step3           *launcher3 `json:"step3,omitempty"`
+	TokenLock       string     `json:"token_lock,omitempty"`        // handoff with -p2-lock-token
+	TokenSDDL       string     `json:"token_sddl,omitempty"`        // its token's owner and DACL after the lock
+	TokenSDDLBefore string     `json:"token_sddl_before,omitempty"` // and before it
+	ProcessLock     string     `json:"process_lock,omitempty"`      // its process DACL, likewise
 }
 
 // TestProbe2ChildHelper runs a probe2 child's part; skipped otherwise.
@@ -251,6 +253,8 @@ func TestProbe2ChildHelper(t *testing.T) {
 	case "wait":
 		time.Sleep(5 * time.Minute)
 		os.Exit(9)
+	case "pipeclient":
+		os.Exit(runPipeClient())
 	default:
 		os.Exit(runProgram(*p2Mode))
 	}
@@ -394,11 +398,23 @@ func runProgram(mode string) int {
 				r.JobProcs[pid] = reach(pid, images[pid])
 			}
 		}
+		// Other processes by id (the launcher's conhost, step 3): whether
+		// the id still names them, and what the program reaches.
+		if ex := extraTargets(); len(ex) > 0 {
+			r.Extra = map[uint32]extraReach{}
+			for pid, created := range ex {
+				r.Extra[pid] = extraReach{Identity: targetIdentity(pid, 0, created), Reach: reach(pid, "")}
+			}
+		}
 	case "uilimits":
 		r.UI = uiCalls()
 	}
 	if writeJSON(*p2Out, r) != nil {
 		return 5
+	}
+	if *p2Say {
+		// Its line, to the standard output it was given (step 3).
+		fmt.Fprintln(os.Stdout, "program-says-hello")
 	}
 	return 0
 }
@@ -498,14 +514,73 @@ func runLauncher() int {
 			rec.TokenSDDL = ownTokenSDDL()
 			rec.ProcessLock = errString(limitOwnDACL())
 		}
+		// Step 3. The launcher's own conhost (it holds a copy of the
+		// launcher's token from before any lock): found, and locked or let
+		// go if asked. The restricted token made again after the lock. The
+		// standard output it was given, passed to the program.
+		l3 := &launcher3{Conhost: findConhost()}
+		rec.Step3 = l3
+		if *p2LockConhost && l3.Conhost.PID != 0 {
+			lockConhost(l3.Conhost)
+		}
+		if *p2FreeConsole {
+			if r, _, e := procFreeConsole.Call(); r == 0 {
+				l3.Conhost.FreeConsole = e.Error()
+			} else {
+				l3.Conhost.FreeConsole = "ok"
+			}
+			if l3.Conhost.PID != 0 {
+				l3.Conhost.Running = stillRunning(l3.Conhost.PID)
+			}
+		}
+		if *p2RestrictAft {
+			o := &restrictOrder{}
+			var t2 windows.Token
+			o.OpenAfterLock = errString(windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY, &t2))
+			if t2 != 0 {
+				t2.Close()
+			}
+			// From the handle opened before the lock.
+			r2, err := restrictToken(own, *p2Restrict)
+			o.RestrictAfterLock = errString(err)
+			if err == nil {
+				defer r2.Close()
+				if *p2SvcSID != "" {
+					_ = setDefaultDACL(r2, rec.Token.User, *p2SvcSID)
+				}
+				o.RestrictedFacts = readTokenFacts(r2)
+				restricted = r2
+			}
+			l3.Order = o
+		}
+		extra := ""
+		if l3.Conhost.PID != 0 && l3.Conhost.Created != 0 {
+			extra = fmt.Sprintf(" -p2-extra=%d:%d", l3.Conhost.PID, l3.Conhost.Created)
+		}
+		if *p2PassStd {
+			l3.Std = &stdFacts{}
+			if h := launcherStd(l3.Std); h != 0 {
+				childStdOut = h
+				extra += " -p2-say"
+			}
+		}
 		// The program, once resumed (after this launcher has exited), tries
 		// to open this launcher: process, thread and token.
 		childDetached = *p2Detach
 		var created, exitT, kernelT, userT windows.Filetime
 		_ = windows.GetProcessTimes(windows.CurrentProcess(), &created, &exitT, &kernelT, &userT)
 		out := filepath.Join(filepath.Dir(*p2Out), "child-handoff-"+randHex(4)+".json")
-		pi, err := startSuspended(restricted, *p2Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=openlauncher -p2-out="%s" -p2-target=%d -p2-thread=%d -p2-target-created=%d`,
-			out, windows.GetCurrentProcessId(), rec.ThreadID, uint64(created.HighDateTime)<<32|uint64(created.LowDateTime)), "")
+		pi, err := startSuspended(restricted, *p2Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=openlauncher -p2-out="%s" -p2-target=%d -p2-thread=%d -p2-target-created=%d%s`,
+			out, windows.GetCurrentProcessId(), rec.ThreadID, uint64(created.HighDateTime)<<32|uint64(created.LowDateTime), extra), "")
+		if l3.Std != nil {
+			l3.Std.PassedOn = errString(err)
+		}
+		if *p2Report != "" {
+			l3.Cwd, _ = os.Getwd()
+			_, rerr := os.ReadDir(l3.Cwd)
+			l3.CwdRead = errString(rerr)
+			l3.Report = sendReport(*p2Report, report{Cwd: l3.Cwd, CwdRead: l3.CwdRead, Lock: rec.TokenLock, PID: pi.ProcessId, TID: pi.ThreadId})
+		}
 		if err != nil {
 			rec.Restricted += "; handoff start: " + err.Error()
 		} else {
@@ -659,6 +734,10 @@ func startSuspended(tok windows.Token, exe, args, logPath string) (windows.Proce
 		childPipes = append(childPipes, r)
 		out = w
 	}
+	if childStdOut != 0 {
+		// The launcher's own standard output (the service's pipe), step 3.
+		out = childStdOut
+	}
 	al, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return pi, err
@@ -721,6 +800,7 @@ type probe2Config struct {
 	Users     map[string]probeUser `json:"users"` // hop: "b"; shapes: the shapes
 	Shapes    []string             `json:"shapes,omitempty"`
 	ToolsFile string               `json:"tools_file,omitempty"` // real tools for the launcher to start
+	ExeGUI    string               `json:"exe_gui,omitempty"`    // the GUI-subsystem copy of Exe (step 3)
 	// Required is the service's required privileges (nil: ChangeNotify only).
 	Required []string `json:"-"`
 }
@@ -741,6 +821,8 @@ type hopResult struct {
 	ServiceOpen      string            `json:"service_opens_program"`
 	ServiceName      string            `json:"service_reads_image_name"`
 	Kill             string            `json:"job_kill"`
+	Report           *reportPipe       `json:"report,omitempty"`
+	Output           *outputPipe       `json:"output,omitempty"`
 	Handoff          *handoffResult    `json:"handoff,omitempty"`
 	ServiceSeesAtomB string            `json:"service_sees_program_atom,omitempty"`
 }
@@ -750,15 +832,18 @@ type probe2Result struct {
 	WindowStation string `json:"window_station"`
 	// The fallback, when the service can make no window station: a
 	// desktop in the service's own, with the runner added to it.
-	ServiceWindowStation string                `json:"service_window_station,omitempty"`
-	WindowStationACE     string                `json:"window_station_ace,omitempty"`
-	NullDesktop          string                `json:"null_desktop,omitempty"`
-	WindowStationSDDL    string                `json:"window_station_and_desktop_sddl,omitempty"`
-	Desktop              string                `json:"desktop"`
-	DesktopName          string                `json:"desktop_name"`
-	Hops                 map[string]hopResult  `json:"hops"`   // "interactive", "interactive+local"
-	Shapes               map[string]string     `json:"shapes"` // shape: "ok" or "errno N: text"
-	RouteA               *routeAResult         `json:"route_a,omitempty"`
+	ServiceWindowStation string               `json:"service_window_station,omitempty"`
+	WindowStationACE     string               `json:"window_station_ace,omitempty"`
+	NullDesktop          string               `json:"null_desktop,omitempty"`
+	WindowStationSDDL    string               `json:"window_station_and_desktop_sddl,omitempty"`
+	Desktop              string               `json:"desktop"`
+	DesktopName          string               `json:"desktop_name"`
+	Hops                 map[string]hopResult `json:"hops"`   // "interactive", "interactive+local"
+	Shapes               map[string]string    `json:"shapes"` // shape: "ok" or "errno N: text"
+	RouteA               *routeAResult        `json:"route_a,omitempty"`
+	// Step 3: whether this service may read the runner's account rights.
+	RunnerRights         string                `json:"runner_rights_read,omitempty"`
+	RunnerRightsList     []string              `json:"runner_rights,omitempty"`
 	Masks                map[string]maskResult `json:"window_station_masks,omitempty"`
 	UnnamedWindowStation string                `json:"unnamed_window_station"`
 	UnnamedHop           *maskResult           `json:"unnamed_window_station_hop,omitempty"`
@@ -831,6 +916,9 @@ func runHops(c probe2Config) probe2Result {
 	// A window station with no name (Chromium's pattern): whether the
 	// service may make one where a named one is refused, and whether a
 	// run can use a desktop in it. A station of the run's own would keep
+	// Step 3: whether this service (ChangeNotify only) may read the
+	// runner's account rights, to re-check its denied logons.
+	res.RunnerRights, res.RunnerRightsList = accountRights(b.SID)
 	// runs off the connector's.
 	res.UnnamedWindowStation, res.UnnamedHop = tryUnnamedStation(c, b, sa)
 	deskName := "run-" + randHex(4)
@@ -935,6 +1023,18 @@ func runHops(c probe2Config) probe2Result {
 		{key: "handoff-locked", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true},
 		// With no console for the program (DETACHED_PROCESS, pipes for its
 		// output), and for the launcher too: no conhost to reach.
+		// Step 3, each on the design's shape (locked, the program with no
+		// console): the launcher's conhost reached by id; freed; locked;
+		// the launcher a GUI-subsystem copy (no console at all), with the
+		// output through seclogon and the report pipe; the output pipes
+		// inheritable or not; the restricted token made after the lock.
+		{key: "s3-conhost", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true},
+		{key: "s3-freeconsole", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, freeConsole: true},
+		{key: "s3-lockconhost", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, lockConhost: true},
+		{key: "s3-gui", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, gui: true, outPipe: "inheritable", passStd: true, report: true},
+		{key: "s3-pipes-inheritable", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, outPipe: "inheritable", passStd: true, report: true},
+		{key: "s3-pipes-not-inheritable", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, outPipe: "not-inheritable", passStd: true},
+		{key: "s3-restrict-after-lock", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, restrictAfterLock: true},
 		{key: "handoff-locked-detached-program", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true},
 		{key: "handoff-locked-detached", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, detachedLauncher: true},
 		// The service named in the program's token's default DACL: whether
@@ -1010,6 +1110,14 @@ type hopOpts struct {
 	lockToken              bool // handoff: the launcher locks its own token and process first
 	detachedProgram        bool // handoff: the program has no console
 	detachedLauncher       bool // the launcher has no console (DETACHED_PROCESS to seclogon)
+	// Step 3.
+	gui               bool   // the launcher is the GUI-subsystem copy
+	outPipe           string // "inheritable", "not-inheritable": the service's pipe as the launcher's output
+	passStd           bool   // the launcher gives the program its own output
+	report            bool   // the launcher reports on a per-run named pipe
+	freeConsole       bool   // the launcher frees its console before starting the program
+	lockConhost       bool   // the launcher locks its conhost's process and token
+	restrictAfterLock bool   // the launcher makes the restricted token after the lock
 }
 
 // objectSDDL is the window station's (and desktop's) access list in SDDL.
@@ -1092,13 +1200,49 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 	n, _ := windows.UTF16PtrFromString(u.Name)
 	dot, _ := windows.UTF16PtrFromString(".")
 	pw, _ := windows.UTF16PtrFromString(u.Password)
-	cl, _ := windows.UTF16FromString(`"` + c.Exe + `" ` + args)
+	// Step 3: the launcher's report pipe, the run's output pipe, and the
+	// launcher as a GUI-subsystem copy of the binary.
+	if o.report {
+		h.Report = makeReportPipe(serviceSIDString(), u.SID)
+		args += " -p2-report=" + h.Report.Name
+		// Other accounts try it first: another runner, and a plain user.
+		h.Report.Other = map[string]string{}
+		for _, k := range []string{"c", "m"} {
+			if ou, ok := c.Users[k]; ok {
+				h.Report.Other[k] = tryPipeAs(c.Exe, ou, h.Report.Name)
+			}
+		}
+	}
+	if o.passStd {
+		args += " -p2-passstd"
+	}
+	if o.freeConsole {
+		args += " -p2-freeconsole"
+	}
+	if o.lockConhost {
+		args += " -p2-lockconhost"
+	}
+	if o.restrictAfterLock {
+		args += " -p2-restrict-after-lock"
+	}
+	launcherExe := c.Exe
+	if o.gui {
+		launcherExe = c.ExeGUI
+	}
+	cl, _ := windows.UTF16FromString(`"` + launcherExe + `" ` + args)
 	dir, _ := windows.UTF16PtrFromString(filepath.Dir(c.Exe))
 	var dsk *uint16 // null: seclogon's own choice (a contrast only)
 	if desktop != "" {
 		dsk, _ = windows.UTF16PtrFromString(desktop)
 	}
 	si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{})), Desktop: dsk}
+	if o.outPipe != "" {
+		h.Output = makeOutputPipe(o.outPipe == "inheritable")
+		if h.Output.Make == "ok" {
+			si.Flags |= windows.STARTF_USESTDHANDLES
+			si.StdOutput, si.StdErr = h.Output.w, h.Output.w
+		}
+	}
 	flags := uintptr(windows.CREATE_SUSPENDED)
 	if !o.withWindow {
 		if o.detachedLauncher {
@@ -1115,6 +1259,11 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 		return h
 	}
 	h.Start = "ok"
+	if h.Output != nil {
+		// The launcher has its copy; the service's goes, so the read ends
+		// when the run's processes are done.
+		h.Output.closeWrite()
+	}
 	var job, port windows.Handle
 	err := errors.New("no job (this variant)")
 	if !o.noJob {
@@ -1161,6 +1310,14 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 	}
 	if o.handoff {
 		h.Handoff = handoff(h.Launcher, &pi, job, c.Exe)
+		if h.Report != nil {
+			h.Report.collect(h.Launcher.Step3 != nil && h.Launcher.Step3.Report == "ok")
+		}
+		if h.Output != nil {
+			// The program has ended (handoff waits for it): its output, and the
+			// launcher's, are in the pipe.
+			h.Output.wait(15 * time.Second)
+		}
 	}
 	if o.exitAfter && h.Launcher.ChildRecordPath != "" {
 		// The program, started by a launcher that has since exited, says
@@ -1559,10 +1716,21 @@ func TestRunnerHopProbe(t *testing.T) {
 		}
 	})
 	t.Run("hop", func(t *testing.T) {
-		users := map[string]probeUser{"b": newShapedUser(t, dir, hSID, bGrants, bDenies, false)}
+		// Step 3 adds another runner ("c") and a plain user ("m"), who try
+		// the report pipe, and the GUI-subsystem copy of the binary.
+		users := map[string]probeUser{
+			"b": newShapedUser(t, dir, hSID, bGrants, bDenies, false),
+			"c": newShapedUser(t, dir, hSID, bGrants, bDenies, false),
+			"m": newShapedUser(t, dir, hSID, nil, nil, false),
+		}
+		exeGUI := filepath.Join(dir, "probe-gui.exe")
+		if err := guiCopy(exe, exeGUI); err != nil {
+			t.Fatalf("the GUI-subsystem copy: %v", err)
+		}
 		res := runProbe2Service(t, m, name+"h", mustSID(t, hSID), dir, exe,
-			probe2Config{Exe: exe, CLSID: clsid, Mode: "hop", Users: users, ToolsFile: writeTools(t, dir)})
+			probe2Config{Exe: exe, ExeGUI: exeGUI, CLSID: clsid, Mode: "hop", Users: users, ToolsFile: writeTools(t, dir)})
 		probe2ExpectHop(t, res, users["b"], exe)
+		probe3Expect(t, res, users["b"], exe)
 		// The no-job hop's program outlives its hop (the service may not end
 		// it): the test, an administrator, ends it here.
 		if pid := res.Hops["no-job-with-window"].Launcher.WaitingPID; pid == 0 {
