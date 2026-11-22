@@ -550,11 +550,16 @@ func userGroups(uid, gid uint32) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	// gid 0 counts whatever its name (AGENT-LINUX-RUNTIME §11.1).
+	return withGidZero(ids, names), nil
+}
+
+// withGidZero adds "root" to names when ids hold gid 0: it counts
+// whatever its name (AGENT-LINUX-RUNTIME §11.1).
+func withGidZero(ids, names []string) []string {
 	if slices.Contains(ids, "0") {
-		names = append(names, "root")
+		return append(names, "root")
 	}
-	return names, nil
+	return names
 }
 
 // groupNames names the groups gids.

@@ -980,3 +980,13 @@ func TestOtherGroupsAdmitted(t *testing.T) {
 		t.Errorf("identity %+v", id)
 	}
 }
+
+// gid 0 in the group database counts as root whatever its name.
+func TestGidZeroCountsByNumber(t *testing.T) {
+	if got := withGidZero([]string{"100", "0"}, []string{"users", "wheel"}); !slices.Contains(got, "root") {
+		t.Errorf("gid 0 named wheel: %v, want root among them", got)
+	}
+	if got := withGidZero([]string{"100"}, []string{"users"}); slices.Contains(got, "root") {
+		t.Errorf("no gid 0: %v", got)
+	}
+}
