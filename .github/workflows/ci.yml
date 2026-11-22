@@ -147,7 +147,7 @@ jobs:
           for t in hop route-a shapes seclogon-disabled; do t="TestRunnerHopProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe2.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
-      # internal/state's tests crashed once on Windows with an access
+      # internal/state's tests crashed on Windows with an access
       # violation (0xc0000005) and no Go trace. Run 10 more times,
       # verbosely, with GOTRACEBACK=wer, so a crash says where; the
       # whole output is kept as an artifact.
@@ -170,12 +170,89 @@ jobs:
             fi
           done
           exit $ok
+      # Diagnosis for that crash: it was Go not turning a nil dereference
+      # (in a test protector's Wipe on a nil receiver) into a recoverable
+      # panic; the process died at the dereference. The wipe no longer
+      # relies on that. TestRecoveredNilDereference repeats such a
+      # dereference, recovered: here the whole package runs with it (the
+      # crashes came in whole-package runs; alone it did not crash), 10
+      # times as is and 10 times with async preemption off. Each run that
+      # does not pass is told apart by what it wrote: a Go traceback, a test
+      # failure, or a crash with no Go traceback (under GOTRACEBACK=wer a
+      # fatal Go error ends as an exception too). A crash here is the runtime's, not
+      # this repository's code's, so the step warns and does not fail the
+      # job. The test binary is kept with any dump, so a debugger can read
+      # it (dumps from "go test" above come from its own binary, which is
+      # not kept).
+      - name: the runner's processor and extended state (diagnosis)
+        if: runner.os == 'Windows' && !cancelled()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          # The leading guess for the crash is an exception frame that needs
+          # more stack than Go keeps for it on Windows, on processors whose
+          # extended state (AVX-512) makes the frame larger: so, the model,
+          # the extended-state features the OS enables, and the size of a
+          # CONTEXT holding them.
+          (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          Add-Type -TypeDefinition @"
+          using System; using System.Runtime.InteropServices;
+          public static class XState {
+            [DllImport("kernel32.dll")] public static extern ulong GetEnabledXStateFeatures();
+            [DllImport("kernel32.dll", SetLastError = true)] public static extern bool InitializeContext(IntPtr buffer, uint flags, out IntPtr context, ref uint length);
+          }
+          "@
+          $mask = [XState]::GetEnabledXStateFeatures()
+          $len = [uint32]0
+          $ctx = [IntPtr]::Zero
+          [void][XState]::InitializeContext([IntPtr]::Zero, 0x00100040, [ref]$ctx, [ref]$len) # CONTEXT_XSTATE: asks for the size
+          "enabled extended-state features: 0x{0:x} (AVX-512: {1}); a CONTEXT with them: {2} bytes" -f $mask, (($mask -band 0xe0) -eq 0xe0), $len
+      - name: recovered nil dereference, with and without async preemption (diagnosis)
+        if: runner.os == 'Windows' && !cancelled()
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: bash
+        env:
+          GOTRACEBACK: wer
+          VETTID_AGENT_TEST_NILDEREF: "1"
+        run: |
+          [ -f "$RUNNER_TEMP/state.test.exe" ] || go test -c -o "$RUNNER_TEMP/state.test.exe" ./internal/state
+          for arm in default asyncpreemptoff; do
+            if [ "$arm" = asyncpreemptoff ]; then export GODEBUG=asyncpreemptoff=1; else unset GODEBUG; fi
+            crashes=0
+            for i in $(seq 1 10); do
+              out="$RUNNER_TEMP/nilderef-$arm-$i.txt"
+              status=0
+              (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$out" 2>&1) || status=$?
+              # By what the run wrote, not the status alone: under
+              # GOTRACEBACK=wer a fatal Go error also ends as an exception.
+              if [ "$status" = 0 ]; then
+                continue
+              elif grep -qE '^goroutine [0-9]+ \[' "$out"; then
+                kind="a Go traceback (a panic or fatal error Go caught)"
+              elif [ "$status" = 1 ] && grep -q -- '--- FAIL' "$out"; then
+                kind="a test failure"
+              else
+                kind="a crash with no Go traceback"; crashes=$((crashes+1))
+              fi
+              echo "$arm run $i: exit $status, $kind" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
+              tail -n 15 "$out"
+            done
+            echo "$arm: $crashes of 10 runs crashed with no Go traceback" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
+            if [ "$crashes" != 0 ]; then echo "::warning::recovered nil dereference ($arm): $crashes of 10 runs crashed with no Go traceback"; fi
+          done
+          if compgen -G "$RUNNER_TEMP/dumps/state.test.exe.*.dmp" > /dev/null; then
+            cp "$RUNNER_TEMP/state.test.exe" "$RUNNER_TEMP/dumps/"
+          fi
       - name: keep the crash hunt's output
         if: runner.os == 'Windows' && !cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: state-crash-hunt
-          path: ${{ runner.temp }}/state-*.txt
+          path: |
+            ${{ runner.temp }}/state-*.txt
+            ${{ runner.temp }}/nilderef-*.txt
           retention-days: 7
           if-no-files-found: ignore
       # The runner's user is an administrator, for whom every folder can be
