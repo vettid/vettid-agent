@@ -372,20 +372,28 @@ func TestRootChannel(t *testing.T) {
 	}
 }
 
-// A member in an administrator's group gets member_is_admin for tools,
-// and status still.
+// A member in a root-equivalent group gets member_is_admin for tools,
+// and status still. A member in sudo whose sudo asks for its password
+// keeps its tools (AGENT-LINUX-RUNTIME §11).
 func TestRootMemberIsAdmin(t *testing.T) {
 	e := setupRoot(t)
-	if _, err := user.LookupGroup("sudo"); err != nil {
-		t.Skip("no sudo group here")
+	if _, err := user.LookupGroup("sudo"); err == nil {
+		e.cmd("gpasswd", "-a", e.member, "sudo")
+		e.later("gpasswd", "-d", e.member, "sudo")
+		if got := e.clientAs(e.member, OpMCP); got != "ok member=true admin=false holds=false" {
+			t.Errorf("a member in sudo, tools: %q, want its tools", got)
+		}
 	}
-	e.cmd("gpasswd", "-a", e.member, "sudo")
-	e.later("gpasswd", "-d", e.member, "sudo")
+	if _, err := user.LookupGroup("disk"); err != nil {
+		t.Skip("no disk group here")
+	}
+	e.cmd("gpasswd", "-a", e.member, "disk")
+	e.later("gpasswd", "-d", e.member, "disk")
 	if got := e.clientAs(e.member, OpMCP); got != "member_is_admin" {
-		t.Errorf("a member in sudo, tools: %q", got)
+		t.Errorf("a member in disk, tools: %q", got)
 	}
 	if got := e.clientAs(e.member, OpStatus); got != "ok member=true admin=false holds=true" {
-		t.Errorf("a member in sudo, status: %q", got)
+		t.Errorf("a member in disk, status: %q", got)
 	}
 }
 
@@ -394,20 +402,20 @@ func TestRootMemberIsAdmin(t *testing.T) {
 // as the primary group of the process (newgrp's, SO_PEERCRED's gid).
 func TestRootHeldAdminGroup(t *testing.T) {
 	e := setupRoot(t)
-	g, err := user.LookupGroup("sudo")
+	g, err := user.LookupGroup("disk")
 	if err != nil {
-		t.Skip("no sudo group here")
+		t.Skip("no disk group here")
 	}
 	gid, _ := strconv.ParseUint(g.Gid, 10, 32)
-	sudo := uint32(gid)
+	disk := uint32(gid)
 	if got := e.clientWith(e.member, nil, nil, OpMCP); got != "ok member=true admin=false holds=false" {
-		t.Fatalf("the member, not in sudo: %q", got)
+		t.Fatalf("the member, not in disk: %q", got)
 	}
-	if got := e.clientWith(e.member, nil, []uint32{sudo}, OpMCP); got != "member_is_admin" {
-		t.Errorf("sudo held as a supplementary group: %q, want member_is_admin", got)
+	if got := e.clientWith(e.member, nil, []uint32{disk}, OpMCP); got != "member_is_admin" {
+		t.Errorf("disk held as a supplementary group: %q, want member_is_admin", got)
 	}
-	if got := e.clientWith(e.member, &sudo, nil, OpMCP); got != "member_is_admin" {
-		t.Errorf("sudo as the process's primary group: %q, want member_is_admin", got)
+	if got := e.clientWith(e.member, &disk, nil, OpMCP); got != "member_is_admin" {
+		t.Errorf("disk as the process's primary group: %q, want member_is_admin", got)
 	}
 }
 

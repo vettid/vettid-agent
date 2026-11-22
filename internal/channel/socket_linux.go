@@ -43,14 +43,18 @@ const (
 	activationFD = 3
 )
 
-// adminGroups are the groups that make the member an administrator on
-// Linux (owner decision a, GC #15946; AGENT-LINUX-RUNTIME §11): sudo's
-// usual groups, and the groups that give root in all but name (a
-// container or VM manager, raw disks, the root group, the shadow file,
-// every log): groups that read what root reads. The member then gets
-// member_is_admin for every tool, as on Windows. A held gid 0 counts
-// whatever its name.
-var adminGroups = []string{"sudo", "wheel", "admin", "docker", "lxd", "incus-admin", "libvirt", "libvirtd",
+// adminGroups are the root-equivalent groups that make the member an
+// administrator on Linux (owner decision a, GC #16214;
+// AGENT-LINUX-RUNTIME §11): groups that give root with no password
+// prompt (a container or VM manager, raw disks, the root group, the
+// shadow file) or read every log. The member then gets member_is_admin
+// for every tool, as on Windows. A held gid 0 counts whatever its name.
+//
+// sudo's usual groups (sudo, wheel, admin) are not here: a member whose
+// sudo asks for its password keeps its tools. Root code (install, the
+// run helper, the elevated status) checks for sudo rules and polkit
+// grants that ask for none, and records the result as MemberAdmin.
+var adminGroups = []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd",
 	"microk8s", "disk", "root", "shadow", "adm", "systemd-journal"}
 
 // ErrNotActivated: the service was not started by its systemd socket.
@@ -81,9 +85,11 @@ type ListenConfig struct {
 	Socket string
 	// MemberUID is the member's uid, from the service's configuration.
 	MemberUID uint32
-	// MemberAdmin: install found a sudo rule that gives the member root
-	// (sudo -l, which only root can read), so the member is an
-	// administrator whatever its groups.
+	// MemberAdmin: root code last found that the member can become root
+	// without a password (a NOPASSWD or !authenticate sudo rule, a
+	// doas nopass rule, a polkit grant; AGENT-LINUX-RUNTIME §11), which
+	// only root can read, so the member is an administrator whatever its
+	// groups.
 	MemberAdmin bool
 	// Version is this program's version; a client of another version is
 	// refused.

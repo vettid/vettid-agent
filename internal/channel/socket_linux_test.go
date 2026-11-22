@@ -294,7 +294,19 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 			t.Errorf("a member in %s: %+v", g, id)
 		}
 	}
-	// install's sudo rule, whatever the groups.
+	// sudo's usual groups alone don't count: sudo asks for the password.
+	for _, g := range []string{"sudo", "wheel", "admin"} {
+		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
+		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
+		if err := dialAs(t, path, OpMCP); err != nil {
+			t.Errorf("a member in %s: %v, want its tools", g, err)
+		}
+		if id := recv(t, s.ids); id.HoldsAdmins {
+			t.Errorf("a member in %s: %+v", g, id)
+		}
+	}
+	// Root code's finding (a sudo rule asking for no password), whatever
+	// the groups.
 	none := func(uint32, uint32) ([]string, error) { return nil, nil }
 	path, s := serve(t, ListenConfig{MemberUID: uid, MemberAdmin: true, groupsOf: none})
 	if err := dialAs(t, path, OpMCP); !errors.Is(err, ErrMemberIsAdmin) {
