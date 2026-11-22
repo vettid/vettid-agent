@@ -47,7 +47,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -678,7 +677,15 @@ func runHops(c probe2Config) probe2Result {
 		}
 		wsName = windows.UTF16ToString(name)
 		res.ServiceWindowStation = wsName
-		res.WindowStationACE = errString(grantWindowStation(windows.Handle(cur), b.SID))
+		// The station's access list is put back when the service is done.
+		if restore, err := keepStationDACL(windows.Handle(cur)); err == nil {
+			defer restore()
+		} else {
+			res.WindowStationACE = "keeping its access list: " + err.Error()
+		}
+		if res.WindowStationACE == "" {
+			res.WindowStationACE = errString(grantWindowStation(windows.Handle(cur), b.SID))
+		}
 		desk, _, e = procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
 	}
 	if desk == 0 {
@@ -1015,51 +1022,65 @@ func newShapedUser(t *testing.T, dir, svcSID string, grants, denies []string, mu
 	return u
 }
 
-// registerInteractiveClass registers a throwaway class whose AppID runs as
-// the Interactive User and lets only INTERACTIVE (and SYSTEM and
-// administrators) launch and activate it; its server is exe, which exits.
-func registerInteractiveClass(t *testing.T, exe string) string {
+// registerClass registers a throwaway class whose AppID runs as the
+// Interactive User. launch is its LaunchPermission and AccessPermission in
+// SDDL, or "" for none (the machine's default applies). Its server is
+// exe, which exits. The keys' removal is registered before they are
+// written, so a failure part way leaves nothing.
+func registerClass(t *testing.T, exe, launch string) string {
 	t.Helper()
-	clsid := "{" + strings.ToUpper(fmt.Sprintf("%s-%s-%s-%s-%s", randHex(4), randHex(2), randHex(2), randHex(2), randHex(6))) + "}"
-	appid := "{" + strings.ToUpper(fmt.Sprintf("%s-%s-%s-%s-%s", randHex(4), randHex(2), randHex(2), randHex(2), randHex(6))) + "}"
-	sd, err := windows.SecurityDescriptorFromString("O:BAG:BAD:(A;;0xb;;;IU)(A;;0xb;;;SY)(A;;0xb;;;BA)")
+	guid := func() string {
+		return "{" + strings.ToUpper(fmt.Sprintf("%s-%s-%s-%s-%s", randHex(4), randHex(2), randHex(2), randHex(2), randHex(6))) + "}"
+	}
+	clsid, appid := guid(), guid()
+	appKey := `SOFTWARE\Classes\AppID\` + appid
+	clsKey := `SOFTWARE\Classes\CLSID\` + clsid
+	t.Cleanup(func() {
+		for _, k := range []string{clsKey + `\LocalServer32`, clsKey, appKey} {
+			if err := registry.DeleteKey(registry.LOCAL_MACHINE, k); err != nil && !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) {
+				t.Errorf("removing %s: %v", k, err)
+			}
+		}
+	})
+	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, appKey, registry.ALL_ACCESS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	// SecurityDescriptorFromString gives a self-relative descriptor, the
-	// form the registry values take, as it is.
-	perm := unsafe.Slice((*byte)(unsafe.Pointer(sd)), sd.Length())
-	k, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\AppID\`+appid, registry.ALL_ACCESS)
-	if err != nil {
-		t.Fatal(err)
+	errs := []error{k.SetStringValue("RunAs", "Interactive User")}
+	if launch != "" {
+		sd, err := windows.SecurityDescriptorFromString(launch)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// SecurityDescriptorFromString gives a self-relative descriptor, the
+		// form the registry values take, as it is.
+		perm := unsafe.Slice((*byte)(unsafe.Pointer(sd)), sd.Length())
+		errs = append(errs, k.SetBinaryValue("LaunchPermission", perm), k.SetBinaryValue("AccessPermission", perm))
 	}
-	t.Cleanup(func() { _ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\AppID\`+appid) })
-	for _, err := range []error{k.SetStringValue("RunAs", "Interactive User"), k.SetBinaryValue("LaunchPermission", perm), k.SetBinaryValue("AccessPermission", perm)} {
+	k.Close()
+	for _, err := range errs {
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	k.Close()
-	k, _, err = registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\CLSID\`+clsid, registry.ALL_ACCESS)
+	k, _, err = registry.CreateKey(registry.LOCAL_MACHINE, clsKey, registry.ALL_ACCESS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := k.SetStringValue("AppID", appid); err != nil {
-		t.Fatal(err)
-	}
+	err = k.SetStringValue("AppID", appid)
 	k.Close()
-	ls, _, err := registry.CreateKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\CLSID\`+clsid+`\LocalServer32`, registry.ALL_ACCESS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := ls.SetStringValue("", `"`+exe+`" -test.run=^$`); err != nil {
+	ls, _, err := registry.CreateKey(registry.LOCAL_MACHINE, clsKey+`\LocalServer32`, registry.ALL_ACCESS)
+	if err != nil {
 		t.Fatal(err)
 	}
+	err = ls.SetStringValue("", `"`+exe+`" -test.run=^$`)
 	ls.Close()
-	t.Cleanup(func() {
-		_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\CLSID\`+clsid+`\LocalServer32`)
-		_ = registry.DeleteKey(registry.LOCAL_MACHINE, `SOFTWARE\Classes\CLSID\`+clsid)
-	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	return clsid
 }
 
@@ -1156,9 +1177,15 @@ func TestRunnerHopProbe(t *testing.T) {
 		if err != nil {
 			t.Errorf("restoring seclogon: %v", err)
 		}
-		if st0.State == svc.Running {
+		// As found: running, or stopped.
+		switch st0.State {
+		case svc.Running:
 			if err := sl.Start(); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
 				t.Errorf("restarting seclogon: %v", err)
+			}
+		case svc.Stopped:
+			if _, err := sl.Control(svc.Stop); err != nil && !errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) && !errors.Is(err, windows.ERROR_INVALID_SERVICE_CONTROL) {
+				t.Errorf("stopping seclogon again: %v", err)
 			}
 		}
 	}()
@@ -1210,14 +1237,23 @@ func TestRunnerHopProbe(t *testing.T) {
 	if err := os.WriteFile(exe, b, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	clsid := registerInteractiveClass(t, exe)
+	// Three classes run as the Interactive User: one only INTERACTIVE may
+	// launch (first: the plan's case), one with no launch permission of
+	// its own (the machine's default), one Authenticated Users may launch.
+	clsid := "interactive-only=" + registerClass(t, exe, "O:BAG:BAD:(A;;0xb;;;IU)(A;;0xb;;;SY)(A;;0xb;;;BA)") +
+		",machine-default=" + registerClass(t, exe, "") +
+		",authenticated-users=" + registerClass(t, exe, "O:BAG:BAD:(A;;0xb;;;AU)(A;;0xb;;;SY)(A;;0xb;;;BA)")
 	bDenies := []string{"SeDenyRemoteInteractiveLogonRight", "SeDenyNetworkLogonRight"}
 	bGrants := []string{"SeInteractiveLogonRight"}
 
 	// First, while no process the secondary logon service started runs
 	// (it does not stop while one does).
 	t.Run("seclogon-disabled", func(t *testing.T) {
-		// seclogon does not stop while a process it started runs: any left		// from the hops is ended first (and named).		endProcessesUnder(t, dir)
+		// seclogon does not stop while a process it started runs. This
+		// subtest runs first, so there must be none.
+		if n := endProcessesUnder(t, dir); n != 0 {
+			t.Errorf("%d processes from the probe's folder already running", n)
+		}
 		users := map[string]probeUser{"b": newShapedUser(t, dir, dSID, bGrants, bDenies, false)}
 		c := c0
 		c.StartType = mgr.StartDisabled
@@ -1278,8 +1314,17 @@ func TestRunnerHopProbe(t *testing.T) {
 			t.Fatal("no route A record")
 		}
 		t.Logf("route A: assign %s, station entry %s, desktop %s, logon %s", res.RouteA.EnableAssign, res.RouteA.WindowStationACE, res.RouteA.Desktop, res.RouteA.Logon)
-		for k, s := range res.RouteA.Starts {
-			t.Logf("route A %s: start %s, exit %s, desktop %q, beep %q, output %.300s", k, s.Start, s.Exit, s.Record.Desktop, s.Record.Beep, s.Output)
+		if res.RouteA.EnableAssign != "ok" || res.RouteA.WindowStationACE != "ok" || res.RouteA.Desktop != "ok" || res.RouteA.Logon != "ok" {
+			t.Errorf("route A's setup: %+v", res.RouteA)
+		}
+		// Measured: user32 initializes for route A's child on an explicit
+		// desktop of the run's own and on the service's own (Default).
+		for key, prefix := range map[string]string{"explicit-desktop": "runa-", "inherited-desktop": "Default"} {
+			s, ok := res.RouteA.Starts[key]
+			t.Logf("route A %s: start %s, exit %s, desktop %q, beep %q, output %.300s", key, s.Start, s.Exit, s.Record.Desktop, s.Record.Beep, s.Output)
+			if !ok || s.Start != "ok" || s.Exit != "exit 0x0" || !strings.HasPrefix(s.Record.Desktop, prefix) || s.Record.Beep != "ok" {
+				t.Errorf("route A %s: %+v, measured user32 working there", key, s)
+			}
 		}
 	})
 	t.Run("shapes", func(t *testing.T) {
@@ -1318,21 +1363,37 @@ func mustSID(t *testing.T, s string) *windows.SID {
 	return sid
 }
 
-// probe2ExpectHop checks what the plan relies on; the rest is recorded.
+// probe2Hops are the hops runHops makes; each must be in the record.
+var probe2Hops = []string{"interactive", "interactive-no-ui-limits", "interactive+local", "null-dacl-desktop",
+	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl"}
+
+// probe2ExpectHop checks each recorded value against what was measured
+// (no check depends on another step having worked); what a run measures
+// for the first time is logged, then pinned.
 func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	t.Helper()
-	// A window station of the run's own, or (measured: the cut1 account
-	// may not make one) a desktop of its own in the service's window
-	// station, with the runner added to that.
-	if r.Desktop != "ok" || !(strings.HasPrefix(r.WindowStation, "ok") || r.WindowStationACE == "ok") {
-		t.Errorf("window station %q (fallback %q, entry %q), desktop %q", r.WindowStation, r.ServiceWindowStation, r.WindowStationACE, r.Desktop)
+	// The cut1 account may not make a named window station; a desktop of
+	// the run's own in the service's station, with the runner added to it,
+	// works.
+	if !strings.HasPrefix(r.WindowStation, "CreateWindowStation: Access is denied") {
+		t.Errorf("named window station: %q, measured denied", r.WindowStation)
 	}
+	if r.WindowStationACE != "ok" || r.Desktop != "ok" {
+		t.Errorf("the runner's entry on the service's station %q, desktop %q", r.WindowStationACE, r.Desktop)
+	}
+	t.Logf("window station with no name: %s; a hop there: %+v", r.UnnamedWindowStation, r.UnnamedHop)
+	t.Logf("window station and desktop access: %s", r.WindowStationSDDL)
 
-	for restrict, h := range r.Hops {
-		where := "hop " + restrict
+	for _, key := range probe2Hops {
+		h, ok := r.Hops[key]
+		if !ok {
+			t.Errorf("hop %s: missing from the record", key)
+			continue
+		}
+		where := "hop " + key
+		noJob := key == "no-job-with-window"
 		wantLimits, wantJob := "ok", "ok"
-		noJob := restrict == "no-job-with-window"
-		if strings.HasSuffix(restrict, "no-ui-limits") || noJob {
+		if key == "interactive-no-ui-limits" || noJob {
 			wantLimits = "not set"
 		}
 		if noJob {
@@ -1343,94 +1404,133 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			continue
 		}
 		l := h.Launcher
-		if l.Token.User != u.SID || l.ServiceSentinel {
-			t.Errorf("%s: launcher as %s (want %s), service handle inherited %v", where, l.Token.User, u.SID, l.ServiceSentinel)
-		}
-		if l.Restricted != "ok" {
-			t.Errorf("%s: restricted token: %s", where, l.Restricted)
+		if l.Token.User != u.SID || l.ServiceSentinel || l.Restricted != "ok" {
+			t.Errorf("%s: launcher as %s (want %s), service handle inherited %v, restricted token %s", where, l.Token.User, u.SID, l.ServiceSentinel, l.Restricted)
 			continue
 		}
-		p := l.Children["program"]
-		if p.Start != "ok" || p.Exit != "exit 0x0" || !strings.EqualFold(p.ImageName, exe) {
+		if key == "exit-after" {
+			// The launcher exited right after resuming the program, which
+			// then tried to open it (logged, then pinned).
+			t.Logf("%s: the program opening its exited launcher: %v", where, h.ExitAfter.OpenLauncher)
+			if len(h.ExitAfter.OpenLauncher) == 0 {
+				t.Errorf("%s: no record from the program", where)
+			}
+			continue
+		}
+
+		// The program: its token, its image, no inheritance.
+		p, ok := l.Children["program"]
+		if !ok || p.Start != "ok" || p.Exit != "exit 0x0" || !strings.EqualFold(p.ImageName, exe) {
 			t.Errorf("%s: program %+v", where, p)
 		}
-		if p.Record.Token.User != u.SID || p.Record.Token.Interactive != "deny-only" || p.Record.SentinelInherits ||
-			!sameSet(p.Record.Token.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
+		if p.Record.Token.User != u.SID || p.Record.Token.Interactive != "deny-only" || p.Record.Token.Batch != "absent" ||
+			p.Record.SentinelInherits || !sameSet(p.Record.Token.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
 			t.Errorf("%s: program's token %+v, launcher handle inherited %v", where, p.Record.Token, p.Record.SentinelInherits)
 		}
-		// LOCAL can only be made deny-only if the runner's token holds it.
-		if restrict == "interactive+local" && l.Token.Local != "absent" && p.Record.Token.Local != "deny-only" {
-			t.Errorf("%s: LOCAL %s (the launcher's: %s)", where, p.Record.Token.Local, l.Token.Local)
+		// LOCAL: absent from the runner's token on a desktop of the run's
+		// own; seclogon's own desktop gives it, enabled.
+		wantLocal := "absent"
+		if h.Desktop == "" {
+			wantLocal = "enabled"
 		}
-		if p.Record.Token.Batch != "absent" {
-			t.Errorf("%s: BATCH %s", where, p.Record.Token.Batch)
+		if l.Token.Local != wantLocal || p.Record.Token.Local != wantLocal {
+			t.Errorf("%s: LOCAL: launcher %s, program %s, measured %s", where, l.Token.Local, p.Record.Token.Local, wantLocal)
+		}
+
+		// The service and the program: the service may not open it (the
+		// runner's default DACL) unless it is named there (measured, then
+		// pinned); without a job it may not end it; with one, closing the
+		// job ends the launcher and the program (the job's messages).
+		switch {
+		case key == "service-in-default-dacl":
+			t.Logf("%s: the service opening the program: %q, image %q; the launcher's DACL change %q", where, h.ServiceOpen, h.ServiceName, l.DefaultDACL)
+		case h.Desktop == "":
+			if h.ServiceOpen != "ok" {
+				t.Errorf("%s: the service opening the program on seclogon's desktop: %q, measured ok", where, h.ServiceOpen)
+			}
+		case noJob:
+			if h.ServiceOpen != "" {
+				t.Errorf("%s: open tried without a job: %q", where, h.ServiceOpen)
+			}
+		default:
+			if h.ServiceOpen != "Access is denied." {
+				t.Errorf("%s: the service opening the program: %q, measured Access is denied.", where, h.ServiceOpen)
+			}
 		}
 		if noJob {
-			t.Logf("%s: %s", where, h.Kill)
+			if !strings.Contains(h.Kill, "may not end the program: Access is denied.") {
+				t.Errorf("%s: %s, measured: the service may not end the program", where, h.Kill)
+			}
+		} else {
+			if !slicesContain(h.JobPIDs, l.WaitingPID) {
+				t.Errorf("%s: the waiting program %d not in the job %v", where, l.WaitingPID, h.JobPIDs)
+			}
+			if h.Kill != "ok" {
+				t.Errorf("%s: closing the job: %s", where, h.Kill)
+			}
+			t.Logf("%s: in the job: %v; ended when it closed: %v", where, h.JobImages, h.JobExits)
 		}
-		if !noJob && !slicesContain(h.JobPIDs, l.WaitingPID) {
-			t.Errorf("%s: the waiting program %d not in the job %v", where, l.WaitingPID, h.JobPIDs)
-		}
-		if h.ServiceOpen == "ok" && h.Kill != "ok" {
-			t.Errorf("%s: job kill: %s", where, h.Kill)
-		}
+
+		// user32 and DCOM.
 		u32 := l.Children["user32"]
-		dcom, dcomOpen := l.Children["dcom"].Record.DCOM, l.Children["dcom-unrestricted"].Record.DCOM
-		t.Logf("%s: launcher user32: %s; user32 child: %s, desktop %q, beep %q; dcom: %q; dcom with INTERACTIVE: %q; the runner's logon SID %s",
-			where, l.LauncherUser32, u32.Exit, u32.Record.Desktop, u32.Record.Beep, dcom, dcomOpen, l.LogonSID)
 		if h.Desktop == "" {
 			// seclogon's own desktop (lpDesktop null; the plan rules it
 			// out): user32 does not initialize there.
 			if !strings.Contains(l.LauncherUser32, "initialization routine failed") {
-				t.Errorf("%s: user32 on seclogon's own desktop: %s, want the DLL initialization failure", where, l.LauncherUser32)
+				t.Errorf("%s: user32 on seclogon's own desktop: %s, measured the DLL initialization failure", where, l.LauncherUser32)
 			}
 		} else {
-			// On a desktop of the run's own, with the runner's entry on the
-			// window station including the standard rights (0xF037F),
-			// user32 and so ole32 initialize, in the launcher and its
-			// restricted children.
 			want := h.Desktop[strings.LastIndex(h.Desktop, `\`)+1:]
 			if l.LauncherUser32 != "ok" || u32.Exit != "exit 0x0" || u32.Record.Desktop != want || u32.Record.Beep != "ok" {
 				t.Errorf("%s: user32: launcher %s; child %+v, want it on %q", where, l.LauncherUser32, u32, want)
 			}
-			// DCOM: a class run as the Interactive User that only INTERACTIVE
-			// may launch is refused (E_ACCESSDENIED) to a program holding
-			// INTERACTIVE deny-only, and passes the launch check for one
-			// holding it enabled (its throwaway server then never registers).
-			if dcom != "HRESULT 0x80070005" {
-				t.Errorf("%s: DCOM with INTERACTIVE deny-only: %q, want HRESULT 0x80070005", where, dcom)
+			// The class only INTERACTIVE may launch: refused with INTERACTIVE
+			// deny-only, past the launch check with it enabled (its throwaway
+			// server never registers).
+			if d := l.Children["dcom"].Record.DCOM; d != "HRESULT 0x80070005" {
+				t.Errorf("%s: DCOM with INTERACTIVE deny-only: %q, measured HRESULT 0x80070005", where, d)
 			}
-			if dcomOpen == "" || dcomOpen == "HRESULT 0x80070005" || strings.HasPrefix(dcomOpen, "ole32") {
-				t.Errorf("%s: DCOM with INTERACTIVE enabled: %q, want past the launch check", where, dcomOpen)
+			if d := l.Children["dcom-unrestricted"].Record.DCOM; d != "HRESULT 0x80080005" {
+				t.Errorf("%s: DCOM with INTERACTIVE enabled: %q, measured HRESULT 0x80080005", where, d)
 			}
+			t.Logf("%s: DCOM by class, INTERACTIVE deny-only: %v; enabled: %v", where,
+				l.Children["dcom"].Record.DCOMs, l.Children["dcom-unrestricted"].Record.DCOMs)
 		}
-		// LOCAL: absent from the runner's token with a desktop of the run's
-		// own; seclogon's own desktop gives it (recorded).
-		if h.Desktop != "" && (l.Token.Local != "absent" || p.Record.Token.Local != "absent") {
-			t.Errorf("%s: LOCAL: launcher %s, program %s; measured absent from the runner's token", where, l.Token.Local, p.Record.Token.Local)
-		}
-		for name, tl := range l.Tools {
-			t.Logf("%s: tool %s: start %s, exit %s", where, name, tl.Start, tl.Exit)
-			if tl.Start != "ok" || tl.Exit != "exit 0x0" {
-				t.Errorf("%s: %s as the run's program: %+v", where, name, tl)
+
+		// The program opening its launcher (the same user): as it is, and
+		// after the launcher limits its own DACL (logged, then pinned).
+		t.Logf("%s: the program opening its launcher: %v; after the launcher's DACL (%s): %v", where,
+			l.Children["open-launcher"].Record.OpenLauncher, l.LauncherDACL, l.Children["open-launcher-limited"].Record.OpenLauncher)
+
+		if key == "interactive" {
+			if len(l.Tools) == 0 {
+				t.Errorf("%s: no tools were started", where)
 			}
-		}
-		if restrict == "interactive" && len(l.Tools) == 0 {
-			t.Errorf("%s: no tools were started", where)
+			for name, tl := range l.Tools {
+				if tl.Start != "ok" || tl.Exit != "exit 0x0" {
+					t.Errorf("%s: %s as the run's program: %+v", where, name, tl)
+				}
+			}
 		}
 	}
-	t.Logf("window station and desktop access: %s", r.WindowStationSDDL)
-	// The runner's entry on the window station, mask by mask: whether
-	// user32 initializes in the launcher and a restricted child.
+
+	// The runner's entry on the window station, mask by mask.
 	for _, mask := range probeMasks {
 		key := fmt.Sprintf("%#x", mask)
-		m := r.Masks[key]
+		m, ok := r.Masks[key]
+		if !ok {
+			t.Errorf("window station entry %s: missing from the record", key)
+			continue
+		}
 		t.Logf("window station entry %s: set %s, start %s, launcher user32 %s, child %q", key, m.Set, m.Start, m.Launcher, m.Child)
 	}
-	if m := r.Masks["0x37f"]; m.Launcher == "ok" {
-		t.Errorf("window station entry 0x37f: user32 initialized; measured to fail")
+	// Measured: READ_CONTROL is the standard right needed, and
+	// WINSTA_EXITWINDOWS is needed; WINSTA_ALL_ACCESS alone fails.
+	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x2033f": false} {
+		if got := r.Masks[key].Launcher == "ok"; got != works {
+			t.Errorf("window station entry %s: user32 initialized %v, measured %v", key, got, works)
+		}
 	}
-	_ = strconv.Itoa
 }
 
 func slicesContain(s []uint32, v uint32) bool {
@@ -1550,6 +1650,9 @@ func runRouteA(c probe2Config) *routeAResult {
 	var n uint32
 	procGetUserObjectInformation.Call(cur, 2, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)*2), uintptr(unsafe.Pointer(&n)))
 	ws := windows.UTF16ToString(name)
+	if restore, err := keepStationDACL(windows.Handle(cur)); err == nil {
+		defer restore()
+	}
 	r.WindowStationACE = errString(grantWindowStation(windows.Handle(cur), a.SID))
 	sa, err := userObjectSA(a.SID)
 	if err != nil {
@@ -1605,7 +1708,8 @@ func writeTools(t *testing.T, dir string) string {
 	} {
 		p, err := exec.LookPath(c.file)
 		if err != nil {
-			t.Logf("no %s on this runner", c.file)
+			// The runner has each of these: a missing one is a change to know of.
+			t.Errorf("no %s on this runner", c.file)
 			continue
 		}
 		if strings.HasSuffix(strings.ToLower(p), ".cmd") {
@@ -1627,11 +1731,12 @@ func writeTools(t *testing.T, dir string) string {
 // endProcessesUnder ends, and names, every process whose image is under
 // dir: one still running when the test ends is a finding (it was not
 // ended by its job or its parent), recorded here.
-func endProcessesUnder(t *testing.T, dir string) {
+func endProcessesUnder(t *testing.T, dir string) int {
+	found := 0
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		t.Logf("process snapshot: %v", err)
-		return
+		return 0
 	}
 	defer windows.CloseHandle(snap)
 	var e windows.ProcessEntry32
@@ -1654,13 +1759,15 @@ func endProcessesUnder(t *testing.T, dir string) {
 					}
 					tok.Close()
 				}
-				t.Logf("still running at the end: pid %d, %s, as %s; ended", e.ProcessID, img, user)
+				found++
+				t.Logf("still running: pid %d, %s, as %s; ended", e.ProcessID, img, user)
 				_ = windows.TerminateProcess(p, 1)
 				_, _ = windows.WaitForSingleObject(p, 5000)
 			}
 		}
 		windows.CloseHandle(p)
 	}
+	return found
 }
 
 // jobExits collects, for up to d, the job's messages that a process
@@ -1764,4 +1871,20 @@ func tryUnnamedStation(c probe2Config, b probeUser, sa *windows.SecurityAttribut
 	defer procCloseDesktop.Call(desk)
 	h := runHop(c, b, hopOpts{key: "unnamed station", restrict: "interactive", desktop: wsName + `\run`, uiLimits: true, quick: true}, 0)
 	return "ok: " + wsName, &maskResult{Set: "ok", Start: h.Start, Launcher: h.Launcher.LauncherUser32, Child: h.Launcher.Children["user32"].Record.Desktop}
+}
+
+// keepStationDACL reads the window station's access list and returns a
+// function that puts it back.
+func keepStationDACL(ws windows.Handle) (func(), error) {
+	sd, err := windows.GetSecurityInfo(ws, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return nil, err
+	}
+	dacl, _, err := sd.DACL()
+	if err != nil {
+		return nil, err
+	}
+	return func() {
+		_ = windows.SetSecurityInfo(ws, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
+	}, nil
 }
