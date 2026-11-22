@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -409,7 +410,8 @@ func (s *Store) retryDurable() error {
 var durableRetryDelay = 20 * time.Millisecond
 
 func checkProtector(p Protector) error {
-	if p == nil || !protectorName.MatchString(p.Name()) {
+	// A typed nil is refused before any of its methods runs (see safeWipe).
+	if p == nil || typedNil(p) || !protectorName.MatchString(p.Name()) {
 		return errors.New("state: invalid protector")
 	}
 	return nil
@@ -562,9 +564,9 @@ func (s *Store) Wipe(resolve Resolver) error {
 // protector in ps to delete its key (a protector without a key present
 // succeeds without doing anything), then removes the state and temporary
 // files as Wipe does, whatever the protectors answered. Nil entries are
-// skipped; a typed-nil entry whose Wipe panics is reported as an error
-// (safeWipe). Every step is attempted; the errors are joined. It may be
-// retried.
+// skipped; a typed-nil entry is refused with an error without being
+// called, and a Wipe that panics is reported as an error (safeWipe).
+// Every step is attempted; the errors are joined. It may be retried.
 func (s *Store) WipeAll(ps []Protector) error {
 	if s.lock == nil {
 		return ErrClosed
@@ -584,18 +586,35 @@ func (s *Store) WipeAll(ps []Protector) error {
 }
 
 // safeWipe calls p.Wipe and turns a panic into an error. A nil
-// interface is skipped by the caller; a typed nil pointer inside the
-// interface (an interface holding (*T)(nil)) cannot be told apart
-// without reflection, so it is called: if its Wipe tolerates a nil
-// receiver that is fine, and if it dereferences one the panic becomes
-// this error instead of crashing the wipe half-way.
+// interface is skipped by the caller. A typed nil inside the interface
+// (an interface holding (*T)(nil)) is refused here, without calling its
+// Wipe: a nil dereference in Wipe would otherwise be relied on to become
+// a recoverable panic, which on Windows it does not always do (the
+// process dies instead, part way through the wipe). The recover stays as
+// a backstop for other panics.
 func safeWipe(p Protector) (err error) {
+	if typedNil(p) {
+		return errors.New("a nil protector (its key, if any, cannot be deleted through it)")
+	}
 	defer func() {
 		if r := recover(); r != nil {
-			err = errors.New("the protector failed (a nil protector?)")
+			// Its type, never the panic's value (which could carry anything).
+			err = fmt.Errorf("the protector (%T) failed", p)
 		}
 	}()
 	return p.Wipe()
+}
+
+// typedNil reports whether p holds a nil pointer, map, slice, func or
+// channel: an interface that is not nil but whose methods would run on
+// nothing. (reflect.ValueOf never gives an interface kind.)
+func typedNil(p Protector) bool {
+	v := reflect.ValueOf(p)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		return v.IsNil()
+	}
+	return false
 }
 
 // oldProtector returns the protector of the last Create or Load or,
@@ -621,7 +640,9 @@ func (s *Store) oldProtector(resolve Resolver) Protector {
 	if err != nil {
 		return nil
 	}
-	if p := resolve(h.Protector); p != nil && p.Name() == h.Protector {
+	// A typed nil from resolve counts as no protector: none of its methods
+	// is called (see safeWipe).
+	if p := resolve(h.Protector); p != nil && !typedNil(p) && p.Name() == h.Protector {
 		return p
 	}
 	return nil
