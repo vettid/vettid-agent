@@ -1445,9 +1445,13 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			continue
 		}
 		if key == "exit-after" {
-			// The launcher exited right after resuming the program, which
-			// then tried to open it (logged, then pinned).
-			t.Logf("%s: the program opening its launcher (running: %s): %v", where, h.ExitAfter.LauncherRunning, h.ExitAfter.OpenLauncher)
+			// Measured: the launcher has exited, and its process object (kept by
+			// the service's handle) still opens with each right; an exited
+			// process runs nothing, so these rights take nothing over.
+			if h.ExitAfter.LauncherRunning != "false" {
+				t.Errorf("%s: the launcher running when the program checked: %q, measured false", where, h.ExitAfter.LauncherRunning)
+			}
+			t.Logf("%s: the program opening its exited launcher: %v", where, h.ExitAfter.OpenLauncher)
 			if len(h.ExitAfter.OpenLauncher) == 0 {
 				t.Errorf("%s: no record from the program", where)
 			}
@@ -1482,7 +1486,11 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			if l.DefaultDACL != "ok" {
 				t.Errorf("%s: setting the program's default DACL: %s", where, l.DefaultDACL)
 			}
-			t.Logf("%s: the service opening the program: %q, image %q; the launcher's DACL change %q", where, h.ServiceOpen, h.ServiceName, l.DefaultDACL)
+			// Measured: named there, the service may open the program, and so
+			// end it and read its image itself.
+			if h.ServiceOpen != "ok" || !strings.EqualFold(h.ServiceName, exe) {
+				t.Errorf("%s: the service opening the program: %q, image %q; measured ok, %s", where, h.ServiceOpen, h.ServiceName, exe)
+			}
 		case h.Desktop == "":
 			if h.ServiceOpen != "ok" {
 				t.Errorf("%s: the service opening the program on seclogon's desktop: %q, measured ok", where, h.ServiceOpen)
@@ -1580,7 +1588,9 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	}
 	// Measured: READ_CONTROL is the standard right needed, and
 	// WINSTA_EXITWINDOWS is needed; WINSTA_ALL_ACCESS alone fails.
-	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false} {
+	// 0x2007A is the narrowest that works: without EXITWINDOWS (0x2003A)
+	// it fails.
+	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false, "0x2007a": true, "0x2003a": false} {
 		if got := r.Masks[key].Launcher == "ok"; got != works {
 			t.Errorf("window station entry %s: user32 initialized %v, measured %v", key, got, works)
 		}
