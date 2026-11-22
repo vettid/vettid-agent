@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !linux
 
 package channel
 
@@ -8,8 +8,12 @@ import (
 	"os"
 )
 
-// The Unix socket end of the channel comes with AGENT-PLAN A5.6; until
-// then the stub finds no service here.
+// The channel is built for Windows (A3.10a) and Linux (A5.6); the macOS
+// end comes with card #15817. Until then the stub finds no service here.
+
+// ServiceAccount is the account that must own pairing n's channel: none
+// here.
+func ServiceAccount(n string) string { return "" }
 
 // ReadPipe answers ErrNoService: no channel is built for this system yet.
 func ReadPipe(n string) (string, error) {

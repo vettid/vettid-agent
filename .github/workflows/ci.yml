@@ -39,7 +39,38 @@ jobs:
         run: go mod verify
       - name: go vet
         run: go vet ./...
+      # On Windows, a test binary that crashes outside Go's handler (as
+      # internal/state's did once, 0xc0000005) leaves a full dump here,
+      # kept as an artifact below. Only this module's test binaries
+      # (<package>.test.exe, as go test names them) are dumped, through
+      # per-program keys, which match an executable's base name, so the
+      # same test binaries run by later steps (some as throwaway users)
+      # are dumped too; not the service the probes register (probe.exe)
+      # nor anything else on the runner. A dump holds no more than a
+      # test's own throwaway data.
+      - name: keep crash dumps of the test binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
+          $dir = Join-Path $env:RUNNER_TEMP 'dumps'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          $pkgs = go list ./...
+          if ($LASTEXITCODE) { exit 1 }
+          foreach ($p in $pkgs) {
+            $k = Join-Path $base (($p -split '/')[-1] + '.test.exe')
+            New-Item -Force $k | Out-Null
+            Set-ItemProperty $k -Name DumpFolder -Value $dir -Type ExpandString
+            Set-ItemProperty $k -Name DumpType -Value 2 -Type DWord
+            Set-ItemProperty $k -Name DumpCount -Value 5 -Type DWord
+          }
+          Get-ChildItem $base | Select-Object -ExpandProperty PSChildName
       - name: go test
+        env:
+          # wer: a traceback as crash gives, but leaving Windows Error Reporting
+          # on (crash sets SEM_NOGPFAULTERRORBOX, so no dump would be written).
+          GOTRACEBACK: ${{ runner.os == 'Windows' && 'wer' || 'single' }}
         run: go test ${{ matrix.race }} -count=1 ./...
       # The DPAPI tests again, verbose, as the record of what Windows
       # answered. Only this step creates local test users and runs a helper
@@ -69,6 +100,20 @@ jobs:
                    TestTokenIdentityElevation TestPipeFailedInstanceKeepsName TestPipeBusy \
                    TestElevatedPairEndToEnd TestStubOverPipe; do
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel.txt" || { echo "::error::$t did not pass"; exit 1; }
+          done
+      # The channel's Unix-socket end as root (AGENT-PLAN A5.6): throwaway
+      # users and groups and a transient systemd socket unit, removed in
+      # cleanup. The step fails unless each root test passed (not skipped).
+      - name: channel tests as root, with test users and a systemd socket
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          # Built as releases are (scripts/build-release): without cgo, so
+          # os/user reads /etc/passwd and /etc/group as it will there.
+          CGO_ENABLED=0 go test -c -o "$RUNNER_TEMP/channel.test" ./internal/channel
+          sudo VETTID_TEST_LINUX_ROOT=1 "$RUNNER_TEMP/channel.test" -test.run '^TestRoot' -test.count=1 -test.v -test.timeout=300s | tee "$RUNNER_TEMP/channel-root.txt"
+          for t in TestRootChannel TestRootMemberIsAdmin TestRootHeldAdminGroup TestRootClientRefusesImpostors TestRootNotStarved; do
+            grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel-root.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
       # AGENT-PLAN A3.10b's first check, measured: what a virtual service
       # account (NT SERVICE\<name>) holds, and how it can start a program
@@ -102,6 +147,37 @@ jobs:
           for t in hop route-a shapes seclogon-disabled; do t="TestRunnerHopProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe2.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
+      # internal/state's tests crashed once on Windows with an access
+      # violation (0xc0000005) and no Go trace. Run 10 more times,
+      # verbosely, with GOTRACEBACK=wer, so a crash says where; the
+      # whole output is kept as an artifact.
+      - name: internal/state repeated, verbose (crash hunt)
+        # It runs whatever an earlier step did, so a flaky test there
+        # doesn't hide it.
+        if: runner.os == 'Windows' && !cancelled()
+        shell: bash
+        env:
+          GOTRACEBACK: wer
+        run: |
+          set -o pipefail
+          go test -c -o "$RUNNER_TEMP/state.test.exe" ./internal/state
+          ok=0
+          for i in $(seq 1 10); do
+            if ! (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$RUNNER_TEMP/state-$i.txt" 2>&1); then
+              echo "::error::run $i failed"
+              tail -n 80 "$RUNNER_TEMP/state-$i.txt"
+              ok=1
+            fi
+          done
+          exit $ok
+      - name: keep the crash hunt's output
+        if: runner.os == 'Windows' && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: state-crash-hunt
+          path: ${{ runner.temp }}/state-*.txt
+          retention-days: 7
+          if-no-files-found: ignore
       # The runner's user is an administrator, for whom every folder can be
       # changed, so internal/run's on-disk access checks skip in "go test"
       # above. Here the package's tests run again as a new standard user,
@@ -207,6 +283,16 @@ jobs:
           bin="./vettid-agent-ci$(go env GOEXE)"
           go build -o "$bin" ./cmd/vettid-agent
           "$bin" version
+      # Last, so a dump from any Windows step above (the crash hunt
+      # included) is kept.
+      - name: keep any crash dump (Windows)
+        if: runner.os == 'Windows' && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crash-dumps
+          path: ${{ runner.temp }}/dumps
+          retention-days: 7
+          if-no-files-found: ignore
 
   govulncheck:
     runs-on: ubuntu-26.04

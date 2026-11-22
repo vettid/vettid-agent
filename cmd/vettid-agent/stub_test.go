@@ -80,7 +80,7 @@ func TestStubPassesMessages(t *testing.T) {
 	go func() { done <- run([]string{"mcp", "--name", "work"}, &out, &errOut) }()
 	s := f.end(t)
 	cfg := f.cfgs[0]
-	if cfg.Op != channel.OpMCP || cfg.Pipe != stubPipe || cfg.Service != channel.ServiceSID("vettid-agent-work") ||
+	if cfg.Op != channel.OpMCP || cfg.Pipe != stubPipe || cfg.Service != channel.ServiceAccount("work") ||
 		cfg.Version != readVersion().Version {
 		t.Fatalf("dial config %+v", cfg)
 	}
