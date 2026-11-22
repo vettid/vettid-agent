@@ -109,6 +109,7 @@ var (
 	p2ExitWin  = flag.Bool("p2-exitwindows", false, "probe2 uilimits: also try ExitWindowsEx")
 	p2LockTok  = flag.Bool("p2-lock-token", false, "probe2 launcher, handoff: lock its own token and process with OWNER RIGHTS DACLs first")
 	p2Created  = flag.Uint64("p2-target-created", 0, "probe2 openlauncher: the launcher's creation time, to tell it from a process that reuses its id")
+	p2Detach   = flag.Bool("p2-detached", false, "probe2 launcher, handoff: start the program DETACHED_PROCESS (no console) with pipes for its output")
 )
 
 // tokenFacts is what a process reads of its own token.
@@ -191,6 +192,10 @@ type programRecord struct {
 	// TargetIdentity: whether the id opened is still the launcher's
 	// ("launcher", "gone: …", "reused: …").
 	TargetIdentity string `json:"target_identity,omitempty"`
+	// JobProcs: every other process in the program's own job, as the
+	// program can reach it.
+	JobProcs map[uint32]reachable `json:"job_procs,omitempty"`
+	SelfPID  uint32               `json:"self_pid,omitempty"`
 }
 
 // childStart is one program the launcher started.
@@ -224,15 +229,16 @@ type launcherRecord struct {
 	WaitingStartedOK bool                  `json:"waiting_started"`
 	// Handoff: the program started suspended, for the service to check
 	// and resume once this launcher has exited.
-	HandoffPID    uint32 `json:"handoff_pid,omitempty"`
-	HandoffTID    uint32 `json:"handoff_tid,omitempty"`
-	HandoffImage  string `json:"handoff_image,omitempty"` // as the launcher read it
-	HandoffRecord string `json:"handoff_record,omitempty"`
-	ThreadDACL    string `json:"handoff_thread_dacl,omitempty"`
-	ThreadID      uint32 `json:"launcher_thread_id,omitempty"`
-	TokenLock     string `json:"token_lock,omitempty"`   // handoff with -p2-lock-token
-	TokenSDDL     string `json:"token_sddl,omitempty"`   // its token's owner and DACL after the lock
-	ProcessLock   string `json:"process_lock,omitempty"` // its process DACL, likewise
+	HandoffPID      uint32 `json:"handoff_pid,omitempty"`
+	HandoffTID      uint32 `json:"handoff_tid,omitempty"`
+	HandoffImage    string `json:"handoff_image,omitempty"` // as the launcher read it
+	HandoffRecord   string `json:"handoff_record,omitempty"`
+	ThreadDACL      string `json:"handoff_thread_dacl,omitempty"`
+	ThreadID        uint32 `json:"launcher_thread_id,omitempty"`
+	TokenLock       string `json:"token_lock,omitempty"`        // handoff with -p2-lock-token
+	TokenSDDL       string `json:"token_sddl,omitempty"`        // its token's owner and DACL after the lock
+	TokenSDDLBefore string `json:"token_sddl_before,omitempty"` // and before it
+	ProcessLock     string `json:"process_lock,omitempty"`      // its process DACL, likewise
 }
 
 // TestProbe2ChildHelper runs a probe2 child's part; skipped otherwise.
@@ -344,14 +350,15 @@ func runProgram(mode string) int {
 		}
 		p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(*p2Target))
 		if err != nil {
-			for _, k := range []string{"TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"} {
+			for _, k := range []string{"TOKEN_DUPLICATE", "TOKEN_IMPERSONATE", "TOKEN_READ_CONTROL", "TOKEN_WRITE_DAC", "TOKEN_WRITE_OWNER"} {
 				r.OpenLauncher[k] = "the process: " + err.Error()
 			}
 		} else {
 			for _, right := range []struct {
 				name string
 				mask uint32
-			}{{"TOKEN_DUPLICATE", windows.TOKEN_DUPLICATE | windows.TOKEN_QUERY}, {"TOKEN_IMPERSONATE", windows.TOKEN_IMPERSONATE}} {
+			}{{"TOKEN_DUPLICATE", windows.TOKEN_DUPLICATE | windows.TOKEN_QUERY}, {"TOKEN_IMPERSONATE", windows.TOKEN_IMPERSONATE},
+				{"TOKEN_READ_CONTROL", windows.READ_CONTROL}, {"TOKEN_WRITE_DAC", windows.WRITE_DAC}, {"TOKEN_WRITE_OWNER", windows.WRITE_OWNER}} {
 				var tok windows.Token
 				if err := windows.OpenProcessToken(p, right.mask, &tok); err != nil {
 					r.OpenLauncher[right.name] = err.Error()
@@ -372,6 +379,20 @@ func runProgram(mode string) int {
 				tok.Close()
 			}
 			windows.CloseHandle(p)
+		}
+		// Every other process in its own job (conhosts, if any): what the
+		// program can reach of each.
+		r.SelfPID = windows.GetCurrentProcessId()
+		r.JobProcs = map[uint32]reachable{}
+		pids := jobPIDs(0)
+		if pids == nil {
+			r.JobProcs[0] = reachable{Image: "its own job: the process list could not be read"}
+		}
+		images := imagesOf(pids)
+		for _, pid := range pids {
+			if pid != r.SelfPID {
+				r.JobProcs[pid] = reach(pid, images[pid])
+			}
 		}
 	case "uilimits":
 		r.UI = uiCalls()
@@ -472,12 +493,14 @@ func runLauncher() int {
 			// Its own token and process, each limited to SYSTEM and OWNER
 			// RIGHTS (the token: QUERY; the process: SYNCHRONIZE and
 			// QUERY_LIMITED_INFORMATION), before the program exists.
+			rec.TokenSDDLBefore = ownTokenSDDL()
 			rec.TokenLock = errString(lockOwnToken())
 			rec.TokenSDDL = ownTokenSDDL()
 			rec.ProcessLock = errString(limitOwnDACL())
 		}
 		// The program, once resumed (after this launcher has exited), tries
 		// to open this launcher: process, thread and token.
+		childDetached = *p2Detach
 		var created, exitT, kernelT, userT windows.Filetime
 		_ = windows.GetProcessTimes(windows.CurrentProcess(), &created, &exitT, &kernelT, &userT)
 		out := filepath.Join(filepath.Dir(*p2Out), "child-handoff-"+randHex(4)+".json")
@@ -622,6 +645,20 @@ func startSuspended(tok windows.Token, exe, args, logPath string) (windows.Proce
 		defer windows.CloseHandle(lh)
 		out = lh
 	}
+	console := uint32(windows.CREATE_NO_WINDOW)
+	if childDetached {
+		// No console at all (so no conhost): DETACHED_PROCESS, its output
+		// to a pipe whose read end stays with this process.
+		console = windows.DETACHED_PROCESS
+		var r, w windows.Handle
+		if err := windows.CreatePipe(&r, &w, sa, 0); err != nil {
+			return pi, fmt.Errorf("pipe: %w", err)
+		}
+		_ = windows.SetHandleInformation(r, windows.HANDLE_FLAG_INHERIT, 0)
+		defer windows.CloseHandle(w)
+		childPipes = append(childPipes, r)
+		out = w
+	}
 	al, err := windows.NewProcThreadAttributeList(1)
 	if err != nil {
 		return pi, err
@@ -643,7 +680,7 @@ func startSuspended(tok windows.Token, exe, args, logPath string) (windows.Proce
 	}
 	cl, _ := windows.UTF16PtrFromString(`"` + exe + `" ` + args)
 	err = windows.CreateProcessAsUser(tok, nil, cl, nil, nil, true,
-		windows.CREATE_SUSPENDED|windows.CREATE_NO_WINDOW|windows.EXTENDED_STARTUPINFO_PRESENT, nil, nil, &si.StartupInfo, &pi)
+		windows.CREATE_SUSPENDED|console|windows.EXTENDED_STARTUPINFO_PRESENT, nil, nil, &si.StartupInfo, &pi)
 	return pi, err
 }
 
@@ -896,6 +933,10 @@ func runHops(c probe2Config) probe2Result {
 		// The same, with the launcher locking its own token and process
 		// first: which of the two is what keeps the program out.
 		{key: "handoff-locked", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true},
+		// With no console for the program (DETACHED_PROCESS, pipes for its
+		// output), and for the launcher too: no conhost to reach.
+		{key: "handoff-locked-detached-program", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true},
+		{key: "handoff-locked-detached", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, detachedLauncher: true},
 		// The service named in the program's token's default DACL: whether
 		// it may then open the program.
 		{key: "service-in-default-dacl", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, svcDACL: true},
@@ -967,6 +1008,8 @@ type hopOpts struct {
 	svcDACL                bool // the service is named in the program's default DACL
 	handoff                bool // the launcher hands the suspended program to the service and exits
 	lockToken              bool // handoff: the launcher locks its own token and process first
+	detachedProgram        bool // handoff: the program has no console
+	detachedLauncher       bool // the launcher has no console (DETACHED_PROCESS to seclogon)
 }
 
 // objectSDDL is the window station's (and desktop's) access list in SDDL.
@@ -997,6 +1040,9 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
 		out, c.Exe, restrict, sentinel, c.CLSID)
+	if o.detachedProgram {
+		args += " -p2-detached"
+	}
 	if o.lockToken {
 		args += " -p2-lock-token"
 	}
@@ -1055,7 +1101,11 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 	si := &windows.StartupInfo{Cb: uint32(unsafe.Sizeof(windows.StartupInfo{})), Desktop: dsk}
 	flags := uintptr(windows.CREATE_SUSPENDED)
 	if !o.withWindow {
-		flags |= windows.CREATE_NO_WINDOW
+		if o.detachedLauncher {
+			flags |= windows.DETACHED_PROCESS
+		} else {
+			flags |= windows.CREATE_NO_WINDOW
+		}
 	}
 	var pi windows.ProcessInformation
 	if r, _, e := procCreateProcessWithLogonW.Call(uintptr(unsafe.Pointer(n)), uintptr(unsafe.Pointer(dot)), uintptr(unsafe.Pointer(pw)),
@@ -1605,7 +1655,7 @@ func mustSID(t *testing.T, s string) *windows.SID {
 
 // probe2Hops are the hops runHops makes; each must be in the record.
 var probe2Hops = []string{"interactive", "interactive-no-ui-limits", "interactive+local", "null-dacl-desktop",
-	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl", "handoff", "handoff-locked"}
+	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl", "handoff", "handoff-locked", "handoff-locked-detached-program", "handoff-locked-detached"}
 
 // probe2ExpectHop checks each recorded value against what was measured
 // (no check depends on another step having worked); what a run measures
@@ -1644,6 +1694,12 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if noJob {
 			wantJob = "no job (this variant)"
 		}
+		if key == "handoff-locked-detached" && h.Start != "ok" {
+			// Whether seclogon takes DETACHED_PROCESS for the launcher
+			// (logged, then pinned).
+			t.Logf("%s: CreateProcessWithLogonW with DETACHED_PROCESS: %s", where, h.Start)
+			continue
+		}
 		if h.Start != "ok" || h.Job != wantJob || h.UILimits != wantLimits {
 			t.Errorf("%s: start %q, job %q, UI limits %q", where, h.Start, h.Job, h.UILimits)
 			continue
@@ -1653,24 +1709,27 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			t.Errorf("%s: launcher as %s (want %s), service handle inherited %v, restricted token %s", where, l.Token.User, u.SID, l.ServiceSentinel, l.Restricted)
 			continue
 		}
-		if key == "handoff" || key == "handoff-locked" {
+		if strings.HasPrefix(key, "handoff") {
 			// The design's shape, each step asserted: the launcher gone, and
 			// every handle of the service's to it closed, before the resume;
 			// the service opens the suspended program and its thread, reads
 			// the image, finds it in the job, checks the thread is the
 			// program's, resumes it. The program then tries to open its
 			// launcher (process, thread, token) and runs to exit 0.
+			locked := strings.HasPrefix(key, "handoff-locked")
+			detached := strings.Contains(key, "detached")
 			hr := h.Handoff
 			if hr == nil {
 				t.Errorf("%s: no handoff record (launcher: %s)", where, l.Restricted)
 				continue
 			}
-			t.Logf("%s: %+v; the launcher read %q, set the thread's DACL: %s; token lock %q (%s), process lock %q", where,
-				*hr, l.HandoffImage, l.ThreadDACL, l.TokenLock, l.TokenSDDL, l.ProcessLock)
+			t.Logf("%s: %+v; the launcher read %q, set the thread's DACL: %s; its token before the lock %s, lock %q (after: %s), process lock %q", where,
+				*hr, l.HandoffImage, l.ThreadDACL, l.TokenSDDLBefore, l.TokenLock, l.TokenSDDL, l.ProcessLock)
+			t.Logf("%s: the other processes in the program's job, as it reaches them: %+v", where, hr.Program.JobProcs)
 			if l.ThreadDACL != "ok" || l.DefaultDACL != "ok" || !strings.EqualFold(l.HandoffImage, exe) {
 				t.Errorf("%s: launcher: default DACL %q, thread DACL %q, image %q", where, l.DefaultDACL, l.ThreadDACL, l.HandoffImage)
 			}
-			if key == "handoff-locked" && (l.TokenLock != "ok" || l.ProcessLock != "ok") {
+			if locked && (l.TokenLock != "ok" || l.ProcessLock != "ok") {
 				t.Errorf("%s: the launcher locking its token %q, its process %q", where, l.TokenLock, l.ProcessLock)
 			}
 			if hr.LauncherGone != "true" || hr.Open != "ok" || hr.OpenThread != "ok" || !strings.EqualFold(hr.Image, exe) ||
@@ -1690,12 +1749,16 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			//   INTERACTIVE enabled.
 			// - With the launcher's token and process locked as well: every
 			//   open refused. The lock is what keeps the program out.
+			// Without consoles (logged, then pinned): whether the process
+			// object is still there.
 			ol := hr.Program.OpenLauncher
-			if hr.Program.TargetIdentity != "launcher" {
+			if detached {
+				t.Logf("%s: the launcher's id when the program ran: %q; its opens: %v", where, hr.Program.TargetIdentity, ol)
+			} else if hr.Program.TargetIdentity != "launcher" {
 				t.Errorf("%s: the launcher's id when the program ran: %q, measured still the launcher", where, hr.Program.TargetIdentity)
 			}
 			want, wantCopy := "ok", "enabled"
-			if key == "handoff-locked" {
+			if locked {
 				want, wantCopy = "Access is denied.", ""
 				// The lock holds against the launcher itself: it may no longer
 				// read its own token's access list.
@@ -1703,8 +1766,18 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 					t.Errorf("%s: the launcher reading its locked token: %q, measured Access is denied.", where, l.TokenSDDL)
 				}
 			}
-			for _, right := range []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"} {
-				if v := ol[right]; v != want {
+			rights := []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"}
+			if locked {
+				// The locked token's own access list may not be read or changed
+				// either, nor its owner.
+				rights = append(rights, "TOKEN_READ_CONTROL", "TOKEN_WRITE_DAC", "TOKEN_WRITE_OWNER")
+			}
+			for _, right := range rights {
+				v := ol[right]
+				switch {
+				case detached && v == "ok":
+					t.Errorf("%s: the program opening its launcher with %s: ok, want refused", where, right)
+				case !detached && v != want:
 					t.Errorf("%s: the program opening its launcher with %s: %q, measured %q", where, right, v, want)
 				}
 			}
@@ -1715,6 +1788,10 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			}
 			if hr.Program.LauncherTokenInteractive != wantCopy {
 				t.Errorf("%s: INTERACTIVE in a copy of the launcher's token: %q, measured %q", where, hr.Program.LauncherTokenInteractive, wantCopy)
+			}
+			// With no console for the program, nothing else is in its job.
+			if strings.Contains(key, "detached") && len(hr.Program.JobProcs) != 0 {
+				t.Errorf("%s: other processes in the program's job: %+v, want none", where, hr.Program.JobProcs)
 			}
 			if h.Kill != "ok (the launcher)" {
 				t.Errorf("%s: closing the job: %s", where, h.Kill)
@@ -2524,3 +2601,46 @@ func targetIdentity(pid, tid uint32, created uint64) string {
 	}
 	return "launcher"
 }
+
+// reachable is what the run's program can do to another process in its
+// job.
+type reachable struct {
+	Image       string `json:"image"`
+	VMWrite     string `json:"vm_write"`        // OpenProcess(PROCESS_VM_WRITE)
+	Token       string `json:"token_duplicate"` // OpenProcessToken(TOKEN_DUPLICATE|TOKEN_QUERY)
+	TokenUser   string `json:"token_user,omitempty"`
+	Interactive string `json:"interactive,omitempty"` // in that token
+}
+
+func reach(pid uint32, image string) reachable {
+	r := reachable{Image: image}
+	if p, err := windows.OpenProcess(windows.PROCESS_VM_WRITE, false, pid); err != nil {
+		r.VMWrite = err.Error()
+	} else {
+		r.VMWrite = "ok"
+		windows.CloseHandle(p)
+	}
+	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		r.Token = "the process: " + err.Error()
+		return r
+	}
+	defer windows.CloseHandle(p)
+	var tok windows.Token
+	if err := windows.OpenProcessToken(p, windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY, &tok); err != nil {
+		r.Token = err.Error()
+		return r
+	}
+	defer tok.Close()
+	r.Token = "ok"
+	facts := readTokenFacts(tok)
+	r.TokenUser, r.Interactive = facts.User, facts.Interactive
+	return r
+}
+
+// childDetached makes startSuspended start its programs with no console
+// (the launcher's -p2-detached); childPipes keeps their pipes' read ends.
+var (
+	childDetached bool
+	childPipes    []windows.Handle
+)
