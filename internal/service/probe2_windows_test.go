@@ -1681,21 +1681,40 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 				!sameSet(pt.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
 				t.Errorf("%s: the program's token %+v", where, pt)
 			}
-			// Every open of the launcher refused: the id no longer names the
-			// launcher (not another process under a reused id), and no right
-			// succeeds.
+			// The program opening its exited launcher. Measured: with every
+			// handle of the service's closed, the launcher's process object is
+			// still there (the same process, by its creation time: something
+			// besides the service holds it), its threads are gone.
+			// - Closed handles alone: the program opens the process and the
+			//   token with each right, and a copy of the token holds
+			//   INTERACTIVE enabled.
+			// - With the launcher's token and process locked as well: every
+			//   open refused. The lock is what keeps the program out.
 			ol := hr.Program.OpenLauncher
-			if !strings.HasPrefix(hr.Program.TargetIdentity, "gone: ") {
-				t.Errorf("%s: the launcher's id when the program ran: %q, want gone", where, hr.Program.TargetIdentity)
+			if hr.Program.TargetIdentity != "launcher" {
+				t.Errorf("%s: the launcher's id when the program ran: %q, measured still the launcher", where, hr.Program.TargetIdentity)
 			}
-			rights := []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "THREAD_SET_CONTEXT", "THREAD_SUSPEND_RESUME", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"}
-			for _, right := range rights {
-				if v, ok := ol[right]; !ok || v == "ok" {
-					t.Errorf("%s: the program opening its launcher with %s: %q, want refused", where, right, v)
+			want, wantCopy := "ok", "enabled"
+			if key == "handoff-locked" {
+				want, wantCopy = "Access is denied.", ""
+				// The lock holds against the launcher itself: it may no longer
+				// read its own token's access list.
+				if l.TokenSDDL != "OpenProcessToken: Access is denied." {
+					t.Errorf("%s: the launcher reading its locked token: %q, measured Access is denied.", where, l.TokenSDDL)
 				}
 			}
-			if hr.Program.LauncherTokenInteractive != "" {
-				t.Errorf("%s: the program copied its launcher's token: INTERACTIVE %s", where, hr.Program.LauncherTokenInteractive)
+			for _, right := range []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"} {
+				if v := ol[right]; v != want {
+					t.Errorf("%s: the program opening its launcher with %s: %q, measured %q", where, right, v, want)
+				}
+			}
+			for _, right := range []string{"THREAD_SET_CONTEXT", "THREAD_SUSPEND_RESUME"} {
+				if v := ol[right]; v != "The parameter is incorrect." {
+					t.Errorf("%s: the program opening its launcher's thread with %s: %q, measured gone (The parameter is incorrect.)", where, right, v)
+				}
+			}
+			if hr.Program.LauncherTokenInteractive != wantCopy {
+				t.Errorf("%s: INTERACTIVE in a copy of the launcher's token: %q, measured %q", where, hr.Program.LauncherTokenInteractive, wantCopy)
 			}
 			if h.Kill != "ok (the launcher)" {
 				t.Errorf("%s: closing the job: %s", where, h.Kill)
