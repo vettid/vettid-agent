@@ -43,6 +43,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -916,6 +917,9 @@ var probeMasks = []uint32{
 	// 0x2007A less each of its specific rights in turn:
 	// READATTRIBUTES, CREATEDESKTOP, WRITEATTRIBUTES, ACCESSGLOBALATOMS.
 	0x20078, 0x20072, 0x2006a, 0x2005a,
+	// READATTRIBUTES, CREATEDESKTOP and WRITEATTRIBUTES each may go: all
+	// three (0x20060), and each pair of them.
+	0x20060, 0x20070, 0x20068, 0x20062,
 }
 
 // maskResult is one window station entry tried.
@@ -1761,38 +1765,48 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			}
 		}
 
-		// Contrast for the handoff: while the launcher waits, its thread and
-		// token keep the runner's default DACL whatever the launcher set on
-		// its process (recorded, then pinned).
-		t.Logf("%s: the launcher's thread and token from the program: %v (copy's INTERACTIVE %s); after the launcher's process DACL: %v (copy's INTERACTIVE %s)", where,
-			open, l.Children["open-launcher"].Record.LauncherTokenInteractive, limited, l.Children["open-launcher-limited"].Record.LauncherTokenInteractive)
-
-		// The job's UI limits, from the program: refused with them, and
-		// what each call does without them (the contrast).
-		ui := l.Children["uilimits"].Record.UI
-		t.Logf("%s: UI calls from the program: %v; the service finds the program's atom: %s", where, ui, h.ServiceSeesAtomB)
-		if h.UILimits == "ok" && h.Desktop != "" {
-			for _, call := range []string{"CreateDesktop", "SwitchDesktop", "ExitWindowsEx"} {
-				if v, ok := ui[call]; !ok || v == "ok" {
-					t.Errorf("%s: %s under the UI limits: %q, want refused", where, call, v)
-				}
-			}
-			if v := ui["GlobalFindAtom(the service's)"]; v == "" || v == "found" {
-				t.Errorf("%s: the program finding the service's global atom: %q, want not found", where, v)
-			}
-			if ui["GlobalAddAtom"] != "ok" || h.ServiceSeesAtomB == "" || h.ServiceSeesAtomB == "found" {
-				t.Errorf("%s: the program's atom %q; the service finding it: %q, want not found", where, ui["GlobalAddAtom"], h.ServiceSeesAtomB)
+		// Contrast for the handoff. While the launcher waits, the program
+		// may open its thread and its token, before and after the
+		// launcher's process DACL (which guards the process object only);
+		// a copy of the token holds INTERACTIVE enabled. Measured.
+		for _, right := range []string{"THREAD_SET_CONTEXT", "THREAD_SUSPEND_RESUME", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"} {
+			if open[right] != "ok" || limited[right] != "ok" {
+				t.Errorf("%s: the program opening its launcher's %s: %q, after the launcher's DACL %q; measured ok both", where, right, open[right], limited[right])
 			}
 		}
-		if key == "interactive-no-ui-limits" {
-			// Without the limits the atoms are shared: the contrast that
-			// shows the limit is what separates them.
-			if ui["GlobalFindAtom(the service's)"] != "found" || h.ServiceSeesAtomB != "found" {
-				t.Errorf("%s: without UI limits, atoms: program finds the service's %q, service finds the program's %q; want both found", where, ui["GlobalFindAtom(the service's)"], h.ServiceSeesAtomB)
+		for step, c := range map[string]childStart{"before": l.Children["open-launcher"], "after": l.Children["open-launcher-limited"]} {
+			if c.Record.LauncherTokenInteractive != "enabled" {
+				t.Errorf("%s: INTERACTIVE in a copy of the launcher's token (%s its DACL): %q, measured enabled", where, step, c.Record.LauncherTokenInteractive)
 			}
-			if _, ok := ui["ExitWindowsEx"]; ok {
-				t.Errorf("%s: ExitWindowsEx tried without the UI limits", where)
-			}
+		}
+
+		// The job's UI limits, from the program. Measured, with the hop
+		// without them as the contrast:
+		// - CreateDesktop: refused under them, ok without;
+		// - global atoms: separate both ways under them, shared without;
+		// - SwitchDesktop: refused either way (not a test of the limit);
+		// - ExitWindowsEx (tried under them only): fails, with last error 0.
+		ui := l.Children["uilimits"].Record.UI
+		const notFound = "The system cannot find the file specified."
+		var want map[string]string
+		switch {
+		case h.Desktop == "":
+			want = map[string]string{"user32": "A dynamic link library (DLL) initialization routine failed."}
+		case h.UILimits == "ok":
+			want = map[string]string{"CreateDesktop": "Access is denied.", "SwitchDesktop": "Access is denied.",
+				"ExitWindowsEx": "The operation completed successfully.", "GlobalFindAtom(the service's)": notFound, "GlobalAddAtom": "ok"}
+		default:
+			want = map[string]string{"CreateDesktop": "ok", "SwitchDesktop": "Access is denied.", "GlobalFindAtom(the service's)": "found", "GlobalAddAtom": "ok"}
+		}
+		if !maps.Equal(ui, want) {
+			t.Errorf("%s: UI calls from the program: %v, measured %v", where, ui, want)
+		}
+		wantAtom := notFound
+		if h.UILimits != "ok" {
+			wantAtom = "found"
+		}
+		if h.ServiceSeesAtomB != wantAtom {
+			t.Errorf("%s: the service finding the program's atom: %q, measured %q", where, h.ServiceSeesAtomB, wantAtom)
 		}
 
 		if key == "interactive" {
@@ -1819,9 +1833,11 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	}
 	// Measured: READ_CONTROL is the standard right needed, and
 	// WINSTA_EXITWINDOWS is needed; WINSTA_ALL_ACCESS alone fails.
-	// 0x2007A works, and without EXITWINDOWS (0x2003A) it fails; its other
-	// single removals are logged above until measured.
-	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false, "0x2007a": true, "0x2003a": false} {
+	// 0x2007A works; without EXITWINDOWS (0x2003A) or ACCESSGLOBALATOMS
+	// (0x2005A) it fails, and without any one of the other three it works.
+	// The combinations of those three are logged above until measured.
+	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false, "0x2007a": true, "0x2003a": false,
+		"0x20078": true, "0x20072": true, "0x2006a": true, "0x2005a": false} {
 		// In the launcher and in its restricted child alike.
 		m := r.Masks[key]
 		launcherOK, childOK := m.Launcher == "ok", strings.HasPrefix(m.Child, "run-")
