@@ -14,6 +14,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -489,11 +490,16 @@ func serviceSIDString() string {
 // probe3Hops are step 3's hops.
 var probe3Hops = []string{"s3-conhost", "s3-freeconsole", "s3-lockconhost", "s3-gui", "s3-pipes-inheritable", "s3-pipes-not-inheritable", "s3-restrict-after-lock"}
 
-// probe3Expect checks step 3. This first round records each value
-// (logged, then pinned); the handoff itself is asserted as in step 2.
+// probe3Expect checks step 3, each value as measured.
 func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 	t.Helper()
-	t.Logf("step 3: the service reading the runner's account rights: %s %v", r.RunnerRights, r.RunnerRightsList)
+	// 5. The cut1 service may open the policy for lookups but may not read
+	// an account's rights: the re-check of the runners' denied logons is
+	// for the elevated status.
+	if r.RunnerRights != "LsaEnumerateAccountRights: NTSTATUS 0xc0000022" {
+		t.Errorf("the service reading the runner's account rights: %q %v, measured STATUS_ACCESS_DENIED", r.RunnerRights, r.RunnerRightsList)
+	}
+	denied := map[string]string{"read": "Access is denied.", "write": "Access is denied."}
 	for _, key := range probe3Hops {
 		h, ok := r.Hops[key]
 		if !ok {
@@ -505,19 +511,103 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 			b, _ := json.Marshal(v)
 			t.Logf("%s: %s: %s", where, label, b)
 		}
-		show("start", map[string]string{"start": h.Start, "job": h.Job, "kill": h.Kill})
-		show("launcher step 3", h.Launcher.Step3)
-		show("launcher", map[string]string{"restricted": h.Launcher.Restricted, "token_lock": h.Launcher.TokenLock, "process_lock": h.Launcher.ProcessLock, "default_dacl": h.Launcher.DefaultDACL, "thread_dacl": h.Launcher.ThreadDACL})
-		if h.Handoff != nil {
-			show("handoff", map[string]string{"launcher_gone": h.Handoff.LauncherGone, "open": h.Handoff.Open, "image": h.Handoff.Image, "in_job": h.Handoff.InJob, "resume": h.Handoff.Resume, "exit": h.Handoff.Exit})
-			show("program's token", h.Handoff.Program.Token)
-			show("program: launcher", map[string]any{"identity": h.Handoff.Program.TargetIdentity, "opens": h.Handoff.Program.OpenLauncher})
-			show("program: by id", h.Handoff.Program.Extra)
-			show("program: its job", h.Handoff.Program.JobProcs)
-		} else {
-			t.Errorf("%s: no handoff record", where)
-		}
+		l, l3, hr := h.Launcher, h.Launcher.Step3, h.Handoff
+		show("launcher step 3", l3)
 		show("report pipe", h.Report)
 		show("output pipe", h.Output)
+		if h.Start != "ok" || h.Job != "ok" || h.Kill != "ok (the launcher)" || l3 == nil || hr == nil {
+			t.Errorf("%s: start %q, job %q, kill %q, step 3 %v, handoff %v", where, h.Start, h.Job, h.Kill, l3 != nil, hr != nil)
+			continue
+		}
+		// The handoff, as in step 2: locked, gone, resumed once, exit 0, the
+		// program's restricted token, and every open of its launcher refused.
+		if l.TokenLock != "ok" || l.ProcessLock != "ok" || l.DefaultDACL != "ok" || l.ThreadDACL != "ok" ||
+			hr.LauncherGone != "true" || hr.Open != "ok" || hr.InJob != "true" || hr.Resume != "ok (was suspended 1)" || hr.Exit != "exit 0x0" ||
+			!strings.EqualFold(hr.Image, exe) {
+			t.Errorf("%s: launcher %+v; handoff %+v", where, l, *hr)
+		}
+		if pt := hr.Program.Token; pt.User != u.SID || pt.Interactive != "deny-only" || pt.Local != "absent" || !sameSet(pt.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
+			t.Errorf("%s: the program's token %+v", where, pt)
+		}
+		for right, v := range hr.Program.OpenLauncher {
+			want := "Access is denied."
+			if strings.HasPrefix(right, "THREAD_") {
+				want = "The parameter is incorrect."
+			}
+			if v != want {
+				t.Errorf("%s: the program opening its launcher with %s: %q, measured %q", where, right, v, want)
+			}
+		}
+		if len(hr.Program.JobProcs) != 0 {
+			t.Errorf("%s: other processes in the program's job: %+v, measured none", where, hr.Program.JobProcs)
+		}
+
+		// 1. The launcher's conhost. With a console it has one, whose token
+		// holds INTERACTIVE enabled; by the time the program runs it is gone
+		// (not kept like the launcher's own process object), so the program
+		// reaches nothing by its id. FreeConsole ends it at once; it may be
+		// locked. The GUI-subsystem launcher has none.
+		ch := l3.Conhost
+		if key == "s3-gui" {
+			if ch == nil || ch.Token != "no conhost" || len(hr.Program.Extra) != 0 {
+				t.Errorf("%s: the GUI launcher's conhost %+v, the program's tries %+v; measured none", where, ch, hr.Program.Extra)
+			}
+		} else {
+			if ch == nil || ch.PID == 0 || ch.Token != "ok" || ch.Interactive != "enabled" {
+				t.Errorf("%s: the launcher's conhost %+v, measured one with INTERACTIVE enabled", where, ch)
+			} else if x, ok := hr.Program.Extra[ch.PID]; !ok || x.Identity != "gone: The parameter is incorrect." || x.Reach.VMWrite != "The parameter is incorrect." {
+				t.Errorf("%s: the program trying the conhost %d: %+v, measured gone", where, ch.PID, x)
+			}
+		}
+		switch key {
+		case "s3-freeconsole":
+			if ch == nil || ch.FreeConsole != "ok" || ch.Running != "false" {
+				t.Errorf("%s: FreeConsole %+v, measured ok and the conhost ended", where, ch)
+			}
+		case "s3-lockconhost":
+			if ch == nil || ch.LockProcess != "ok" || ch.LockToken != "ok" {
+				t.Errorf("%s: locking the conhost %+v, measured ok", where, ch)
+			}
+		}
+
+		// 2. The output through seclogon: inheritable or not when the
+		// service makes it, the launcher receives an inheritable pipe,
+		// writes to it, passes it on; both lines reach the service after the
+		// launcher has gone.
+		if h.Output != nil {
+			if l3.Std == nil || l3.Std.Output != "pipe" || l3.Std.Inheritable != "true" || l3.Std.Write != "ok" || l3.Std.PassedOn != "ok" {
+				t.Errorf("%s: the launcher's output %+v", where, l3.Std)
+			}
+			if h.Output.Make != "ok" || h.Output.Got != "launcher-says-hello\nprogram-says-hello\n" {
+				t.Errorf("%s: the output pipe %+v, measured both lines", where, h.Output)
+			}
+		}
+
+		// 3. The report pipe: the runner connects and reports; another runner
+		// and a plain user may neither read nor write it.
+		if h.Report != nil {
+			rp := h.Report
+			if rp.Make != "ok" || l3.Report != "ok" || rp.Read != "ok" || rp.Got == nil ||
+				rp.Got.Lock != "ok" || rp.Got.CwdRead != "ok" || rp.Got.PID != l.HandoffPID || rp.Got.TID != l.HandoffTID || rp.Got.Cwd != l3.Cwd {
+				t.Errorf("%s: the report pipe %+v (the launcher: %q, pid %d tid %d)", where, rp, l3.Report, l.HandoffPID, l.HandoffTID)
+			}
+			for _, k := range []string{"c", "m"} {
+				var got map[string]string
+				if err := json.Unmarshal([]byte(rp.Other[k]), &got); err != nil || !maps.Equal(got, denied) {
+					t.Errorf("%s: user %s opening the report pipe: %q, measured refused both ways", where, k, rp.Other[k])
+				}
+			}
+		}
+
+		// 4. The order: after the lock the launcher may not open its token
+		// again, and the restricted token made from the handle opened before
+		// works.
+		if key == "s3-restrict-after-lock" {
+			o := l3.Order
+			if o == nil || o.OpenAfterLock != "Access is denied." || o.RestrictAfterLock != "ok" || o.RestrictedFacts.Interactive != "deny-only" ||
+				!sameSet(o.RestrictedFacts.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
+				t.Errorf("%s: the order %+v", where, o)
+			}
+		}
 	}
 }
