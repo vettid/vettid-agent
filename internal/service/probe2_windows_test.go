@@ -1127,7 +1127,7 @@ var desktopMasks = []uint32{
 	desktopWithout(0x80),  // DESKTOP_WRITEOBJECTS
 	desktopWithout(0x100), // DESKTOP_SWITCHDESKTOP
 	0x20000, 0x20001, 0x20002, 0x20003, 0x20007, 0x200c3,
-	// What the measurement leaves: READOBJECTS, CREATEWINDOW (ole32) and
+	// The narrowest (0x83): READOBJECTS, CREATEWINDOW (ole32) and
 	// WRITEOBJECTS, without READ_CONTROL; and without CREATEWINDOW.
 	0x83, 0x20083, 0x81,
 }

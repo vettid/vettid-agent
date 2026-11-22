@@ -512,6 +512,8 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 		"0x201ef": {true, true}, "0x201df": {true, true}, "0x201bf": {true, true}, "0x2017f": {false, false}, "0x200ff": {true, true},
 		"0x20000": {false, false}, "0x20001": {false, false}, "0x20002": {false, false}, "0x20003": {false, false},
 		"0x20007": {false, false}, "0x200c3": {true, true},
+		// The narrowest: READOBJECTS, CREATEWINDOW, WRITEOBJECTS.
+		"0x83": {true, true}, "0x20083": {true, true}, "0x81": {true, false},
 	}
 	for _, mask := range desktopMasks {
 		key := fmt.Sprintf("%#x", mask)
@@ -529,8 +531,8 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if got := (works{u32, u32 && m.ChildOLE == "ok"}); got != want {
 			t.Errorf("desktop entry %s: user32 %v, ole32 %v (%+v); measured %v, %v", key, got.user32, got.ole32, m, want.user32, want.ole32)
 		}
-		if key == "0x201fd" && m.ChildOLE != "CoInitializeEx: Access is denied." {
-			t.Errorf("desktop entry 0x201fd: ole32 %q, measured refused", m.ChildOLE)
+		if (key == "0x201fd" || key == "0x81") && m.ChildOLE != "CoInitializeEx: Access is denied." {
+			t.Errorf("desktop entry %s: ole32 %q, measured refused", key, m.ChildOLE)
 		}
 	}
 	denied := map[string]string{"read": "Access is denied.", "write": "Access is denied."}
