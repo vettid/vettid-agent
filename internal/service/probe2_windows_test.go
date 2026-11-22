@@ -47,6 +47,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,7 @@ type programRecord struct {
 	DCOM             string            `json:"dcom,omitempty"`
 	DCOMs            map[string]string `json:"dcoms,omitempty"`
 	OpenLauncher     map[string]string `json:"open_launcher,omitempty"` // right: "ok" or the error
+	LauncherRunning  string            `json:"launcher_running,omitempty"`
 }
 
 // childStart is one program the launcher started.
@@ -266,6 +268,15 @@ func runProgram(mode string) int {
 		// with a right that would let it take the launcher over.
 		time.Sleep(*p2Delay)
 		r.OpenLauncher = map[string]string{}
+		// Whether the launcher is still running (an exited process can still
+		// be opened while any handle to it is open, here the service's).
+		if p, err := windows.OpenProcess(windows.SYNCHRONIZE, false, uint32(*p2Target)); err != nil {
+			r.LauncherRunning = "open: " + err.Error()
+		} else {
+			ev, _ := windows.WaitForSingleObject(p, 0)
+			r.LauncherRunning = strconv.FormatBool(ev == uint32(windows.WAIT_TIMEOUT))
+			windows.CloseHandle(p)
+		}
 		for _, right := range []struct {
 			name string
 			mask uint32
@@ -337,7 +348,9 @@ func runLauncher() int {
 		return 0
 	}
 	var own windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &own); err != nil {
+	// ADJUST_DEFAULT: the restricted token takes this handle's access, and
+	// the default DACL variant changes it.
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY|windows.TOKEN_ADJUST_DEFAULT, &own); err != nil {
 		rec.Restricted = "OpenProcessToken: " + err.Error()
 		_ = writeJSON(*p2Out, rec)
 		return 0
@@ -390,7 +403,10 @@ func runLauncher() int {
 		{"program", "program", restricted, ""},
 		{"user32", "user32", restricted, ""},
 		{"dcom", "dcom", restricted, " -p2-clsid=" + *p2CLSID},
-		{"dcom-unrestricted", "dcom", own, " -p2-clsid=" + *p2CLSID},
+		// With INTERACTIVE enabled, only the class INTERACTIVE alone may
+		// launch: the others then launch a server, which never registers,
+		// and the call waits out its timeout.
+		{"dcom-unrestricted", "dcom", own, " -p2-clsid=" + strings.SplitN(*p2CLSID, ",", 2)[0]},
 	} {
 		out := filepath.Join(dir, "child-"+c.name+"-"+randHex(4)+".json")
 		args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=%s -p2-out="%s" -p2-sentinel=%d%s`, c.mode, out, uint64(sentinel), c.extra)
@@ -550,7 +566,8 @@ type hopResult struct {
 	Launcher    launcherRecord    `json:"launcher"`
 	JobPIDs     []uint32          `json:"job_pids"`
 	JobImages   map[uint32]string `json:"job_images"`
-	JobExits    []uint32          `json:"job_exits"`          // from the job's messages, after it was closed
+	JobExits    []uint32          `json:"job_exits"` // from the job's messages, after it was closed
+	Took        string            `json:"took"`
 	ExitAfter   programRecord     `json:"exit_after_program"` // exit-after: the program's record
 	Desktop     string            `json:"desktop"`            // the launcher's, as asked ("": seclogon's choice)
 	ServiceOpen string            `json:"service_opens_program"`
@@ -824,8 +841,10 @@ func objectSDDL(ws, desk windows.Handle) string {
 	return s
 }
 
-func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
-	h := hopResult{Desktop: o.desktop}
+func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResult) {
+	h = hopResult{Desktop: o.desktop}
+	started := time.Now()
+	defer func() { h.Took = time.Since(started).Round(time.Second).String() }()
 	desktop, restrict := o.desktop, o.restrict
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
@@ -942,15 +961,27 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) hopResult {
 		// Closing the job (its last handle) kills what is in it: the job's
 		// messages say which processes ended.
 		windows.CloseHandle(job)
-		h.JobExits = jobExits(port, 10*time.Second)
-		ended := func(pid uint32) bool { return pid != 0 && slices.Contains(h.JobExits, pid) }
+		// Two proofs, as the service may not open the program: the job's
+		// exit messages (recorded), and whether the processes are still
+		// there. The launcher: through the service's own handle to it. The
+		// program: whether a process snapshot (which needs no handle) still
+		// lists it.
+		h.JobExits = jobExits(port, 3*time.Second)
+		launcherEnded := false
+		if ev, _ := windows.WaitForSingleObject(pi.Process, 10000); ev == windows.WAIT_OBJECT_0 {
+			launcherEnded = true
+		}
+		programEnded := h.Launcher.WaitingPID == 0
+		for end := time.Now().Add(10 * time.Second); !programEnded && time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
+			programEnded = len(imagesOf([]uint32{h.Launcher.WaitingPID})) == 0
+		}
 		switch {
-		case h.Launcher.WaitingPID != 0 && ended(h.Launcher.WaitingPID) && ended(pi.ProcessId):
+		case launcherEnded && programEnded && h.Launcher.WaitingPID != 0:
 			h.Kill = "ok"
-		case h.Launcher.WaitingPID == 0 && ended(pi.ProcessId):
+		case launcherEnded && programEnded:
 			h.Kill = "ok (the launcher)"
 		default:
-			h.Kill = fmt.Sprintf("not all ended: exits %v, launcher %d, program %d", h.JobExits, pi.ProcessId, h.Launcher.WaitingPID)
+			h.Kill = fmt.Sprintf("not all ended: launcher %d ended %v, program %d ended %v (job messages %v)", pi.ProcessId, launcherEnded, h.Launcher.WaitingPID, programEnded, h.JobExits)
 		}
 	}
 	if o.noJob {
@@ -1123,7 +1154,7 @@ func runProbe2Service(t *testing.T, m *mgr.Mgr, name string, svcSID *windows.SID
 		t.Fatalf("start: %v", err)
 	}
 	var rec []byte
-	for end := time.Now().Add(9 * time.Minute); ; time.Sleep(500 * time.Millisecond) {
+	for end := time.Now().Add(15 * time.Minute); ; time.Sleep(500 * time.Millisecond) {
 		if rec, err = os.ReadFile(cfg.Out); err == nil && len(rec) > 0 {
 			break
 		}
@@ -1381,7 +1412,12 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	if r.WindowStationACE != "ok" || r.Desktop != "ok" {
 		t.Errorf("the runner's entry on the service's station %q, desktop %q", r.WindowStationACE, r.Desktop)
 	}
-	t.Logf("window station with no name: %s; a hop there: %+v", r.UnnamedWindowStation, r.UnnamedHop)
+	// Measured: with no name, CreateWindowStation gives the service's own
+	// station (the one named after its logon session), not a new one.
+	if r.UnnamedWindowStation != "ok: "+r.ServiceWindowStation {
+		t.Errorf("window station with no name: %q, measured the service's own (%s)", r.UnnamedWindowStation, r.ServiceWindowStation)
+	}
+	t.Logf("a hop on it (before the runner's entry is added): %+v", r.UnnamedHop)
 	t.Logf("window station and desktop access: %s", r.WindowStationSDDL)
 
 	for _, key := range probe2Hops {
@@ -1411,7 +1447,7 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if key == "exit-after" {
 			// The launcher exited right after resuming the program, which
 			// then tried to open it (logged, then pinned).
-			t.Logf("%s: the program opening its exited launcher: %v", where, h.ExitAfter.OpenLauncher)
+			t.Logf("%s: the program opening its launcher (running: %s): %v", where, h.ExitAfter.LauncherRunning, h.ExitAfter.OpenLauncher)
 			if len(h.ExitAfter.OpenLauncher) == 0 {
 				t.Errorf("%s: no record from the program", where)
 			}
@@ -1443,6 +1479,9 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		// job ends the launcher and the program (the job's messages).
 		switch {
 		case key == "service-in-default-dacl":
+			if l.DefaultDACL != "ok" {
+				t.Errorf("%s: setting the program's default DACL: %s", where, l.DefaultDACL)
+			}
 			t.Logf("%s: the service opening the program: %q, image %q; the launcher's DACL change %q", where, h.ServiceOpen, h.ServiceName, l.DefaultDACL)
 		case h.Desktop == "":
 			if h.ServiceOpen != "ok" {
@@ -1493,14 +1532,29 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			if d := l.Children["dcom-unrestricted"].Record.DCOM; d != "HRESULT 0x80080005" {
 				t.Errorf("%s: DCOM with INTERACTIVE enabled: %q, measured HRESULT 0x80080005", where, d)
 			}
-			t.Logf("%s: DCOM by class, INTERACTIVE deny-only: %v; enabled: %v", where,
-				l.Children["dcom"].Record.DCOMs, l.Children["dcom-unrestricted"].Record.DCOMs)
+			// By class, with INTERACTIVE deny-only. Measured: the machine's
+			// default refuses it too; a class Authenticated Users may launch
+			// passes the launch check (its server then never registers).
+			for class, want := range map[string]string{"interactive-only": "HRESULT 0x80070005", "machine-default": "HRESULT 0x80070005", "authenticated-users": "HRESULT 0x80080005"} {
+				if got := l.Children["dcom"].Record.DCOMs[class]; got != want {
+					t.Errorf("%s: DCOM class %s with INTERACTIVE deny-only: %q, measured %s", where, class, got, want)
+				}
+			}
 		}
 
 		// The program opening its launcher (the same user): as it is, and
 		// after the launcher limits its own DACL (logged, then pinned).
-		t.Logf("%s: the program opening its launcher: %v; after the launcher's DACL (%s): %v", where,
-			l.Children["open-launcher"].Record.OpenLauncher, l.LauncherDACL, l.Children["open-launcher-limited"].Record.OpenLauncher)
+		// Measured: as it is, the program may open its launcher with each
+		// right; after the launcher's OWNER RIGHTS DACL, with none.
+		open, limited := l.Children["open-launcher"].Record.OpenLauncher, l.Children["open-launcher-limited"].Record.OpenLauncher
+		if l.LauncherDACL != "ok" {
+			t.Errorf("%s: the launcher's own DACL: %s", where, l.LauncherDACL)
+		}
+		for _, right := range []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC"} {
+			if open[right] != "ok" || limited[right] != "Access is denied." {
+				t.Errorf("%s: the program opening its launcher with %s: %q, after the launcher's DACL %q; measured ok, then Access is denied.", where, right, open[right], limited[right])
+			}
+		}
 
 		if key == "interactive" {
 			if len(l.Tools) == 0 {
@@ -1526,7 +1580,7 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	}
 	// Measured: READ_CONTROL is the standard right needed, and
 	// WINSTA_EXITWINDOWS is needed; WINSTA_ALL_ACCESS alone fails.
-	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x2033f": false} {
+	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false} {
 		if got := r.Masks[key].Launcher == "ok"; got != works {
 			t.Errorf("window station entry %s: user32 initialized %v, measured %v", key, got, works)
 		}
