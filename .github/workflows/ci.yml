@@ -161,9 +161,9 @@ jobs:
       # dereference, recovered: here the whole package runs with it (the
       # crashes came in whole-package runs; alone it did not crash), 10
       # times as is and 10 times with async preemption off. Each run that
-      # does not pass is told apart by its exit status: 1 a test failure, 2
-      # a Go panic, anything else a crash outside Go (an access violation
-      # shows as a signal in this shell). A crash here is the runtime's, not
+      # does not pass is told apart by what it wrote: a Go traceback, a test
+      # failure, or a crash with no Go traceback (under GOTRACEBACK=wer a
+      # fatal Go error ends as an exception too). A crash here is the runtime's, not
       # this repository's code's, so the step warns and does not fail the
       # job. The test binary is kept with any dump, so a debugger can read
       # it (dumps from "go test" above come from its own binary, which is
@@ -209,17 +209,22 @@ jobs:
               out="$RUNNER_TEMP/nilderef-$arm-$i.txt"
               status=0
               (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$out" 2>&1) || status=$?
-              case $status in
-                0) continue ;;
-                1) kind="a test failure" ;;
-                2) kind="a Go panic" ;;
-                *) kind="a crash outside Go"; crashes=$((crashes+1)) ;;
-              esac
+              # By what the run wrote, not the status alone: under
+              # GOTRACEBACK=wer a fatal Go error also ends as an exception.
+              if [ "$status" = 0 ]; then
+                continue
+              elif grep -qE '^goroutine [0-9]+ \[' "$out"; then
+                kind="a Go traceback (a panic or fatal error Go caught)"
+              elif [ "$status" = 1 ] && grep -q -- '--- FAIL' "$out"; then
+                kind="a test failure"
+              else
+                kind="a crash with no Go traceback"; crashes=$((crashes+1))
+              fi
               echo "$arm run $i: exit $status, $kind" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
               tail -n 15 "$out"
             done
-            echo "$arm: $crashes of 10 runs crashed outside Go" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
-            if [ "$crashes" != 0 ]; then echo "::warning::recovered nil dereference ($arm): $crashes of 10 runs crashed outside Go"; fi
+            echo "$arm: $crashes of 10 runs crashed with no Go traceback" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
+            if [ "$crashes" != 0 ]; then echo "::warning::recovered nil dereference ($arm): $crashes of 10 runs crashed with no Go traceback"; fi
           done
           if compgen -G "$RUNNER_TEMP/dumps/state.test.exe.*.dmp" > /dev/null; then
             cp "$RUNNER_TEMP/state.test.exe" "$RUNNER_TEMP/dumps/"

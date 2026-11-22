@@ -1034,6 +1034,26 @@ func (nilSlice) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil,
 func (nilSlice) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
 func (nilSlice) Wipe() error                   { nilTolerantCalls++; return nil }
 
+// nilMap, nilFunc and nilChan: the other kinds that may be nil.
+type (
+	nilMap  map[string]int
+	nilFunc func()
+	nilChan chan int
+)
+
+func (nilMap) Name() string                   { nilTolerantCalls++; return testProtectorName }
+func (nilMap) Wrap([]byte) ([]byte, error)    { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilMap) Unwrap([]byte) ([]byte, error)  { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilMap) Wipe() error                    { nilTolerantCalls++; return nil }
+func (nilFunc) Name() string                  { nilTolerantCalls++; return testProtectorName }
+func (nilFunc) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilFunc) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilFunc) Wipe() error                   { nilTolerantCalls++; return nil }
+func (nilChan) Name() string                  { nilTolerantCalls++; return testProtectorName }
+func (nilChan) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilChan) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilChan) Wipe() error                   { nilTolerantCalls++; return nil }
+
 // panicky is a protector whose Wipe panics.
 type panicky struct{ fixedProtector }
 
@@ -1064,13 +1084,23 @@ func TestResolvedTypedNilNotCalled(t *testing.T) {
 	for _, tn := range []struct {
 		name string
 		p    Protector
-	}{{"pointer", (*nilTolerant)(nil)}, {"slice", nilSlice(nil)}} {
+	}{{"pointer", (*nilTolerant)(nil)}, {"slice", nilSlice(nil)}, {"map", nilMap(nil)}, {"func", nilFunc(nil)}, {"chan", nilChan(nil)}} {
 		resolve := func(string) Protector { return tn.p }
 		t.Run("Wipe/"+tn.name, func(t *testing.T) {
 			s, _ := reopened(t)
 			nilTolerantCalls = 0
 			if err := s.Wipe(resolve); !errors.Is(err, ErrProtectorUnknown) {
 				t.Errorf("Wipe = %v, want ErrProtectorUnknown", err)
+			}
+			if nilTolerantCalls != 0 {
+				t.Errorf("the typed nil's methods were called %d times", nilTolerantCalls)
+			}
+		})
+		t.Run("Load/"+tn.name, func(t *testing.T) {
+			s, _ := reopened(t)
+			nilTolerantCalls = 0
+			if _, err := s.Load(resolve); !errors.Is(err, ErrUnknownProtector) {
+				t.Errorf("Load = %v, want ErrUnknownProtector", err)
 			}
 			if nilTolerantCalls != 0 {
 				t.Errorf("the typed nil's methods were called %d times", nilTolerantCalls)
