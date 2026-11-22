@@ -986,7 +986,7 @@ func TestOtherGroupsAdmitted(t *testing.T) {
 // It replaces the package's group lookups: never t.Parallel.
 func TestAdminGroupsCountByGid(t *testing.T) {
 	db := map[string]string{"0": "wheel", "100": "users", "998": "containers"}
-	byName := map[string]string{"docker": "998", "root": "0", "users": "100"}
+	byName := map[string]string{"docker": "998", "users": "100"}
 	oldU, oldID, oldName := lookupUserID, lookupGroupID, lookupGroupName
 	t.Cleanup(func() { lookupUserID, lookupGroupID, lookupGroupName = oldU, oldID, oldName })
 	lookupGroupID = func(id string) (*user.Group, error) {
