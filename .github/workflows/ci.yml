@@ -159,15 +159,43 @@ jobs:
       # panic; the process died at the dereference. The wipe no longer
       # relies on that. TestRecoveredNilDereference repeats such a
       # dereference, recovered: here the whole package runs with it (the
-      # crashes came in whole-package runs; alone it did not crash), 10 times
-      # as is and 10 times
-      # with async preemption off, and the crashes are counted. A crash
-      # here is the runtime's, not this repository's code's, so the step
-      # warns and does not fail. The test binary is kept with any dump, so
-      # a debugger can read it (dumps from "go test" above come from its own
-      # binary, which is not kept).
+      # crashes came in whole-package runs; alone it did not crash), 10
+      # times as is and 10 times with async preemption off. Each run that
+      # does not pass is told apart by its exit status: 1 a test failure, 2
+      # a Go panic, anything else a crash outside Go (an access violation
+      # shows as a signal in this shell). A crash here is the runtime's, not
+      # this repository's code's, so the step warns and does not fail the
+      # job. The test binary is kept with any dump, so a debugger can read
+      # it (dumps from "go test" above come from its own binary, which is
+      # not kept).
+      - name: the runner's processor and extended state (diagnosis)
+        if: runner.os == 'Windows' && !cancelled()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: pwsh
+        run: |
+          # The leading guess for the crash is an exception frame that needs
+          # more stack than Go keeps for it on Windows, on processors whose
+          # extended state (AVX-512) makes the frame larger: so, the model,
+          # the extended-state features the OS enables, and the size of a
+          # CONTEXT holding them.
+          (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
+          Add-Type -TypeDefinition @"
+          using System; using System.Runtime.InteropServices;
+          public static class XState {
+            [DllImport("kernel32.dll")] public static extern ulong GetEnabledXStateFeatures();
+            [DllImport("kernel32.dll", SetLastError = true)] public static extern bool InitializeContext(IntPtr buffer, uint flags, out IntPtr context, ref uint length);
+          }
+          "@
+          $mask = [XState]::GetEnabledXStateFeatures()
+          $len = [uint32]0
+          $ctx = [IntPtr]::Zero
+          [void][XState]::InitializeContext([IntPtr]::Zero, 0x00100040, [ref]$ctx, [ref]$len) # CONTEXT_XSTATE: asks for the size
+          "enabled extended-state features: 0x{0:x} (AVX-512: {1}); a CONTEXT with them: {2} bytes" -f $mask, (($mask -band 0xe0) -eq 0xe0), $len
       - name: recovered nil dereference, with and without async preemption (diagnosis)
         if: runner.os == 'Windows' && !cancelled()
+        continue-on-error: true
+        timeout-minutes: 15
         shell: bash
         env:
           GOTRACEBACK: wer
@@ -178,12 +206,20 @@ jobs:
             if [ "$arm" = asyncpreemptoff ]; then export GODEBUG=asyncpreemptoff=1; else unset GODEBUG; fi
             crashes=0
             for i in $(seq 1 10); do
-              if ! (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$RUNNER_TEMP/nilderef-$arm-$i.txt" 2>&1); then
-                crashes=$((crashes+1))
-              fi
+              out="$RUNNER_TEMP/nilderef-$arm-$i.txt"
+              status=0
+              (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$out" 2>&1) || status=$?
+              case $status in
+                0) continue ;;
+                1) kind="a test failure" ;;
+                2) kind="a Go panic" ;;
+                *) kind="a crash outside Go"; crashes=$((crashes+1)) ;;
+              esac
+              echo "$arm run $i: exit $status, $kind" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
+              tail -n 15 "$out"
             done
-            echo "$arm: $crashes of 10 runs crashed" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
-            if [ "$crashes" != 0 ]; then echo "::warning::recovered nil dereference ($arm): $crashes of 10 runs crashed"; fi
+            echo "$arm: $crashes of 10 runs crashed outside Go" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
+            if [ "$crashes" != 0 ]; then echo "::warning::recovered nil dereference ($arm): $crashes of 10 runs crashed outside Go"; fi
           done
           if compgen -G "$RUNNER_TEMP/dumps/state.test.exe.*.dmp" > /dev/null; then
             cp "$RUNNER_TEMP/state.test.exe" "$RUNNER_TEMP/dumps/"

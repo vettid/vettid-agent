@@ -410,7 +410,8 @@ func (s *Store) retryDurable() error {
 var durableRetryDelay = 20 * time.Millisecond
 
 func checkProtector(p Protector) error {
-	if p == nil || !protectorName.MatchString(p.Name()) {
+	// A typed nil is refused before any of its methods runs (see safeWipe).
+	if p == nil || typedNil(p) || !protectorName.MatchString(p.Name()) {
 		return errors.New("state: invalid protector")
 	}
 	return nil
@@ -563,9 +564,9 @@ func (s *Store) Wipe(resolve Resolver) error {
 // protector in ps to delete its key (a protector without a key present
 // succeeds without doing anything), then removes the state and temporary
 // files as Wipe does, whatever the protectors answered. Nil entries are
-// skipped; a typed-nil entry whose Wipe panics is reported as an error
-// (safeWipe). Every step is attempted; the errors are joined. It may be
-// retried.
+// skipped; a typed-nil entry is refused with an error without being
+// called, and a Wipe that panics is reported as an error (safeWipe).
+// Every step is attempted; the errors are joined. It may be retried.
 func (s *Store) WipeAll(ps []Protector) error {
 	if s.lock == nil {
 		return ErrClosed
@@ -597,19 +598,20 @@ func safeWipe(p Protector) (err error) {
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			err = errors.New("the protector failed")
+			// Its type, never the panic's value (which could carry anything).
+			err = fmt.Errorf("the protector (%T) failed", p)
 		}
 	}()
 	return p.Wipe()
 }
 
-// typedNil reports whether p holds a nil pointer, map, slice, func,
-// channel or interface: an interface that is not nil but whose methods
-// would run on nothing.
+// typedNil reports whether p holds a nil pointer, map, slice, func or
+// channel: an interface that is not nil but whose methods would run on
+// nothing. (reflect.ValueOf never gives an interface kind.)
 func typedNil(p Protector) bool {
 	v := reflect.ValueOf(p)
 	switch v.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
 		return v.IsNil()
 	}
 	return false
@@ -638,7 +640,9 @@ func (s *Store) oldProtector(resolve Resolver) Protector {
 	if err != nil {
 		return nil
 	}
-	if p := resolve(h.Protector); p != nil && p.Name() == h.Protector {
+	// A typed nil from resolve counts as no protector: none of its methods
+	// is called (see safeWipe).
+	if p := resolve(h.Protector); p != nil && !typedNil(p) && p.Name() == h.Protector {
 		return p
 	}
 	return nil
