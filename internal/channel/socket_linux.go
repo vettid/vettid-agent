@@ -43,19 +43,23 @@ const (
 	activationFD = 3
 )
 
-// adminGroups are the root-equivalent groups that make the member an
-// administrator on Linux (owner decision a, GC #16214;
-// AGENT-LINUX-RUNTIME §11): groups that give root with no password
-// prompt (a container or VM manager, raw disks, the root group, the
-// shadow file) or read every log. The member then gets member_is_admin
-// for every tool, as on Windows. A held gid 0 counts whatever its name.
+// adminGroups are the refusing groups that make the member an
+// administrator on Linux (owner decisions a, GC #16214 and #16258;
+// AGENT-LINUX-RUNTIME §11.1): groups that give root, or what root reads,
+// with no password prompt: a container, VM or build-root manager, raw
+// disks, the kernel's memory, the root group, the password hashes, every
+// keystroke (input), and a writable /usr/local (Debian's staff). The
+// member then gets member_is_admin for every tool, as on Windows. A held
+// gid 0 counts whatever its name.
 //
-// sudo's usual groups (sudo, wheel, admin) are not here: a member whose
-// sudo asks for its password keeps its tools. Root code (install, the
-// run helper, the elevated status) checks for sudo rules and polkit
-// grants that ask for none, and records the result as MemberAdmin.
-var adminGroups = []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd",
-	"microk8s", "disk", "root", "shadow", "adm", "systemd-journal"}
+// Not here: sudo's usual groups (sudo, wheel, admin), since a member
+// whose sudo asks for its password keeps its tools, and the log readers
+// (adm, systemd-journal), which status reports instead. Root code
+// (install, the run helper, the elevated status) checks for sudo rules,
+// PAM stacks, empty passwords and polkit grants that ask for no
+// password, and records the result as MemberAdmin.
+var adminGroups = []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "mock",
+	"disk", "kmem", "root", "shadow", "input", "staff"}
 
 // ErrNotActivated: the service was not started by its systemd socket.
 var ErrNotActivated = errors.New("the connector service must be started by its systemd socket, not by hand")

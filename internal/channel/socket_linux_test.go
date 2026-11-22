@@ -294,8 +294,8 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 			t.Errorf("a member in %s: %+v", g, id)
 		}
 	}
-	// sudo's usual groups alone don't count: sudo asks for the password.
-	for _, g := range []string{"sudo", "wheel", "admin"} {
+	// sudo's usual groups, and the log readers, alone don't count.
+	for _, g := range []string{"sudo", "wheel", "admin", "adm", "systemd-journal", "video", "lpadmin"} {
 		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
 		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
 		if err := dialAs(t, path, OpMCP); err != nil {
@@ -963,7 +963,7 @@ func TestActivatedSocketMadeByRoot(t *testing.T) {
 // Groups not on the list don't make the member an administrator.
 func TestOtherGroupsAdmitted(t *testing.T) {
 	uid, _ := me(t)
-	groups := func(uint32, uint32) ([]string, error) { return []string{"users", "staff", "dialout", "video"}, nil }
+	groups := func(uint32, uint32) ([]string, error) { return []string{"users", "cdrom", "dialout", "video"}, nil }
 	path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups,
 		peerNames: func([]uint32) ([]string, error) { return []string{"plugdev", "audio"}, nil }})
 	if err := dialAs(t, path, OpMCP); err != nil {
