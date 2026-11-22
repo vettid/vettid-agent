@@ -499,8 +499,20 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 	if r.RunnerRights != "LsaEnumerateAccountRights: NTSTATUS 0xc0000022" {
 		t.Errorf("the service reading the runner's account rights: %q %v, measured STATUS_ACCESS_DENIED", r.RunnerRights, r.RunnerRightsList)
 	}
-	// The run's desktop: the runner's entry, mask by mask (logged, then
-	// pinned). Full access is what the other hops use, so it must work.
+	// The run's desktop: the runner's entry, mask by mask. Measured: no
+	// standard right is needed; DESKTOP_READOBJECTS and
+	// DESKTOP_WRITEOBJECTS are, for user32; DESKTOP_CREATEWINDOW is, for
+	// ole32 (without it user32 works and CoInitializeEx is refused); each
+	// other right may go. "user32" is user32 in the launcher and its
+	// restricted child; "ole32" is ole32 in the child as well.
+	type works struct{ user32, ole32 bool }
+	measured := map[string]works{
+		"0xf01ff": {true, true}, "0x1ff": {true, true}, "0x201ff": {true, true},
+		"0x201fe": {false, false}, "0x201fd": {true, false}, "0x201fb": {true, true}, "0x201f7": {true, true},
+		"0x201ef": {true, true}, "0x201df": {true, true}, "0x201bf": {true, true}, "0x2017f": {false, false}, "0x200ff": {true, true},
+		"0x20000": {false, false}, "0x20001": {false, false}, "0x20002": {false, false}, "0x20003": {false, false},
+		"0x20007": {false, false}, "0x200c3": {true, true},
+	}
 	for _, mask := range desktopMasks {
 		key := fmt.Sprintf("%#x", mask)
 		m, ok := r.DesktopMasks[key]
@@ -509,9 +521,17 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 			continue
 		}
 		t.Logf("desktop entry %s: set %s, start %s, launcher user32 %s, child %q, child ole32 %q", key, m.Set, m.Start, m.Launcher, m.Child, m.ChildOLE)
-	}
-	if m := r.DesktopMasks["0xf01ff"]; m.Launcher != "ok" || !strings.HasPrefix(m.Child, "dmask-") || m.ChildOLE != "ok" {
-		t.Errorf("desktop entry 0xf01ff: %+v, want user32 and ole32 working", m)
+		want, ok := measured[key]
+		if !ok {
+			continue // logged until measured
+		}
+		u32 := m.Set == "ok" && m.Start == "ok" && m.Launcher == "ok" && strings.HasPrefix(m.Child, "dmask-")
+		if got := (works{u32, u32 && m.ChildOLE == "ok"}); got != want {
+			t.Errorf("desktop entry %s: user32 %v, ole32 %v (%+v); measured %v, %v", key, got.user32, got.ole32, m, want.user32, want.ole32)
+		}
+		if key == "0x201fd" && m.ChildOLE != "CoInitializeEx: Access is denied." {
+			t.Errorf("desktop entry 0x201fd: ole32 %q, measured refused", m.ChildOLE)
+		}
 	}
 	denied := map[string]string{"read": "Access is denied.", "write": "Access is denied."}
 	for _, key := range probe3Hops {
