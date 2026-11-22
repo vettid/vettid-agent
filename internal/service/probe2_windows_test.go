@@ -1694,10 +1694,13 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if noJob {
 			wantJob = "no job (this variant)"
 		}
-		if key == "handoff-locked-detached" && h.Start != "ok" {
-			// Whether seclogon takes DETACHED_PROCESS for the launcher
-			// (logged, then pinned).
-			t.Logf("%s: CreateProcessWithLogonW with DETACHED_PROCESS: %s", where, h.Start)
+		if key == "handoff-locked-detached" {
+			// Measured: seclogon does not take DETACHED_PROCESS for the
+			// launcher. The launcher keeps CREATE_NO_WINDOW; its conhost
+			// ends with it, before the program runs.
+			if h.Start != "The parameter is incorrect." {
+				t.Errorf("%s: CreateProcessWithLogonW with DETACHED_PROCESS: %q, measured The parameter is incorrect.", where, h.Start)
+			}
 			continue
 		}
 		if h.Start != "ok" || h.Job != wantJob || h.UILimits != wantLimits {
@@ -1749,13 +1752,16 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			//   INTERACTIVE enabled.
 			// - With the launcher's token and process locked as well: every
 			//   open refused. The lock is what keeps the program out.
-			// Without consoles (logged, then pinned): whether the process
-			// object is still there.
+			// With no console for the program as well, the process object is
+			// still there: a conhost is not what holds it.
 			ol := hr.Program.OpenLauncher
-			if detached {
-				t.Logf("%s: the launcher's id when the program ran: %q; its opens: %v", where, hr.Program.TargetIdentity, ol)
-			} else if hr.Program.TargetIdentity != "launcher" {
+			if hr.Program.TargetIdentity != "launcher" {
 				t.Errorf("%s: the launcher's id when the program ran: %q, measured still the launcher", where, hr.Program.TargetIdentity)
+			}
+			// The launcher's token before the lock: owned by the runner, so the
+			// lock's OWNER RIGHTS entry applies to the runner.
+			if locked && !strings.HasPrefix(l.TokenSDDLBefore, "O:"+u.SID+"D:") {
+				t.Errorf("%s: the launcher's token before the lock: %q, measured owned by the runner", where, l.TokenSDDLBefore)
 			}
 			want, wantCopy := "ok", "enabled"
 			if locked {
@@ -1772,12 +1778,13 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 				// either, nor its owner.
 				rights = append(rights, "TOKEN_READ_CONTROL", "TOKEN_WRITE_DAC", "TOKEN_WRITE_OWNER")
 			}
+			if !locked {
+				// Unlocked, the token's own access list may be read and
+				// changed, and its owner too.
+				rights = append(rights, "TOKEN_READ_CONTROL", "TOKEN_WRITE_DAC", "TOKEN_WRITE_OWNER")
+			}
 			for _, right := range rights {
-				v := ol[right]
-				switch {
-				case detached && v == "ok":
-					t.Errorf("%s: the program opening its launcher with %s: ok, want refused", where, right)
-				case !detached && v != want:
+				if v := ol[right]; v != want {
 					t.Errorf("%s: the program opening its launcher with %s: %q, measured %q", where, right, v, want)
 				}
 			}
@@ -1789,9 +1796,24 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			if hr.Program.LauncherTokenInteractive != wantCopy {
 				t.Errorf("%s: INTERACTIVE in a copy of the launcher's token: %q, measured %q", where, hr.Program.LauncherTokenInteractive, wantCopy)
 			}
-			// With no console for the program, nothing else is in its job.
-			if strings.Contains(key, "detached") && len(hr.Program.JobProcs) != 0 {
-				t.Errorf("%s: other processes in the program's job: %+v, want none", where, hr.Program.JobProcs)
+			// The other processes in the program's job. Measured: with no
+			// console, none. With one, only the program's own conhost (the
+			// launcher's ended with it), which the program may open and whose
+			// token it may open, but which runs with the program's own
+			// restricted token (INTERACTIVE deny-only): nothing more to gain.
+			if detached {
+				if len(hr.Program.JobProcs) != 0 {
+					t.Errorf("%s: other processes in the program's job: %+v, measured none", where, hr.Program.JobProcs)
+				}
+			} else {
+				if len(hr.Program.JobProcs) != 1 {
+					t.Errorf("%s: other processes in the program's job: %+v, measured its conhost only", where, hr.Program.JobProcs)
+				}
+				for pid, rp := range hr.Program.JobProcs {
+					if rp.Image != "conhost.exe" || rp.VMWrite != "ok" || rp.Token != "ok" || rp.TokenUser != u.SID || rp.Interactive != "deny-only" {
+						t.Errorf("%s: process %d in the program's job: %+v, measured its conhost with the program's own token", where, pid, rp)
+					}
+				}
 			}
 			if h.Kill != "ok (the launcher)" {
 				t.Errorf("%s: closing the job: %s", where, h.Kill)
