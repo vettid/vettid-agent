@@ -43,23 +43,33 @@ const (
 	activationFD = 3
 )
 
-// adminGroups are the refusing groups that make the member an
-// administrator on Linux (owner decisions a, GC #16214 and #16258;
-// AGENT-LINUX-RUNTIME §11.1): groups that give root, or what root reads,
-// with no password prompt: a container, VM or build-root manager, raw
-// disks, the kernel's memory, the root group, the password hashes, every
-// keystroke (input), and a writable /usr/local (Debian's staff). The
-// member then gets member_is_admin for every tool, as on Windows. A held
-// gid 0 counts whatever its name.
+// adminGroups are the refusing groups the service checks at each
+// connection (owner decisions a, GC #16214 and #16258;
+// AGENT-LINUX-RUNTIME §11.1 and §11.3): groups that give root, or what
+// root reads, with no password prompt: a container, VM or build-root
+// manager, polkit's empower group, raw disks, the kernel's memory, the
+// root group, the password hashes, every keystroke read or typed (input,
+// uinput), and /usr/src (Debian's src). The member then gets
+// member_is_admin for every tool, as on Windows. A held gid 0 counts
+// whatever its name, and each group counts by its gid as well as its
+// name, so a second name for the same gid is caught.
 //
 // Not here: sudo's usual groups (sudo, wheel, admin), since a member
-// whose sudo asks for its password keeps its tools, and the log readers
-// (adm, systemd-journal), which status reports instead. Root code
-// (install, the run helper, the elevated status) checks for sudo rules,
-// PAM stacks, empty passwords and polkit grants that ask for no
-// password, and records the result as MemberAdmin.
-var adminGroups = []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "mock",
-	"disk", "kmem", "root", "shadow", "input", "staff"}
+// whose sudo asks for its password keeps its tools; the log readers
+// (adm, systemd-journal), which status reports; and staff, which counts
+// only where it can write /usr/local, judged by root code. Root code
+// (install, the run helper, the elevated status) makes the checks that
+// need root and records the result as MemberAdmin.
+var adminGroups = []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "snap_microk8s",
+	"mock", "empower", "disk", "kmem", "root", "shadow", "input", "uinput", "src"}
+
+// The group database, as the admin check reads it; tests replace them.
+var (
+	lookupUserID    = user.LookupId
+	lookupGroupID   = user.LookupGroupId
+	lookupGroupName = user.LookupGroup
+	groupIDsOf      = (*user.User).GroupIds
+)
 
 // ErrNotActivated: the service was not started by its systemd socket.
 var ErrNotActivated = errors.New("the connector service must be started by its systemd socket, not by hand")
@@ -537,11 +547,11 @@ func (l *Listener) identify(cred *unix.Ucred, gids []uint32) (Identity, error) {
 // userGroups names the groups of uid in the system's group database, with
 // gid (the group the client connected with) among them.
 func userGroups(uid, gid uint32) ([]string, error) {
-	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
+	u, err := lookupUserID(strconv.FormatUint(uint64(uid), 10))
 	if err != nil {
 		return nil, err
 	}
-	ids, err := u.GroupIds()
+	ids, err := groupIDsOf(u)
 	if err != nil {
 		return nil, err
 	}
@@ -550,14 +560,21 @@ func userGroups(uid, gid uint32) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return withGidZero(ids, names), nil
+	return withAdminGids(ids, names), nil
 }
 
-// withGidZero adds "root" to names when ids hold gid 0: it counts
-// whatever its name (AGENT-LINUX-RUNTIME §11.1).
-func withGidZero(ids, names []string) []string {
+// withAdminGids adds to names each refusing group whose gid ids hold,
+// whatever name the lookup gave that gid, and "root" for gid 0
+// (AGENT-LINUX-RUNTIME §11.1): a second group entry with a refusing
+// group's gid is caught.
+func withAdminGids(ids, names []string) []string {
 	if slices.Contains(ids, "0") {
-		return append(names, "root")
+		names = append(names, "root")
+	}
+	for _, name := range adminGroups {
+		if g, err := lookupGroupName(name); err == nil && slices.Contains(ids, g.Gid) {
+			names = append(names, name)
+		}
 	}
 	return names
 }
@@ -568,13 +585,17 @@ func groupNames(gids []uint32) ([]string, error) {
 	for i, g := range gids {
 		ids[i] = strconv.FormatUint(uint64(g), 10)
 	}
-	return lookupGroups(ids)
+	names, err := lookupGroups(ids)
+	if err != nil {
+		return nil, err
+	}
+	return withAdminGids(ids, names), nil
 }
 
 func lookupGroups(ids []string) ([]string, error) {
 	var names []string
 	for _, id := range ids {
-		g, err := user.LookupGroupId(id)
+		g, err := lookupGroupID(id)
 		if err != nil {
 			// A gid this lookup can't name may be an administrator's group
 			// from NSS (LDAP, sssd), which a build without cgo doesn't read:

@@ -282,8 +282,8 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 	uid, _ := me(t)
 	// The refusing groups of AGENT-LINUX-RUNTIME §11.1, named here so that
 	// dropping one from adminGroups fails.
-	refusing := []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "mock",
-		"disk", "kmem", "root", "shadow", "input", "staff"}
+	refusing := []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "snap_microk8s",
+		"mock", "empower", "disk", "kmem", "root", "shadow", "input", "uinput", "src"}
 	if len(refusing) != len(adminGroups) {
 		t.Errorf("adminGroups %v, want %v", adminGroups, refusing)
 	}
@@ -302,7 +302,7 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 		}
 	}
 	// sudo's usual groups, and the log readers, alone don't count.
-	for _, g := range []string{"sudo", "wheel", "admin", "adm", "systemd-journal", "video", "lpadmin"} {
+	for _, g := range []string{"sudo", "wheel", "admin", "adm", "systemd-journal", "video", "lpadmin", "staff", "tty"} {
 		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
 		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
 		if err := dialAs(t, path, OpMCP); err != nil {
@@ -981,12 +981,52 @@ func TestOtherGroupsAdmitted(t *testing.T) {
 	}
 }
 
-// gid 0 in the group database counts as root whatever its name.
-func TestGidZeroCountsByNumber(t *testing.T) {
-	if got := withGidZero([]string{"100", "0"}, []string{"users", "wheel"}); !slices.Contains(got, "root") {
-		t.Errorf("gid 0 named wheel: %v, want root among them", got)
+// A refusing group counts by its gid, through userGroups and groupNames
+// themselves: gid 0 named otherwise, and a second name for docker's gid.
+func TestAdminGroupsCountByGid(t *testing.T) {
+	db := map[string]string{"0": "wheel", "100": "users", "998": "containers"}
+	byName := map[string]string{"docker": "998", "root": "0", "users": "100"}
+	oldU, oldID, oldName := lookupUserID, lookupGroupID, lookupGroupName
+	t.Cleanup(func() { lookupUserID, lookupGroupID, lookupGroupName = oldU, oldID, oldName })
+	lookupGroupID = func(id string) (*user.Group, error) {
+		if n, ok := db[id]; ok {
+			return &user.Group{Gid: id, Name: n}, nil
+		}
+		return nil, user.UnknownGroupIdError(id)
 	}
-	if got := withGidZero([]string{"100"}, []string{"users"}); slices.Contains(got, "root") {
-		t.Errorf("no gid 0: %v", got)
+	lookupGroupName = func(name string) (*user.Group, error) {
+		if id, ok := byName[name]; ok {
+			return &user.Group{Gid: id, Name: name}, nil
+		}
+		return nil, user.UnknownGroupError(name)
+	}
+	for _, c := range []struct {
+		gids []uint32
+		want string
+	}{{[]uint32{100, 0}, "root"}, {[]uint32{100, 998}, "docker"}} {
+		got, err := groupNames(c.gids)
+		if err != nil || !slices.Contains(got, c.want) {
+			t.Errorf("groupNames(%v): %v, %v; want %s among them", c.gids, got, err, c.want)
+		}
+	}
+	if got, err := groupNames([]uint32{100}); err != nil || slices.ContainsFunc(got, func(g string) bool { return slices.Contains(adminGroups, g) }) {
+		t.Errorf("groupNames(users): %v, %v", got, err)
+	}
+	oldIDs := groupIDsOf
+	t.Cleanup(func() { groupIDsOf = oldIDs })
+	lookupUserID = func(id string) (*user.User, error) { return &user.User{Uid: id, Username: "member"}, nil }
+	groupIDsOf = func(*user.User) ([]string, error) { return []string{"100"}, nil }
+	// The primary gid the client connected with: docker's, by another name;
+	// then gid 0, named wheel.
+	for _, c := range []struct {
+		gid  uint32
+		want string
+	}{{998, "docker"}, {0, "root"}} {
+		if got, err := userGroups(1000, c.gid); err != nil || !slices.Contains(got, c.want) {
+			t.Errorf("userGroups(gid %d): %v, %v; want %s among them", c.gid, got, err, c.want)
+		}
+	}
+	if got, err := userGroups(1000, 100); err != nil || slices.ContainsFunc(got, func(g string) bool { return slices.Contains(adminGroups, g) }) {
+		t.Errorf("userGroups(users): %v, %v", got, err)
 	}
 }
