@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -75,6 +76,13 @@ var (
 	procGetHandleInformation     = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetHandleInformation")
 	procCreateRestrictedToken2   = modadvapi32.NewProc("CreateRestrictedToken")
 	procCoCreateInstance         = windows.NewLazySystemDLL("ole32.dll").NewProc("CoCreateInstance")
+	procSwitchDesktop            = moduser32.NewProc("SwitchDesktop")
+	procOpenDesktopW             = moduser32.NewProc("OpenDesktopW")
+	procExitWindowsEx            = moduser32.NewProc("ExitWindowsEx")
+	procGlobalAddAtomW           = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalAddAtomW")
+	procGlobalFindAtomW          = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalFindAtomW")
+	procGlobalDeleteAtom         = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalDeleteAtom")
+	procIsProcessInJob           = windows.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob")
 )
 
 // The children's flags.
@@ -91,6 +99,12 @@ var (
 	p2Delay    = flag.Duration("p2-delay", 0, "probe2 openlauncher: wait this long first")
 	p2Exit     = flag.Bool("p2-exit-after", false, "probe2 launcher: start the openlauncher program and exit right after resuming it")
 	p2SvcSID   = flag.String("p2-svcsid", "", "probe2 launcher: give the service this access in the program's default DACL")
+	p2Thread   = flag.Uint64("p2-thread", 0, "probe2 openlauncher: a thread id of the launcher's")
+	p2Handoff  = flag.Bool("p2-handoff", false, "probe2 launcher: start the program suspended, hand it to the service and exit")
+	p2UI       = flag.Bool("p2-ui-limits", false, "probe2 launcher: the job has UI limits (the uilimits child then also tries ExitWindowsEx)")
+	p2AtomA    = flag.String("p2-atom-a", "", "probe2 uilimits: a global atom the service added, to look for")
+	p2AtomB    = flag.String("p2-atom-b", "", "probe2 uilimits: a global atom to add, for the service to look for")
+	p2ExitWin  = flag.Bool("p2-exitwindows", false, "probe2 uilimits: also try ExitWindowsEx")
 )
 
 // tokenFacts is what a process reads of its own token.
@@ -166,6 +180,10 @@ type programRecord struct {
 	DCOMs            map[string]string `json:"dcoms,omitempty"`
 	OpenLauncher     map[string]string `json:"open_launcher,omitempty"` // right: "ok" or the error
 	LauncherRunning  string            `json:"launcher_running,omitempty"`
+	// LauncherTokenInteractive: INTERACTIVE in the launcher's token, as
+	// read through a handle the program opened.
+	LauncherTokenInteractive string            `json:"launcher_token_interactive,omitempty"`
+	UI                       map[string]string `json:"ui,omitempty"` // uilimits: call: "ok" or the error
 }
 
 // childStart is one program the launcher started.
@@ -197,6 +215,14 @@ type launcherRecord struct {
 	Children         map[string]childStart `json:"children"` // program, user32, dcom, dcom-unrestricted
 	WaitingPID       uint32                `json:"waiting_pid"`
 	WaitingStartedOK bool                  `json:"waiting_started"`
+	// Handoff: the program started suspended, for the service to check
+	// and resume once this launcher has exited.
+	HandoffPID    uint32 `json:"handoff_pid,omitempty"`
+	HandoffTID    uint32 `json:"handoff_tid,omitempty"`
+	HandoffImage  string `json:"handoff_image,omitempty"` // as the launcher read it
+	HandoffRecord string `json:"handoff_record,omitempty"`
+	ThreadDACL    string `json:"handoff_thread_dacl,omitempty"`
+	ThreadID      uint32 `json:"launcher_thread_id,omitempty"`
 }
 
 // TestProbe2ChildHelper runs a probe2 child's part; skipped otherwise.
@@ -289,6 +315,55 @@ func runProgram(mode string) int {
 				windows.CloseHandle(p)
 			}
 		}
+		// The launcher's thread and token keep the runner's default DACL,
+		// whatever the launcher sets on its process.
+		if *p2Thread != 0 {
+			for _, right := range []struct {
+				name string
+				mask uint32
+			}{{"THREAD_SET_CONTEXT", windows.THREAD_SET_CONTEXT}, {"THREAD_SUSPEND_RESUME", windows.THREAD_SUSPEND_RESUME}} {
+				th, err := windows.OpenThread(right.mask, false, uint32(*p2Thread))
+				if err != nil {
+					r.OpenLauncher[right.name] = err.Error()
+				} else {
+					r.OpenLauncher[right.name] = "ok"
+					windows.CloseHandle(th)
+				}
+			}
+		}
+		p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(*p2Target))
+		if err != nil {
+			for _, k := range []string{"TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"} {
+				r.OpenLauncher[k] = "the process: " + err.Error()
+			}
+		} else {
+			for _, right := range []struct {
+				name string
+				mask uint32
+			}{{"TOKEN_DUPLICATE", windows.TOKEN_DUPLICATE | windows.TOKEN_QUERY}, {"TOKEN_IMPERSONATE", windows.TOKEN_IMPERSONATE}} {
+				var tok windows.Token
+				if err := windows.OpenProcessToken(p, right.mask, &tok); err != nil {
+					r.OpenLauncher[right.name] = err.Error()
+					continue
+				}
+				r.OpenLauncher[right.name] = "ok"
+				if right.name == "TOKEN_DUPLICATE" {
+					// What a copy of it would hold: INTERACTIVE enabled is what
+					// the program's own token lacks.
+					var dup windows.Token
+					if err := windows.DuplicateTokenEx(tok, windows.TOKEN_QUERY, nil, windows.SecurityImpersonation, windows.TokenImpersonation, &dup); err != nil {
+						r.LauncherTokenInteractive = "DuplicateTokenEx: " + err.Error()
+					} else {
+						r.LauncherTokenInteractive = readTokenFacts(dup).Interactive
+						dup.Close()
+					}
+				}
+				tok.Close()
+			}
+			windows.CloseHandle(p)
+		}
+	case "uilimits":
+		r.UI = uiCalls()
 	}
 	if writeJSON(*p2Out, r) != nil {
 		return 5
@@ -319,6 +394,8 @@ func activate(clsid string) string {
 // runLauncher is the launcher: it runs as the runner, started by the
 // service.
 func runLauncher() int {
+	// One thread of the launcher's, for the program to try to open.
+	runtime.LockOSThread()
 	rec := launcherRecord{Children: map[string]childStart{}}
 	self := windows.GetCurrentProcessToken()
 	rec.Token = readTokenFacts(self)
@@ -327,6 +404,7 @@ func runLauncher() int {
 	// unrestricted token, on the run's desktop), before any child.
 	rec.LauncherUser32 = errString(moduser32.Load())
 	rec.LogonSID = logonSID(self)
+	rec.ThreadID = windows.GetCurrentThreadId()
 	if *p2Quick {
 		var own windows.Token
 		if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_DUPLICATE|windows.TOKEN_QUERY|windows.TOKEN_ASSIGN_PRIMARY, &own); err != nil {
@@ -371,6 +449,34 @@ func runLauncher() int {
 		// QUERY_LIMITED_INFORMATION and TERMINATE.
 		rec.DefaultDACL = errString(setDefaultDACL(restricted, rec.Token.User, *p2SvcSID))
 	}
+	if *p2Handoff {
+		// The program starts suspended. The service gets, through the
+		// token's default DACL, SYNCHRONIZE, QUERY_LIMITED_INFORMATION and
+		// TERMINATE on the process; on its thread (set here, since the
+		// same mask in the default DACL would mean CREATE_THREAD on the
+		// process) SYNCHRONIZE, QUERY_LIMITED_INFORMATION and
+		// SUSPEND_RESUME. The launcher reports the ids and exits; the
+		// service checks the image and resumes it.
+		out := filepath.Join(filepath.Dir(*p2Out), "child-handoff-"+randHex(4)+".json")
+		pi, err := startSuspended(restricted, *p2Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=program -p2-out="%s"`, out), "")
+		if err != nil {
+			rec.Restricted += "; handoff start: " + err.Error()
+		} else {
+			rec.HandoffPID, rec.HandoffTID, rec.HandoffRecord = pi.ProcessId, pi.ThreadId, out
+			buf := make([]uint16, windows.MAX_LONG_PATH)
+			nn := uint32(len(buf))
+			if err := windows.QueryFullProcessImageName(pi.Process, 0, &buf[0], &nn); err != nil {
+				rec.HandoffImage = err.Error()
+			} else {
+				rec.HandoffImage = windows.UTF16ToString(buf[:nn])
+			}
+			rec.ThreadDACL = errString(setThreadDACL(pi.Thread, rec.Token.User, *p2SvcSID))
+			windows.CloseHandle(pi.Thread)
+			windows.CloseHandle(pi.Process)
+		}
+		_ = writeJSON(*p2Out, rec)
+		return 0
+	}
 	if *p2Exit {
 		// Start the program that tries to open this launcher, and exit right
 		// after resuming it: by the time it tries, the launcher is gone.
@@ -403,6 +509,7 @@ func runLauncher() int {
 		{"program", "program", restricted, ""},
 		{"user32", "user32", restricted, ""},
 		{"dcom", "dcom", restricted, " -p2-clsid=" + *p2CLSID},
+		{"uilimits", "uilimits", restricted, uiArgs()},
 		// With INTERACTIVE enabled, only the class INTERACTIVE alone may
 		// launch: the others then launch a server, which never registers,
 		// and the call waits out its timeout.
@@ -422,7 +529,7 @@ func runLauncher() int {
 	// again once the launcher has limited its own process's DACL through
 	// OWNER RIGHTS.
 	openArgs := func(out string) string {
-		return fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=openlauncher -p2-out="%s" -p2-target=%d`, out, windows.GetCurrentProcessId())
+		return fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=openlauncher -p2-out="%s" -p2-target=%d -p2-thread=%d`, out, windows.GetCurrentProcessId(), rec.ThreadID)
 	}
 	for _, step := range []string{"open-launcher", "open-launcher-limited"} {
 		if step == "open-launcher-limited" {
@@ -559,20 +666,22 @@ type probe2Config struct {
 
 // hopResult is one launcher run.
 type hopResult struct {
-	Start       string            `json:"start"`
-	Errno       uint32            `json:"errno,omitempty"`
-	Job         string            `json:"job"`
-	UILimits    string            `json:"ui_limits"`
-	Launcher    launcherRecord    `json:"launcher"`
-	JobPIDs     []uint32          `json:"job_pids"`
-	JobImages   map[uint32]string `json:"job_images"`
-	JobExits    []uint32          `json:"job_exits"` // from the job's messages, after it was closed
-	Took        string            `json:"took"`
-	ExitAfter   programRecord     `json:"exit_after_program"` // exit-after: the program's record
-	Desktop     string            `json:"desktop"`            // the launcher's, as asked ("": seclogon's choice)
-	ServiceOpen string            `json:"service_opens_program"`
-	ServiceName string            `json:"service_reads_image_name"`
-	Kill        string            `json:"job_kill"`
+	Start            string            `json:"start"`
+	Errno            uint32            `json:"errno,omitempty"`
+	Job              string            `json:"job"`
+	UILimits         string            `json:"ui_limits"`
+	Launcher         launcherRecord    `json:"launcher"`
+	JobPIDs          []uint32          `json:"job_pids"`
+	JobImages        map[uint32]string `json:"job_images"`
+	JobExits         []uint32          `json:"job_exits"` // from the job's messages, after it was closed
+	Took             string            `json:"took"`
+	ExitAfter        programRecord     `json:"exit_after_program"` // exit-after: the program's record
+	Desktop          string            `json:"desktop"`            // the launcher's, as asked ("": seclogon's choice)
+	ServiceOpen      string            `json:"service_opens_program"`
+	ServiceName      string            `json:"service_reads_image_name"`
+	Kill             string            `json:"job_kill"`
+	Handoff          *handoffResult    `json:"handoff,omitempty"`
+	ServiceSeesAtomB string            `json:"service_sees_program_atom,omitempty"`
 }
 
 // probe2Result is what the service records.
@@ -756,6 +865,10 @@ func runHops(c probe2Config) probe2Result {
 		// The launcher exits right after resuming the program, which then
 		// tries to open it.
 		{key: "exit-after", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, exitAfter: true},
+		// The design's shape: the launcher starts the program suspended,
+		// hands it to the service and exits; the service checks the image
+		// and resumes it.
+		{key: "handoff", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true},
 		// The service named in the program's token's default DACL: whether
 		// it may then open the program.
 		{key: "service-in-default-dacl", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, svcDACL: true},
@@ -800,6 +913,9 @@ var probeMasks = []uint32{
 	// The four the measurement found may each go, together
 	// (EXITWINDOWS stays): 0x2007A.
 	winstaWithout(0x4 | 0x1 | 0x100 | 0x200),
+	// 0x2007A less each of its specific rights in turn:
+	// READATTRIBUTES, CREATEDESKTOP, WRITEATTRIBUTES, ACCESSGLOBALATOMS.
+	0x20078, 0x20072, 0x2006a, 0x2005a,
 }
 
 // maskResult is one window station entry tried.
@@ -819,6 +935,7 @@ type hopOpts struct {
 	quick                  bool // the launcher checks user32 only (the mask variants)
 	exitAfter              bool // the launcher exits right after resuming the program
 	svcDACL                bool // the service is named in the program's default DACL
+	handoff                bool // the launcher hands the suspended program to the service and exits
 }
 
 // objectSDDL is the window station's (and desktop's) access list in SDDL.
@@ -849,6 +966,35 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
 		out, c.Exe, restrict, sentinel, c.CLSID)
+	if o.handoff {
+		args += " -p2-handoff"
+		if u, err := windows.GetCurrentProcessToken().GetTokenUser(); err == nil {
+			args += " -p2-svcsid=" + u.User.Sid.String()
+		}
+	}
+	if o.uiLimits {
+		args += " -p2-ui-limits"
+	}
+	// A global atom the service adds (the program should not see it
+	// under the UI limits), and one the program adds (the service should
+	// not see it).
+	atomA, atomB := "vettid-p2-a-"+randHex(4), "vettid-p2-b-"+randHex(4)
+	if !o.quick {
+		an, _ := windows.UTF16PtrFromString(atomA)
+		if a, _, _ := procGlobalAddAtomW.Call(uintptr(unsafe.Pointer(an))); a != 0 {
+			defer procGlobalDeleteAtom.Call(a)
+		}
+		args += " -p2-atom-a=" + atomA + " -p2-atom-b=" + atomB
+		defer func() {
+			bn, _ := windows.UTF16PtrFromString(atomB)
+			if a, _, e := procGlobalFindAtomW.Call(uintptr(unsafe.Pointer(bn))); a == 0 {
+				h.ServiceSeesAtomB = e.Error()
+			} else {
+				h.ServiceSeesAtomB = "found"
+				procGlobalDeleteAtom.Call(a)
+			}
+		}()
+	}
 	if o.exitAfter {
 		args += " -p2-exit-after"
 	}
@@ -928,6 +1074,9 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 			}
 			break
 		}
+	}
+	if o.handoff {
+		h.Handoff = handoff(h.Launcher, pi.Process, job, c.Exe)
 	}
 	if o.exitAfter && h.Launcher.ChildRecordPath != "" {
 		// The program, started by a launcher that has since exited, says
@@ -1325,6 +1474,27 @@ func TestRunnerHopProbe(t *testing.T) {
 		res := runProbe2Service(t, m, name+"h", mustSID(t, hSID), dir, exe,
 			probe2Config{Exe: exe, CLSID: clsid, Mode: "hop", Users: users, ToolsFile: writeTools(t, dir)})
 		probe2ExpectHop(t, res, users["b"], exe)
+		// The no-job hop's program outlives its hop (the service may not end
+		// it): the test, an administrator, ends it here.
+		if pid := res.Hops["no-job-with-window"].Launcher.WaitingPID; pid == 0 {
+			t.Errorf("no-job hop: no waiting program recorded")
+		} else if img := imagesOf([]uint32{pid})[pid]; !strings.EqualFold(img, filepath.Base(exe)) && !strings.EqualFold(img, exe) {
+			t.Errorf("no-job hop: program %d is %q, not running as %s", pid, img, filepath.Base(exe))
+		} else {
+			p, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, pid)
+			if err == nil {
+				err = windows.TerminateProcess(p, 1)
+				if err == nil {
+					if ev, _ := windows.WaitForSingleObject(p, 10000); ev != windows.WAIT_OBJECT_0 {
+						err = errors.New("did not end")
+					}
+				}
+				windows.CloseHandle(p)
+			}
+			if err != nil {
+				t.Errorf("ending the no-job hop's program %d: %v", pid, err)
+			}
+		}
 	})
 	// Route A, as a contrast: the service holds SeAssignPrimaryTokenPrivilege
 	// and starts the user32 child itself with CreateProcessAsUser.
@@ -1396,7 +1566,7 @@ func mustSID(t *testing.T, s string) *windows.SID {
 
 // probe2Hops are the hops runHops makes; each must be in the record.
 var probe2Hops = []string{"interactive", "interactive-no-ui-limits", "interactive+local", "null-dacl-desktop",
-	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl"}
+	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl", "handoff"}
 
 // probe2ExpectHop checks each recorded value against what was measured
 // (no check depends on another step having worked); what a run measures
@@ -1442,6 +1612,33 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 		l := h.Launcher
 		if l.Token.User != u.SID || l.ServiceSentinel || l.Restricted != "ok" {
 			t.Errorf("%s: launcher as %s (want %s), service handle inherited %v, restricted token %s", where, l.Token.User, u.SID, l.ServiceSentinel, l.Restricted)
+			continue
+		}
+		if key == "handoff" {
+			// The design's shape, each step asserted: the launcher gone before
+			// the resume; the service opens the suspended program and its
+			// thread, reads the image, finds it in the job, resumes it; the
+			// program runs to exit 0 with its restricted token.
+			hr := h.Handoff
+			if hr == nil {
+				t.Errorf("%s: no handoff record (launcher: %s)", where, l.Restricted)
+				continue
+			}
+			t.Logf("%s: %+v; the launcher read %q, set the thread's DACL: %s", where, *hr, l.HandoffImage, l.ThreadDACL)
+			if l.ThreadDACL != "ok" || l.DefaultDACL != "ok" || !strings.EqualFold(l.HandoffImage, exe) {
+				t.Errorf("%s: launcher: default DACL %q, thread DACL %q, image %q", where, l.DefaultDACL, l.ThreadDACL, l.HandoffImage)
+			}
+			if hr.LauncherGone != "true" || hr.Open != "ok" || hr.OpenThread != "ok" || !strings.EqualFold(hr.Image, exe) ||
+				hr.InJob != "true" || hr.Resume != "ok (was suspended 1)" || hr.Exit != "exit 0x0" {
+				t.Errorf("%s: %+v", where, *hr)
+			}
+			if pt := hr.Program.Token; pt.User != u.SID || pt.Interactive != "deny-only" || pt.Local != "absent" ||
+				!sameSet(pt.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
+				t.Errorf("%s: the program's token %+v", where, pt)
+			}
+			if h.Kill != "ok (the launcher)" {
+				t.Errorf("%s: closing the job: %s", where, h.Kill)
+			}
 			continue
 		}
 		if key == "exit-after" {
@@ -1564,6 +1761,40 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			}
 		}
 
+		// Contrast for the handoff: while the launcher waits, its thread and
+		// token keep the runner's default DACL whatever the launcher set on
+		// its process (recorded, then pinned).
+		t.Logf("%s: the launcher's thread and token from the program: %v (copy's INTERACTIVE %s); after the launcher's process DACL: %v (copy's INTERACTIVE %s)", where,
+			open, l.Children["open-launcher"].Record.LauncherTokenInteractive, limited, l.Children["open-launcher-limited"].Record.LauncherTokenInteractive)
+
+		// The job's UI limits, from the program: refused with them, and
+		// what each call does without them (the contrast).
+		ui := l.Children["uilimits"].Record.UI
+		t.Logf("%s: UI calls from the program: %v; the service finds the program's atom: %s", where, ui, h.ServiceSeesAtomB)
+		if h.UILimits == "ok" && h.Desktop != "" {
+			for _, call := range []string{"CreateDesktop", "SwitchDesktop", "ExitWindowsEx"} {
+				if v, ok := ui[call]; !ok || v == "ok" {
+					t.Errorf("%s: %s under the UI limits: %q, want refused", where, call, v)
+				}
+			}
+			if v := ui["GlobalFindAtom(the service's)"]; v == "" || v == "found" {
+				t.Errorf("%s: the program finding the service's global atom: %q, want not found", where, v)
+			}
+			if ui["GlobalAddAtom"] != "ok" || h.ServiceSeesAtomB == "" || h.ServiceSeesAtomB == "found" {
+				t.Errorf("%s: the program's atom %q; the service finding it: %q, want not found", where, ui["GlobalAddAtom"], h.ServiceSeesAtomB)
+			}
+		}
+		if key == "interactive-no-ui-limits" {
+			// Without the limits the atoms are shared: the contrast that
+			// shows the limit is what separates them.
+			if ui["GlobalFindAtom(the service's)"] != "found" || h.ServiceSeesAtomB != "found" {
+				t.Errorf("%s: without UI limits, atoms: program finds the service's %q, service finds the program's %q; want both found", where, ui["GlobalFindAtom(the service's)"], h.ServiceSeesAtomB)
+			}
+			if _, ok := ui["ExitWindowsEx"]; ok {
+				t.Errorf("%s: ExitWindowsEx tried without the UI limits", where)
+			}
+		}
+
 		if key == "interactive" {
 			if len(l.Tools) == 0 {
 				t.Errorf("%s: no tools were started", where)
@@ -1588,11 +1819,14 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	}
 	// Measured: READ_CONTROL is the standard right needed, and
 	// WINSTA_EXITWINDOWS is needed; WINSTA_ALL_ACCESS alone fails.
-	// 0x2007A is the narrowest that works: without EXITWINDOWS (0x2003A)
-	// it fails.
+	// 0x2007A works, and without EXITWINDOWS (0x2003A) it fails; its other
+	// single removals are logged above until measured.
 	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false, "0x2007a": true, "0x2003a": false} {
-		if got := r.Masks[key].Launcher == "ok"; got != works {
-			t.Errorf("window station entry %s: user32 initialized %v, measured %v", key, got, works)
+		// In the launcher and in its restricted child alike.
+		m := r.Masks[key]
+		launcherOK, childOK := m.Launcher == "ok", strings.HasPrefix(m.Child, "run-")
+		if launcherOK != works || childOK != works {
+			t.Errorf("window station entry %s: user32 in the launcher %v, in the restricted child %v (%q); measured %v", key, launcherOK, childOK, m.Child, works)
 		}
 	}
 }
@@ -1951,4 +2185,167 @@ func keepStationDACL(ws windows.Handle) (func(), error) {
 	return func() {
 		_ = windows.SetSecurityInfo(ws, windows.SE_WINDOW_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, dacl, nil)
 	}, nil
+}
+
+// uiCalls tries, from the run's program, what the job's UI limits are
+// to refuse: a desktop of its own, switching to its desktop,
+// ExitWindowsEx (only with -p2-exitwindows, so only where the limits
+// are set), and the window station's global atoms (one the service
+// added, which it should not see; one it adds, which the service
+// should not see).
+func uiCalls() map[string]string {
+	out := map[string]string{}
+	if err := moduser32.Load(); err != nil {
+		out["user32"] = err.Error()
+		return out
+	}
+	dn, _ := windows.UTF16PtrFromString("p2-own-" + randHex(4))
+	if d, _, e := procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), 0); d == 0 {
+		out["CreateDesktop"] = e.Error()
+	} else {
+		out["CreateDesktop"] = "ok"
+		procCloseDesktop.Call(d)
+	}
+	// Its own desktop, by name, with DESKTOP_SWITCHDESKTOP.
+	cur, _, _ := procGetThreadDesktop.Call(uintptr(windows.GetCurrentThreadId()))
+	name := make([]uint16, 256)
+	var n uint32
+	procGetUserObjectInformation.Call(cur, 2, uintptr(unsafe.Pointer(&name[0])), uintptr(len(name)*2), uintptr(unsafe.Pointer(&n)))
+	if d, _, e := procOpenDesktopW.Call(uintptr(unsafe.Pointer(&name[0])), 0, 0, 0x100 /* DESKTOP_SWITCHDESKTOP */); d == 0 {
+		out["SwitchDesktop"] = "OpenDesktop: " + e.Error()
+	} else {
+		if r, _, e := procSwitchDesktop.Call(d); r == 0 {
+			out["SwitchDesktop"] = e.Error()
+		} else {
+			out["SwitchDesktop"] = "ok"
+		}
+		procCloseDesktop.Call(d)
+	}
+	if *p2ExitWin {
+		// EWX_LOGOFF: the job's limit is to refuse it before anything else.
+		if r, _, e := procExitWindowsEx.Call(0, 0); r == 0 {
+			out["ExitWindowsEx"] = e.Error()
+		} else {
+			out["ExitWindowsEx"] = "ok"
+		}
+	}
+	if *p2AtomA != "" {
+		a, _ := windows.UTF16PtrFromString(*p2AtomA)
+		if r, _, e := procGlobalFindAtomW.Call(uintptr(unsafe.Pointer(a))); r == 0 {
+			out["GlobalFindAtom(the service's)"] = e.Error()
+		} else {
+			out["GlobalFindAtom(the service's)"] = "found"
+		}
+	}
+	if *p2AtomB != "" {
+		b, _ := windows.UTF16PtrFromString(*p2AtomB)
+		if r, _, e := procGlobalAddAtomW.Call(uintptr(unsafe.Pointer(b))); r == 0 {
+			out["GlobalAddAtom"] = e.Error()
+		} else {
+			out["GlobalAddAtom"] = "ok"
+		}
+	}
+	return out
+}
+
+// setThreadDACL gives the program's thread a DACL: full access for its
+// user and SYSTEM, and for the service SYNCHRONIZE,
+// THREAD_QUERY_LIMITED_INFORMATION and THREAD_SUSPEND_RESUME.
+func setThreadDACL(th windows.Handle, user, service string) error {
+	sd, err := windows.SecurityDescriptorFromString("D:(A;;GA;;;" + user + ")(A;;GA;;;SY)(A;;0x100802;;;" + service + ")")
+	if err != nil {
+		return err
+	}
+	acl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetSecurityInfo(th, windows.SE_KERNEL_OBJECT, windows.DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+}
+
+// uiArgs passes the launcher's UI-limit flags on to the uilimits child.
+func uiArgs() string {
+	s := fmt.Sprintf(` -p2-atom-a=%s -p2-atom-b=%s`, *p2AtomA, *p2AtomB)
+	if *p2UI {
+		s += " -p2-exitwindows"
+	}
+	return s
+}
+
+// handoffResult is the service's side of the handoff.
+type handoffResult struct {
+	LauncherGone string        `json:"launcher_gone_before_resume"` // "true", or what was seen
+	Open         string        `json:"open_process"`                // QUERY_LIMITED|SYNCHRONIZE|TERMINATE
+	OpenThread   string        `json:"open_thread"`                 // SUSPEND_RESUME|SYNCHRONIZE
+	Image        string        `json:"image"`                       // as the service read it
+	InJob        string        `json:"in_job"`
+	Resume       string        `json:"resume"` // "ok (was suspended N)" or the error
+	Exit         string        `json:"exit"`
+	Program      programRecord `json:"program"`
+}
+
+// handoff is the service's part: once the launcher has exited, open the
+// suspended program and its thread, check its image and job, resume it
+// and wait for it to end.
+func handoff(l launcherRecord, launcher, job windows.Handle, exe string) *handoffResult {
+	r := &handoffResult{}
+	if l.HandoffPID == 0 {
+		r.Open = "no program handed over"
+		return r
+	}
+	if ev, _ := windows.WaitForSingleObject(launcher, 30000); ev == windows.WAIT_OBJECT_0 {
+		r.LauncherGone = "true"
+	} else {
+		r.LauncherGone = fmt.Sprintf("still running (wait %d)", ev)
+	}
+	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE|windows.PROCESS_TERMINATE, false, l.HandoffPID)
+	if err != nil {
+		r.Open = err.Error()
+		return r
+	}
+	defer windows.CloseHandle(p)
+	r.Open = "ok"
+	th, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME|windows.SYNCHRONIZE, false, l.HandoffTID)
+	if err != nil {
+		r.OpenThread = err.Error()
+		return r
+	}
+	defer windows.CloseHandle(th)
+	r.OpenThread = "ok"
+	buf := make([]uint16, windows.MAX_LONG_PATH)
+	n := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(p, 0, &buf[0], &n); err != nil {
+		r.Image = err.Error()
+		return r
+	}
+	r.Image = windows.UTF16ToString(buf[:n])
+	if !strings.EqualFold(r.Image, exe) {
+		// Not the program: end it unresumed.
+		_ = windows.TerminateProcess(p, 1)
+		return r
+	}
+	var in int32
+	if ok, _, e := procIsProcessInJob.Call(uintptr(p), uintptr(job), uintptr(unsafe.Pointer(&in))); ok == 0 {
+		r.InJob = e.Error()
+	} else {
+		r.InJob = strconv.FormatBool(in != 0)
+	}
+	prev, err := windows.ResumeThread(th)
+	if err != nil {
+		r.Resume = err.Error()
+		return r
+	}
+	r.Resume = fmt.Sprintf("ok (was suspended %d)", prev)
+	if ev, _ := windows.WaitForSingleObject(p, 60000); ev != windows.WAIT_OBJECT_0 {
+		r.Exit = "did not end within 1m"
+		_ = windows.TerminateProcess(p, 1)
+	} else {
+		var code uint32
+		_ = windows.GetExitCodeProcess(p, &code)
+		r.Exit = fmt.Sprintf("exit %#x", code)
+	}
+	if b, err := os.ReadFile(l.HandoffRecord); err == nil {
+		_ = json.Unmarshal(b, &r.Program)
+	}
+	return r
 }
