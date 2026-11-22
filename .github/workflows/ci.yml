@@ -131,6 +131,22 @@ jobs:
           for t in default cut3 cut3+grant2 cut2+grant1 cut1 cut1-seclogon-stopped; do t="TestServiceAccountProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
+      # A3.10b's second measurement, for the owner's decision B: the
+      # launcher hop, the image check, a window station and desktop of
+      # the run's own, DCOM with INTERACTIVE deny-only, inheritance, and
+      # B's runner shape. A throwaway service, users and class, removed
+      # afterwards.
+      - name: runner hop probe, verbose
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          VETTID_AGENT_TEST_OTHER_USER: "1"
+        run: |
+          set -o pipefail
+          go test -count=1 -v -timeout 30m -run 'TestRunnerHopProbe$' ./internal/service | tee "$RUNNER_TEMP/probe2.txt"
+          for t in hop route-a shapes seclogon-disabled; do t="TestRunnerHopProbe/$t"
+            grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe2.txt" || { echo "::error::$t did not pass"; exit 1; }
+          done
       # internal/state's tests crashed once on Windows with an access
       # violation (0xc0000005) and no Go trace. Run 10 more times,
       # verbosely, with GOTRACEBACK=wer, so a crash says where; the
