@@ -63,7 +63,8 @@ const (
 var adminGroups = []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "snap_microk8s",
 	"mock", "empower", "disk", "kmem", "root", "shadow", "input", "uinput", "src"}
 
-// The group database, as the admin check reads it; tests replace them.
+// The group database, as the admin check reads it; tests replace them
+// (so no test that does may run in parallel).
 var (
 	lookupUserID    = user.LookupId
 	lookupGroupID   = user.LookupGroupId
@@ -560,23 +561,31 @@ func userGroups(uid, gid uint32) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return withAdminGids(ids, names), nil
+	return withAdminGids(ids, names)
 }
 
 // withAdminGids adds to names each refusing group whose gid ids hold,
 // whatever name the lookup gave that gid, and "root" for gid 0
 // (AGENT-LINUX-RUNTIME §11.1): a second group entry with a refusing
 // group's gid is caught.
-func withAdminGids(ids, names []string) []string {
+func withAdminGids(ids, names []string) ([]string, error) {
 	if slices.Contains(ids, "0") {
 		names = append(names, "root")
 	}
 	for _, name := range adminGroups {
-		if g, err := lookupGroupName(name); err == nil && slices.Contains(ids, g.Gid) {
+		g, err := lookupGroupName(name)
+		var unknown user.UnknownGroupError
+		switch {
+		case errors.As(err, &unknown):
+			continue // not on this computer
+		case err != nil:
+			return nil, fmt.Errorf("group %s can't be looked up: %w", name, err)
+		}
+		if slices.Contains(ids, g.Gid) {
 			names = append(names, name)
 		}
 	}
-	return names
+	return names, nil
 }
 
 // groupNames names the groups gids.
@@ -589,7 +598,7 @@ func groupNames(gids []uint32) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return withAdminGids(ids, names), nil
+	return withAdminGids(ids, names)
 }
 
 func lookupGroups(ids []string) ([]string, error) {

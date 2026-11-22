@@ -284,8 +284,8 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 	// dropping one from adminGroups fails.
 	refusing := []string{"docker", "lxd", "incus-admin", "libvirt", "libvirtd", "microk8s", "snap_microk8s",
 		"mock", "empower", "disk", "kmem", "root", "shadow", "input", "uinput", "src"}
-	if len(refusing) != len(adminGroups) {
-		t.Errorf("adminGroups %v, want %v", adminGroups, refusing)
+	if got, want := slices.Sorted(slices.Values(adminGroups)), slices.Sorted(slices.Values(refusing)); !slices.Equal(got, want) {
+		t.Errorf("adminGroups %v, want %v", got, want)
 	}
 	for _, g := range refusing {
 		groups := func(uint32, uint32) ([]string, error) { return []string{"users", g}, nil }
@@ -983,6 +983,7 @@ func TestOtherGroupsAdmitted(t *testing.T) {
 
 // A refusing group counts by its gid, through userGroups and groupNames
 // themselves: gid 0 named otherwise, and a second name for docker's gid.
+// It replaces the package's group lookups: never t.Parallel.
 func TestAdminGroupsCountByGid(t *testing.T) {
 	db := map[string]string{"0": "wheel", "100": "users", "998": "containers"}
 	byName := map[string]string{"docker": "998", "root": "0", "users": "100"}
