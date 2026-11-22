@@ -1030,4 +1030,12 @@ func TestAdminGroupsCountByGid(t *testing.T) {
 	if got, err := userGroups(1000, 100); err != nil || slices.ContainsFunc(got, func(g string) bool { return slices.Contains(adminGroups, g) }) {
 		t.Errorf("userGroups(users): %v, %v", got, err)
 	}
+	// A lookup that fails for another reason than "not found" refuses.
+	lookupGroupName = func(string) (*user.Group, error) { return nil, errors.New("/etc/group unreadable") }
+	if _, err := groupNames([]uint32{100}); err == nil {
+		t.Error("groupNames with a failing lookup: no error")
+	}
+	if _, err := userGroups(1000, 100); err == nil {
+		t.Error("userGroups with a failing lookup: no error")
+	}
 }
