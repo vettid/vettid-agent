@@ -922,12 +922,12 @@ func runHops(c probe2Config) probe2Result {
 		res.WindowStation = err.Error()
 		return res
 	}
-	// A window station with no name (Chromium's pattern): whether the
-	// service may make one where a named one is refused, and whether a
-	// run can use a desktop in it. A station of the run's own would keep
 	// Step 3: whether this service (ChangeNotify only) may read the
 	// runner's account rights, to re-check its denied logons.
 	res.RunnerRights, res.RunnerRightsList = accountRights(b.SID)
+	// A window station with no name (Chromium's pattern): whether the
+	// service may make one where a named one is refused, and whether a
+	// run can use a desktop in it. A station of the run's own would keep
 	// runs off the connector's.
 	res.UnnamedWindowStation, res.UnnamedHop = tryUnnamedStation(c, b, sa)
 	deskName := "run-" + randHex(4)
@@ -1030,8 +1030,6 @@ func runHops(c probe2Config) probe2Result {
 		// The same, with the launcher locking its own token and process
 		// first: which of the two is what keeps the program out.
 		{key: "handoff-locked", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true},
-		// With no console for the program (DETACHED_PROCESS, pipes for its
-		// output), and for the launcher too: no conhost to reach.
 		// Step 3, each on the design's shape (locked, the program with no
 		// console): the launcher's conhost reached by id; freed; locked;
 		// the launcher a GUI-subsystem copy (no console at all), with the
@@ -1044,6 +1042,8 @@ func runHops(c probe2Config) probe2Result {
 		{key: "s3-pipes-inheritable", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, outPipe: "inheritable", passStd: true, report: true},
 		{key: "s3-pipes-not-inheritable", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, outPipe: "not-inheritable", passStd: true},
 		{key: "s3-restrict-after-lock", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, restrictAfterLock: true},
+		// With no console for the program (DETACHED_PROCESS, pipes for its
+		// output), and for the launcher too: no conhost to reach.
 		{key: "handoff-locked-detached-program", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true},
 		{key: "handoff-locked-detached", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true, detachedProgram: true, detachedLauncher: true},
 		// The service named in the program's token's default DACL: whether

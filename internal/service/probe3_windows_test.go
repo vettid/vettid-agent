@@ -543,8 +543,10 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 		if pt := hr.Program.Token; pt.User != u.SID || pt.Interactive != "deny-only" || pt.Local != "absent" || !sameSet(pt.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
 			t.Errorf("%s: the program's token %+v", where, pt)
 		}
-		for right, v := range hr.Program.OpenLauncher {
-			want := "Access is denied."
+		// Every right, from a fixed list: a missing one is a failure.
+		for _, right := range []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "THREAD_SET_CONTEXT", "THREAD_SUSPEND_RESUME",
+			"TOKEN_DUPLICATE", "TOKEN_IMPERSONATE", "TOKEN_READ_CONTROL", "TOKEN_WRITE_DAC", "TOKEN_WRITE_OWNER"} {
+			v, want := hr.Program.OpenLauncher[right], "Access is denied."
 			if strings.HasPrefix(right, "THREAD_") {
 				want = "The parameter is incorrect."
 			}
@@ -588,6 +590,10 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 		// service makes it, the launcher receives an inheritable pipe,
 		// writes to it, passes it on; both lines reach the service after the
 		// launcher has gone.
+		wantOutput := key == "s3-gui" || strings.HasPrefix(key, "s3-pipes-")
+		if (h.Output != nil) != wantOutput {
+			t.Errorf("%s: an output pipe recorded %v, want %v", where, h.Output != nil, wantOutput)
+		}
 		if h.Output != nil {
 			if l3.Std == nil || l3.Std.Output != "pipe" || l3.Std.Inheritable != "true" || l3.Std.Write != "ok" || l3.Std.PassedOn != "ok" {
 				t.Errorf("%s: the launcher's output %+v", where, l3.Std)
@@ -599,6 +605,10 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 
 		// 3. The report pipe: the runner connects and reports; another runner
 		// and a plain user may neither read nor write it.
+		wantReport := key == "s3-gui" || key == "s3-pipes-inheritable"
+		if (h.Report != nil) != wantReport {
+			t.Errorf("%s: a report pipe recorded %v, want %v", where, h.Report != nil, wantReport)
+		}
 		if h.Report != nil {
 			rp := h.Report
 			if rp.Make != "ok" || l3.Report != "ok" || rp.Read != "ok" || rp.Got == nil ||
