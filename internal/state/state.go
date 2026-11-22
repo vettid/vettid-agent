@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -584,18 +585,34 @@ func (s *Store) WipeAll(ps []Protector) error {
 }
 
 // safeWipe calls p.Wipe and turns a panic into an error. A nil
-// interface is skipped by the caller; a typed nil pointer inside the
-// interface (an interface holding (*T)(nil)) cannot be told apart
-// without reflection, so it is called: if its Wipe tolerates a nil
-// receiver that is fine, and if it dereferences one the panic becomes
-// this error instead of crashing the wipe half-way.
+// interface is skipped by the caller. A typed nil inside the interface
+// (an interface holding (*T)(nil)) is refused here, without calling its
+// Wipe: a nil dereference in Wipe would otherwise be relied on to become
+// a recoverable panic, which on Windows it does not always do (the
+// process dies instead, part way through the wipe). The recover stays as
+// a backstop for other panics.
 func safeWipe(p Protector) (err error) {
+	if typedNil(p) {
+		return errors.New("a nil protector (its key, if any, cannot be deleted through it)")
+	}
 	defer func() {
 		if r := recover(); r != nil {
-			err = errors.New("the protector failed (a nil protector?)")
+			err = errors.New("the protector failed")
 		}
 	}()
 	return p.Wipe()
+}
+
+// typedNil reports whether p holds a nil pointer, map, slice, func,
+// channel or interface: an interface that is not nil but whose methods
+// would run on nothing.
+func typedNil(p Protector) bool {
+	v := reflect.ValueOf(p)
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.Interface:
+		return v.IsNil()
+	}
+	return false
 }
 
 // oldProtector returns the protector of the last Create or Load or,

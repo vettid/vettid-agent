@@ -131,7 +131,7 @@ jobs:
           for t in default cut3 cut3+grant2 cut2+grant1 cut1 cut1-seclogon-stopped; do t="TestServiceAccountProbe/$t"
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/probe.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
-      # internal/state's tests crashed once on Windows with an access
+      # internal/state's tests crashed on Windows with an access
       # violation (0xc0000005) and no Go trace. Run 10 more times,
       # verbosely, with GOTRACEBACK=wer, so a crash says where; the
       # whole output is kept as an artifact.
@@ -154,12 +154,46 @@ jobs:
             fi
           done
           exit $ok
+      # Diagnosis for that crash: it was Go not turning a nil dereference
+      # (in a test protector's Wipe on a nil receiver) into a recoverable
+      # panic; the process died at the dereference. The wipe no longer
+      # relies on that. TestRecoveredNilDereference repeats such a
+      # dereference, recovered: here it runs 10 times as is and 10 times
+      # with async preemption off, and the crashes are counted. A crash
+      # here is the runtime's, not this repository's code's, so the step
+      # warns and does not fail. The test binary is kept with any dump, so
+      # a debugger can read it (dumps from "go test" above come from its own
+      # binary, which is not kept).
+      - name: recovered nil dereference, with and without async preemption (diagnosis)
+        if: runner.os == 'Windows' && !cancelled()
+        shell: bash
+        env:
+          GOTRACEBACK: wer
+          VETTID_AGENT_TEST_NILDEREF: "1"
+        run: |
+          [ -f "$RUNNER_TEMP/state.test.exe" ] || go test -c -o "$RUNNER_TEMP/state.test.exe" ./internal/state
+          for arm in default asyncpreemptoff; do
+            if [ "$arm" = asyncpreemptoff ]; then export GODEBUG=asyncpreemptoff=1; else unset GODEBUG; fi
+            crashes=0
+            for i in $(seq 1 10); do
+              if ! (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 -test.run '^TestRecoveredNilDereference$' > "$RUNNER_TEMP/nilderef-$arm-$i.txt" 2>&1); then
+                crashes=$((crashes+1))
+              fi
+            done
+            echo "$arm: $crashes of 10 runs crashed" | tee -a "$RUNNER_TEMP/nilderef-summary.txt"
+            if [ "$crashes" != 0 ]; then echo "::warning::recovered nil dereference ($arm): $crashes of 10 runs crashed"; fi
+          done
+          if compgen -G "$RUNNER_TEMP/dumps/state.test.exe.*.dmp" > /dev/null; then
+            cp "$RUNNER_TEMP/state.test.exe" "$RUNNER_TEMP/dumps/"
+          fi
       - name: keep the crash hunt's output
         if: runner.os == 'Windows' && !cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: state-crash-hunt
-          path: ${{ runner.temp }}/state-*.txt
+          path: |
+            ${{ runner.temp }}/state-*.txt
+            ${{ runner.temp }}/nilderef-*.txt
           retention-days: 7
           if-no-files-found: ignore
       # The runner's user is an administrator, for whom every folder can be

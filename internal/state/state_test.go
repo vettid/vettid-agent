@@ -1015,6 +1015,66 @@ func replaceSetup(t *testing.T) (*Store, *fixedProtector, string, int64) {
 	return s, oldP, link, size
 }
 
+// nilTolerant is a protector whose Wipe runs on a nil receiver without
+// a dereference, counting the calls.
+type nilTolerant struct{ fixedProtector }
+
+var nilTolerantWipes int
+
+func (*nilTolerant) Wipe() error {
+	nilTolerantWipes++
+	return nil
+}
+
+// A typed nil protector is refused without its Wipe being called, and
+// the rest of the wipe goes on: the other protector's key and the state
+// file are deleted.
+func TestWipeAllTypedNilNotCalled(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	nilTolerantWipes = 0
+	var typedNil *nilTolerant
+	err := s.WipeAll([]Protector{typedNil, p})
+	if err == nil || !strings.Contains(err.Error(), "protector 0") || !strings.Contains(err.Error(), "nil protector") {
+		t.Fatalf("WipeAll = %v, want an error naming protector 0 as nil", err)
+	}
+	if nilTolerantWipes != 0 {
+		t.Errorf("the typed nil's Wipe was called %d times", nilTolerantWipes)
+	}
+	if p.hasKey || p.wiped != 1 {
+		t.Errorf("the other protector: key remains %v, wiped %d times", p.hasKey, p.wiped)
+	}
+	if ok, _ := s.Exists(); ok {
+		t.Error("state file remains")
+	}
+}
+
+// Go turns a nil dereference into a panic that recover catches. On
+// Windows CI that has failed: the process died with an access violation
+// and no Go trace, at the dereference in fixedProtector.Wipe on a nil
+// receiver. This repeats that dereference, recovered, many times. It
+// runs only with VETTID_AGENT_TEST_NILDEREF=1 (the CI crash hunt), as it
+// can crash the test binary.
+func TestRecoveredNilDereference(t *testing.T) {
+	if os.Getenv("VETTID_AGENT_TEST_NILDEREF") != "1" {
+		t.Skip("VETTID_AGENT_TEST_NILDEREF=1 runs it (it can crash the binary)")
+	}
+	var p Protector = (*fixedProtector)(nil)
+	for i := 0; i < 20000; i++ {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("round %d: no panic from a nil dereference", i)
+				}
+			}()
+			_ = p.Wipe()
+		}()
+	}
+}
+
 // A typed nil pointer in WipeAll does not crash the wipe.
 func TestWipeAllTypedNil(t *testing.T) {
 	s := openTest(t)
