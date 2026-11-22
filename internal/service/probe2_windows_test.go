@@ -84,6 +84,7 @@ var (
 	procGlobalFindAtomW          = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalFindAtomW")
 	procGlobalDeleteAtom         = windows.NewLazySystemDLL("kernel32.dll").NewProc("GlobalDeleteAtom")
 	procIsProcessInJob           = windows.NewLazySystemDLL("kernel32.dll").NewProc("IsProcessInJob")
+	procGetProcessIdOfThread     = windows.NewLazySystemDLL("kernel32.dll").NewProc("GetProcessIdOfThread")
 )
 
 // The children's flags.
@@ -106,6 +107,8 @@ var (
 	p2AtomA    = flag.String("p2-atom-a", "", "probe2 uilimits: a global atom the service added, to look for")
 	p2AtomB    = flag.String("p2-atom-b", "", "probe2 uilimits: a global atom to add, for the service to look for")
 	p2ExitWin  = flag.Bool("p2-exitwindows", false, "probe2 uilimits: also try ExitWindowsEx")
+	p2LockTok  = flag.Bool("p2-lock-token", false, "probe2 launcher, handoff: lock its own token and process with OWNER RIGHTS DACLs first")
+	p2Created  = flag.Uint64("p2-target-created", 0, "probe2 openlauncher: the launcher's creation time, to tell it from a process that reuses its id")
 )
 
 // tokenFacts is what a process reads of its own token.
@@ -185,6 +188,9 @@ type programRecord struct {
 	// read through a handle the program opened.
 	LauncherTokenInteractive string            `json:"launcher_token_interactive,omitempty"`
 	UI                       map[string]string `json:"ui,omitempty"` // uilimits: call: "ok" or the error
+	// TargetIdentity: whether the id opened is still the launcher's
+	// ("launcher", "gone: …", "reused: …").
+	TargetIdentity string `json:"target_identity,omitempty"`
 }
 
 // childStart is one program the launcher started.
@@ -224,6 +230,9 @@ type launcherRecord struct {
 	HandoffRecord string `json:"handoff_record,omitempty"`
 	ThreadDACL    string `json:"handoff_thread_dacl,omitempty"`
 	ThreadID      uint32 `json:"launcher_thread_id,omitempty"`
+	TokenLock     string `json:"token_lock,omitempty"`   // handoff with -p2-lock-token
+	TokenSDDL     string `json:"token_sddl,omitempty"`   // its token's owner and DACL after the lock
+	ProcessLock   string `json:"process_lock,omitempty"` // its process DACL, likewise
 }
 
 // TestProbe2ChildHelper runs a probe2 child's part; skipped otherwise.
@@ -294,6 +303,7 @@ func runProgram(mode string) int {
 		// Whether the run's program may open its launcher (the same user)
 		// with a right that would let it take the launcher over.
 		time.Sleep(*p2Delay)
+		r.TargetIdentity = targetIdentity(uint32(*p2Target), uint32(*p2Thread), *p2Created)
 		r.OpenLauncher = map[string]string{}
 		// Whether the launcher is still running (an exited process can still
 		// be opened while any handle to it is open, here the service's).
@@ -458,8 +468,21 @@ func runLauncher() int {
 		// process) SYNCHRONIZE, QUERY_LIMITED_INFORMATION and
 		// SUSPEND_RESUME. The launcher reports the ids and exits; the
 		// service checks the image and resumes it.
+		if *p2LockTok {
+			// Its own token and process, each limited to SYSTEM and OWNER
+			// RIGHTS (the token: QUERY; the process: SYNCHRONIZE and
+			// QUERY_LIMITED_INFORMATION), before the program exists.
+			rec.TokenLock = errString(lockOwnToken())
+			rec.TokenSDDL = ownTokenSDDL()
+			rec.ProcessLock = errString(limitOwnDACL())
+		}
+		// The program, once resumed (after this launcher has exited), tries
+		// to open this launcher: process, thread and token.
+		var created, exitT, kernelT, userT windows.Filetime
+		_ = windows.GetProcessTimes(windows.CurrentProcess(), &created, &exitT, &kernelT, &userT)
 		out := filepath.Join(filepath.Dir(*p2Out), "child-handoff-"+randHex(4)+".json")
-		pi, err := startSuspended(restricted, *p2Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=program -p2-out="%s"`, out), "")
+		pi, err := startSuspended(restricted, *p2Exe, fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=openlauncher -p2-out="%s" -p2-target=%d -p2-thread=%d -p2-target-created=%d`,
+			out, windows.GetCurrentProcessId(), rec.ThreadID, uint64(created.HighDateTime)<<32|uint64(created.LowDateTime)), "")
 		if err != nil {
 			rec.Restricted += "; handoff start: " + err.Error()
 		} else {
@@ -870,6 +893,9 @@ func runHops(c probe2Config) probe2Result {
 		// hands it to the service and exits; the service checks the image
 		// and resumes it.
 		{key: "handoff", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true},
+		// The same, with the launcher locking its own token and process
+		// first: which of the two is what keeps the program out.
+		{key: "handoff-locked", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, handoff: true, lockToken: true},
 		// The service named in the program's token's default DACL: whether
 		// it may then open the program.
 		{key: "service-in-default-dacl", restrict: "interactive", desktop: res.DesktopName, uiLimits: true, svcDACL: true},
@@ -940,6 +966,7 @@ type hopOpts struct {
 	exitAfter              bool // the launcher exits right after resuming the program
 	svcDACL                bool // the service is named in the program's default DACL
 	handoff                bool // the launcher hands the suspended program to the service and exits
+	lockToken              bool // handoff: the launcher locks its own token and process first
 }
 
 // objectSDDL is the window station's (and desktop's) access list in SDDL.
@@ -970,6 +997,9 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 	out := filepath.Join(u.OutDir, "launcher-"+randHex(4)+".json")
 	args := fmt.Sprintf(`-test.run=^TestProbe2ChildHelper$ -p2-mode=launcher -p2-out="%s" -p2-exe="%s" -p2-restrict=%s -p2-sentinel=%d -p2-clsid=%s`,
 		out, c.Exe, restrict, sentinel, c.CLSID)
+	if o.lockToken {
+		args += " -p2-lock-token"
+	}
 	if o.handoff {
 		args += " -p2-handoff"
 		if u, err := windows.GetCurrentProcessToken().GetTokenUser(); err == nil {
@@ -1080,7 +1110,7 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 		}
 	}
 	if o.handoff {
-		h.Handoff = handoff(h.Launcher, pi.Process, job, c.Exe)
+		h.Handoff = handoff(h.Launcher, &pi, job, c.Exe)
 	}
 	if o.exitAfter && h.Launcher.ChildRecordPath != "" {
 		// The program, started by a launcher that has since exited, says
@@ -1120,9 +1150,12 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 		// program: whether a process snapshot (which needs no handle) still
 		// lists it.
 		h.JobExits = jobExits(port, 3*time.Second)
-		launcherEnded := false
-		if ev, _ := windows.WaitForSingleObject(pi.Process, 10000); ev == windows.WAIT_OBJECT_0 {
-			launcherEnded = true
+		// The handoff closed its handle once it saw the launcher end.
+		launcherEnded := pi.Process == 0 && h.Handoff != nil && h.Handoff.LauncherGone == "true"
+		if pi.Process != 0 {
+			if ev, _ := windows.WaitForSingleObject(pi.Process, 10000); ev == windows.WAIT_OBJECT_0 {
+				launcherEnded = true
+			}
 		}
 		programEnded := h.Launcher.WaitingPID == 0
 		for end := time.Now().Add(10 * time.Second); !programEnded && time.Now().Before(end); time.Sleep(200 * time.Millisecond) {
@@ -1153,12 +1186,14 @@ func runHop(c probe2Config, u probeUser, o hopOpts, sentinel uint64) (h hopResul
 		}
 		_ = windows.TerminateProcess(pi.Process, 1)
 	}
-	if ev, _ := windows.WaitForSingleObject(pi.Process, 10000); ev != windows.WAIT_OBJECT_0 {
-		_ = windows.TerminateProcess(pi.Process, 1)
-		h.Kill += "; the launcher still ran"
+	if pi.Process != 0 {
+		if ev, _ := windows.WaitForSingleObject(pi.Process, 10000); ev != windows.WAIT_OBJECT_0 {
+			_ = windows.TerminateProcess(pi.Process, 1)
+			h.Kill += "; the launcher still ran"
+		}
+		windows.CloseHandle(pi.Process)
+		windows.CloseHandle(pi.Thread)
 	}
-	windows.CloseHandle(pi.Process)
-	windows.CloseHandle(pi.Thread)
 	return h
 }
 
@@ -1570,7 +1605,7 @@ func mustSID(t *testing.T, s string) *windows.SID {
 
 // probe2Hops are the hops runHops makes; each must be in the record.
 var probe2Hops = []string{"interactive", "interactive-no-ui-limits", "interactive+local", "null-dacl-desktop",
-	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl", "handoff"}
+	"seclogon-default-desktop", "no-job-with-window", "exit-after", "service-in-default-dacl", "handoff", "handoff-locked"}
 
 // probe2ExpectHop checks each recorded value against what was measured
 // (no check depends on another step having worked); what a run measures
@@ -1618,19 +1653,25 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 			t.Errorf("%s: launcher as %s (want %s), service handle inherited %v, restricted token %s", where, l.Token.User, u.SID, l.ServiceSentinel, l.Restricted)
 			continue
 		}
-		if key == "handoff" {
-			// The design's shape, each step asserted: the launcher gone before
-			// the resume; the service opens the suspended program and its
-			// thread, reads the image, finds it in the job, resumes it; the
-			// program runs to exit 0 with its restricted token.
+		if key == "handoff" || key == "handoff-locked" {
+			// The design's shape, each step asserted: the launcher gone, and
+			// every handle of the service's to it closed, before the resume;
+			// the service opens the suspended program and its thread, reads
+			// the image, finds it in the job, checks the thread is the
+			// program's, resumes it. The program then tries to open its
+			// launcher (process, thread, token) and runs to exit 0.
 			hr := h.Handoff
 			if hr == nil {
 				t.Errorf("%s: no handoff record (launcher: %s)", where, l.Restricted)
 				continue
 			}
-			t.Logf("%s: %+v; the launcher read %q, set the thread's DACL: %s", where, *hr, l.HandoffImage, l.ThreadDACL)
+			t.Logf("%s: %+v; the launcher read %q, set the thread's DACL: %s; token lock %q (%s), process lock %q", where,
+				*hr, l.HandoffImage, l.ThreadDACL, l.TokenLock, l.TokenSDDL, l.ProcessLock)
 			if l.ThreadDACL != "ok" || l.DefaultDACL != "ok" || !strings.EqualFold(l.HandoffImage, exe) {
 				t.Errorf("%s: launcher: default DACL %q, thread DACL %q, image %q", where, l.DefaultDACL, l.ThreadDACL, l.HandoffImage)
+			}
+			if key == "handoff-locked" && (l.TokenLock != "ok" || l.ProcessLock != "ok") {
+				t.Errorf("%s: the launcher locking its token %q, its process %q", where, l.TokenLock, l.ProcessLock)
 			}
 			if hr.LauncherGone != "true" || hr.Open != "ok" || hr.OpenThread != "ok" || !strings.EqualFold(hr.Image, exe) ||
 				hr.InJob != "true" || hr.Resume != "ok (was suspended 1)" || hr.Exit != "exit 0x0" {
@@ -1640,21 +1681,42 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 				!sameSet(pt.Privileges, []string{"SeChangeNotifyPrivilege+"}) {
 				t.Errorf("%s: the program's token %+v", where, pt)
 			}
+			// Every open of the launcher refused: the id no longer names the
+			// launcher (not another process under a reused id), and no right
+			// succeeds.
+			ol := hr.Program.OpenLauncher
+			if !strings.HasPrefix(hr.Program.TargetIdentity, "gone: ") {
+				t.Errorf("%s: the launcher's id when the program ran: %q, want gone", where, hr.Program.TargetIdentity)
+			}
+			rights := []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "THREAD_SET_CONTEXT", "THREAD_SUSPEND_RESUME", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"}
+			for _, right := range rights {
+				if v, ok := ol[right]; !ok || v == "ok" {
+					t.Errorf("%s: the program opening its launcher with %s: %q, want refused", where, right, v)
+				}
+			}
+			if hr.Program.LauncherTokenInteractive != "" {
+				t.Errorf("%s: the program copied its launcher's token: INTERACTIVE %s", where, hr.Program.LauncherTokenInteractive)
+			}
 			if h.Kill != "ok (the launcher)" {
 				t.Errorf("%s: closing the job: %s", where, h.Kill)
 			}
 			continue
 		}
 		if key == "exit-after" {
-			// Measured: the launcher has exited, and its process object (kept by
-			// the service's handle) still opens with each right; an exited
-			// process runs nothing, so these rights take nothing over.
+			// The contrast for the handoff's closed handles. Measured: the
+			// launcher has exited, but the service's handle to it keeps its
+			// process object and its token alive, and the program opens both
+			// with each right; a copy of the token holds INTERACTIVE enabled.
 			if h.ExitAfter.LauncherRunning != "false" {
 				t.Errorf("%s: the launcher running when the program checked: %q, measured false", where, h.ExitAfter.LauncherRunning)
 			}
-			t.Logf("%s: the program opening its exited launcher: %v", where, h.ExitAfter.OpenLauncher)
-			if len(h.ExitAfter.OpenLauncher) == 0 {
-				t.Errorf("%s: no record from the program", where)
+			for _, right := range []string{"PROCESS_VM_WRITE", "PROCESS_CREATE_THREAD", "WRITE_DAC", "TOKEN_DUPLICATE", "TOKEN_IMPERSONATE"} {
+				if v := h.ExitAfter.OpenLauncher[right]; v != "ok" {
+					t.Errorf("%s: the program opening its exited launcher with %s: %q, measured ok", where, right, v)
+				}
+			}
+			if v := h.ExitAfter.LauncherTokenInteractive; v != "enabled" {
+				t.Errorf("%s: INTERACTIVE in a copy of the exited launcher's token: %q, measured enabled", where, v)
 			}
 			continue
 		}
@@ -2307,17 +2369,22 @@ type handoffResult struct {
 // handoff is the service's part: once the launcher has exited, open the
 // suspended program and its thread, check its image and job, resume it
 // and wait for it to end.
-func handoff(l launcherRecord, launcher, job windows.Handle, exe string) *handoffResult {
+func handoff(l launcherRecord, pi *windows.ProcessInformation, job windows.Handle, exe string) *handoffResult {
 	r := &handoffResult{}
 	if l.HandoffPID == 0 {
 		r.Open = "no program handed over"
 		return r
 	}
-	if ev, _ := windows.WaitForSingleObject(launcher, 30000); ev == windows.WAIT_OBJECT_0 {
+	if ev, _ := windows.WaitForSingleObject(pi.Process, 30000); ev == windows.WAIT_OBJECT_0 {
 		r.LauncherGone = "true"
 	} else {
 		r.LauncherGone = fmt.Sprintf("still running (wait %d)", ev)
 	}
+	// No handle of the service's may keep the launcher's process object,
+	// and so its token, alive once the program runs.
+	windows.CloseHandle(pi.Process)
+	windows.CloseHandle(pi.Thread)
+	pi.Process, pi.Thread = 0, 0
 	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE|windows.PROCESS_TERMINATE, false, l.HandoffPID)
 	if err != nil {
 		r.Open = err.Error()
@@ -2325,7 +2392,7 @@ func handoff(l launcherRecord, launcher, job windows.Handle, exe string) *handof
 	}
 	defer windows.CloseHandle(p)
 	r.Open = "ok"
-	th, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME|windows.SYNCHRONIZE, false, l.HandoffTID)
+	th, err := windows.OpenThread(windows.THREAD_SUSPEND_RESUME|windows.SYNCHRONIZE|windows.THREAD_QUERY_LIMITED_INFORMATION, false, l.HandoffTID)
 	if err != nil {
 		r.OpenThread = err.Error()
 		return r
@@ -2350,6 +2417,12 @@ func handoff(l launcherRecord, launcher, job windows.Handle, exe string) *handof
 	} else {
 		r.InJob = strconv.FormatBool(in != 0)
 	}
+	// The thread is the program's, not another process's under a reused id.
+	if owner, _, e := procGetProcessIdOfThread.Call(uintptr(th)); uint32(owner) != l.HandoffPID {
+		r.Resume = fmt.Sprintf("the thread is process %d's (%v), not the program's; not resumed", owner, e)
+		_ = windows.TerminateProcess(p, 1)
+		return r
+	}
 	prev, err := windows.ResumeThread(th)
 	if err != nil {
 		r.Resume = err.Error()
@@ -2368,4 +2441,67 @@ func handoff(l launcherRecord, launcher, job windows.Handle, exe string) *handof
 		_ = json.Unmarshal(b, &r.Program)
 	}
 	return r
+}
+
+// lockOwnToken gives this process's token a DACL whose OWNER RIGHTS
+// entry replaces the owner's implicit rights: SYSTEM all, the owner
+// TOKEN_QUERY only.
+func lockOwnToken() error {
+	var tok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.WRITE_DAC|windows.READ_CONTROL, &tok); err != nil {
+		return fmt.Errorf("OpenProcessToken: %w", err)
+	}
+	defer tok.Close()
+	sd, err := windows.SecurityDescriptorFromString("D:P(A;;GA;;;SY)(A;;0x8;;;OW)")
+	if err != nil {
+		return err
+	}
+	acl, _, err := sd.DACL()
+	if err != nil {
+		return err
+	}
+	return windows.SetSecurityInfo(windows.Handle(tok), windows.SE_KERNEL_OBJECT,
+		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION, nil, nil, acl, nil)
+}
+
+// ownTokenSDDL is this process's token's owner and DACL, in SDDL.
+func ownTokenSDDL() string {
+	var tok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.READ_CONTROL, &tok); err != nil {
+		return "OpenProcessToken: " + err.Error()
+	}
+	defer tok.Close()
+	sd, err := windows.GetSecurityInfo(windows.Handle(tok), windows.SE_KERNEL_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+	if err != nil {
+		return err.Error()
+	}
+	return sd.String()
+}
+
+// targetIdentity says whether the process id (and thread id) the
+// program was given are still the launcher's, or now another
+// process's: an exited process's ids may be reused.
+func targetIdentity(pid, tid uint32, created uint64) string {
+	p, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err == nil {
+		var c, e, k, u windows.Filetime
+		err = windows.GetProcessTimes(p, &c, &e, &k, &u)
+		windows.CloseHandle(p)
+		if err == nil && created != 0 && uint64(c.HighDateTime)<<32|uint64(c.LowDateTime) != created {
+			return "reused: process " + strconv.Itoa(int(pid)) + " is another process"
+		}
+	}
+	if tid != 0 {
+		if th, terr := windows.OpenThread(windows.THREAD_QUERY_LIMITED_INFORMATION, false, tid); terr == nil {
+			owner, _, _ := procGetProcessIdOfThread.Call(uintptr(th))
+			windows.CloseHandle(th)
+			if uint32(owner) != pid {
+				return fmt.Sprintf("reused: thread %d is process %d's", tid, owner)
+			}
+		}
+	}
+	if err != nil {
+		return "gone: " + err.Error()
+	}
+	return "launcher"
 }
