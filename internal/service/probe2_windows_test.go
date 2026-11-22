@@ -1835,9 +1835,13 @@ func probe2ExpectHop(t *testing.T, r probe2Result, u probeUser, exe string) {
 	// WINSTA_EXITWINDOWS is needed; WINSTA_ALL_ACCESS alone fails.
 	// 0x2007A works; without EXITWINDOWS (0x2003A) or ACCESSGLOBALATOMS
 	// (0x2005A) it fails, and without any one of the other three it works.
-	// The combinations of those three are logged above until measured.
+	// So do all three together: 0x20060 (READ_CONTROL, EXITWINDOWS,
+	// ACCESSGLOBALATOMS) is the narrowest, as each of the three is missing
+	// from a mask that fails holding the other two (0x37F, 0x2003A,
+	// 0x2005A).
 	for key, works := range map[string]bool{"0x37f": false, "0x2037f": true, "0x6037f": true, "0x2033f": false, "0x2007a": true, "0x2003a": false,
-		"0x20078": true, "0x20072": true, "0x2006a": true, "0x2005a": false} {
+		"0x20078": true, "0x20072": true, "0x2006a": true, "0x2005a": false,
+		"0x20060": true, "0x20070": true, "0x20068": true, "0x20062": true} {
 		// In the launcher and in its restricted child alike.
 		m := r.Masks[key]
 		launcherOK, childOK := m.Launcher == "ok", strings.HasPrefix(m.Child, "run-")
