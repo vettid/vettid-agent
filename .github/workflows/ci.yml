@@ -158,7 +158,9 @@ jobs:
       # (in a test protector's Wipe on a nil receiver) into a recoverable
       # panic; the process died at the dereference. The wipe no longer
       # relies on that. TestRecoveredNilDereference repeats such a
-      # dereference, recovered: here it runs 10 times as is and 10 times
+      # dereference, recovered: here the whole package runs with it (the
+      # crashes came in whole-package runs; alone it did not crash), 10 times
+      # as is and 10 times
       # with async preemption off, and the crashes are counted. A crash
       # here is the runtime's, not this repository's code's, so the step
       # warns and does not fail. The test binary is kept with any dump, so
@@ -176,7 +178,7 @@ jobs:
             if [ "$arm" = asyncpreemptoff ]; then export GODEBUG=asyncpreemptoff=1; else unset GODEBUG; fi
             crashes=0
             for i in $(seq 1 10); do
-              if ! (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 -test.run '^TestRecoveredNilDereference$' > "$RUNNER_TEMP/nilderef-$arm-$i.txt" 2>&1); then
+              if ! (cd internal/state && "$RUNNER_TEMP/state.test.exe" -test.v -test.count=1 > "$RUNNER_TEMP/nilderef-$arm-$i.txt" 2>&1); then
                 crashes=$((crashes+1))
               fi
             done
