@@ -504,8 +504,9 @@ func (l *Listener) hello(c *ServerConn, busy bool, cred *unix.Ucred, gids []uint
 // identify maps a client's uid to who it is: the member, or root (a
 // command under sudo, the only elevated administrator on Linux). Anyone
 // else holds nothing, and Admit refuses them. The member is an
-// administrator if the group database or the groups the client holds
-// (gids, SO_PEERGROUPS) name one of adminGroups: both are read at each
+// administrator if root code recorded it so (MemberAdmin), if it holds
+// gid 0, or if the group database or the groups the client holds (gids,
+// SO_PEERGROUPS) name one of adminGroups: both are read at each
 // connection, and if either can't be, the client is refused.
 func (l *Listener) identify(cred *unix.Ucred, gids []uint32) (Identity, error) {
 	id := Identity{Member: cred.Uid == l.cfg.MemberUID, ElevatedAdmin: cred.Uid == 0}

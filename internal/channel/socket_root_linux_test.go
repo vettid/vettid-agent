@@ -373,8 +373,9 @@ func TestRootChannel(t *testing.T) {
 }
 
 // A member in a root-equivalent group gets member_is_admin for tools,
-// and status still. A member in sudo whose sudo asks for its password
-// keeps its tools (AGENT-LINUX-RUNTIME §11).
+// and status still. A member in sudo keeps its tools (AGENT-LINUX-RUNTIME
+// §11): with MemberAdmin false, root code found no sudo rule that asks
+// for no password.
 func TestRootMemberIsAdmin(t *testing.T) {
 	e := setupRoot(t)
 	if _, err := user.LookupGroup("sudo"); err == nil {
@@ -383,6 +384,8 @@ func TestRootMemberIsAdmin(t *testing.T) {
 		if got := e.clientAs(e.member, OpMCP); got != "ok member=true admin=false holds=false" {
 			t.Errorf("a member in sudo, tools: %q, want its tools", got)
 		}
+	} else {
+		t.Log("no sudo group here; the sudo case is not checked")
 	}
 	if _, err := user.LookupGroup("disk"); err != nil {
 		t.Skip("no disk group here")

@@ -200,7 +200,7 @@ func serve(t *testing.T, cfg ListenConfig) (path string, s served) {
 	cfg.fd = listenAt(t, path)
 	cfg.Socket = path
 	if cfg.peerNames == nil {
-		// This test user's real groups (which may hold sudo) don't decide
+		// This test user's real groups (which may hold docker or adm) don't decide
 		// here; TestRootMemberIsAdmin runs the real lookup.
 		cfg.peerNames = func([]uint32) ([]string, error) { return nil, nil }
 	}
@@ -300,6 +300,8 @@ func TestAcceptMemberIsAdmin(t *testing.T) {
 		path, s := serve(t, ListenConfig{MemberUID: uid, groupsOf: groups})
 		if err := dialAs(t, path, OpMCP); err != nil {
 			t.Errorf("a member in %s: %v, want its tools", g, err)
+			recv(t, s.refused)
+			continue
 		}
 		if id := recv(t, s.ids); id.HoldsAdmins {
 			t.Errorf("a member in %s: %+v", g, id)
