@@ -499,6 +499,20 @@ func probe3Expect(t *testing.T, r probe2Result, u probeUser, exe string) {
 	if r.RunnerRights != "LsaEnumerateAccountRights: NTSTATUS 0xc0000022" {
 		t.Errorf("the service reading the runner's account rights: %q %v, measured STATUS_ACCESS_DENIED", r.RunnerRights, r.RunnerRightsList)
 	}
+	// The run's desktop: the runner's entry, mask by mask (logged, then
+	// pinned). Full access is what the other hops use, so it must work.
+	for _, mask := range desktopMasks {
+		key := fmt.Sprintf("%#x", mask)
+		m, ok := r.DesktopMasks[key]
+		if !ok {
+			t.Errorf("desktop entry %s: missing from the record (%+v)", key, r.DesktopMasks["station"])
+			continue
+		}
+		t.Logf("desktop entry %s: set %s, start %s, launcher user32 %s, child %q, child ole32 %q", key, m.Set, m.Start, m.Launcher, m.Child, m.ChildOLE)
+	}
+	if m := r.DesktopMasks["0xf01ff"]; m.Launcher != "ok" || !strings.HasPrefix(m.Child, "dmask-") || m.ChildOLE != "ok" {
+		t.Errorf("desktop entry 0xf01ff: %+v, want user32 and ole32 working", m)
+	}
 	denied := map[string]string{"read": "Access is denied.", "write": "Access is denied."}
 	for _, key := range probe3Hops {
 		h, ok := r.Hops[key]

@@ -181,6 +181,7 @@ type programRecord struct {
 	SentinelInherits bool              `json:"launcher_sentinel_inherited"`
 	Desktop          string            `json:"desktop,omitempty"`
 	Beep             string            `json:"beep,omitempty"`
+	OLE              string            `json:"ole,omitempty"`
 	DCOM             string            `json:"dcom,omitempty"`
 	DCOMs            map[string]string `json:"dcoms,omitempty"`
 	OpenLauncher     map[string]string `json:"open_launcher,omitempty"` // right: "ok" or the error
@@ -294,6 +295,13 @@ func runProgram(mode string) int {
 			r.Beep = e.Error()
 		} else {
 			r.Beep = "ok"
+		}
+		// ole32 too (it needs user32 working on the desktop).
+		if err := windows.CoInitializeEx(0, windows.COINIT_APARTMENTTHREADED); err != nil {
+			r.OLE = "CoInitializeEx: " + err.Error()
+		} else {
+			r.OLE = "ok"
+			windows.CoUninitialize()
 		}
 	case "dcom":
 		// -p2-clsid is name=clsid,…; DCOM keeps the first (the class only
@@ -845,6 +853,7 @@ type probe2Result struct {
 	RunnerRights         string                `json:"runner_rights_read,omitempty"`
 	RunnerRightsList     []string              `json:"runner_rights,omitempty"`
 	Masks                map[string]maskResult `json:"window_station_masks,omitempty"`
+	DesktopMasks         map[string]maskResult `json:"desktop_masks,omitempty"`
 	UnnamedWindowStation string                `json:"unnamed_window_station"`
 	UnnamedHop           *maskResult           `json:"unnamed_window_station_hop,omitempty"`
 }
@@ -1060,7 +1069,64 @@ func runHops(c probe2Config) probe2Result {
 		}
 		res.Masks[key] = mr
 	}
+	// The narrowest entry on the run's desktop that user32 and ole32 need:
+	// with the runner's window station entry back at one that works, a
+	// desktop of its own for each mask (the runner's entry exactly that
+	// mask), and a quick launcher there.
+	res.DesktopMasks = map[string]maskResult{}
+	if err := setWindowStationEntry(windows.Handle(wsh), b.SID, 0xf037f, windows.SET_ACCESS); err != nil {
+		res.DesktopMasks["station"] = maskResult{Set: "the window station entry: " + err.Error()}
+		return res
+	}
+	station := res.DesktopName[:strings.LastIndex(res.DesktopName, `\`)]
+	for _, mask := range desktopMasks {
+		key := fmt.Sprintf("%#x", mask)
+		mr := maskResult{}
+		sd, err := windows.SecurityDescriptorFromString(fmt.Sprintf("D:P(A;;GA;;;SY)(A;;GA;;;OW)(A;;%#x;;;%s)", mask, b.SID))
+		if err != nil {
+			mr.Set = err.Error()
+			res.DesktopMasks[key] = mr
+			continue
+		}
+		sa := &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}
+		name := "dmask-" + randHex(4)
+		dn, _ := windows.UTF16PtrFromString(name)
+		d, _, e := procCreateDesktopW.Call(uintptr(unsafe.Pointer(dn)), 0, 0, 0, uintptr(windows.MAXIMUM_ALLOWED), uintptr(unsafe.Pointer(sa)))
+		if d == 0 {
+			mr.Set = "CreateDesktop: " + e.Error()
+			res.DesktopMasks[key] = mr
+			continue
+		}
+		mr.Set = "ok"
+		h := runHop(c, b, hopOpts{key: "desktop mask " + key, restrict: "interactive", desktop: station + `\` + name, uiLimits: true, quick: true}, 0)
+		mr.Start, mr.Launcher = h.Start, h.Launcher.LauncherUser32
+		mr.Child = h.Launcher.Children["user32"].Record.Desktop
+		mr.ChildOLE = h.Launcher.Children["user32"].Record.OLE
+		procCloseDesktop.Call(d)
+		res.DesktopMasks[key] = mr
+	}
 	return res
+}
+
+// desktopWithout is DESKTOP_* all (0x1FF) with READ_CONTROL (0x20000)
+// and without the rights given.
+func desktopWithout(drop uint32) uint32 { return 0x201ff &^ drop }
+
+// desktopMasks: all rights, the specific ones alone, with READ_CONTROL,
+// with READ_CONTROL less each specific right in turn, and some narrower
+// guesses.
+var desktopMasks = []uint32{
+	0xf01ff, 0x1ff, 0x201ff,
+	desktopWithout(0x1),   // DESKTOP_READOBJECTS
+	desktopWithout(0x2),   // DESKTOP_CREATEWINDOW
+	desktopWithout(0x4),   // DESKTOP_CREATEMENU
+	desktopWithout(0x8),   // DESKTOP_HOOKCONTROL
+	desktopWithout(0x10),  // DESKTOP_JOURNALRECORD
+	desktopWithout(0x20),  // DESKTOP_JOURNALPLAYBACK
+	desktopWithout(0x40),  // DESKTOP_ENUMERATE
+	desktopWithout(0x80),  // DESKTOP_WRITEOBJECTS
+	desktopWithout(0x100), // DESKTOP_SWITCHDESKTOP
+	0x20000, 0x20001, 0x20002, 0x20003, 0x20007, 0x200c3,
 }
 
 // winstaWithout is WINSTA_ALL_ACCESS (0x37F) with READ_CONTROL (0x20000)
@@ -1095,6 +1161,7 @@ type maskResult struct {
 	Start    string `json:"start,omitempty"`
 	Launcher string `json:"launcher_user32,omitempty"`
 	Child    string `json:"child_desktop,omitempty"` // the desktop's name, or why user32 failed
+	ChildOLE string `json:"child_ole,omitempty"`     // the desktop masks: ole32 in the restricted child
 }
 
 // hopOpts is one way of starting the launcher.
