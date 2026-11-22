@@ -201,7 +201,9 @@ func decodeFile(raw []byte, resolve Resolver) (plaintext []byte, h *header, p Pr
 		return nil, nil, nil, nil, ErrUnknownProtector
 	}
 	p = resolve(h.Protector)
-	if p == nil || p.Name() != h.Protector {
+	// A typed nil counts as no protector: none of its methods is called
+	// (see safeWipe).
+	if p == nil || typedNil(p) || p.Name() != h.Protector {
 		return nil, nil, nil, nil, ErrUnknownProtector
 	}
 	dataKey, err = p.Unwrap(h.WrappedKey)

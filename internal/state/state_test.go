@@ -1015,6 +1015,192 @@ func replaceSetup(t *testing.T) (*Store, *fixedProtector, string, int64) {
 	return s, oldP, link, size
 }
 
+// nilTolerant is a protector whose methods all run on a nil receiver
+// without a dereference, counting the calls; so is nilSlice, on a nil
+// slice.
+type nilTolerant struct{}
+
+var nilTolerantCalls int
+
+func (*nilTolerant) Name() string                  { nilTolerantCalls++; return testProtectorName }
+func (*nilTolerant) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil, errors.New("no") }
+func (*nilTolerant) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
+func (*nilTolerant) Wipe() error                   { nilTolerantCalls++; return nil }
+
+type nilSlice []byte
+
+func (nilSlice) Name() string                  { nilTolerantCalls++; return testProtectorName }
+func (nilSlice) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilSlice) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilSlice) Wipe() error                   { nilTolerantCalls++; return nil }
+
+// nilMap, nilFunc and nilChan: the other kinds that may be nil.
+type (
+	nilMap  map[string]int
+	nilFunc func()
+	nilChan chan int
+)
+
+func (nilMap) Name() string                   { nilTolerantCalls++; return testProtectorName }
+func (nilMap) Wrap([]byte) ([]byte, error)    { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilMap) Unwrap([]byte) ([]byte, error)  { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilMap) Wipe() error                    { nilTolerantCalls++; return nil }
+func (nilFunc) Name() string                  { nilTolerantCalls++; return testProtectorName }
+func (nilFunc) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilFunc) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilFunc) Wipe() error                   { nilTolerantCalls++; return nil }
+func (nilChan) Name() string                  { nilTolerantCalls++; return testProtectorName }
+func (nilChan) Wrap([]byte) ([]byte, error)   { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilChan) Unwrap([]byte) ([]byte, error) { nilTolerantCalls++; return nil, errors.New("no") }
+func (nilChan) Wipe() error                   { nilTolerantCalls++; return nil }
+
+// panicky is a protector whose Wipe panics.
+type panicky struct{ fixedProtector }
+
+func (*panicky) Wipe() error { panic("a value that must not reach the error") }
+
+// reopened is a store over an existing state file, opened again so that
+// it has no protector of its own yet: Wipe and CreateReplace resolve one.
+func reopened(t *testing.T) (*Store, []byte) {
+	t.Helper()
+	s := openTest(t)
+	if err := s.Create(newFixedProtector(seq(0x40, 32)), []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(s.Path())
+	dir := s.Dir()
+	s.Close()
+	s2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s2.Close() })
+	return s2, before
+}
+
+// A typed nil that resolve returns counts as no protector: Wipe and
+// CreateReplace call none of its methods.
+func TestResolvedTypedNilNotCalled(t *testing.T) {
+	for _, tn := range []struct {
+		name string
+		p    Protector
+	}{{"pointer", (*nilTolerant)(nil)}, {"slice", nilSlice(nil)}, {"map", nilMap(nil)}, {"func", nilFunc(nil)}, {"chan", nilChan(nil)}} {
+		resolve := func(string) Protector { return tn.p }
+		t.Run("Wipe/"+tn.name, func(t *testing.T) {
+			s, _ := reopened(t)
+			nilTolerantCalls = 0
+			if err := s.Wipe(resolve); !errors.Is(err, ErrProtectorUnknown) {
+				t.Errorf("Wipe = %v, want ErrProtectorUnknown", err)
+			}
+			if nilTolerantCalls != 0 {
+				t.Errorf("the typed nil's methods were called %d times", nilTolerantCalls)
+			}
+		})
+		t.Run("Load/"+tn.name, func(t *testing.T) {
+			s, _ := reopened(t)
+			nilTolerantCalls = 0
+			if _, err := s.Load(resolve); !errors.Is(err, ErrUnknownProtector) {
+				t.Errorf("Load = %v, want ErrUnknownProtector", err)
+			}
+			if nilTolerantCalls != 0 {
+				t.Errorf("the typed nil's methods were called %d times", nilTolerantCalls)
+			}
+		})
+		t.Run("CreateReplace/"+tn.name, func(t *testing.T) {
+			s, before := reopened(t)
+			nilTolerantCalls = 0
+			if err := s.CreateReplace(newFixedProtector(seq(0x50, 32)), []byte("b"), resolve); !errors.Is(err, ErrProtectorUnknown) {
+				t.Errorf("CreateReplace = %v, want ErrProtectorUnknown", err)
+			}
+			if nilTolerantCalls != 0 {
+				t.Errorf("the typed nil's methods were called %d times", nilTolerantCalls)
+			}
+			if after, _ := os.ReadFile(s.Path()); !bytes.Equal(before, after) {
+				t.Error("the state file changed")
+			}
+		})
+		t.Run("Create/"+tn.name, func(t *testing.T) {
+			s := openTest(t)
+			nilTolerantCalls = 0
+			if err := s.Create(tn.p, []byte("a")); err == nil || !strings.Contains(err.Error(), "invalid protector") {
+				t.Errorf("Create = %v, want invalid protector", err)
+			}
+			if nilTolerantCalls != 0 {
+				t.Errorf("the typed nil's methods were called %d times", nilTolerantCalls)
+			}
+		})
+	}
+}
+
+// A Wipe that panics is reported by the protector's type, not the panic's
+// value, and the rest of the wipe goes on.
+func TestWipeAllPanicBackstop(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	err := s.WipeAll([]Protector{&panicky{}, p})
+	if err == nil || !strings.Contains(err.Error(), "the protector (*state.panicky) failed") || strings.Contains(err.Error(), "must not reach") {
+		t.Fatalf("WipeAll = %v, want the protector's type and not the panic's value", err)
+	}
+	if p.hasKey {
+		t.Error("the other protector's key remains")
+	}
+	if ok, _ := s.Exists(); ok {
+		t.Error("state file remains")
+	}
+}
+
+// A typed nil protector is refused without its Wipe being called, and
+// the rest of the wipe goes on: the other protector's key and the state
+// file are deleted.
+func TestWipeAllTypedNilNotCalled(t *testing.T) {
+	s := openTest(t)
+	p := newFixedProtector(seq(0x40, 32))
+	if err := s.Create(p, []byte("a")); err != nil {
+		t.Fatal(err)
+	}
+	nilTolerantCalls = 0
+	var typedNil *nilTolerant
+	err := s.WipeAll([]Protector{typedNil, nilSlice(nil), p})
+	if err == nil || !strings.Contains(err.Error(), "protector 0") || !strings.Contains(err.Error(), "nil protector") {
+		t.Fatalf("WipeAll = %v, want an error naming protector 0 as nil", err)
+	}
+	if nilTolerantCalls != 0 {
+		t.Errorf("the typed nils' methods were called %d times", nilTolerantCalls)
+	}
+	if p.hasKey || p.wiped != 1 {
+		t.Errorf("the other protector: key remains %v, wiped %d times", p.hasKey, p.wiped)
+	}
+	if ok, _ := s.Exists(); ok {
+		t.Error("state file remains")
+	}
+}
+
+// Go turns a nil dereference into a panic that recover catches. On
+// Windows CI that has failed: the process died with an access violation
+// and no Go trace, at the dereference in fixedProtector.Wipe on a nil
+// receiver. This repeats that dereference, recovered, many times. It
+// runs only with VETTID_AGENT_TEST_NILDEREF=1 (the CI crash hunt), as it
+// can crash the test binary.
+func TestRecoveredNilDereference(t *testing.T) {
+	if os.Getenv("VETTID_AGENT_TEST_NILDEREF") != "1" {
+		t.Skip("VETTID_AGENT_TEST_NILDEREF=1 runs it (it can crash the binary)")
+	}
+	var p Protector = (*fixedProtector)(nil)
+	for i := 0; i < 20000; i++ {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatalf("round %d: no panic from a nil dereference", i)
+				}
+			}()
+			_ = p.Wipe()
+		}()
+	}
+}
+
 // A typed nil pointer in WipeAll does not crash the wipe.
 func TestWipeAllTypedNil(t *testing.T) {
 	s := openTest(t)
