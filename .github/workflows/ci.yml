@@ -43,8 +43,10 @@ jobs:
       # internal/state's did once, 0xc0000005) leaves a full dump here,
       # kept as an artifact below. Only this module's test binaries
       # (<package>.test.exe, as go test names them) are dumped, through
-      # per-program keys: not the service the probes register (probe.exe)
-      # nor anything else on the runner, so a dump holds no more than a
+      # per-program keys, which match an executable's base name, so the
+      # same test binaries run by later steps (some as throwaway users)
+      # are dumped too; not the service the probes register (probe.exe)
+      # nor anything else on the runner. A dump holds no more than a
       # test's own throwaway data.
       - name: keep crash dumps of the test binaries (Windows)
         if: runner.os == 'Windows'
@@ -54,7 +56,9 @@ jobs:
           $base = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps'
           $dir = Join-Path $env:RUNNER_TEMP 'dumps'
           New-Item -ItemType Directory -Force $dir | Out-Null
-          foreach ($p in (go list ./...)) {
+          $pkgs = go list ./...
+          if ($LASTEXITCODE) { exit 1 }
+          foreach ($p in $pkgs) {
             $k = Join-Path $base (($p -split '/')[-1] + '.test.exe')
             New-Item -Force $k | Out-Null
             Set-ItemProperty $k -Name DumpFolder -Value $dir -Type ExpandString
@@ -64,16 +68,10 @@ jobs:
           Get-ChildItem $base | Select-Object -ExpandProperty PSChildName
       - name: go test
         env:
-          GOTRACEBACK: ${{ runner.os == 'Windows' && 'crash' || 'single' }}
+          # wer: a traceback as crash gives, but leaving Windows Error Reporting
+          # on (crash sets SEM_NOGPFAULTERRORBOX, so no dump would be written).
+          GOTRACEBACK: ${{ runner.os == 'Windows' && 'wer' || 'single' }}
         run: go test ${{ matrix.race }} -count=1 ./...
-      - name: keep any crash dump (Windows)
-        if: runner.os == 'Windows' && always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: crash-dumps
-          path: ${{ runner.temp }}/dumps
-          retention-days: 7
-          if-no-files-found: ignore
       # The DPAPI tests again, verbose, as the record of what Windows
       # answered. Only this step creates local test users and runs a helper
       # as them (internal/protect/dpapi_otheruser_windows_test.go), so that
@@ -135,7 +133,7 @@ jobs:
           done
       # internal/state's tests crashed once on Windows with an access
       # violation (0xc0000005) and no Go trace. Run 10 more times,
-      # verbosely, with GOTRACEBACK=crash, so a crash says where; the
+      # verbosely, with GOTRACEBACK=wer, so a crash says where; the
       # whole output is kept as an artifact.
       - name: internal/state repeated, verbose (crash hunt)
         # It runs whatever an earlier step did, so a flaky test there
@@ -143,7 +141,7 @@ jobs:
         if: runner.os == 'Windows' && !cancelled()
         shell: bash
         env:
-          GOTRACEBACK: crash
+          GOTRACEBACK: wer
         run: |
           set -o pipefail
           go test -c -o "$RUNNER_TEMP/state.test.exe" ./internal/state
@@ -157,7 +155,7 @@ jobs:
           done
           exit $ok
       - name: keep the crash hunt's output
-        if: runner.os == 'Windows' && always()
+        if: runner.os == 'Windows' && !cancelled()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: state-crash-hunt
@@ -269,6 +267,16 @@ jobs:
           bin="./vettid-agent-ci$(go env GOEXE)"
           go build -o "$bin" ./cmd/vettid-agent
           "$bin" version
+      # Last, so a dump from any Windows step above (the crash hunt
+      # included) is kept.
+      - name: keep any crash dump (Windows)
+        if: runner.os == 'Windows' && !cancelled()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crash-dumps
+          path: ${{ runner.temp }}/dumps
+          retention-days: 7
+          if-no-files-found: ignore
 
   govulncheck:
     runs-on: ubuntu-26.04
