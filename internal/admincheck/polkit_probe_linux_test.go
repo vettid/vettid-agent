@@ -26,6 +26,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func run(t *testing.T, name string, args ...string) string {
@@ -50,8 +52,10 @@ type subject struct {
 	// want: for a session subject, the kind worked out beforehand, which
 	// its answers must confirm (KindFrom over every kind), or it is not
 	// checked.
-	want *Kind
-	pid  int
+	want  *Kind
+	pid   int
+	start uint64
+	uid   string
 }
 
 // sessionKind is the kind polkitd judges a logind session by. Its logind
@@ -200,19 +204,20 @@ func subjects(t *testing.T, u *user.User) []subject {
 				candidates: all,
 				want:       &k,
 				pid:        pid,
+				start:      startTime(t, pid),
+				uid:        u.Uid,
 			})
 		}
 	}
 	// Processes of the member's in no session: a transient system service,
 	// and a unit of the member's own service manager if it runs.
-	if pid := sleeper(t, nil, "systemd-run", "--uid", u.Uid, "--gid", u.Gid); pid != 0 {
+	if pid := sleeper(t, u, false); pid != 0 {
 		out = append(out, noSession(t, u, "system service", pid, cands))
 	} else {
 		t.Fatal("the no-session process didn't start")
 	}
 	if exec.Command("systemctl", "is-active", "--quiet", "user@"+u.Uid+".service").Run() == nil {
-		m := u.Username + "@"
-		if pid := sleeper(t, []string{"--user", "--machine=" + m}, "systemd-run", "--user", "--machine="+m); pid != 0 {
+		if pid := sleeper(t, u, true); pid != 0 {
 			out = append(out, noSession(t, u, "user service", pid, cands))
 		} else {
 			t.Error("the user service didn't start: not checked")
@@ -223,34 +228,53 @@ func subjects(t *testing.T, u *user.User) []subject {
 	return out
 }
 
-// sleeper starts a transient unit that sleeps, with the given systemd-run
-// command (and systemctl scope), and returns its main pid, or 0 if it
-// didn't start.
-func sleeper(t *testing.T, scope []string, cmd ...string) int {
+// sleeper starts a transient unit that sleeps, as the member, and
+// returns its main pid, or 0 if it didn't start. A system service (the
+// helper's child's kind: no_new_privs), or, with inManager, a unit of the
+// member's own service manager, reached as §11.4 says: a system service
+// as the member with no PAMName (so no session opens) talks to the
+// manager's bus.
+func sleeper(t *testing.T, u *user.User, inManager bool) int {
 	unit := fmt.Sprintf("vettid-polkit-probe-%d", time.Now().UnixNano())
-	args := append(append([]string{}, cmd[1:]...), "--unit", unit, "--collect", "--property=RuntimeMaxSec=600")
-	// The system service, as the helper's child is, has no_new_privs; a
-	// unit of the member's manager is left as an ordinary user service
-	// is, since a rule can read subject.no_new_privileges.
-	if scope == nil {
-		args = append(args, "--property=NoNewPrivileges=yes")
+	var hop []string
+	ctl := []string{"systemctl"}
+	start := []string{"systemd-run", "--uid", u.Uid, "--gid", u.Gid, "--property=NoNewPrivileges=yes"}
+	if inManager {
+		rt := "/run/user/" + u.Uid
+		hop = []string{"systemd-run", "--uid", u.Uid, "--gid", u.Gid, "--pipe", "--wait", "--quiet", "--collect",
+			"-E", "XDG_RUNTIME_DIR=" + rt, "-E", "DBUS_SESSION_BUS_ADDRESS=unix:path=" + rt + "/bus"}
+		ctl = []string{"systemctl", "--user"}
+		start = []string{"systemd-run", "--user"} // as an ordinary user service: no NoNewPrivileges
 	}
-	args = append(args, "/bin/sleep", "600")
-	if out, err := exec.Command(cmd[0], args...).CombinedOutput(); err != nil {
-		t.Logf("%s: %v\n%s", strings.Join(cmd, " "), err, out)
+	via := func(cmd ...string) *exec.Cmd {
+		all := append(append([]string{}, hop...), cmd...)
+		return exec.Command(all[0], all[1:]...)
+	}
+	args := append(append([]string{}, start...), "--unit", unit, "--collect", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
+	if out, err := via(args...).CombinedOutput(); err != nil {
+		t.Logf("%s: %v\n%s", strings.Join(args, " "), err, out)
 		return 0
 	}
-	ctl := append(append([]string{}, scope...), "stop", unit)
-	t.Cleanup(func() { _ = exec.Command("systemctl", ctl...).Run() })
-	show := append(append([]string{}, scope...), "show", "-p", "MainPID", "--value", unit)
+	t.Cleanup(func() { _ = via(append(append([]string{}, ctl...), "stop", unit)...).Run() })
 	for i := 0; i < 50; i++ {
-		out, _ := exec.Command("systemctl", show...).Output()
+		out, _ := via(append(append([]string{}, ctl...), "show", "-p", "MainPID", "--value", unit)...).Output()
 		if pid, _ := strconv.Atoi(strings.TrimSpace(string(out))); pid != 0 {
+			// The pid came back from a hop running as the member:
+			// confirm it before asking polkitd (§11.4).
+			if inManager && !inManagerUnit(pid, u) {
+				t.Errorf("the user service reported pid %d, which isn't in user@%s.service with the member's uids", pid, u.Uid)
+				return 0
+			}
 			return pid
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 	return 0
+}
+
+func inManagerUnit(pid int, u *user.User) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	return err == nil && strings.Contains(string(b), "/user@"+u.Uid+".service/") && ownedBy(pid, u.Uid)
 }
 
 // noSession is the subject for a process of the member's in no session.
@@ -259,10 +283,12 @@ func sleeper(t *testing.T, scope []string, cmd ...string) int {
 // session (sd_uid_get_display): which one is read from its answers.
 func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) subject {
 	sub := subject{
-		name: what,
-		arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
-		kind: NoSession,
-		pid:  pid,
+		name:  what,
+		arg:   fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
+		kind:  NoSession,
+		pid:   pid,
+		start: startTime(t, pid),
+		uid:   u.Uid,
 	}
 	if s := pidSession(pid); s != "" {
 		sub.kind, sub.name = sessionKind(t, s), what+" (in session "+s+")"
@@ -276,6 +302,89 @@ func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) s
 		sub.candidates = nil // no session to be judged by
 	}
 	return sub
+}
+
+// polkitVersion is polkitd's own, from the Authority's BackendVersion.
+func polkitVersion(t *testing.T) int {
+	out := run(t, "busctl", "get-property", "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+		"org.freedesktop.PolicyKit1.Authority", "BackendVersion")
+	var v int
+	if _, err := fmt.Sscanf(strings.TrimSpace(out), "s \"%d", &v); err != nil || v < 122 {
+		t.Fatalf("polkit's version %q: not checked (122 is the floor)", strings.TrimSpace(out))
+	}
+	return v
+}
+
+// ask puts one CheckAuthorization to polkitd for a subject: on polkit
+// 124 and later by a pidfd root opens (polkitd then trusts it, and gives
+// rules subject.system_unit and no_new_privileges), else by pid and
+// start time.
+func ask(t *testing.T, version int, s *subject, id string) Answer {
+	ans := Answer{Action: id, Kind: s.kind, Subject: s.name}
+	var cmd *exec.Cmd
+	parse := ParseCheckAuthorization
+	if version >= 124 {
+		fd, err := unix.PidfdOpen(s.pid, 0)
+		if err != nil {
+			ans.Err = "pidfd_open: " + err.Error()
+			return ans
+		}
+		f := os.NewFile(uintptr(fd), "pidfd")
+		defer f.Close()
+		// the pidfd is for the process the subject was recorded as
+		if st, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", s.pid)); err != nil || startTimeOf(st) != s.start {
+			ans.Err = "the subject's process has gone"
+			return ans
+		}
+		cmd = exec.Command("busctl", "call", "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
+			"org.freedesktop.PolicyKit1.Authority", "CheckAuthorization", "(sa{sv})sa{ss}us",
+			"unix-process", "2", "pidfd", "h", "3", "uid", "i", s.uid, id, "0", "0", "")
+		cmd.ExtraFiles = []*os.File{f} // fd 3
+		parse = ParseBusctlCheck
+	} else {
+		cmd = exec.Command("gdbus", "call", "--system", "--dest", "org.freedesktop.PolicyKit1",
+			"--object-path", "/org/freedesktop/PolicyKit1/Authority",
+			"--method", "org.freedesktop.PolicyKit1.Authority.CheckAuthorization",
+			s.arg, id, "{}", "0", "")
+	}
+	cmd.Env = append(os.Environ(), "LC_ALL=C")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		ans.Err = strings.TrimSpace(string(out))
+	} else if ans.Authorized, ans.Challenge, ans.Temporary, err = parse(string(out)); err != nil {
+		ans.Err = err.Error()
+	}
+	return ans
+}
+
+func startTimeOf(stat []byte) uint64 {
+	i := strings.LastIndexByte(string(stat), ')')
+	if i < 0 {
+		return 0
+	}
+	f := strings.Fields(string(stat[i+2:]))
+	if len(f) < 20 {
+		return 0
+	}
+	v, _ := strconv.ParseUint(f[19], 10, 64)
+	return v
+}
+
+// groupsDiffer names a process of the member's whose held groups aren't
+// exactly the group database's, or is empty.
+func groupsDiffer(t *testing.T, u *user.User) string {
+	want := dbGroups(t, u)
+	ents, _ := os.ReadDir("/proc")
+	for _, e := range ents {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || !ownedBy(pid, u.Uid) {
+			continue
+		}
+		if held := heldGroups(pid); held != want && held != "unreadable" {
+			return fmt.Sprintf("pid %d holds groups %q, the group database gives %q", pid, held, want)
+		}
+	}
+	return ""
 }
 
 // heldGroups are a process's supplementary groups, sorted, as one string.
@@ -363,6 +472,8 @@ func TestPolkitProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	version := polkitVersion(t)
+	t.Logf("polkit %d: subjects asked by %s", version, map[bool]string{true: "pidfd", false: "pid and start time"}[version >= 124])
 	conds := conditions(t)
 	subs := subjects(t, u)
 	var answers []Answer
@@ -370,19 +481,7 @@ func TestPolkitProbe(t *testing.T) {
 		s := &subs[i]
 		var these []Answer
 		for id := range actions {
-			ans := Answer{Action: id, Kind: s.kind, Subject: s.name}
-			cmd := exec.Command("gdbus", "call", "--system", "--dest", "org.freedesktop.PolicyKit1",
-				"--object-path", "/org/freedesktop/PolicyKit1/Authority",
-				"--method", "org.freedesktop.PolicyKit1.Authority.CheckAuthorization",
-				s.arg, id, "{}", "0", "")
-			cmd.Env = append(os.Environ(), "LC_ALL=C")
-			out, err := cmd.CombinedOutput()
-			if err != nil {
-				ans.Err = strings.TrimSpace(string(out))
-			} else if ans.Authorized, ans.Challenge, ans.Temporary, err = ParseCheckAuthorization(string(out)); err != nil {
-				ans.Err = err.Error()
-			}
-			these = append(these, ans)
+			these = append(these, ask(t, version, s, id))
 		}
 		if len(s.candidates) > 1 {
 			t.Logf("%s:", s.name)
@@ -445,6 +544,16 @@ func TestPolkitProbe(t *testing.T) {
 			}
 		}
 		answers = append(answers, these...)
+	}
+	// Every process of the member's, not only the subjects: one holding
+	// groups the database doesn't give makes polkit not checked.
+	if bad := groupsDiffer(t, u); bad != "" {
+		t.Logf("%s: not checked for every subject", bad)
+		for j := range answers {
+			if answers[j].Err == "" {
+				answers[j].Err = "a process of the member's holds groups the group database doesn't give"
+			}
+		}
 	}
 	t.Logf("%d actions; subjects:", len(actions))
 	for _, s := range subs {

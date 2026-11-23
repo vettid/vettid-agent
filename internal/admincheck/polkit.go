@@ -183,9 +183,11 @@ func judge(actions map[string]Action, ans Answer, c Conditions) Verdict {
 		v.Result, v.Reason = Refuse, why
 		return v
 	}
-	// An administrator's default, or no: granted with no password, either
-	// is a grant the stock defaults don't make.
-	if def.admin() || def == No {
+	// An administrator's default, no, or the member's own password:
+	// granted with no password, each is a grant the stock defaults don't
+	// make (a grant over auth_self can change the member's password, say,
+	// and then sudo needs only that).
+	if def.admin() || def == No || def == AuthSelf || def == AuthSelfKeep {
 		if why, ok := Allowlist[a.ID]; ok {
 			if cond, ok := conditional[a.ID]; ok {
 				if met, unmet := cond(c); !met {
@@ -197,8 +199,11 @@ func judge(actions map[string]Action, ans Answer, c Conditions) Verdict {
 			return v
 		}
 		v.Result, v.Reason = Refuse, "an administrator's action ("+string(def)+" for "+ans.Kind.String()+") granted with no password"
-		if def == No {
+		switch def {
+		case No:
 			v.Reason = "an action refused by default (no for " + ans.Kind.String() + ") granted with no password"
+		case AuthSelf, AuthSelfKeep:
+			v.Reason = "an action that asks for the member's password (" + string(def) + " for " + ans.Kind.String() + ") granted with no password"
 		}
 		v.adminDefault = true
 		return v

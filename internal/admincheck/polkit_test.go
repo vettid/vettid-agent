@@ -547,3 +547,35 @@ func TestGateByID(t *testing.T) {
 		}
 	}
 }
+
+func TestParseBusctlCheck(t *testing.T) {
+	for _, c := range []struct {
+		out              string
+		auth, chal, temp bool
+		bad              bool
+	}{
+		{out: "(bba{ss}) true false 0", auth: true},
+		{out: "(bba{ss}) false true 1 \"polkit.result\" \"auth_self\"", chal: true},
+		{out: "(bba{ss}) true false 1 \"polkit.temporary_authorization_id\" \"tmpauthz3\"", auth: true, temp: true},
+		{out: "(bba{ss}) true false 1 \"a \\\"b\\\"\" \"c d\"", auth: true},
+		{out: "(bba{ss}) true false 2 \"a\" \"b\"", bad: true},
+		{out: "(bb) true false", bad: true},
+		{out: "(bba{ss}) maybe false 0", bad: true},
+		{out: "(bba{ss}) true false 1 \"unterminated", bad: true},
+	} {
+		auth, chal, temp, err := ParseBusctlCheck(c.out)
+		if (err != nil) != c.bad || (!c.bad && (auth != c.auth || chal != c.chal || temp != c.temp)) {
+			t.Errorf("%q: %v %v %v %v", c.out, auth, chal, temp, err)
+		}
+	}
+}
+
+// A grant of an action that asks for the member's own password refuses.
+func TestJudgeAuthSelf(t *testing.T) {
+	for _, d := range []Default{AuthSelf, AuthSelfKeep} {
+		actions := map[string]Action{"org.x.self": {ID: "org.x.self", Any: d, Inactive: d, Active: d}}
+		if v := Judge(actions, []Answer{{Action: "org.x.self", Kind: Active, Authorized: true}}, met); v[0].Result != Refuse {
+			t.Errorf("%s granted: %s", d, v[0].Result)
+		}
+	}
+}

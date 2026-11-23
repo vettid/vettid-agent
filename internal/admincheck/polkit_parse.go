@@ -55,7 +55,8 @@ func ParsePkaction(out string) (map[string]Action, error) {
 				cur.ExecArgv1 = strings.TrimSpace(v)
 			case k == "org.freedesktop.policykit.imply":
 				// split on single spaces, as polkitd does (g_strsplit)
-				for _, id := range strings.Split(strings.TrimSpace(v), " ") {
+				// pkaction prints "<key> -> <value>"
+				for _, id := range strings.Split(strings.TrimPrefix(v, " "), " ") {
 					if id != "" {
 						cur.Implies = append(cur.Implies, id)
 					}
@@ -89,4 +90,60 @@ func ParseCheckAuthorization(out string) (authorized, challenge, temporary bool,
 		return false, false, false, fmt.Errorf("an answer it can't read: %q", strings.TrimSpace(out))
 	}
 	return m[1] == "true", m[2] == "true", strings.Contains(m[3], "'polkit.temporary_authorization_id'"), nil
+}
+
+// ParseBusctlCheck reads busctl's printing of CheckAuthorization's reply,
+// `(bba{ss}) <authorized> <challenge> <n> "<key>" "<value>" ...`.
+func ParseBusctlCheck(out string) (authorized, challenge, temporary bool, err error) {
+	f, err := busctlFields(strings.TrimSpace(out))
+	if err != nil {
+		return false, false, false, err
+	}
+	if len(f) < 4 || f[0] != "(bba{ss})" || (f[1] != "true" && f[1] != "false") || (f[2] != "true" && f[2] != "false") {
+		return false, false, false, fmt.Errorf("an answer it can't read: %q", out)
+	}
+	n := 0
+	if _, err := fmt.Sscanf(f[3], "%d", &n); err != nil || len(f) != 4+2*n {
+		return false, false, false, fmt.Errorf("an answer it can't read: %q", out)
+	}
+	for i := 0; i < n; i++ {
+		if f[4+2*i] == "polkit.temporary_authorization_id" {
+			temporary = true
+		}
+	}
+	return f[1] == "true", f[2] == "true", temporary, nil
+}
+
+// busctlFields splits busctl's output on spaces, keeping double-quoted
+// strings (with backslash escapes) whole and unquoted.
+func busctlFields(s string) ([]string, error) {
+	var out []string
+	for i := 0; i < len(s); {
+		switch {
+		case s[i] == ' ':
+			i++
+		case s[i] == '"':
+			var b strings.Builder
+			j := i + 1
+			for ; j < len(s) && s[j] != '"'; j++ {
+				if s[j] == '\\' && j+1 < len(s) {
+					j++
+				}
+				b.WriteByte(s[j])
+			}
+			if j >= len(s) {
+				return nil, fmt.Errorf("an unterminated string in %q", s)
+			}
+			out = append(out, b.String())
+			i = j + 1
+		default:
+			j := i
+			for j < len(s) && s[j] != ' ' {
+				j++
+			}
+			out = append(out, s[i:j])
+			i = j
+		}
+	}
+	return out, nil
 }
