@@ -102,6 +102,21 @@ func TestCheck(t *testing.T) {
 		tok.Groups = append(tok.Groups, g)
 		checkCode(t, tok, CodeExtraGroup)
 	}
+	// A default group with other attributes than the measured 7 (deny-only
+	// here), a repeated label, and a repeated default group.
+	tok = okToken()
+	for i, g := range tok.Groups {
+		if g.SID == "S-1-5-32-545" {
+			tok.Groups[i].Attributes = 0x10
+		}
+	}
+	checkCode(t, tok, CodeExtraGroup)
+	for _, g := range []Group{{SID: "S-1-16-12288", Attributes: 0x60}, {SID: "S-1-1-0", Attributes: 7}} {
+		tok := okToken()
+		tok.Groups = append(tok.Groups, g)
+		checkCode(t, tok, CodeExtraGroup)
+	}
+
 	tok = okToken()
 	for i, g := range tok.Groups {
 		if isLogonSID(g.SID) {

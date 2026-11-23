@@ -119,6 +119,12 @@ const (
 // highLabel is the integrity label the measured token holds (High).
 const highLabel = "S-1-16-12288"
 
+// defaultGroupAttributes are the measured default groups' attributes:
+// SE_GROUP_MANDATORY | SE_GROUP_ENABLED_BY_DEFAULT | SE_GROUP_ENABLED. A
+// default group that is deny-only, or owner, or anything else, is not the
+// measured token's.
+const defaultGroupAttributes = 7
+
 // defaultGroups are the groups a virtual service account's token holds
 // besides its logon SID and its integrity label: measured on
 // windows-2025 by this package's service test (TestSelfCheckService,
@@ -139,9 +145,10 @@ var defaultGroups = map[string]string{
 // Check refuses a token that is not the service's own (serviceSID), that
 // holds any privilege but SeChangeNotifyPrivilege, that holds
 // Administrators in any form (enabled or deny-only), or that holds any
-// group beyond exactly the measured set: defaultGroups by SID, one logon
-// SID (S-1-5-5-x-y, marked as the logon SID), and the High label (marked
-// as the label). Every privilege and group is checked, so a Windows build
+// group beyond exactly the measured set: defaultGroups by SID with their
+// measured attributes, one logon SID (S-1-5-5-x-y, marked as the logon
+// SID), and one High label (marked as the label); a group listed twice is
+// refused too. Every privilege and group is checked, so a Windows build
 // that adds one fails closed.
 func Check(t Token, serviceSID string) error {
 	if !strings.EqualFold(t.User, serviceSID) {
@@ -157,15 +164,21 @@ func Check(t Token, serviceSID string) error {
 		return &CheckError{Code: CodePrivileges, Detail: "the service holds privileges beyond " + changeNotify + ": " + strings.Join(extra, ", ")}
 	}
 	var groups []string
-	logon := 0
+	logon, label := 0, 0
+	seen := map[string]bool{}
 	for _, g := range t.Groups {
+		repeated := seen[g.SID]
+		seen[g.SID] = true
 		switch {
 		case g.SID == "S-1-5-32-544":
 			return &CheckError{Code: CodeAdministrators, Detail: "the service's account is in Administrators"}
-		case defaultGroups[g.SID] != "":
+		case repeated:
+			groups = append(groups, g.SID)
+		case defaultGroups[g.SID] != "" && g.Attributes == defaultGroupAttributes:
 		case isLogonSID(g.SID) && g.Attributes&seGroupLogonID == seGroupLogonID && logon == 0:
 			logon++
-		case g.SID == highLabel && g.Attributes&seGroupIntegrity != 0:
+		case g.SID == highLabel && g.Attributes&seGroupIntegrity != 0 && label == 0:
+			label++
 		default:
 			groups = append(groups, g.SID)
 		}
