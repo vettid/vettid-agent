@@ -80,6 +80,7 @@ type serviceHost struct {
 	// (tests).
 	resolve      state.Resolver
 	runSessionFn func(context.Context, session) error
+	decoded      func(*pairing.Record) // sees each record loadRecord decodes
 
 	store *state.Store
 
@@ -441,6 +442,9 @@ func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 	clear(raw)
 	if err != nil {
 		return nil, err
+	}
+	if h.decoded != nil {
+		h.decoded(rec)
 	}
 	if rec.Phase != pairing.PhasePaired {
 		clear(rec.Device)

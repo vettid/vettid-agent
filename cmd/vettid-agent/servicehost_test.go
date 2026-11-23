@@ -18,6 +18,7 @@ import (
 	"github.com/vettid/vettid-agent/internal/channel"
 	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/state"
+	"github.com/vettid/vettid-agent/internal/vaultconn"
 )
 
 // testHost is a serviceHost on a state directory of the test's own, fed
@@ -614,6 +615,60 @@ func TestHostPreemptsNonReadingStub(t *testing.T) {
 	fg := th.connect(t, channel.OpForget)
 	if a := fg.waitAnswer(t); a != "accept" {
 		t.Fatalf("forget with a non-reading stub: %s, want accept", a)
+	}
+}
+
+// A forget client that never sends its request is closed after
+// requestWait, and gives its place back: a stub is served again.
+func TestHostSilentForgetClosed(t *testing.T) {
+	old := requestWait
+	requestWait = 200 * time.Millisecond
+	t.Cleanup(func() { requestWait = old })
+	th := startHost(t, time.Minute)
+	fg := th.connect(t, channel.OpForget)
+	if a := fg.waitAnswer(t); a != "accept" {
+		t.Fatalf("forget: %s", a)
+	}
+	select {
+	case <-fg.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a silent forget client was not closed")
+	}
+	stub := th.connect(t, channel.OpMCP)
+	if a := stub.waitAnswer(t); a != "accept" {
+		t.Fatalf("a stub after the silent forget: %s", a)
+	}
+}
+
+// A record that is not paired is cleared by loadRecord before it says
+// not paired.
+func TestHostLoadRecordClearsUnpaired(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	store, err := state.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	device := []byte(`{"name":"agent","vault_id":"v1","device_id":"d1"}`)
+	raw, err := (&pairing.Record{Phase: pairing.PhaseWaiting, Deadline: time.Now().Add(time.Hour), Device: device}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(cmdTestProtector{}, raw); err != nil {
+		t.Fatal(err)
+	}
+	var seen *pairing.Record
+	h := &serviceHost{Dir: dir, store: store, resolve: func(string) state.Protector { return cmdTestProtector{} },
+		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
+		decoded:    func(r *pairing.Record) { seen = r }}
+	defer store.Close()
+	if _, err := h.loadRecord(); !errors.Is(err, vaultconn.ErrNotPaired) {
+		t.Fatalf("loadRecord = %v, want not paired", err)
+	}
+	if seen == nil || len(seen.Device) == 0 {
+		t.Fatal("no record was decoded")
+	}
+	if bytes.Count(seen.Device, []byte{0}) != len(seen.Device) {
+		t.Fatalf("the record that is not paired was left in memory: %q", seen.Device)
 	}
 }
 
