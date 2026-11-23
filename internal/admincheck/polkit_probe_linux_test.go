@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -288,8 +289,9 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 				return 0
 			}
 			if inManager {
-				if d := strings.TrimSpace(viaOut(append(append([]string{}, ctl...), "show", "-p", "DropInPaths", "--value", unit)...)); d != "" {
-					t.Errorf("the user service has drop-ins (%s): not checked", d)
+				d := viaOut(append(append([]string{}, ctl...), "show", "-p", "DropInPaths", "--value", unit)...)
+				if bad := memberDropIns(strings.Fields(d), u); bad != "" {
+					t.Errorf("the user service has a drop-in the member can write (%s): not checked", bad)
 					return 0
 				}
 			}
@@ -317,6 +319,27 @@ func managerContext(u *user.User) string {
 	return strings.TrimRight(string(b), "\x00\n")
 }
 
+// memberDropIns names a drop-in the member could have written: under the
+// member's home or runtime folder, or a file (or its folder) not owned by
+// root. The distribution's own (Fedora's user service.d) are fine.
+func memberDropIns(paths []string, u *user.User) string {
+	for _, p := range paths {
+		if strings.HasPrefix(p, u.HomeDir+"/") || strings.HasPrefix(p, "/run/user/"+u.Uid+"/") {
+			return p
+		}
+		for _, q := range []string{p, filepath.Dir(p)} {
+			fi, err := os.Stat(q)
+			if err != nil {
+				return p
+			}
+			if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 || fi.Mode().Perm()&0o022 != 0 {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
 // confirmSleeper: the pid is the probe's own unit's sleep, the member's,
 // in user@<uid>.service for the manager's (no_new_privs off, as an
 // ordinary user service) or else in a system unit (no_new_privs on).
@@ -328,7 +351,10 @@ func confirmSleeper(pid int, u *user.User, unit string, inManager bool) bool {
 	if inManager && !strings.Contains(string(cg), "/user@"+u.Uid+".service/") {
 		return false
 	}
-	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err != nil || !strings.HasSuffix(exe, "/sleep") {
+	// the very file /bin/sleep is (merged /usr, multicall builds alike)
+	exe, err1 := os.Stat(fmt.Sprintf("/proc/%d/exe", pid))
+	sleep, err2 := os.Stat("/bin/sleep")
+	if err1 != nil || err2 != nil || !os.SameFile(exe, sleep) {
 		return false
 	}
 	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
@@ -431,7 +457,7 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 		if err != nil || !ownedBy(pid, u.Uid) {
 			continue
 		}
-		if held := heldGroups(pid); held != "unreadable" && held != want && !sdPam(pid, u) {
+		if held := heldGroups(pid); held != "unreadable" && held != want && !(held == "" && sdPam(pid, u)) {
 			return fmt.Sprintf("pid %d holds groups %q, the group database gives %q", pid, held, want)
 		}
 	}
@@ -458,8 +484,15 @@ func dbGroups(t *testing.T, u *user.User) string {
 	return set(strings.Fields(run(t, "id", "-G", u.Username)))
 }
 
-// sdPam: the process is (sd-pam), a child of the member's manager.
+// sdPam: the process is (sd-pam), a child of the member's manager, in
+// the first user namespace (a name and a parent can be had by any unit's
+// process; dropping groups needs a namespace of one's own).
 func sdPam(pid int, u *user.User) bool {
+	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
+	init, err2 := os.Readlink("/proc/1/ns/user")
+	if err1 != nil || err2 != nil || ns != init {
+		return false
+	}
 	comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
 	if strings.TrimSpace(string(comm)) != "(sd-pam)" {
 		return false
