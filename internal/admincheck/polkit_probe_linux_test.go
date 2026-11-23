@@ -476,8 +476,11 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 // enumerate its groups.
 func subgidOverlap(t *testing.T, u *user.User) string {
 	b, err := os.ReadFile("/etc/subgid")
-	if err != nil {
+	if errors.Is(err, fs.ErrNotExist) {
 		return "" // no ranges
+	}
+	if err != nil {
+		return fmt.Sprintf("/etc/subgid can't be read (%v)", err)
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Split(strings.TrimSpace(line), ":")
@@ -494,8 +497,10 @@ func subgidOverlap(t *testing.T, u *user.User) string {
 			for g := lo; g < lo+4096 && g < start+n; g++ {
 				args = append(args, strconv.FormatUint(g, 10))
 			}
-			// exit 0: every key found; 2: some not found, the usual case.
-			// Anything else, or no getent, is a lookup that didn't run.
+			// exit 0: every key found; 2: some not found, the usual case,
+			// but also what a network source that can't be reached gives
+			// (getent can't tell them apart). Anything else, or no getent,
+			// is a lookup that didn't run.
 			out, err := exec.Command("getent", args...).Output()
 			var ee *exec.ExitError
 			if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 2) {
