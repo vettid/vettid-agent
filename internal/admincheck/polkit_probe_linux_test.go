@@ -377,6 +377,14 @@ func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) s
 	return sub
 }
 
+func mustReadlink(t *testing.T, p string) string {
+	l, err := os.Readlink(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
 // pidOnly logs once that busctl couldn't pass a pidfd.
 var pidOnly sync.Once
 
@@ -489,18 +497,25 @@ func dbGroups(t *testing.T, u *user.User) string {
 	return set(strings.Fields(run(t, "id", "-G", u.Username)))
 }
 
-// inFirstUserNS: the process shares PID 1's user namespace.
+// inFirstUserNS: the process shares PID 1's user namespace. It fails
+// closed: a link it can't read counts as the first namespace, so the
+// exact comparison applies.
 func inFirstUserNS(pid int) bool {
 	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
 	first, err2 := os.Readlink("/proc/1/ns/user")
-	return err1 == nil && err2 == nil && ns == first
+	if err1 != nil || err2 != nil {
+		return true
+	}
+	return ns == first
 }
 
 // sdPam: the process is (sd-pam), a child of the member's manager, in
 // the first user namespace (a name and a parent can be had by any unit's
 // process; dropping groups needs a namespace of one's own).
 func sdPam(pid int, u *user.User) bool {
-	if !inFirstUserNS(pid) {
+	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
+	first, err2 := os.Readlink("/proc/1/ns/user")
+	if err1 != nil || err2 != nil || ns != first {
 		return false
 	}
 	comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
@@ -580,6 +595,9 @@ func TestPolkitProbe(t *testing.T) {
 	actions, err := ParsePkaction(run(t, "pkaction", "--verbose"))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if self, err := os.Readlink("/proc/self/ns/user"); err != nil || !strings.HasPrefix(self, "user:") || self != mustReadlink(t, "/proc/1/ns/user") {
+		t.Fatal("the probe isn't in PID 1's user namespace: groups would read unmapped")
 	}
 	version := polkitVersion(t)
 	t.Logf("polkit %d: subjects asked by %s", version, map[bool]string{true: "pidfd", false: "pid and start time"}[version >= 124])
