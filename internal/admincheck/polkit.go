@@ -295,7 +295,18 @@ func lift(actions map[string]Action, vs []Verdict) {
 // verdict. excl[i][j] is the
 // refusals candidate i explains and j doesn't, for the candidates kept.
 // When ok is false, k is NoSession.
+//
+// The actions the rules file covers (RulesFile) are left out: with the
+// file in place their answers follow the file, not the stock defaults, so
+// a stock yes that now asks would count as evidence against the kind.
 func KindFrom(actions map[string]Action, answers []Answer, all []Kind) (k Kind, candidates []Kind, excl [][]int, ok bool) {
+	stock := answers[:0:0]
+	for _, a := range answers {
+		if !RulesFile[a.Action] {
+			stock = append(stock, a)
+		}
+	}
+	answers = stock
 	for _, c := range all {
 		same := false
 		for _, d := range candidates {
@@ -504,6 +515,31 @@ var ExecPathIf = map[string]struct{ id, action, why string }{
 	"/usr/libexec/gvfsd-admin": {"org.gtk.vfs.file-operations-helper", "org.gtk.vfs.file-operations", "gvfs's admin backend"},
 	// the same helper at Arch's path, under the same gate (GC #16724)
 	"/usr/lib/gvfsd-admin": {"org.gtk.vfs.file-operations-helper", "org.gtk.vfs.file-operations", "gvfs's admin backend"},
+}
+
+// RulesFile names the actions the rules file (testdata/40-vettid-agent.rules,
+// §11.4) makes ask for an administrator (AUTH_ADMIN): 19 actions (GC
+// #16894, #16914).
+var RulesFile = map[string]bool{
+	"org.freedesktop.packagekit.package-install":              true,
+	"org.freedesktop.packagekit.package-remove":               true,
+	"org.freedesktop.packagekit.trigger-offline-update":       true,
+	"org.freedesktop.packagekit.trigger-offline-upgrade":      true,
+	"org.rpm.dnf.v0.rpm.execute_trusted_transaction":          true,
+	"org.rpm.dnf.v0.rpm.Repo.confirm_key":                     true,
+	"org.fedoraproject.FirewallD1.all":                        true,
+	"org.fedoraproject.FirewallD1.config":                     true,
+	"org.fedoraproject.FirewallD1.direct":                     true,
+	"org.fedoraproject.FirewallD1.policies":                   true,
+	"org.opensuse.cupspkhelper.mechanism.all-edit":            true,
+	"org.opensuse.cupspkhelper.mechanism.printeraddremove":    true,
+	"org.opensuse.cupspkhelper.mechanism.printer-local-edit":  true,
+	"org.opensuse.cupspkhelper.mechanism.printer-remote-edit": true,
+	"org.opensuse.cupspkhelper.mechanism.server-settings":     true,
+	"org.freedesktop.sysupdate1.cancel-check":                 true,
+	"org.freedesktop.sysupdate1.cancel-update":                true,
+	"org.freedesktop.sysupdate1.cancel-update-to-version":     true,
+	"org.freedesktop.sysupdate1.cancel-vacuum":                true,
 }
 
 // Allowlist names the stock grants of an administrator's action measured

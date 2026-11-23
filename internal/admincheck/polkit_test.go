@@ -1,6 +1,7 @@
 package admincheck
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -680,5 +681,54 @@ func TestPackageKitOffline(t *testing.T) {
 	}
 	if n := strings.Count(string(rules), "    case \""); n != 19 {
 		t.Errorf("the rules file has %d actions, want 19", n)
+	}
+}
+
+// RulesFile is exactly the actions testdata/40-vettid-agent.rules lists.
+func TestRulesFileMatchesItsList(t *testing.T) {
+	b, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if id, ok := strings.CutPrefix(strings.TrimSpace(line), "case \""); ok {
+			listed[strings.TrimSuffix(id, "\":")] = true
+		}
+	}
+	if len(listed) != len(RulesFile) {
+		t.Errorf("the file lists %d, RulesFile %d", len(listed), len(RulesFile))
+	}
+	for id := range listed {
+		if !RulesFile[id] {
+			t.Errorf("%s listed, not in RulesFile", id)
+		}
+	}
+}
+
+// With the rules file in place, actions it covers whose stock default for
+// an active session is yes answer with a challenge: that is no evidence
+// against the active kind (Arch's update cancels, PackageKit's offline
+// triggers).
+func TestKindFromLeavesOutTheRulesFile(t *testing.T) {
+	actions := map[string]Action{}
+	var answers []Answer
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("org.x.admin-%d", i) // active asks, inactive refuses outright
+		actions[id] = Action{ID: id, Any: No, Inactive: No, Active: AuthAdmin}
+		answers = append(answers, Answer{Action: id, Challenge: true})
+	}
+	for id := range RulesFile {
+		actions[id] = Action{ID: id, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
+		answers = append(answers, Answer{Action: id, Challenge: true}) // the file's AUTH_ADMIN
+	}
+	k, kept, excl, ok := KindFrom(actions, answers, []Kind{Active, Inactive})
+	if !ok || k != Active {
+		t.Fatalf("kind %s ok %v", k, ok)
+	}
+	for i := 1; i < len(kept); i++ {
+		if excl[i][0] != 0 {
+			t.Errorf("%s explains %d refusals active doesn't", kept[i], excl[i][0])
+		}
 	}
 }
