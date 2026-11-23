@@ -24,7 +24,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -290,7 +289,7 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 			}
 			if inManager {
 				d := viaOut(append(append([]string{}, ctl...), "show", "-p", "DropInPaths", "--value", unit)...)
-				if bad := memberDropIns(strings.Fields(d), u); bad != "" {
+				if bad := memberDropIns(strings.Fields(d)); bad != "" {
 					t.Errorf("the user service has a drop-in the member can write (%s): not checked", bad)
 					return 0
 				}
@@ -317,27 +316,6 @@ func managerContext(u *user.User) string {
 		return ""
 	}
 	return strings.TrimRight(string(b), "\x00\n")
-}
-
-// memberDropIns names a drop-in the member could have written: under the
-// member's home or runtime folder, or a file (or its folder) not owned by
-// root. The distribution's own (Fedora's user service.d) are fine.
-func memberDropIns(paths []string, u *user.User) string {
-	for _, p := range paths {
-		if strings.HasPrefix(p, u.HomeDir+"/") || strings.HasPrefix(p, "/run/user/"+u.Uid+"/") {
-			return p
-		}
-		for _, q := range []string{p, filepath.Dir(p)} {
-			fi, err := os.Stat(q)
-			if err != nil {
-				return p
-			}
-			if st, ok := fi.Sys().(*syscall.Stat_t); !ok || st.Uid != 0 || fi.Mode().Perm()&0o022 != 0 {
-				return p
-			}
-		}
-	}
-	return ""
 }
 
 // confirmSleeper: the pid is the probe's own unit's sleep, the member's,
