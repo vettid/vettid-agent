@@ -17,6 +17,7 @@ import (
 
 	"github.com/vettid/vettid-agent/internal/channel"
 	"github.com/vettid/vettid-agent/internal/pairing"
+	"github.com/vettid/vettid-agent/internal/state"
 )
 
 // testHost is a serviceHost on a state directory of the test's own, fed
@@ -434,6 +435,195 @@ func TestHostPairBadCode(t *testing.T) {
 	}
 	if strings.Contains(text, code) {
 		t.Fatalf("the answer echoes the code: %q", text)
+	}
+}
+
+// readerFunc is an io.Reader from a function.
+type readerFunc func([]byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// pair's request deadline is lifted once the request is read: a pairing
+// that takes longer than requestWait still answers.
+func TestHostPairOutlivesRequestDeadline(t *testing.T) {
+	old := requestWait
+	requestWait = 200 * time.Millisecond
+	t.Cleanup(func() { requestWait = old })
+	th := startHost(t, time.Minute)
+	th.h.pairOptions = func(o *pairing.Options) {
+		code := o.Code
+		o.Code = func() (string, error) {
+			time.Sleep(600 * time.Millisecond) // the pairing waits past requestWait
+			return code()
+		}
+	}
+	fc := th.connect(t, channel.OpPair)
+	fc.waitAnswer(t)
+	if err := channel.SendRequest(fc, channel.Request{Code: "not-a-pairing-code-1234"}); err != nil {
+		t.Fatal(err)
+	}
+	if text, rc := fc.console(t); rc != 1 || text == "" {
+		t.Fatalf("pair: %d %q", rc, text)
+	}
+}
+
+// During the idle stop's drain, a client handed over is served, and the
+// host goes back to taking clients: a second one is served too.
+func TestHostDrainTakesClientsAgain(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	h := &serviceHost{Dir: dir, IdleStop: 100 * time.Millisecond, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+	type end struct {
+		c      *hostConn
+		client net.Conn
+		answer chan string
+	}
+	mk := func() end {
+		server, client := net.Pipe()
+		e := end{client: client, answer: make(chan string, 1)}
+		e.c = &hostConn{rw: server, op: channel.OpStatus,
+			accept:      func() error { e.answer <- "accept"; return nil },
+			refuse:      func(err error) error { e.answer <- err.Error(); return server.Close() },
+			close:       server.Close,
+			setDeadline: server.SetDeadline}
+		t.Cleanup(func() { client.Close() })
+		return e
+	}
+	first, second := mk(), mk()
+	calls := 0
+	done := make(chan error, 1)
+	go func() {
+		done <- h.Serve(context.Background(), func(ctx context.Context) (*hostConn, error) {
+			if calls == 1 && ctx.Err() != nil {
+				// The stop's accept has ended: the second client waits for
+				// the host to take clients again, as it would on the channel.
+				return nil, ctx.Err()
+			}
+			calls++
+			switch calls {
+			case 1:
+				// Handed over as the stop began.
+				<-ctx.Done()
+				return first.c, nil
+			case 2:
+				// Connects during the drain, once the host takes clients again.
+				return second.c, nil
+			}
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	}()
+	for _, e := range []end{first, second} {
+		select {
+		case a := <-e.answer:
+			if a != "accept" {
+				t.Fatalf("answer %s", a)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a client was not served")
+		}
+	}
+	for _, e := range []end{first, second} {
+		if err := channel.SendRequest(e.client, channel.Request{}); err != nil {
+			t.Fatal(err)
+		}
+		var out bytes.Buffer
+		if code, err := channel.Relay(e.client, &out); err != nil || code != 0 {
+			t.Fatalf("status: %d %v", code, err)
+		}
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errIdle) {
+			t.Fatalf("Serve = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the host did not stop")
+	}
+}
+
+// The decrypted record's device and grants are cleared once a stub's
+// session has ended.
+func TestHostClearsRecordAfterSession(t *testing.T) {
+	v := newVault(t)
+	dir := pairedDir(t, v)
+	pairOptions = nil
+	var rec *pairing.Record
+	var device []byte
+	h := &serviceHost{Dir: dir, IdleStop: time.Minute, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
+		resolve:    func(string) state.Protector { return cmdTestProtector{} },
+		runSessionFn: func(_ context.Context, s session) error {
+			rec = s.Record
+			device = rec.Device
+			if len(device) == 0 || bytes.Count(device, []byte{0}) == len(device) {
+				t.Error("the session got no device")
+			}
+			return nil
+		}}
+	th := &testHost{h: h, clients: make(chan *hostConn), done: make(chan error, 1)}
+	ctx, cancel := context.WithCancel(context.Background())
+	th.cancel = cancel
+	go func() {
+		th.done <- h.Serve(ctx, func(ctx context.Context) (*hostConn, error) {
+			select {
+			case c := <-th.clients:
+				return c, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		})
+	}()
+	t.Cleanup(func() { cancel(); <-th.done })
+	fc := th.connect(t, channel.OpMCP)
+	fc.waitAnswer(t)
+	select {
+	case <-fc.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session did not end")
+	}
+	if rec == nil {
+		t.Fatal("no session ran")
+	}
+	if bytes.Count(device, []byte{0}) != len(device) {
+		t.Fatal("the record's device was not cleared after the session")
+	}
+	if len(rec.Leash) > 0 && bytes.Count(rec.Leash, []byte{0}) != len(rec.Leash) {
+		t.Fatal("the record's grants were not cleared after the session")
+	}
+}
+
+// An administrator's forget ends a not-paired stub that never reads its
+// answers: the not-paired path goes through stopSession, not only
+// through closeAll at the host's stop.
+func TestHostPreemptsNonReadingStub(t *testing.T) {
+	oldStop, oldPre := mcpStopWait, preemptWait
+	mcpStopWait, preemptWait = 100*time.Millisecond, 3*time.Second
+	t.Cleanup(func() { mcpStopWait, preemptWait = oldStop, oldPre })
+	th := startHost(t, time.Minute)
+	stub := th.connect(t, channel.OpMCP)
+	stub.waitAnswer(t)
+	go func() {
+		for i := 0; i < 200; i++ {
+			if _, err := io.WriteString(stub, msgCall+"\n"); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	fg := th.connect(t, channel.OpForget)
+	if a := fg.waitAnswer(t); a != "accept" {
+		t.Fatalf("forget with a non-reading stub: %s, want accept", a)
+	}
+}
+
+// A client handed over after the host closed its clients is closed at
+// once, never served.
+func TestHostTrackAfterCloseAll(t *testing.T) {
+	h := &serviceHost{}
+	h.closeAll()
+	if h.track(&hostConn{}) {
+		t.Fatal("a client was tracked after closeAll")
 	}
 }
 

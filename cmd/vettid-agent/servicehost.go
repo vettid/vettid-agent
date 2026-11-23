@@ -76,6 +76,10 @@ type serviceHost struct {
 	Protectors *pairing.Protectors
 	// pairOptions adjusts a pairing's options (tests).
 	pairOptions func(*pairing.Options)
+	// resolve replaces Protectors.Resolve, and runSessionFn session.run
+	// (tests).
+	resolve      state.Resolver
+	runSessionFn func(context.Context, session) error
 
 	store *state.Store
 
@@ -88,7 +92,15 @@ type serviceHost struct {
 	exclusive bool // pair or forget runs, or waits for the stub's session to end
 	holds     int  // clients being served, and what else holds the host
 	conns     map[*hostConn]struct{}
+	closing   bool // closeAll ran: a client handed over later is closed at once
 	idle      chan struct{}
+}
+
+func (h *serviceHost) resolver() state.Resolver {
+	if h.resolve != nil {
+		return h.resolve
+	}
+	return h.Protectors.Resolve
 }
 
 // Hold keeps the host from stopping until the matching Release: each
@@ -128,13 +140,19 @@ func (h *serviceHost) Held() int {
 // errIdle: the host stopped because nothing held it for IdleStop.
 var errIdle = errors.New("idle")
 
-func (h *serviceHost) track(c *hostConn) {
+// track records a client being served; once closeAll has run it refuses
+// (the caller closes the client).
+func (h *serviceHost) track(c *hostConn) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closing {
+		return false
+	}
 	if h.conns == nil {
 		h.conns = map[*hostConn]struct{}{}
 	}
 	h.conns[c] = struct{}{}
-	h.mu.Unlock()
+	return true
 }
 
 func (h *serviceHost) untrack(c *hostConn) {
@@ -148,6 +166,7 @@ func (h *serviceHost) untrack(c *hostConn) {
 // its handler, and so the stop, waiting.
 func (h *serviceHost) closeAll() {
 	h.mu.Lock()
+	h.closing = true
 	cs := make([]*hostConn, 0, len(h.conns))
 	for c := range h.conns {
 		cs = append(cs, c)
@@ -184,37 +203,46 @@ func (h *serviceHost) Serve(ctx context.Context, accept func(context.Context) (*
 		idleStop = defaultIdleStop
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
-	acceptCtx, stopAccept := context.WithCancel(ctx)
 	var wg sync.WaitGroup
+	// startAccept takes clients until its context ends; it returns that
+	// context's cancel and a channel closed once it has stopped.
+	startAccept := func() (context.CancelFunc, <-chan struct{}) {
+		actx, stop := context.WithCancel(ctx)
+		done := make(chan struct{})
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(done)
+			for {
+				c, err := accept(actx)
+				if err != nil {
+					if actx.Err() == nil {
+						cancel(err)
+					}
+					return
+				}
+				if !h.track(c) {
+					_ = c.close()
+					continue
+				}
+				h.Hold()
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					defer h.Release()
+					defer h.untrack(c)
+					h.handle(ctx, c)
+				}()
+			}
+		}()
+		return stop, done
+	}
+	stopAccept, acceptDone := startAccept()
 	defer func() {
 		cancel(nil)
 		stopAccept()
 		h.closeAll()
 		wg.Wait()
-	}()
-	acceptDone := make(chan struct{})
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		defer close(acceptDone)
-		for {
-			c, err := accept(acceptCtx)
-			if err != nil {
-				if acceptCtx.Err() == nil {
-					cancel(err)
-				}
-				return
-			}
-			h.Hold()
-			h.track(c)
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				defer h.Release()
-				defer h.untrack(c)
-				h.handle(ctx, c)
-			}()
-		}
 	}()
 	t := time.NewTimer(idleStop)
 	defer t.Stop()
@@ -230,17 +258,15 @@ func (h *serviceHost) Serve(ctx context.Context, accept func(context.Context) (*
 			if h.Held() != 0 {
 				continue
 			}
-			// Stop taking clients; one handed over meanwhile is served.
+			// Stop taking clients. If one was handed over meanwhile, it is
+			// served and the host goes back to taking clients, its idle time
+			// counting again from the last release.
 			stopAccept()
 			<-acceptDone
-			for h.Held() != 0 {
-				select {
-				case <-ctx.Done():
-					return context.Cause(ctx)
-				case <-h.idle:
-				}
+			if h.Held() == 0 {
+				return errIdle
 			}
-			return errIdle
+			stopAccept, acceptDone = startAccept()
 		}
 	}
 }
@@ -284,10 +310,11 @@ func (h *serviceHost) handle(ctx context.Context, c *hostConn) {
 		if c.accept() != nil {
 			return
 		}
+		lift := func() { _ = c.setDeadline(time.Time{}) }
 		if c.op == channel.OpPair {
-			h.pair(ctx, c.rw, func() { _ = c.setDeadline(time.Time{}) })
+			h.pair(ctx, c.rw, lift)
 		} else {
-			h.forget(c.rw)
+			h.forget(c.rw, lift)
 		}
 	default:
 		_ = c.refuse(channel.ErrNotAllowed)
@@ -375,9 +402,13 @@ func (h *serviceHost) runSession(ctx context.Context, rw io.ReadWriter) {
 		clear(rec.Device)
 		clear(rec.Leash)
 	}()
-	err = session{
+	run := func(ctx context.Context, s session) error { return s.run(ctx) }
+	if h.runSessionFn != nil {
+		run = h.runSessionFn
+	}
+	err = run(ctx, session{
 		Store:         h.store,
-		Resolve:       h.Protectors.Resolve,
+		Resolve:       h.resolver(),
 		Record:        rec,
 		AccessMinutes: h.AccessMinutes,
 		Log:           logger,
@@ -386,7 +417,7 @@ func (h *serviceHost) runSession(ctx context.Context, rw io.ReadWriter) {
 		Notices: io.Discard,
 		In:      rw,
 		Out:     rw,
-	}.run(ctx)
+	})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Warn("the MCP session ended", "err", err)
 	}
@@ -402,7 +433,7 @@ func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 	if !ok {
 		return nil, vaultconn.ErrNotPaired
 	}
-	raw, err := h.store.Load(h.Protectors.Resolve)
+	raw, err := h.store.Load(h.resolver())
 	if err != nil {
 		return nil, fmt.Errorf("the state file cannot be opened: %w", err)
 	}
@@ -430,7 +461,7 @@ func (h *serviceHost) status(rw io.ReadWriter) {
 		out.exit(1)
 		return
 	}
-	v, err := state.ReadOnly(h.Dir, h.Protectors.Resolve)
+	v, err := state.ReadOnly(h.Dir, h.resolver())
 	switch {
 	case errors.Is(err, state.ErrNotFound):
 		fmt.Fprintln(out, "Not paired. An administrator pairs it with `vettid-agent pair --name <name>`, as the README says.")
@@ -470,7 +501,7 @@ func (h *serviceHost) pair(ctx context.Context, rw io.ReadWriter, requestRead fu
 	req.Code = ""
 	o := pairing.Options{
 		Store:         h.store,
-		Resolve:       h.Protectors.Resolve,
+		Resolve:       h.resolver(),
 		ResolveErr:    h.Protectors.ResolveErr,
 		AllProtectors: protect.All(h.Dir),
 		Protector:     h.Protectors.New,
@@ -501,15 +532,18 @@ func (h *serviceHost) pair(ctx context.Context, rw io.ReadWriter, requestRead fu
 }
 
 // forget answers `forget --name`: the state's keys and files are
-// deleted, through every protector that could hold its key.
-func (h *serviceHost) forget(rw io.ReadWriter) {
+// deleted, through every protector that could hold its key. requestRead
+// lifts the request's deadline once it is read, so that a slow wipe
+// still answers.
+func (h *serviceHost) forget(rw io.ReadWriter, requestRead func()) {
 	out := &consoleWriter{w: rw}
 	if _, err := channel.ReadRequest(rw); err != nil {
 		fmt.Fprintln(out, "The request could not be read.")
 		out.exit(1)
 		return
 	}
-	err := h.store.Wipe(h.Protectors.Resolve)
+	requestRead()
+	err := h.store.Wipe(h.resolver())
 	switch {
 	case errors.Is(err, state.ErrNothingToWipe):
 		fmt.Fprintln(out, "Nothing to forget: this connector holds no pairing.")
