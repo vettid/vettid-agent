@@ -80,7 +80,6 @@ type serviceHost struct {
 	// (tests).
 	resolve      state.Resolver
 	runSessionFn func(context.Context, session) error
-	decoded      func(*pairing.Record) // sees each record loadRecord decodes
 
 	store *state.Store
 
@@ -137,6 +136,9 @@ func (h *serviceHost) Held() int {
 	defer h.mu.Unlock()
 	return h.holds
 }
+
+// hostDecoded, set only by tests, sees each record loadRecord decodes.
+var hostDecoded func(*pairing.Record)
 
 // errIdle: the host stopped because nothing held it for IdleStop.
 var errIdle = errors.New("idle")
@@ -443,8 +445,8 @@ func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 	if err != nil {
 		return nil, err
 	}
-	if h.decoded != nil {
-		h.decoded(rec)
+	if hostDecoded != nil {
+		hostDecoded(rec)
 	}
 	if rec.Phase != pairing.PhasePaired {
 		clear(rec.Device)

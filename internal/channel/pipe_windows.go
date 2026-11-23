@@ -39,11 +39,13 @@ const (
 	maxInstances = windows.PIPE_UNLIMITED_INSTANCES
 	// maxConns bounds the clients connected at once; one beyond it is
 	// told the channel is busy (chosen; not in the spec). adminReserve
-	// more are kept for an elevated administrator who is not the member:
-	// the member's own processes (the agent among them) can fill
-	// maxConns, by connecting again as each place is freed, but never
-	// keep an administrator from pair, forget or status (chosen; not in
-	// the spec).
+	// more are kept for an elevated administrator who is not the member
+	// (chosen; not in the spec): the member's own processes (the agent
+	// among them) can fill maxConns, but can't hold the places an
+	// administrator needs for pair, forget or status. They can still
+	// contend for the one waiting instance: a member connecting in a loop
+	// may win it before an administrator's Dial, which retries for its
+	// Wait (5 s by default).
 	maxConns     = 16
 	adminReserve = 2
 	bufSize      = 64 << 10
@@ -117,8 +119,8 @@ type Listener struct {
 
 	// ready holds clients whose hello was read and admitted, for Accept.
 	// Only a client counted in live is sent, and only under mu while the
-	// listener is open, so it never holds more than maxConns and a send
-	// never blocks.
+	// listener is open, so it never holds more than maxConns+adminReserve
+	// (the most clients live allows) and a send never blocks.
 	ready chan *ServerConn
 
 	mu sync.Mutex
@@ -168,7 +170,7 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 	l := &Listener{cfg: cfg, path: path, member: member, admins: admins,
 		sa:    &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd},
 		done:  make(chan struct{}),
-		ready: make(chan *ServerConn, maxConns)}
+		ready: make(chan *ServerConn, maxConns+adminReserve)}
 	h, err := l.instance(true)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_PIPE_BUSY) {

@@ -658,8 +658,9 @@ func TestHostLoadRecordClearsUnpaired(t *testing.T) {
 	}
 	var seen *pairing.Record
 	h := &serviceHost{Dir: dir, store: store, resolve: func(string) state.Protector { return cmdTestProtector{} },
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
-		decoded:    func(r *pairing.Record) { seen = r }}
+		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+	hostDecoded = func(r *pairing.Record) { seen = r }
+	t.Cleanup(func() { hostDecoded = nil })
 	defer store.Close()
 	if _, err := h.loadRecord(); !errors.Is(err, vaultconn.ErrNotPaired) {
 		t.Fatalf("loadRecord = %v, want not paired", err)

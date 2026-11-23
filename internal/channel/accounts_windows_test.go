@@ -362,8 +362,10 @@ func TestAdminReserveBeyondMaxConns(t *testing.T) {
 		}
 	})
 	// The member's next connection is told the channel is busy, at once.
+	openedAll(t, held...)
 	var extra windows.Handle
 	member.as(t, func() { extra = openRaw(t, s.pipe) })
+	openedAll(t, extra)
 	f := os.NewFile(uintptr(extra), "extra")
 	line, err := readLine(f)
 	f.Close()
@@ -391,6 +393,67 @@ func TestAdminReserveBeyondMaxConns(t *testing.T) {
 	cfg.Service = me
 	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrBusy) {
 		t.Fatalf("the administrator beyond the reserve: %v, want ErrBusy", err)
+	}
+}
+
+// With every place taken (maxConns by the member, adminReserve by an
+// administrator) and every hello sent, while nothing takes clients from
+// Accept, the listener still closes: the admitted clients' queue holds
+// them all, and no send blocks under its lock.
+func TestAdmittedQueueHoldsTheReserve(t *testing.T) {
+	member := newTestUser(t)
+	me := selfSID(t)
+	l, err := Listen(ListenConfig{Pipe: randomPipe(t), Owner: me, Member: member.sid.String(), Version: testVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Start the accepting goroutine, then take nothing from Accept.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = l.Accept(ctx)
+	hello := func(h windows.Handle) *os.File {
+		if h == 0 {
+			return nil
+		}
+		f := os.NewFile(uintptr(h), "client")
+		if err := writeLine(f, clientHello{Channel: helloVersion, Op: OpStatus, Version: testVersion}); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+	member.as(t, func() {
+		for i := 0; i < maxConns; i++ {
+			files = append(files, hello(openRaw(t, l.cfg.Pipe)))
+		}
+	})
+	for i := 0; i < adminReserve; i++ {
+		files = append(files, hello(openRaw(t, l.cfg.Pipe)))
+	}
+	for _, f := range files {
+		if f == nil {
+			t.FailNow()
+		}
+	}
+	// Every hello admitted and queued.
+	for end := time.Now().Add(5 * time.Second); len(l.ready) < maxConns+adminReserve; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("%d of %d clients queued", len(l.ready), maxConns+adminReserve)
+		}
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- l.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung with the reserve's clients queued")
 	}
 }
 

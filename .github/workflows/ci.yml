@@ -98,7 +98,7 @@ jobs:
           for t in TestOtherUserRefused TestAdminWhoIsNotTheMember TestSquatterRefused TestReadPipeAdminOnly \
                    TestAppContainerRefused TestPipeRemoteRefused TestPipeRejectRemoteFlag TestPipeAnonymousRefused \
                    TestTokenIdentityElevation TestPipeFailedInstanceKeepsName TestPipeBusy \
-                   TestNeitherMemberNorAdminRefusedBeforeHello TestSilentClientDoesNotBlock TestAdminReserveBeyondMaxConns \
+                   TestNeitherMemberNorAdminRefusedBeforeHello TestSilentClientDoesNotBlock TestAdminReserveBeyondMaxConns TestAdmittedQueueHoldsTheReserve \
                    TestElevatedPairEndToEnd TestStubOverPipe; do
             grep -q -- "--- PASS: $t " "$RUNNER_TEMP/channel.txt" || { echo "::error::$t did not pass"; exit 1; }
           done
