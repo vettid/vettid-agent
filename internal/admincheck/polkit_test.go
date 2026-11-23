@@ -529,3 +529,21 @@ func TestKindFromKeepMerge(t *testing.T) {
 		}
 	}
 }
+
+// The gvfs gate lifts only its own action id, not another action that
+// runs the same program.
+func TestGateByID(t *testing.T) {
+	actions := map[string]Action{
+		"org.x.other":                 {ID: "org.x.other", Any: No, Inactive: No, Active: AuthAdminKeep, ExecPath: "/usr/libexec/gvfsd-admin"},
+		"org.gtk.vfs.file-operations": {ID: "org.gtk.vfs.file-operations", Any: No, Inactive: No, Active: AuthAdminKeep},
+	}
+	vs := Judge(actions, []Answer{
+		{Action: "org.x.other", Kind: Active, Subject: "s", Authorized: true},
+		{Action: "org.gtk.vfs.file-operations", Kind: Active, Subject: "s", Challenge: true},
+	}, met)
+	for _, v := range vs {
+		if v.Action == "org.x.other" && v.Result != Refuse {
+			t.Errorf("another id running gvfsd-admin: %s (%s)", v.Result, v.Reason)
+		}
+	}
+}

@@ -253,6 +253,7 @@ func lift(actions map[string]Action, vs []Verdict) {
 	for i := range vs {
 		v := &vs[i]
 		gate, ok := ExecPathIf[actions[v.Action].ExecPath]
+		ok = ok && gate.id == v.Action
 		if v.Result != Refuse || !ok {
 			continue
 		}
@@ -485,8 +486,9 @@ var ExecActionAllow = map[string]struct{ path, argv1, why string }{
 
 // ExecPathIf names the exec.path helpers that run as root but check each
 // caller against another action of their own (proposed for §11.4).
-var ExecPathIf = map[string]struct{ action, why string }{
-	"/usr/libexec/gvfsd-admin": {"org.gtk.vfs.file-operations", "gvfs's admin backend"},
+// Each is pinned to the one action id that runs it.
+var ExecPathIf = map[string]struct{ id, action, why string }{
+	"/usr/libexec/gvfsd-admin": {"org.gtk.vfs.file-operations-helper", "org.gtk.vfs.file-operations", "gvfs's admin backend"},
 }
 
 // Allowlist names the stock grants of an administrator's action measured
