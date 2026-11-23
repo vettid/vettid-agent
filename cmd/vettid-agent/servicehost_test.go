@@ -254,7 +254,12 @@ func TestHostAdminPreemptsStub(t *testing.T) {
 	if text, code := fg.console(t); code != 0 || !strings.Contains(text, "Nothing to forget") {
 		t.Fatalf("forget: %d %q", code, text)
 	}
-	// Then a stub is served again.
+	// Then, once forget's connection is closed, a stub is served again.
+	select {
+	case <-fg.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("forget's connection was not closed")
+	}
 	again := th.connect(t, channel.OpMCP)
 	if a := again.waitAnswer(t); a != "accept" {
 		t.Fatalf("a stub after forget: %s", a)

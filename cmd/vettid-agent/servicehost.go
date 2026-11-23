@@ -256,6 +256,8 @@ func (h *serviceHost) handle(ctx context.Context, c *hostConn) {
 			_ = c.refuse(channel.ErrInUse)
 			return
 		}
+		// The stub's connection is closed before its place is given back:
+		// a pair or forget that ended it then runs with the stub gone.
 		defer h.releaseSession(done)
 		defer c.close()
 		if c.accept() != nil {
@@ -274,8 +276,10 @@ func (h *serviceHost) handle(ctx context.Context, c *hostConn) {
 			_ = c.refuse(channel.ErrInUse)
 			return
 		}
-		defer h.releaseExclusive()
+		// The place is given back before the client is closed, so that a
+		// stub that connects once it sees the close is served.
 		defer c.close()
+		defer h.releaseExclusive()
 		_ = c.setDeadline(time.Now().Add(requestWait))
 		if c.accept() != nil {
 			return
