@@ -513,8 +513,19 @@ func TestJudgeNoDefaultAndArgv1(t *testing.T) {
 	if got["org.gnome.software.dkms-test/active"] != Refuse {
 		t.Errorf("the key test's id in another mode: %v", got)
 	}
-	a, err := ParsePkaction("org.x:\n  implicit any:      no\n  implicit inactive: no\n  implicit active:   no\n  annotation:        org.freedesktop.policykit.imply -> a\tb c\n")
-	if err != nil || len(a["org.x"].Implies) != 2 || a["org.x"].Implies[0] != "a\tb" {
+	a, err := ParsePkaction("org.x:\n  implicit any:      no\n  implicit inactive: no\n  implicit active:   no\n  annotation:        org.freedesktop.policykit.imply -> a\tb  c\n")
+	if err != nil || len(a["org.x"].Implies) != 2 || a["org.x"].Implies[0] != "a\tb" || a["org.x"].Implies[1] != "c" {
 		t.Errorf("imply split: %q %v", a["org.x"].Implies, err)
+	}
+}
+
+// Candidates whose defaults differ only by a keep are one.
+func TestKindFromKeepMerge(t *testing.T) {
+	for _, pair := range [][2]Default{{AuthAdmin, AuthAdminKeep}, {AuthSelf, AuthSelfKeep}} {
+		actions := map[string]Action{"k": {ID: "k", Any: pair[0], Inactive: pair[0], Active: pair[1]}}
+		k, _, _, ok := KindFrom(actions, []Answer{{Action: "k", Challenge: true}}, []Kind{Active, Inactive})
+		if !ok || k != Active {
+			t.Errorf("%s against %s: %s %v", pair[0], pair[1], k, ok)
+		}
 	}
 }
