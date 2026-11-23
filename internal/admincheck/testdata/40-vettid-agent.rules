@@ -1,20 +1,38 @@
-// Written for the VettID agent's separate-account mode: these actions ask
-// for an administrator's password.
-polkit.addRule(function(action, subject) {
-    switch (action.id) {
-    case "org.freedesktop.packagekit.package-install":
-    case "org.freedesktop.packagekit.package-remove":
-    case "org.rpm.dnf.v0.rpm.execute_trusted_transaction":
-    case "org.rpm.dnf.v0.rpm.Repo.confirm_key":
-    case "org.fedoraproject.FirewallD1.all":
-    case "org.fedoraproject.FirewallD1.config":
-    case "org.fedoraproject.FirewallD1.direct":
-    case "org.fedoraproject.FirewallD1.policies":
-    case "org.opensuse.cupspkhelper.mechanism.all-edit":
-    case "org.opensuse.cupspkhelper.mechanism.printeraddremove":
-    case "org.opensuse.cupspkhelper.mechanism.printer-local-edit":
-    case "org.opensuse.cupspkhelper.mechanism.printer-remote-edit":
-    case "org.opensuse.cupspkhelper.mechanism.server-settings":
-        return polkit.Result.AUTH_ADMIN;
-    }
-});
+// Written for the VettID agent's separate-account mode: for the VettID
+// members listed (one per pairing), and for a process of no account (a
+// uid with no name, such as a member's rootless container's), these
+// actions ask for an administrator's password; every other account keeps
+// polkit's defaults. Written by vettid-agent rules-file --write; edit it
+// with that command only.
+(function () {
+    var vettidMembers = [
+@ENTRIES@
+    ];
+    polkit.addRule(function (action, subject) {
+        if (vettidMembers.indexOf(subject.user) < 0 && !/^[0-9]+$/.test(subject.user)) {
+            return;
+        }
+        switch (action.id) {
+        case "org.freedesktop.packagekit.package-install":
+        case "org.freedesktop.packagekit.package-remove":
+        case "org.freedesktop.packagekit.trigger-offline-update":
+        case "org.freedesktop.packagekit.trigger-offline-upgrade":
+        case "org.rpm.dnf.v0.rpm.execute_trusted_transaction":
+        case "org.rpm.dnf.v0.rpm.Repo.confirm_key":
+        case "org.fedoraproject.FirewallD1.all":
+        case "org.fedoraproject.FirewallD1.config":
+        case "org.fedoraproject.FirewallD1.direct":
+        case "org.fedoraproject.FirewallD1.policies":
+        case "org.opensuse.cupspkhelper.mechanism.all-edit":
+        case "org.opensuse.cupspkhelper.mechanism.printeraddremove":
+        case "org.opensuse.cupspkhelper.mechanism.printer-local-edit":
+        case "org.opensuse.cupspkhelper.mechanism.printer-remote-edit":
+        case "org.opensuse.cupspkhelper.mechanism.server-settings":
+        case "org.freedesktop.sysupdate1.cancel-check":
+        case "org.freedesktop.sysupdate1.cancel-update":
+        case "org.freedesktop.sysupdate1.cancel-update-to-version":
+        case "org.freedesktop.sysupdate1.cancel-vacuum":
+            return polkit.Result.AUTH_ADMIN;
+        }
+    });
+})();

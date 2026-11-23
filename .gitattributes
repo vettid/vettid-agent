@@ -1,2 +1,4 @@
 # Vectors are compared byte for byte (and by sha256): never convert line endings.
 testdata/** -text
+# The polkit rules file is embedded and parsed byte for byte: always LF.
+*.rules text eol=lf

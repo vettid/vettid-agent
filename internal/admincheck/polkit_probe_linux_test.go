@@ -12,7 +12,8 @@ package admincheck
 // gdbus), so it needs no D-Bus library.
 //
 // The rules file §11.4 describes, for the runs with it, is
-// testdata/40-vettid-agent.rules (copied to /etc/polkit-1/rules.d/).
+// testdata/40-vettid-agent.rules (copied to /etc/polkit-1/rules.d/, @ENTRIES@
+// replaced by the member's entry, as RenderRulesFile writes it).
 
 import (
 	"errors"

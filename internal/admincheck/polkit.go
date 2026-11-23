@@ -295,7 +295,18 @@ func lift(actions map[string]Action, vs []Verdict) {
 // verdict. excl[i][j] is the
 // refusals candidate i explains and j doesn't, for the candidates kept.
 // When ok is false, k is NoSession.
+//
+// The actions the rules file covers (RulesFile) are left out: with the
+// file in place their answers follow the file, not the stock defaults, so
+// a stock yes that now asks would count as evidence against the kind.
 func KindFrom(actions map[string]Action, answers []Answer, all []Kind) (k Kind, candidates []Kind, excl [][]int, ok bool) {
+	stock := answers[:0:0]
+	for _, a := range answers {
+		if !RulesFile[a.Action] {
+			stock = append(stock, a)
+		}
+	}
+	answers = stock
 	for _, c := range all {
 		same := false
 		for _, d := range candidates {
@@ -395,27 +406,33 @@ func alwaysRefuses(a Action) (string, bool) {
 
 // AlwaysRefuse names the actions that refuse whatever their defaults.
 var AlwaysRefuse = map[string]string{
-	"org.freedesktop.policykit.exec":                          "pkexec: any program as root",
-	"org.freedesktop.systemd1.manage-units":                   "starts units as root",
-	"org.freedesktop.systemd1.manage-unit-files":              "installs units",
-	"org.freedesktop.systemd1.set-environment":                "sets root services' environment",
-	"org.freedesktop.machine1.host-shell":                     "a root shell on the host",
-	"org.freedesktop.machine1.host-login":                     "a login on the host",
-	"org.freedesktop.machine1.shell":                          "a shell in a machine",
-	"org.freedesktop.machine1.login":                          "a login in a machine",
-	"org.freedesktop.machine1.manage-machines":                "manages machines",
-	"org.freedesktop.machine1.manage-images":                  "manages machine images",
-	"org.freedesktop.portable1.attach-images":                 "attaches portable services",
-	"org.freedesktop.udisks2.open-device-system":              "raw access to a system disk",
-	"org.freedesktop.udisks2.modify-device-system":            "modifies a system disk",
-	"org.freedesktop.udisks2.modify-system-configuration":     "changes system disk configuration",
-	"org.libvirt.unix.manage":                                 "manages VMs as root",
-	"org.freedesktop.packagekit.package-install-untrusted":    "installs untrusted packages",
-	"org.freedesktop.packagekit.package-downgrade":            "installs older packages",
-	"org.freedesktop.packagekit.system-sources-configure":     "configures package sources",
-	"org.freedesktop.packagekit.system-trust-signing-key":     "trusts a signing key",
-	"org.freedesktop.packagekit.package-install":              "installs packages, whose scripts run as root (Fedora's B)",
-	"org.freedesktop.packagekit.package-remove":               "removes packages (Fedora's B)",
+	"org.freedesktop.policykit.exec":                       "pkexec: any program as root",
+	"org.freedesktop.systemd1.manage-units":                "starts units as root",
+	"org.freedesktop.systemd1.manage-unit-files":           "installs units",
+	"org.freedesktop.systemd1.set-environment":             "sets root services' environment",
+	"org.freedesktop.machine1.host-shell":                  "a root shell on the host",
+	"org.freedesktop.machine1.host-login":                  "a login on the host",
+	"org.freedesktop.machine1.shell":                       "a shell in a machine",
+	"org.freedesktop.machine1.login":                       "a login in a machine",
+	"org.freedesktop.machine1.manage-machines":             "manages machines",
+	"org.freedesktop.machine1.manage-images":               "manages machine images",
+	"org.freedesktop.portable1.attach-images":              "attaches portable services",
+	"org.freedesktop.udisks2.open-device-system":           "raw access to a system disk",
+	"org.freedesktop.udisks2.modify-device-system":         "modifies a system disk",
+	"org.freedesktop.udisks2.modify-system-configuration":  "changes system disk configuration",
+	"org.libvirt.unix.manage":                              "manages VMs as root",
+	"org.freedesktop.packagekit.package-install-untrusted": "installs untrusted packages",
+	"org.freedesktop.packagekit.package-downgrade":         "installs older packages",
+	"org.freedesktop.packagekit.system-sources-configure":  "configures package sources",
+	"org.freedesktop.packagekit.system-trust-signing-key":  "trusts a signing key",
+	"org.freedesktop.packagekit.package-install":           "installs packages, whose scripts run as root (Fedora's B)",
+	"org.freedesktop.packagekit.package-remove":            "removes packages (Fedora's B)",
+	// PackageKit's offline Cancel checks the same action as the trigger
+	// (pk-engine.c, pk_engine_offline_get_action_id_for_role), so a
+	// repeated cancel could keep updates from installing (the owner,
+	// GC #16914); clear-offline-update only clears the results message
+	"org.freedesktop.packagekit.trigger-offline-update":       "triggers or cancels an offline update",
+	"org.freedesktop.packagekit.trigger-offline-upgrade":      "triggers or cancels an offline upgrade",
 	"org.debian.apt.install-file":                             "installs a package file",
 	"org.debian.apt.install-or-remove-packages":               "installs or removes packages",
 	"org.debian.apt.change-repository":                        "changes package sources",
@@ -456,12 +473,6 @@ var RecordedYes = map[string]map[Kind]bool{
 	"org.freedesktop.home1.update-home-by-owner": {Active: true},
 	// systemd 259's allow_active is yes
 	"org.freedesktop.machine1.register-machine": {Active: true},
-	// systemd 261's allow_active is yes: a cancel only signals a running
-	// update job to stop (the owner's call, GC #16724)
-	"org.freedesktop.sysupdate1.cancel-check":             {Active: true},
-	"org.freedesktop.sysupdate1.cancel-update":            {Active: true},
-	"org.freedesktop.sysupdate1.cancel-update-to-version": {Active: true},
-	"org.freedesktop.sysupdate1.cancel-vacuum":            {Active: true},
 }
 
 // ExecPathAllow names the fixed helpers an exec.path action may run (§11.4).
@@ -506,6 +517,31 @@ var ExecPathIf = map[string]struct{ id, action, why string }{
 	"/usr/lib/gvfsd-admin": {"org.gtk.vfs.file-operations-helper", "org.gtk.vfs.file-operations", "gvfs's admin backend"},
 }
 
+// RulesFile names the actions the rules file (testdata/40-vettid-agent.rules,
+// §11.4) makes ask for an administrator (AUTH_ADMIN): 19 actions (GC
+// #16894, #16914).
+var RulesFile = map[string]bool{
+	"org.freedesktop.packagekit.package-install":              true,
+	"org.freedesktop.packagekit.package-remove":               true,
+	"org.freedesktop.packagekit.trigger-offline-update":       true,
+	"org.freedesktop.packagekit.trigger-offline-upgrade":      true,
+	"org.rpm.dnf.v0.rpm.execute_trusted_transaction":          true,
+	"org.rpm.dnf.v0.rpm.Repo.confirm_key":                     true,
+	"org.fedoraproject.FirewallD1.all":                        true,
+	"org.fedoraproject.FirewallD1.config":                     true,
+	"org.fedoraproject.FirewallD1.direct":                     true,
+	"org.fedoraproject.FirewallD1.policies":                   true,
+	"org.opensuse.cupspkhelper.mechanism.all-edit":            true,
+	"org.opensuse.cupspkhelper.mechanism.printeraddremove":    true,
+	"org.opensuse.cupspkhelper.mechanism.printer-local-edit":  true,
+	"org.opensuse.cupspkhelper.mechanism.printer-remote-edit": true,
+	"org.opensuse.cupspkhelper.mechanism.server-settings":     true,
+	"org.freedesktop.sysupdate1.cancel-check":                 true,
+	"org.freedesktop.sysupdate1.cancel-update":                true,
+	"org.freedesktop.sysupdate1.cancel-update-to-version":     true,
+	"org.freedesktop.sysupdate1.cancel-vacuum":                true,
+}
+
 // Allowlist names the stock grants of an administrator's action measured
 // not to run a program the member chooses as root (§11.4).
 var Allowlist = map[string]string{
@@ -543,8 +579,6 @@ var Allowlist = map[string]string{
 	"org.freedesktop.hostname1.set-static-hostname":           "the host name (with the any-host sudo rule)",
 	"org.freedesktop.packagekit.upgrade-system":               "upgrades (upgrade-only)",
 	"org.freedesktop.packagekit.system-update":                "updates (upgrade-only)",
-	"org.freedesktop.packagekit.trigger-offline-update":       "offline updates (upgrade-only)",
-	"org.freedesktop.packagekit.trigger-offline-upgrade":      "offline upgrades (upgrade-only)",
 	"org.debian.apt.upgrade-packages":                         "upgrades (upgrade-only)",
 	"org.freedesktop.NetworkManager.settings.modify.system":   "system network settings (with local sudo rules)",
 	"org.fedoraproject.thirdparty.opt-out":                    "third-party repositories off",
