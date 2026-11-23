@@ -478,13 +478,14 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 }
 
 // subgidOverlap names a group whose gid lies in one of the member's
-// /etc/subgid ranges, or is empty.
+// /etc/subgid ranges, or is empty. Each gid is looked up by key (getent
+// group <gid> ...), since a network source such as sssd doesn't
+// enumerate its groups.
 func subgidOverlap(t *testing.T, u *user.User) string {
 	b, err := os.ReadFile("/etc/subgid")
 	if err != nil {
 		return "" // no ranges
 	}
-	groups := run(t, "getent", "group")
 	for _, line := range strings.Split(string(b), "\n") {
 		f := strings.Split(strings.TrimSpace(line), ":")
 		if len(f) != 3 || (f[0] != u.Username && f[0] != u.Uid) {
@@ -495,13 +496,15 @@ func subgidOverlap(t *testing.T, u *user.User) string {
 		if err1 != nil || err2 != nil {
 			return "an /etc/subgid line it can't read: " + line
 		}
-		for _, g := range strings.Split(groups, "\n") {
-			gf := strings.Split(g, ":")
-			if len(gf) < 3 {
-				continue
+		for lo := start; lo < start+n; lo += 4096 {
+			args := []string{"group"}
+			for g := lo; g < lo+4096 && g < start+n; g++ {
+				args = append(args, strconv.FormatUint(g, 10))
 			}
-			if gid, err := strconv.ParseUint(gf[2], 10, 32); err == nil && gid >= start && gid < start+n {
-				return fmt.Sprintf("the member's subgid range %s holds group %s (%d)", f[1]+":"+f[2], gf[0], gid)
+			// exit 2: some keys not found, which is the usual case
+			out, _ := exec.Command("getent", args...).Output()
+			if g := strings.TrimSpace(string(out)); g != "" {
+				return fmt.Sprintf("the member's subgid range %s:%s holds group %s", f[1], f[2], strings.SplitN(g, "\n", 2)[0])
 			}
 		}
 	}
