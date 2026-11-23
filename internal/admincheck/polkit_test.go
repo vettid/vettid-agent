@@ -1,6 +1,8 @@
 package admincheck
 
 import (
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 )
@@ -355,8 +357,6 @@ func TestAllowlistNamed(t *testing.T) {
 		"org.freedesktop.Malcontent.WebFilter.ReadAny",
 		"org.freedesktop.NetworkManager.settings.modify.system",
 		"org.freedesktop.packagekit.system-update",
-		"org.freedesktop.packagekit.trigger-offline-update",
-		"org.freedesktop.packagekit.trigger-offline-upgrade",
 		"org.freedesktop.packagekit.upgrade-system",
 		"org.freedesktop.timedate1.set-local-rtc",
 		"org.freedesktop.timedate1.set-ntp",
@@ -616,7 +616,11 @@ func TestArch(t *testing.T) {
 		{"gvfsd-admin at /usr/lib while operations challenge", []Answer{{Action: helper, Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Challenge: true}}, helper, Report},
 		{"gvfsd-admin at /usr/lib while operations are granted", []Answer{{Action: helper, Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Authorized: true}}, helper, Refuse},
 		{"another id running /usr/lib/gvfsd-admin", []Answer{{Action: "org.x.other", Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Challenge: true}}, "org.x.other", Refuse},
-		{"a cancel, active", []Answer{{Action: cancel, Kind: Active, Subject: "s", Authorized: true}}, cancel, Report},
+		// systemd 261's yes for an active session refuses: a cancel can be
+		// repeated, so anything running as the member could keep every
+		// update from installing (the owner, GC #16894).
+		{"a cancel, active, without the rules file", []Answer{{Action: cancel, Kind: Active, Subject: "s", Authorized: true}}, cancel, Refuse},
+		{"a cancel, active, with the rules file (asks for an administrator)", []Answer{{Action: cancel, Kind: Active, Subject: "s", Challenge: true}}, cancel, Nothing},
 		{"a cancel, inactive", []Answer{{Action: cancel, Kind: Inactive, Subject: "s", Authorized: true}}, cancel, Refuse},
 		{"a cancel, no session", []Answer{{Action: cancel, Kind: NoSession, Subject: "s", Authorized: true}}, cancel, Refuse},
 	} {
@@ -630,9 +634,195 @@ func TestArch(t *testing.T) {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
+	rules, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, id := range []string{"cancel-check", "cancel-update", "cancel-update-to-version", "cancel-vacuum"} {
-		if !RecordedYes["org.freedesktop.sysupdate1."+id][Active] || RecordedYes["org.freedesktop.sysupdate1."+id][Inactive] {
-			t.Errorf("%s not recorded yes for active only", id)
+		id = "org.freedesktop.sysupdate1." + id
+		if len(RecordedYes[id]) != 0 {
+			t.Errorf("%s recorded yes", id)
+		}
+		if !strings.Contains(string(rules), `case "`+id+`":`) {
+			t.Errorf("%s not in the rules file", id)
+		}
+	}
+}
+
+// PackageKit's offline trigger refuses when granted, whatever its
+// defaults, and passes with the rules file (the owner, GC #16914);
+// clear-offline-update is no administrator's action.
+func TestPackageKitOffline(t *testing.T) {
+	rules, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"org.freedesktop.packagekit.trigger-offline-update", "org.freedesktop.packagekit.trigger-offline-upgrade"} {
+		for _, d := range []Default{Yes, AuthAdminKeep} {
+			actions := map[string]Action{id: {ID: id, Any: AuthAdmin, Inactive: d, Active: d}}
+			if v := Judge(actions, []Answer{{Action: id, Kind: Active, Subject: "s", Authorized: true}}, met); v[0].Result != Refuse {
+				t.Errorf("%s granted over %s: %s", id, d, v[0].Result)
+			}
+			if v := Judge(actions, []Answer{{Action: id, Kind: Active, Subject: "s", Challenge: true}}, met); v[0].Result != Nothing {
+				t.Errorf("%s asking (the rules file): %s", id, v[0].Result)
+			}
+		}
+		if _, ok := Allowlist[id]; ok {
+			t.Errorf("%s allowlisted", id)
+		}
+		if !strings.Contains(string(rules), `case "`+id+`":`) {
+			t.Errorf("%s not in the rules file", id)
+		}
+	}
+	clear := "org.freedesktop.packagekit.clear-offline-update"
+	actions := map[string]Action{clear: {ID: clear, Any: AuthAdmin, Inactive: Yes, Active: Yes}}
+	if v := Judge(actions, []Answer{{Action: clear, Kind: Active, Subject: "s", Authorized: true}}, met); v[0].Result == Refuse {
+		t.Errorf("clear-offline-update refused")
+	}
+	if n := strings.Count(string(rules), "    case \""); n != 19 {
+		t.Errorf("the rules file has %d actions, want 19", n)
+	}
+}
+
+// RulesFile is exactly the actions testdata/40-vettid-agent.rules lists.
+func TestRulesFileMatchesItsList(t *testing.T) {
+	b, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := map[string]bool{}
+	for _, line := range strings.Split(string(b), "\n") {
+		if id, ok := strings.CutPrefix(strings.TrimSpace(line), "case \""); ok {
+			listed[strings.TrimSuffix(id, "\":")] = true
+		}
+	}
+	if len(listed) != len(RulesFile) {
+		t.Errorf("the file lists %d, RulesFile %d", len(listed), len(RulesFile))
+	}
+	for id := range listed {
+		if !RulesFile[id] {
+			t.Errorf("%s listed, not in RulesFile", id)
+		}
+	}
+}
+
+// With the rules file in place, actions it covers whose stock default for
+// an active session is yes answer with a challenge: that is no evidence
+// against the active kind (Arch's update cancels, PackageKit's offline
+// triggers).
+func TestKindFromLeavesOutTheRulesFile(t *testing.T) {
+	actions := map[string]Action{}
+	var answers []Answer
+	for i := 0; i < 6; i++ {
+		id := fmt.Sprintf("org.x.admin-%d", i) // active asks, inactive refuses outright
+		actions[id] = Action{ID: id, Any: No, Inactive: No, Active: AuthAdmin}
+		answers = append(answers, Answer{Action: id, Challenge: true})
+	}
+	for id := range RulesFile {
+		actions[id] = Action{ID: id, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
+		answers = append(answers, Answer{Action: id, Challenge: true}) // the file's AUTH_ADMIN
+	}
+	k, kept, excl, ok := KindFrom(actions, answers, []Kind{Active, Inactive})
+	if !ok || k != Active {
+		t.Fatalf("kind %s ok %v", k, ok)
+	}
+	for i := 1; i < len(kept); i++ {
+		if excl[i][0] != 0 {
+			t.Errorf("%s explains %d refusals active doesn't", kept[i], excl[i][0])
+		}
+	}
+}
+
+// Every action the rules file covers refuses whatever its defaults, is
+// never a recorded yes and isn't allowlisted, so a grant of one never
+// passes without the file.
+func TestRulesFileActionsAlwaysRefuse(t *testing.T) {
+	for id := range RulesFile {
+		if _, ok := alwaysRefuses(Action{ID: id}); !ok {
+			t.Errorf("%s doesn't always refuse", id)
+		}
+		if len(RecordedYes[id]) != 0 {
+			t.Errorf("%s recorded yes", id)
+		}
+		if _, ok := Allowlist[id]; ok {
+			t.Errorf("%s allowlisted", id)
+		}
+	}
+}
+
+// The rules file applies to the VettID members it lists, by user name,
+// and to a process of no account (a uid with no name, as a member's
+// rootless container's is), and to no other account (the owner's a, GC
+// #16962): a name, unlike a group, can't be dropped by a process of the
+// member's. The list and the rule are inside one function.
+func TestRulesFileScopedToTheMembers(t *testing.T) {
+	s, err := RenderRulesFile([]RulesEntry{{"member", "home"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"(function () {\n    var vettidMembers = [\n        \"member\", // home\n    ];",
+		`vettidMembers.indexOf(subject.user) < 0 && !/^[0-9]+$/.test(subject.user)`,
+		"})();\n",
+	} {
+		if !strings.Contains(s, want) {
+			t.Errorf("no %q", want)
+		}
+	}
+	if strings.Index(s, "subject.user") > strings.Index(s, "switch (action.id)") {
+		t.Error("the member check comes after the actions")
+	}
+}
+
+func TestRulesFileRoundTrip(t *testing.T) {
+	es := []RulesEntry{{"alice", "home"}, {"alice", "work"}, {"bob.smith", "lab-2"}}
+	s, err := RenderRulesFile(es)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := ParseRulesFile(s)
+	if err != nil || len(back) != 3 || back[1] != es[1] {
+		t.Fatalf("%v %v", back, err)
+	}
+	// Two pairings for one member keep two entries; forgetting one keeps the other.
+	if left := WithoutPairing(back, "home"); len(left) != 2 || left[0] != es[1] {
+		t.Errorf("forget home: %v", left)
+	}
+	// A rewrite replaces the pairing's old entry.
+	if r := WithPairing(back, RulesEntry{"carol", "home"}); len(r) != 3 || r[2] != (RulesEntry{"carol", "home"}) {
+		t.Errorf("rewrite home: %v", r)
+	}
+	empty, err := RenderRulesFile(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, err := ParseRulesFile(empty); err != nil || len(e) != 0 {
+		t.Errorf("empty: %v %v", e, err)
+	}
+}
+
+func TestRulesFileRefusesNames(t *testing.T) {
+	for _, bad := range []string{`a"b`, `a\\b`, "", "-x", "a b", "a\nb", "a\u2028b", "é"} {
+		if _, err := RenderRulesFile([]RulesEntry{{bad, "home"}}); err == nil {
+			t.Errorf("member %q written", bad)
+		}
+		if _, err := RenderRulesFile([]RulesEntry{{"alice", bad}}); err == nil {
+			t.Errorf("pairing %q written", bad)
+		}
+	}
+}
+
+func TestRulesFileRefusesAnotherFormat(t *testing.T) {
+	good, _ := RenderRulesFile([]RulesEntry{{"alice", "home"}})
+	for _, s := range []string{
+		strings.Replace(good, `"alice", // home`, `"alice", "root", // home`, 1),
+		strings.Replace(good, "AUTH_ADMIN", "YES", 1),
+		good + "polkit.addRule(function () { return polkit.Result.YES; });\n",
+		strings.Replace(good, `"alice"`, `"al\"ice"`, 1),
+		"polkit.addRule(function () {});\n",
+	} {
+		if _, err := ParseRulesFile(s); err == nil {
+			t.Errorf("accepted:\n%s", s)
 		}
 	}
 }
