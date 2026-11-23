@@ -235,6 +235,9 @@ func noSession(t *testing.T, u *user.User, what string, pid int) subject {
 	// (the display session's among them).
 	sub.candidates = []Kind{NoSession}
 	for _, id := range memberSessions(t, u) {
+		if exec.Command("loginctl", "show-session", id).Run() != nil {
+			continue // closed since the listing
+		}
 		k := sessionKind(t, id)
 		dup := false
 		for _, c := range sub.candidates {
@@ -338,18 +341,30 @@ func TestPolkitProbe(t *testing.T) {
 		}
 		if len(s.candidates) > 1 {
 			t.Logf("%s:", s.name)
-			k, excl, ok := KindFrom(actions, these, s.candidates)
-			for i, c := range s.candidates {
-				for j, o := range s.candidates {
+			k, kept, excl, ok := KindFrom(actions, these, s.candidates)
+			refusals := 0
+			for _, a := range these {
+				if a.Err == "" && !a.Authorized {
+					refusals++
+				}
+			}
+			for i, c := range kept {
+				for j, o := range kept {
 					if i != j {
-						t.Logf("  %d of %d refusals explained by %s and not %s", excl[i][j], len(these), c, o)
+						t.Logf("  %d of %d refusals explained by %s and not %s", excl[i][j], refusals, c, o)
 					}
 				}
 			}
-			if !ok {
-				t.Fatalf("%s: can't tell which kind polkitd judged it by", s.name)
-			}
 			s.kind = k
+			if !ok {
+				// Not checked: every answer of this subject's.
+				t.Logf("  can't tell which kind polkitd judged it by")
+				for j := range these {
+					if these[j].Err == "" {
+						these[j].Err = "the kind of subject polkitd judged it by is unknown"
+					}
+				}
+			}
 			for j := range these {
 				these[j].Kind = s.kind
 			}

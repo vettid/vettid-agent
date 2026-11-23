@@ -412,11 +412,22 @@ func TestKindFrom(t *testing.T) {
 		"self": {Any: AuthSelf, Inactive: AuthSelf, Active: AuthAdmin},
 		// any no, active yes
 		"ny": {Any: No, Inactive: No, Active: Yes},
+		// any no, inactive no, active auth_admin: for three candidates
+		"ak3": {Any: No, Inactive: No, Active: AuthAdminKeep},
+		// any and inactive the same
+		"ai": {Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes},
 	}
 	many := func(id string, n int, auth, chal bool) []Answer {
 		var out []Answer
 		for i := 0; i < n; i++ {
 			out = append(out, ans(id, auth, chal))
+		}
+		return out
+	}
+	errs := func(id string, n int) []Answer {
+		var out []Answer
+		for i := 0; i < n; i++ {
+			out = append(out, Answer{Action: id, Err: "timeout"})
 		}
 		return out
 	}
@@ -434,18 +445,16 @@ func TestKindFrom(t *testing.T) {
 		{"too little signal", many("ny", 4, false, false), both, NoSession, false},
 		{"mixed: a rule asks where any's default refuses", append(many("ch", 6, false, true), many("ak", 1, false, true)...), both, NoSession, false},
 		{"everything distinguishing granted", append(many("ch", 6, true, false), ans("same", false, true)), both, NoSession, false},
-		{"errors and unknown actions count for nothing", append(many("ny", 6, false, false)[:0], Answer{Action: "ny", Err: "x"}, ans("zz", false, false), ans("zz", false, true)), both, NoSession, false},
-		{"three candidates", many("ak", 6, false, true), []Kind{NoSession, Inactive, Active}, Active, true},
+		{"errors count for nothing", append(many("ak", 6, false, true), errs("ny", 6)...), both, Active, true},
+		{"errors alone say nothing", errs("ny", 6), both, NoSession, false},
+		{"grants count for nothing", append(many("ak", 6, false, true), many("ny", 6, true, false)...), both, Active, true},
+		{"unknown actions count for nothing", append(many("ny", 4, false, false), many("zz", 6, false, false)...), both, NoSession, false},
+		{"three candidates", many("ak3", 6, false, true), []Kind{NoSession, Inactive, Active}, Active, true},
+		{"candidates whose defaults agree are one", many("ai", 2, false, true), []Kind{NoSession, Inactive}, NoSession, true},
 		{"no candidates", many("ak", 6, false, true), nil, NoSession, false},
 		{"one candidate", many("ak", 6, false, true), []Kind{Active}, NoSession, false},
 	} {
-		if c.name == "three candidates" {
-			// inactive: no, so a challenge says active over inactive too
-			a := actions["ak"]
-			a.Inactive = No
-			actions["ak"] = a
-		}
-		k, excl, ok := KindFrom(actions, c.answers, c.cands)
+		k, _, excl, ok := KindFrom(actions, c.answers, c.cands)
 		if k != c.want || ok != c.ok {
 			t.Errorf("%s: %s %v, want %s %v (%v)", c.name, k, ok, c.want, c.ok, excl)
 		}

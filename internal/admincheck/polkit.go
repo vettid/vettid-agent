@@ -266,9 +266,30 @@ func lift(actions map[string]Action, vs []Verdict) {
 // MinKindSignal refusals the other doesn't, and the other explains none
 // it doesn't: a rule that refuses or asks where the defaults grant can
 // make the evidence mixed, and then it is not ok (the run fails rather
-// than guess). excl[i][j] is the refusals candidate i explains and j
-// doesn't. When ok is false, k is NoSession.
-func KindFrom(actions map[string]Action, answers []Answer, candidates []Kind) (k Kind, excl [][]int, ok bool) {
+// than guess). Candidates whose defaults agree on every action answered
+// are one: the choice between them changes no verdict. excl[i][j] is the
+// refusals candidate i explains and j doesn't, for the candidates kept.
+// When ok is false, k is NoSession.
+func KindFrom(actions map[string]Action, answers []Answer, all []Kind) (k Kind, candidates []Kind, excl [][]int, ok bool) {
+	for _, c := range all {
+		same := false
+		for _, d := range candidates {
+			agree := true
+			for _, a := range answers {
+				if act, known := actions[a.Action]; known && act.defaultFor(c) != act.defaultFor(d) {
+					agree = false
+					break
+				}
+			}
+			same = same || agree
+		}
+		if !same {
+			candidates = append(candidates, c)
+		}
+	}
+	if len(candidates) == 1 && len(all) > 1 {
+		return candidates[0], candidates, [][]int{{0}}, true
+	}
 	explains := func(c Kind, a Answer) bool {
 		act, known := actions[a.Action]
 		if !known || a.Err != "" || a.Authorized {
@@ -297,16 +318,18 @@ func KindFrom(actions map[string]Action, answers []Answer, candidates []Kind) (k
 			}
 		}
 		if clean {
+			// (Two can't both be clean: i's needs excl[j][i] == 0, j's
+			// excl[j][i] >= MinKindSignal. Kept as a guard.)
 			if found >= 0 {
-				return NoSession, excl, false
+				return NoSession, candidates, excl, false
 			}
 			found = i
 		}
 	}
 	if found < 0 || len(candidates) < 2 {
-		return NoSession, excl, false
+		return NoSession, candidates, excl, false
 	}
-	return candidates[found], excl, true
+	return candidates[found], candidates, excl, true
 }
 
 // MinKindSignal is the fewest refusals that must tell a kind from another.
