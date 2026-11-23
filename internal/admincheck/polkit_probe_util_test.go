@@ -131,3 +131,33 @@ func TestSubset(t *testing.T) {
 		}
 	}
 }
+
+// identityMap: a uid_map or gid_map that is the identity over every id
+// ("0 0 4294967295"), as the first user namespace's is.
+func identityMap(m string) bool {
+	lines := strings.Split(strings.TrimSpace(m), "\n")
+	if len(lines) != 1 {
+		return false
+	}
+	f := strings.Fields(lines[0])
+	return len(f) == 3 && f[0] == "0" && f[1] == "0" && f[2] == "4294967295"
+}
+
+func TestIdentityMap(t *testing.T) {
+	for _, c := range []struct {
+		m    string
+		want bool
+	}{
+		{"         0          0 4294967295\n", true},
+		{"0 0 4294967295", true},
+		{"         0       1000          1\n         1     524288      65536\n", false},
+		{"         0          0      65536\n", false},
+		{"         0          1 4294967295\n", false},
+		{"", false},
+		{"0 0 4294967295\n0 0 4294967295\n", false},
+	} {
+		if got := identityMap(c.m); got != c.want {
+			t.Errorf("%q: %v", c.m, got)
+		}
+	}
+}

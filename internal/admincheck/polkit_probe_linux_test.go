@@ -378,14 +378,6 @@ func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) s
 	return sub
 }
 
-func mustReadlink(t *testing.T, p string) string {
-	l, err := os.Readlink(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return l
-}
-
 // pidOnly logs once that busctl couldn't pass a pidfd.
 var pidOnly sync.Once
 
@@ -537,25 +529,34 @@ func dbGroups(t *testing.T, u *user.User) string {
 	return set(strings.Fields(run(t, "id", "-G", u.Username)))
 }
 
-// inFirstUserNS: the process shares PID 1's user namespace. It fails
-// closed: a link it can't read counts as the first namespace, so the
-// exact comparison applies.
+// inFirstUserNS: the process is in the first user namespace, read
+// from its uid_map and gid_map (world-readable, no ptrace access needed,
+// unlike the ns/user link of another uid's process). It fails closed: a
+// map it can't read counts as the first namespace, so the exact
+// comparison applies.
 func inFirstUserNS(pid int) bool {
-	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
-	first, err2 := os.Readlink("/proc/1/ns/user")
+	first, ok := initialUserNS(pid)
+	return first || !ok
+}
+
+// initialUserNS: both of the process's id maps are the identity over
+// every id, which only the first user namespace has unless a privileged
+// process made one so (never the member); ok is false when a map can't
+// be read.
+func initialUserNS(pid int) (first, ok bool) {
+	u, err1 := os.ReadFile(fmt.Sprintf("/proc/%d/uid_map", pid))
+	g, err2 := os.ReadFile(fmt.Sprintf("/proc/%d/gid_map", pid))
 	if err1 != nil || err2 != nil {
-		return true
+		return false, false
 	}
-	return ns == first
+	return identityMap(string(u)) && identityMap(string(g)), true
 }
 
 // sdPam: the process is (sd-pam), a child of the member's manager, in
 // the first user namespace (a name and a parent can be had by any unit's
 // process; dropping groups needs a namespace of one's own).
 func sdPam(pid int, u *user.User) bool {
-	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
-	first, err2 := os.Readlink("/proc/1/ns/user")
-	if err1 != nil || err2 != nil || ns != first {
+	if first, ok := initialUserNS(pid); !first || !ok {
 		return false
 	}
 	comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
@@ -636,8 +637,8 @@ func TestPolkitProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if self, err := os.Readlink("/proc/self/ns/user"); err != nil || !strings.HasPrefix(self, "user:") || self != mustReadlink(t, "/proc/1/ns/user") {
-		t.Fatal("the probe isn't in PID 1's user namespace: groups would read unmapped")
+	if first, ok := initialUserNS(os.Getpid()); !first || !ok {
+		t.Fatal("the probe isn't in the first user namespace: groups would read unmapped")
 	}
 	version := polkitVersion(t)
 	t.Logf("polkit %d: subjects asked by %s", version, map[bool]string{true: "pidfd", false: "pid and start time"}[version >= 124])
