@@ -589,3 +589,50 @@ func TestImplyExact(t *testing.T) {
 		t.Errorf("%q %v", a["org.x"].Implies, err)
 	}
 }
+
+// Arch's helper paths and systemd 261's cancel grants (GC #16724).
+func TestArch(t *testing.T) {
+	const (
+		bl     = "org.gnome.mutter.backlight-helper"
+		helper = "org.gtk.vfs.file-operations-helper"
+		ops    = "org.gtk.vfs.file-operations"
+		cancel = "org.freedesktop.sysupdate1.cancel-update"
+	)
+	actions := map[string]Action{
+		bl:            {ID: bl, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes, ExecPath: "/usr/lib/mutter-backlight-helper"},
+		helper:        {ID: helper, Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdmin, ExecPath: "/usr/lib/gvfsd-admin"},
+		ops:           {ID: ops, Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdminKeep},
+		cancel:        {ID: cancel, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes},
+		"org.x.other": {ID: "org.x.other", Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdmin, ExecPath: "/usr/lib/gvfsd-admin"},
+	}
+	for _, c := range []struct {
+		name    string
+		answers []Answer
+		id      string
+		want    Result
+	}{
+		{"mutter's helper at /usr/lib", []Answer{{Action: bl, Kind: Active, Subject: "s", Authorized: true}}, bl, Nothing},
+		{"mutter's helper at /usr/lib over its auth_admin default", []Answer{{Action: bl, Kind: Inactive, Subject: "s", Authorized: true}}, bl, Refuse},
+		{"gvfsd-admin at /usr/lib while operations challenge", []Answer{{Action: helper, Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Challenge: true}}, helper, Report},
+		{"gvfsd-admin at /usr/lib while operations are granted", []Answer{{Action: helper, Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Authorized: true}}, helper, Refuse},
+		{"another id running /usr/lib/gvfsd-admin", []Answer{{Action: "org.x.other", Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Challenge: true}}, "org.x.other", Refuse},
+		{"a cancel, active", []Answer{{Action: cancel, Kind: Active, Subject: "s", Authorized: true}}, cancel, Report},
+		{"a cancel, inactive", []Answer{{Action: cancel, Kind: Inactive, Subject: "s", Authorized: true}}, cancel, Refuse},
+		{"a cancel, no session", []Answer{{Action: cancel, Kind: NoSession, Subject: "s", Authorized: true}}, cancel, Refuse},
+	} {
+		got := Result("")
+		for _, v := range Judge(actions, c.answers, met) {
+			if v.Action == c.id {
+				got = v.Result
+			}
+		}
+		if got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+	for _, id := range []string{"cancel-check", "cancel-update", "cancel-update-to-version", "cancel-vacuum"} {
+		if !RecordedYes["org.freedesktop.sysupdate1."+id][Active] || RecordedYes["org.freedesktop.sysupdate1."+id][Inactive] {
+			t.Errorf("%s not recorded yes for active only", id)
+		}
+	}
+}

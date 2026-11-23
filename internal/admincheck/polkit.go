@@ -456,6 +456,12 @@ var RecordedYes = map[string]map[Kind]bool{
 	"org.freedesktop.home1.update-home-by-owner": {Active: true},
 	// systemd 259's allow_active is yes
 	"org.freedesktop.machine1.register-machine": {Active: true},
+	// systemd 261's allow_active is yes: a cancel only signals a running
+	// update job to stop (the owner's call, GC #16724)
+	"org.freedesktop.sysupdate1.cancel-check":             {Active: true},
+	"org.freedesktop.sysupdate1.cancel-update":            {Active: true},
+	"org.freedesktop.sysupdate1.cancel-update-to-version": {Active: true},
+	"org.freedesktop.sysupdate1.cancel-vacuum":            {Active: true},
 }
 
 // ExecPathAllow names the fixed helpers an exec.path action may run (§11.4).
@@ -468,6 +474,8 @@ var ExecPathAllow = map[string]string{
 	"/usr/lib/update-notifier/package-system-locked": "update-notifier's lock check",
 	// proposed for §11.4: GNOME 49 and later's backlight helper (mutter's)
 	"/usr/libexec/mutter-backlight-helper": "mutter's backlight helper",
+	// the same helper at Arch's path (GC #16724)
+	"/usr/lib/mutter-backlight-helper": "mutter's backlight helper",
 	// proposed for §11.4: writes only the XKB lines of
 	// /etc/default/keyboard from arguments limited to [a-zA-Z0-9,_:-],
 	// then reconfigures keyboard-configuration; locale1.set-keyboard's
@@ -494,6 +502,8 @@ var ExecActionAllow = map[string]struct{ path, argv1, why string }{
 // Each is pinned to the one action id that runs it.
 var ExecPathIf = map[string]struct{ id, action, why string }{
 	"/usr/libexec/gvfsd-admin": {"org.gtk.vfs.file-operations-helper", "org.gtk.vfs.file-operations", "gvfs's admin backend"},
+	// the same helper at Arch's path, under the same gate (GC #16724)
+	"/usr/lib/gvfsd-admin": {"org.gtk.vfs.file-operations-helper", "org.gtk.vfs.file-operations", "gvfs's admin backend"},
 }
 
 // Allowlist names the stock grants of an administrator's action measured
