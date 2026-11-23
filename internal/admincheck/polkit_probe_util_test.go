@@ -185,47 +185,78 @@ func statusGroups(st string) string {
 	return "none listed"
 }
 
-// hidepid: the /proc mount (from /proc/self/mountinfo) hides other
-// users' processes, and its gid= option if any.
-func hidepid(mountinfo string) (hidden bool, gid string) {
+// hidepid: the hidepid mode of the /proc mount (from
+// /proc/self/mountinfo; "" when none), and its gid= option ("0" when
+// absent: the kernel's default, which mountinfo then doesn't print).
+func hidepid(mountinfo string) (mode, gid string) {
 	for _, line := range strings.Split(mountinfo, "\n") {
 		pre, post, ok := strings.Cut(line, " - ")
 		f, g := strings.Fields(pre), strings.Fields(post)
 		if !ok || len(f) < 5 || f[4] != "/proc" || len(g) < 3 || g[0] != "proc" {
 			continue
 		}
-		hidden, gid = false, ""
+		mode, gid = "", "0"
 		for _, o := range strings.Split(g[2], ",") {
 			switch k, v, _ := strings.Cut(o, "="); k {
 			case "hidepid":
-				hidden = v != "0" && v != "off"
+				mode = v
 			case "gid":
 				gid = v
 			}
 		}
 	}
-	return hidden, gid
+	if mode == "" {
+		gid = ""
+	}
+	return mode, gid
+}
+
+// procHidden: a checker without CAP_SYS_PTRACE (the helper, the
+// oneshot) can't see every process under that hidepid mode. Under
+// 1/noaccess and 2/invisible the gid= group sees everything; under
+// 4/ptraceable only ptrace access does, whatever the group.
+func procHidden(mode, gid string, holds func(string) bool) bool {
+	switch mode {
+	case "", "0", "off":
+		return false
+	case "1", "noaccess", "2", "invisible":
+		return !holds(gid)
+	default: // 4, ptraceable, or a mode not known: fail closed
+		return true
+	}
 }
 
 func TestHidepid(t *testing.T) {
 	const plain = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
 	for _, c := range []struct {
-		mi     string
-		hidden bool
-		gid    string
+		mi        string
+		mode, gid string
 	}{
-		{plain, false, ""},
-		{"22 1 0:21 / /proc rw,relatime shared:12 - proc proc rw,hidepid=invisible,gid=10\n", true, "10"},
-		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=2\n", true, ""},
-		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=noaccess\n", true, ""},
-		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=0\n", false, ""},
-		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=off\n", false, ""},
-		// another proc mount elsewhere doesn't count; the last /proc does
-		{"30 1 0:40 / /run/x/proc rw - proc proc rw,hidepid=2\n" + plain, false, ""},
-		{plain + "40 22 0:50 / /proc rw - proc proc rw,hidepid=invisible\n", true, ""},
+		{plain, "", ""},
+		{"22 1 0:21 / /proc rw,relatime shared:12 - proc proc rw,hidepid=invisible,gid=10\n", "invisible", "10"},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=2\n", "2", "0"},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=1\n", "1", "0"},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=ptraceable,gid=10\n", "ptraceable", "10"},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,gid=10\n", "", ""},
+		{"30 1 0:40 / /run/x/proc rw - proc proc rw,hidepid=2\n" + plain, "", ""},
+		{plain + "40 22 0:50 / /proc rw - proc proc rw,hidepid=invisible\n", "invisible", "0"},
 	} {
-		if h, g := hidepid(c.mi); h != c.hidden || g != c.gid {
-			t.Errorf("%q: %v %q", c.mi, h, g)
+		if m, g := hidepid(c.mi); m != c.mode || g != c.gid {
+			t.Errorf("%q: %q %q", c.mi, m, g)
+		}
+	}
+	root := func(g string) bool { return g == "0" }
+	for _, c := range []struct {
+		mode, gid string
+		hidden    bool
+	}{
+		{"", "", false}, {"0", "0", false}, {"off", "0", false},
+		{"2", "0", false}, {"invisible", "0", false}, {"noaccess", "0", false},
+		{"2", "10", true}, {"1", "10", true}, {"invisible", "10", true},
+		{"ptraceable", "0", true}, {"4", "0", true}, {"5", "0", true},
+	} {
+		if h := procHidden(c.mode, c.gid, root); h != c.hidden {
+			t.Errorf("%s gid=%s: %v", c.mode, c.gid, h)
 		}
 	}
 }

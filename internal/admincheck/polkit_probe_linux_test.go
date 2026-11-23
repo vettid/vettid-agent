@@ -441,13 +441,16 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 func groupsDiffer(t *testing.T, u *user.User) string {
 	want := dbGroups(t, u)
 	// /proc mounted with hidepid hides other users' processes from a
-	// checker outside the mount's gid= group: the scan would see nothing.
+	// checker without CAP_SYS_PTRACE, as the helper is, outside the
+	// mount's gid= group (and under ptraceable, whatever its group): the
+	// scan would see nothing. The probe itself runs as root with
+	// CAP_SYS_PTRACE and sees everything; it judges as the helper would.
 	mi, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
 		return fmt.Sprintf("/proc/self/mountinfo can't be read (%v)", err)
 	}
-	if hidden, gid := hidepid(string(mi)); hidden && !holdsGroup(gid) {
-		return "/proc is mounted with hidepid and the checker isn't in its gid= group"
+	if mode, gid := hidepid(string(mi)); procHidden(mode, gid, holdsGroup) {
+		return fmt.Sprintf("/proc is mounted with hidepid=%s, gid=%s, which hides processes from the helper", mode, gid)
 	}
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
@@ -545,7 +548,7 @@ func holdsGroup(gid string) bool {
 	if gid == "" {
 		return false
 	}
-	if strconv.Itoa(os.Getgid()) == gid {
+	if strconv.Itoa(os.Getegid()) == gid {
 		return true
 	}
 	gs, _ := os.Getgroups()
