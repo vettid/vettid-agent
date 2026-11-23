@@ -154,10 +154,17 @@ type Options struct {
 // Manager keeps one connector's grants. It is safe for concurrent use;
 // Apply and Snapshot are called by vaultconn in Run's goroutine.
 type Manager struct {
-	o    Options
-	now  func() time.Time
-	log  *slog.Logger
-	wake chan struct{}
+	// suspected, if set, reports whether the access session waits for a
+	// vault.status after a resume or a clock jump (internal/access): it is
+	// then neither used nor shown as live on this computer's clock.
+	suspected func() bool
+	// waitedSuspect: step held the grants' work off for the suspicion;
+	// the next status (OnStatus) wakes it.
+	waitedSuspect bool
+	o             Options
+	now           func() time.Time
+	log           *slog.Logger
+	wake          chan struct{}
 
 	mu       sync.Mutex
 	conn     Conn
@@ -670,6 +677,12 @@ func (m *Manager) OnStatus(ownerCheck string) {
 		m.held = false
 		m.signal()
 	}
+	// A status ends the suspicion of internal/access (it calls this after
+	// clearing it): work held off for it starts now, not after idle.
+	if m.waitedSuspect && !m.suspectedLocked() {
+		m.waitedSuspect = false
+		m.signal()
+	}
 }
 
 // Relist asks the background loop for a fresh list of the grants at once
@@ -961,7 +974,7 @@ func (m *Manager) presentable(id string, now time.Time) (*Grant, error) {
 	if m.suspended {
 		return nil, ErrSuspended
 	}
-	if m.conn == nil || !activeAt(m.conn.Access(), now) {
+	if m.conn == nil || !activeAt(m.conn.Access(), now) || m.suspectedLocked() {
 		return nil, ErrNoSession
 	}
 	if !m.listed {
@@ -1076,6 +1089,11 @@ func (m *Manager) Run(ctx context.Context) {
 func (m *Manager) step(ctx context.Context) time.Time {
 	now := m.now()
 	m.mu.Lock()
+	if m.suspectedLocked() {
+		m.waitedSuspect = true
+		m.mu.Unlock()
+		return now.Add(idle)
+	}
 	if m.conn == nil || m.held || !activeAt(m.conn.Access(), now) {
 		m.mu.Unlock()
 		return now.Add(idle)
@@ -1186,3 +1204,17 @@ func logID(s string) string {
 	}
 	return string(b)
 }
+
+// SetSuspected gives the access manager's Suspected (internal/access):
+// while it is true, the session is not used for the grants' work or
+// presentations, and leash.connection_info shows it as unknown. Call it
+// before Run.
+func (m *Manager) SetSuspected(f func() bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.suspected = f
+}
+
+// suspectedLocked reports SetSuspected's answer (m.mu held; the access
+// manager takes its own lock, never this one).
+func (m *Manager) suspectedLocked() bool { return m.suspected != nil && m.suspected() }

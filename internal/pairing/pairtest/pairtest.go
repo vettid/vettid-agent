@@ -110,6 +110,14 @@ type Vault struct {
 	// mailbox after pairing with this error (for example 403
 	// token_revoked).
 	DepositError *RelayError
+	// sessionJSON is the device's current access session as vault.status
+	// names it to an agent (VAULT-MESSAGING 0.41.0 §10.2): the first
+	// session of the approval, or the last device.session.granted sent.
+	// Without either, a session is assumed, as leash.grant.list answers
+	// as if one exists, unless GrantListError is session_required or a
+	// device.session.ended was sent (sessionEnded): then null.
+	sessionJSON  string
+	sessionEnded bool
 	// OnRequest, if set, is called (without the lock held) for every
 	// message the device sends in session other than leash.grant.list
 	// and vault.status, with its inner id, type and body; it may answer
@@ -263,7 +271,10 @@ func (v *Vault) decide(d Decision) error {
 		typ = "device.paired"
 		m := map[string]string{"device_id": DeviceID, "role": "agent", "vault_id": VaultID, "token": tok}
 		if v.SessionSeconds > 0 {
-			m["session_expires_at"] = envelope.FormatTS(now.Add(time.Duration(v.SessionSeconds) * time.Second))
+			exp := now.Add(time.Duration(v.SessionSeconds) * time.Second)
+			m["session_expires_at"] = envelope.FormatTS(exp)
+			b, _ := json.Marshal(map[string]string{"session_id": "s-paired", "expires_at": exp.UTC().Format(time.RFC3339)})
+			v.sessionJSON = string(b)
 		}
 		body, _ = json.Marshal(m)
 	case Reject:
@@ -320,6 +331,19 @@ func ulidNow() (string, time.Time, error) {
 func (v *Vault) SendEvent(typ string, body []byte) (string, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	switch typ {
+	case "device.session.granted":
+		var s struct {
+			SessionID string `json:"session_id"`
+			ExpiresAt string `json:"expires_at"`
+		}
+		if json.Unmarshal(body, &s) == nil && s.SessionID != "" {
+			b, _ := json.Marshal(s)
+			v.sessionJSON, v.sessionEnded = string(b), false
+		}
+	case "device.session.ended":
+		v.sessionJSON, v.sessionEnded = "", true
+	}
 	return v.sealLocked(&envelope.Inner{Type: typ, Body: body})
 }
 
@@ -642,8 +666,22 @@ func (v *Vault) toVault(payload []byte) {
 					_, _ = v.sealLocked(resp)
 				}
 				if in.Type == "vault.status" && in.Re == "" {
+					// A vault set to answer leash.grant.list owner_check_required
+					// is held, and says so here too.
+					oc := "ok"
+					if v.GrantListError == "owner_check_required" {
+						oc = "held"
+					}
+					sess := v.sessionJSON
+					switch {
+					case sess != "":
+					case v.sessionEnded || v.GrantListError == "session_required":
+						sess = "null"
+					default:
+						sess = `{"session_id":"s-test","expires_at":"` + time.Now().Add(time.Hour).UTC().Format(time.RFC3339) + `"}`
+					}
 					_, _ = v.sealLocked(&envelope.Inner{Type: in.Type, Re: in.ID, Status: envelope.StatusOK,
-						Body: []byte(`{"vault_id":"` + VaultID + `","state_seq":1,"header_seq":1,"provisional":false,"devices":[],"connections":[],"owner_check":{"state":"ok"}}`)})
+						Body: []byte(`{"vault_id":"` + VaultID + `","state_seq":1,"header_seq":1,"provisional":false,"devices":[],"connections":[],"owner_check":{"state":"` + oc + `"},"session":` + sess + `}`)})
 				}
 				break
 			}

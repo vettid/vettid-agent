@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vettid/vettid-agent/internal/access"
 	"github.com/vettid/vettid-agent/internal/vaultconn"
 )
 
@@ -295,5 +296,31 @@ func TestNullValueRefused(t *testing.T) {
 	}, nil)
 	if _, err := e.c.Get(context.Background(), itemID, nil); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("Get: %v", err)
+	}
+}
+
+// Asked again after a resume or a clock jump: the access session is
+// checked with the vault first (access Verify), and if that fails the
+// request is not sent again, so nothing reaches the member's phone; the
+// tool call gets the check's outcome.
+func TestAskAgainVerifiesFirst(t *testing.T) {
+	e := newEnv(t, func(n int, id string) (*vaultconn.Response, error) {
+		return ok(copies["marked"]), nil
+	}, nil)
+	e.acc.mu.Lock()
+	e.acc.verify = access.ErrUnreachable
+	e.acc.mu.Unlock()
+	out, err := e.c.Get(context.Background(), itemID, nil)
+	if !errors.Is(err, ErrUnreachable) || out != nil {
+		t.Fatalf("Get: %+v, %v", out, err)
+	}
+	if c := e.conn.copies(); len(c) != 1 {
+		t.Fatalf("sent %d copies: asked again without the check", len(c))
+	}
+	e.acc.mu.Lock()
+	n := e.acc.verifies
+	e.acc.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d checks before asking again", n)
 	}
 }

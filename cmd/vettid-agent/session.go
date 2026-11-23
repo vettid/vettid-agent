@@ -30,6 +30,10 @@ type session struct {
 	// In and Out carry the MCP messages and nothing else.
 	In  io.Reader
 	Out io.Writer
+	// OnManager, if set, is given the session's access manager once it
+	// exists, and nil when the session ends (the service, which tells it
+	// of a resume from sleep).
+	OnManager func(*access.Manager)
 }
 
 // run runs the session until In ends or ctx ends (it then returns
@@ -69,6 +73,16 @@ func (s session) run(ctx context.Context) error {
 		return err
 	}
 	mgr = access.New(conn, s.AccessMinutes*60, nil)
+	// A session starts as after a resume: the saved session is not used on
+	// this computer's clock until a vault.status answers. The computer may
+	// have slept, or its clock moved, since it was saved, and a power event
+	// may have been missed (a service restarted across a sleep).
+	mgr.Suspect()
+	grants.SetSuspected(mgr.Suspected)
+	if s.OnManager != nil {
+		s.OnManager(mgr)
+		defer s.OnManager(nil)
+	}
 	// A vault.status sent while the vault is held (CheckHold) also ends
 	// the grants' hold.
 	mgr.SetStatusHook(grants.OnStatus)
@@ -121,6 +135,13 @@ func (s session) run(ctx context.Context) error {
 			logger.Warn("access session check at start failed", "err", err)
 		}
 	}()
+	// A resume from sleep or a jump of the clock makes the access session
+	// unknown until a vault.status answers (internal/access WatchClock).
+	clockDone := make(chan struct{})
+	go func() {
+		defer close(clockDone)
+		mgr.WatchClock(ctx)
+	}()
 	// The grants' status statements are kept fresh (internal/leash Run).
 	grantsDone := make(chan struct{})
 	go func() {
@@ -137,6 +158,7 @@ func (s session) run(ctx context.Context) error {
 	<-startDone
 	stopSession(serveDone, s.Out, logger)
 	<-grantsDone
+	<-clockDone
 	// Requests the access manager still runs in the background end at
 	// once now that Run has (vaultconn answers ErrStopped).
 	mgr.Wait()

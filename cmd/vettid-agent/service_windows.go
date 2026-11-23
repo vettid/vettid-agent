@@ -37,6 +37,14 @@ const (
 	codeChannel   uint32 = 112 // the channel or the state directory failed
 )
 
+// The power events that end a sleep (WM_POWERBROADCAST's PBT_*):
+// PBT_APMRESUMEAUTOMATIC always, PBT_APMRESUMESUSPEND after it when a
+// person is there.
+const (
+	pbtResumeSuspend   = 0x7
+	pbtResumeAutomatic = 0x12
+)
+
 // textServiceFromSCM answers `service` started from a command line.
 const textServiceFromSCM = "vettid-agent service is started by Windows' service manager, as the installer sets it up; it can't be run from a command line."
 
@@ -135,6 +143,9 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	h := &serviceHost{Dir: dir, AccessMinutes: cfg.AccessMinutes, Log: logger,
+		IdleStop:   time.Duration(cfg.IdleStopSeconds) * time.Second,
+		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
 	stopped := make(chan struct{})
 	defer close(stopped)
 	go func() {
@@ -148,15 +159,17 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 					st <- c.CurrentStatus
 				case svc.Stop, svc.Shutdown:
 					cancel()
+				case svc.PowerEvent:
+					if c.EventType == pbtResumeAutomatic || c.EventType == pbtResumeSuspend {
+						logger.Info("resumed from sleep: the access session is checked with the vault")
+						h.Resumed()
+					}
 				}
 			}
 		}
 	}()
-	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
+	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent}
 	logger.Info("started")
-	h := &serviceHost{Dir: dir, AccessMinutes: cfg.AccessMinutes, Log: logger,
-		IdleStop:   time.Duration(cfg.IdleStopSeconds) * time.Second,
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
 	err = h.Serve(ctx, func(ctx context.Context) (*hostConn, error) {
 		c, err := l.Accept(ctx)
 		if err != nil {

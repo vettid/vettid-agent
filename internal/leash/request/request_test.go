@@ -80,6 +80,8 @@ type fakeAccess struct {
 	sentWith []pairing.Access
 	snap     pairing.Access
 	held     bool
+	verify   error
+	verifies int
 }
 
 func (a *fakeAccess) Ensure(context.Context) error {
@@ -99,6 +101,13 @@ func (a *fakeAccess) OnAnswer(code string, sentWith pairing.Access) {
 	a.answers = append(a.answers, code)
 	a.sentWith = append(a.sentWith, sentWith)
 }
+func (a *fakeAccess) Verify(context.Context) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.verifies++
+	return a.verify
+}
+
 func (a *fakeAccess) Held() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()

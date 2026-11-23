@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vettid/vettid-agent/internal/access"
 	"github.com/vettid/vettid-agent/internal/channel"
 	"github.com/vettid/vettid-agent/internal/leash/request"
 	"github.com/vettid/vettid-agent/internal/mcp"
@@ -92,7 +93,8 @@ type serviceHost struct {
 	exclusive bool // pair or forget runs, or waits for the stub's session to end
 	holds     int  // clients being served, and what else holds the host
 	conns     map[*hostConn]struct{}
-	closing   bool // closeAll ran: a client handed over later is closed at once
+	closing   bool            // closeAll ran: a client handed over later is closed at once
+	mgr       *access.Manager // the stub's session's access manager, while it runs
 	idle      chan struct{}
 }
 
@@ -139,6 +141,19 @@ func (h *serviceHost) Held() int {
 
 // hostDecoded, set only by tests, sees each record loadRecord decodes.
 var hostDecoded func(*pairing.Record)
+
+// Resumed tells the stub's session, if one runs, that the computer
+// resumed from sleep: its access session is unknown until a vault.status
+// answers (AGENT-SEPARATE-ACCOUNT §5). A session started later checks its
+// saved session at start anyway.
+func (h *serviceHost) Resumed() {
+	h.mu.Lock()
+	m := h.mgr
+	h.mu.Unlock()
+	if m != nil {
+		m.Suspect()
+	}
+}
 
 // errIdle: the host stopped because nothing held it for IdleStop.
 var errIdle = errors.New("idle")
@@ -420,6 +435,11 @@ func (h *serviceHost) runSession(ctx context.Context, rw io.ReadWriter) {
 		Notices: io.Discard,
 		In:      rw,
 		Out:     rw,
+		OnManager: func(m *access.Manager) {
+			h.mu.Lock()
+			h.mgr = m
+			h.mu.Unlock()
+		},
 	})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		logger.Warn("the MCP session ended", "err", err)
