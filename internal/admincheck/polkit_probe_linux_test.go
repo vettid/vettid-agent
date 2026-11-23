@@ -440,7 +440,7 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 // so fewer counts too), except the user manager's (sd-pam), which holds
 // none. Outside it, fewer are accepted, and so are gids inside the
 // member's own /etc/subgid ranges (GC #16712, #16829).
-func groupsDiffer(t *testing.T, u *user.User) string {
+func groupsDiffer(t *testing.T, u *user.User, ranges [][2]uint64) string {
 	want := dbGroups(t, u)
 	// /proc mounted with hidepid hides other users' processes from a
 	// checker without CAP_SYS_PTRACE, as the helper is, outside the
@@ -453,14 +453,6 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 	}
 	if mode, gid := hidepid(string(mi)); procHidden(mode, gid, helperGroup) {
 		return fmt.Sprintf("/proc is mounted with hidepid=%s, gid=%s, which hides processes from the helper", mode, gid)
-	}
-	var ranges [][2]uint64
-	if b, err := os.ReadFile("/etc/subgid"); err == nil {
-		if ranges, err = subgidRanges(string(b), u.Username, u.Uid); err != nil {
-			return err.Error()
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Sprintf("/etc/subgid can't be read (%v)", err)
 	}
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
@@ -484,15 +476,10 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 			continue
 		}
 		held := statusGroups(string(st))
-		if held == want || (held == "" && sdPam(pid, u)) {
+		if held == want {
 			continue
 		}
-		// Outside the first user namespace (a rootless container) fewer
-		// groups are accepted, and so are gids inside the member's own
-		// /etc/subgid ranges (the owner's a, GC #16829), which rests on
-		// subgidOverlap finding no real group in them; any other group
-		// beyond the database's still refuses (GC #16712).
-		if !inFirstUserNS(pid) && subsetOrIn(held, want, ranges) {
+		if groupsAccepted(held, want, ranges, inFirstUserNS(pid), held == "" && sdPam(pid, u)) {
 			continue
 		}
 		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
@@ -505,27 +492,11 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 // /etc/subgid ranges, or is empty. Each gid is looked up by key (getent
 // group <gid> ...), since a network source such as sssd doesn't
 // enumerate its groups.
-func subgidOverlap(t *testing.T, u *user.User) string {
-	b, err := os.ReadFile("/etc/subgid")
-	if errors.Is(err, fs.ErrNotExist) {
-		return "" // no ranges
-	}
-	if err != nil {
-		return fmt.Sprintf("/etc/subgid can't be read (%v)", err)
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		f := strings.Split(strings.TrimSpace(line), ":")
-		if len(f) != 3 || (f[0] != u.Username && f[0] != u.Uid) {
-			continue
-		}
-		start, err1 := strconv.ParseUint(f[1], 10, 32)
-		n, err2 := strconv.ParseUint(f[2], 10, 32)
-		if err1 != nil || err2 != nil {
-			return "an /etc/subgid line it can't read: " + line
-		}
-		for lo := start; lo < start+n; lo += 4096 {
+func subgidOverlap(ranges [][2]uint64) string {
+	for _, r := range ranges {
+		for lo := r[0]; lo < r[1]; lo += 4096 {
 			args := []string{"group"}
-			for g := lo; g < lo+4096 && g < start+n; g++ {
+			for g := lo; g < lo+4096 && g < r[1]; g++ {
 				args = append(args, strconv.FormatUint(g, 10))
 			}
 			// exit 0: every key found; 2: some not found, the usual case,
@@ -538,11 +509,35 @@ func subgidOverlap(t *testing.T, u *user.User) string {
 				return fmt.Sprintf("the subgid lookup failed (%v)", err)
 			}
 			if g := strings.TrimSpace(string(out)); g != "" {
-				return fmt.Sprintf("the member's subgid range %s:%s holds group %s", f[1], f[2], strings.SplitN(g, "\n", 2)[0])
+				return fmt.Sprintf("the member's subgid range %d:%d holds group %s", r[0], r[1]-r[0], strings.SplitN(g, "\n", 2)[0])
 			}
 		}
 	}
 	return ""
+}
+
+// memberSubgids reads /etc/subgid once for both the acceptance and the
+// overlap scan (none when it doesn't exist); its error makes polkit not
+// checked. A line counts as the member's as newgidmap counts it: by
+// name, by uid, or by another name with the member's uid (shadow's
+// is_same_user).
+func memberSubgids(u *user.User) ([][2]uint64, string) {
+	b, err := os.ReadFile("/etc/subgid")
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, ""
+	}
+	if err != nil {
+		return nil, fmt.Sprintf("/etc/subgid can't be read (%v)", err)
+	}
+	same := func(owner string) bool {
+		o, err := user.Lookup(owner)
+		return err == nil && o.Uid == u.Uid
+	}
+	r, err := subgidRanges(string(b), u.Username, u.Uid, same)
+	if err != nil {
+		return nil, err.Error()
+	}
+	return r, ""
 }
 
 // heldGroups are a process's supplementary groups, sorted, as one string.
@@ -738,9 +733,12 @@ func TestPolkitProbe(t *testing.T) {
 	// Every process of the member's, not only the subjects: one holding
 	// groups the database doesn't give makes polkit not checked; so does
 	// a subgid range of the member's that holds a real group.
-	bad := groupsDiffer(t, u)
+	ranges, bad := memberSubgids(u)
 	if bad == "" {
-		bad = subgidOverlap(t, u)
+		bad = groupsDiffer(t, u, ranges)
+	}
+	if bad == "" {
+		bad = subgidOverlap(ranges)
 	}
 	if bad != "" {
 		t.Logf("%s: not checked for every subject", bad)

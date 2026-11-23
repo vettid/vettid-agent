@@ -109,14 +109,23 @@ func TestMemberDropIns(t *testing.T) {
 	}
 }
 
-// subgidRanges: the member's /etc/subgid ranges ([start, start+count)),
-// by name or uid.
-func subgidRanges(content, name, uid string) ([][2]uint64, error) {
+// subgidRanges: the member's /etc/subgid ranges ([start, start+count)):
+// lines owned by its name, its uid, or another name sameUser says has
+// its uid. A line of the member's that isn't exactly name:start:count
+// with plain decimal numbers (no sign, no leading zero) is an error.
+func subgidRanges(content, name, uid string, sameUser func(string) bool) ([][2]uint64, error) {
 	var out [][2]uint64
 	for _, line := range strings.Split(content, "\n") {
-		f := strings.Split(strings.TrimSpace(line), ":")
-		if len(f) != 3 || (f[0] != name && f[0] != uid) {
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
+		}
+		f := strings.Split(line, ":")
+		if f[0] != name && f[0] != uid && !sameUser(f[0]) {
+			continue
+		}
+		if len(f) != 3 || !plainDecimal(f[1]) || !plainDecimal(f[2]) {
+			return nil, fmt.Errorf("an /etc/subgid line it can't read: %s", line)
 		}
 		start, err1 := strconv.ParseUint(f[1], 10, 32)
 		n, err2 := strconv.ParseUint(f[2], 10, 32)
@@ -126,6 +135,31 @@ func subgidRanges(content, name, uid string) ([][2]uint64, error) {
 		out = append(out, [2]uint64{start, start + n})
 	}
 	return out, nil
+}
+
+// plainDecimal: digits only, and no leading zero unless it is "0".
+func plainDecimal(v string) bool {
+	if v == "" || (len(v) > 1 && v[0] == '0') {
+		return false
+	}
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// groupsAccepted: a process's held groups, which aren't exactly the
+// database's, are accepted: in the first user namespace only (sd-pam)
+// holding none; outside it, fewer of the database's groups and gids
+// inside the member's own subgid ranges (GC #16712, #16829), which rests
+// on the overlap scan of the same ranges.
+func groupsAccepted(held, want string, ranges [][2]uint64, firstNS, sdPam bool) bool {
+	if firstNS {
+		return sdPam
+	}
+	return subsetOrIn(held, want, ranges)
 }
 
 // subsetOrIn: every id of a is in b or inside one of the ranges.
@@ -150,13 +184,47 @@ func subsetOrIn(a, b string, ranges [][2]uint64) bool {
 	return true
 }
 
+func TestGroupsAccepted(t *testing.T) {
+	ranges := [][2]uint64{{524288, 589824}}
+	want := "10 1001"
+	for _, c := range []struct {
+		held           string
+		firstNS, sdPam bool
+		ok             bool
+	}{
+		{"1001", true, false, false},               // first namespace: fewer refused
+		{"10 1001 524288", true, false, false},     // first namespace: a subgid refused
+		{"", true, true, true},                     // (sd-pam)
+		{"", true, false, false},                   // none, not (sd-pam)
+		{"1001", false, false, true},               // outside: fewer accepted
+		{"1001 524288 524297", false, false, true}, // outside: subgids accepted
+		{"1001 27", false, false, false},           // outside: another group refused
+		{"1001 589824", false, false, false},       // outside: past the range
+	} {
+		if got := groupsAccepted(set(strings.Fields(c.held)), want, ranges, c.firstNS, c.sdPam); got != c.ok {
+			t.Errorf("%q first=%v sdpam=%v: %v", c.held, c.firstNS, c.sdPam, got)
+		}
+	}
+}
+
 func TestSubgidRanges(t *testing.T) {
-	r, err := subgidRanges("other:100000:65536\nmember:524288:65536\n1000:700000:10\n", "member", "1000")
+	none := func(string) bool { return false }
+	r, err := subgidRanges("other:100000:65536\nmember:524288:65536\n1000:700000:10\n", "member", "1000", none)
 	if err != nil || len(r) != 2 || r[0] != [2]uint64{524288, 589824} || r[1] != [2]uint64{700000, 700010} {
 		t.Errorf("%v %v", r, err)
 	}
-	if _, err := subgidRanges("member:x:1\n", "member", "1000"); err == nil {
-		t.Error("a bad line read")
+	for _, bad := range []string{"member:x:1", "member:1:2:3", "member:1", "member:0100:5", "member:+1:5", "member:1:05", "1000::5", "alias:-1:5"} {
+		alias := func(o string) bool { return o == "alias" }
+		if _, err := subgidRanges(bad+"\n", "member", "1000", alias); err == nil {
+			t.Errorf("%q read", bad)
+		}
+	}
+	if r, err := subgidRanges("other:1:2:3\nmember:0:1\n", "member", "1000", none); err != nil || len(r) != 1 {
+		t.Errorf("another's bad line, or a 0 start: %v %v", r, err)
+	}
+	alias := func(o string) bool { return o == "alias" }
+	if r, err := subgidRanges("alias:800000:5\n", "member", "1000", alias); err != nil || len(r) != 1 || r[0] != [2]uint64{800000, 800005} {
+		t.Errorf("another name with the member's uid: %v %v", r, err)
 	}
 	held := set([]string{"1001", "524288", "524297", "589823"})
 	if !subsetOrIn(held, "10 1001", r) {
