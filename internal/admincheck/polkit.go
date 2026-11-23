@@ -257,6 +257,42 @@ func lift(actions map[string]Action, vs []Verdict) {
 	}
 }
 
+// KindFrom is the kind of subject polkitd judged one subject's answers
+// by, of the candidates: the one whose defaults account for the most of
+// its refusals (a challenge where the default is auth_*, an outright
+// refusal where it is no). Grants are never counted: a rule's grant could
+// otherwise vote for the kind under which it says nothing. A grant only
+// takes a vote away, so under the true kind the count is at least any
+// other's; a tie is not ok. counts is per candidate.
+func KindFrom(actions map[string]Action, answers []Answer, candidates []Kind) (k Kind, counts []int, ok bool) {
+	counts = make([]int, len(candidates))
+	for i, c := range candidates {
+		for _, a := range answers {
+			act, known := actions[a.Action]
+			if !known || a.Err != "" || a.Authorized {
+				continue
+			}
+			switch d := act.defaultFor(c); {
+			case d == No && !a.Challenge, d != No && d != Yes && a.Challenge:
+				counts[i]++
+			}
+		}
+	}
+	best, tie := 0, false
+	for i := 1; i < len(counts); i++ {
+		switch {
+		case counts[i] > counts[best]:
+			best, tie = i, false
+		case counts[i] == counts[best]:
+			tie = true
+		}
+	}
+	if len(candidates) == 0 || tie {
+		return 0, counts, false
+	}
+	return candidates[best], counts, true
+}
+
 func implies(a Action, id string) bool {
 	for _, implied := range a.Implies {
 		if implied == id {

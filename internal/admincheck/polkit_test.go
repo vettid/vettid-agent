@@ -1,6 +1,7 @@
 package admincheck
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -395,5 +396,43 @@ func TestAllowlistNamed(t *testing.T) {
 		if _, ok := alwaysRefuses(Action{ID: id}); !ok || len(kinds) == 0 {
 			t.Errorf("%s: recorded yes, but not always refused or for no kind", id)
 		}
+	}
+}
+
+// KindFrom counts refusals only, so grants can't vote for a kind.
+func TestKindFrom(t *testing.T) {
+	actions := map[string]Action{}
+	ans := func(id string, auth, chal bool) Answer { return Answer{Action: id, Authorized: auth, Challenge: chal} }
+	var answers []Answer
+	// judged as any: these challenge (any auth_admin; active yes)
+	for _, id := range []string{"a1", "a2", "a3"} {
+		actions[id] = Action{ID: id, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
+		answers = append(answers, ans(id, false, true))
+	}
+	// a rule grants many that are yes for active and auth_admin for any
+	for i := 0; i < 50; i++ {
+		id := fmt.Sprintf("g%d", i)
+		actions[id] = Action{ID: id, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
+		answers = append(answers, ans(id, true, false))
+	}
+	// no signal: the same defaults for every kind
+	actions["same"] = Action{ID: "same", Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdmin}
+	answers = append(answers, ans("same", false, true))
+	k, counts, ok := KindFrom(actions, answers, []Kind{NoSession, Active})
+	if !ok || k != NoSession {
+		t.Errorf("rule grants steered it: %s %v %v", k, counts, ok)
+	}
+	// judged as active: outright refusals where active is no
+	actions["n"] = Action{ID: "n", Any: AuthAdmin, Inactive: No, Active: No}
+	if k, counts, ok := KindFrom(actions, []Answer{ans("n", false, false)}, []Kind{NoSession, Active}); !ok || k != Active {
+		t.Errorf("active: %s %v %v", k, counts, ok)
+	}
+	// everything distinguishing granted: a tie, not ok
+	if _, counts, ok := KindFrom(actions, []Answer{ans("g1", true, false), ans("same", false, true)}, []Kind{NoSession, Active}); ok {
+		t.Errorf("a tie was ok: %v", counts)
+	}
+	// errors and unknown actions count for nothing
+	if _, counts, ok := KindFrom(actions, []Answer{{Action: "a1", Err: "x"}, ans("zz", false, true)}, []Kind{NoSession, Active}); ok {
+		t.Errorf("no signal was ok: %v", counts)
 	}
 }

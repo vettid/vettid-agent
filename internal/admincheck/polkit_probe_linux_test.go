@@ -41,42 +41,8 @@ type subject struct {
 	arg  string // gdbus's subject argument
 	kind Kind
 	// candidates: the kinds polkitd may judge it by, when they can't be
-	// read beforehand; the one its answers match is taken (kindFrom).
+	// read beforehand; the one its answers match is taken (KindFrom).
 	candidates []Kind
-}
-
-// kindFrom is the kind of subject polkitd judged these answers by: of the
-// candidates, the one whose defaults match the most answers (a default of
-// yes is a grant, no a refusal, auth_* a challenge). A rule's grant can
-// only move a few; a tie fails the run.
-func kindFrom(t *testing.T, actions map[string]Action, answers []Answer, candidates []Kind) Kind {
-	best, bestN, tie := candidates[0], -1, false
-	for _, k := range candidates {
-		n := 0
-		for _, a := range answers {
-			act, ok := actions[a.Action]
-			if !ok || a.Err != "" || a.Temporary {
-				continue
-			}
-			switch d := act.defaultFor(k); {
-			case d == Yes && a.Authorized && !a.Challenge,
-				d == No && !a.Authorized && !a.Challenge,
-				d != Yes && d != No && !a.Authorized && a.Challenge:
-				n++
-			}
-		}
-		t.Logf("  judged as %s: %d of %d answers match the defaults", k, n, len(answers))
-		switch {
-		case n > bestN:
-			best, bestN, tie = k, n, false
-		case n == bestN:
-			tie = true
-		}
-	}
-	if tie {
-		t.Fatalf("can't tell which kind polkitd judged the subject by")
-	}
-	return best
 }
 
 // sessionKind is the kind polkitd judges a logind session by. Its logind
@@ -185,8 +151,8 @@ func subjects(t *testing.T, u *user.User) []subject {
 		if len(f) >= 3 && f[1] == u.Uid {
 			// A manager-class session (systemd 258 and later: the user's
 			// service manager) holds no process logind places in it, so
-			// polkit judges none by it; its processes are judged as the
-			// no-session subject is.
+			// polkit judges none by it; its processes are asked as the user
+			// service subject below.
 			if class := strings.TrimSpace(run(t, "loginctl", "show-session", f[0], "-p", "Class", "--value")); strings.HasPrefix(class, "manager") {
 				t.Logf("session %s: skipped (class %s)", f[0], class)
 				continue
@@ -207,40 +173,64 @@ func subjects(t *testing.T, u *user.User) []subject {
 			})
 		}
 	}
-	// A process of the member's in no session: a transient system service.
-	unit := fmt.Sprintf("vettid-polkit-probe-%d", time.Now().UnixNano())
-	run(t, "systemd-run", "--unit", unit, "--uid", u.Uid, "--gid", u.Gid, "--collect",
-		"--property=NoNewPrivileges=yes", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
-	t.Cleanup(func() { _ = exec.Command("systemctl", "stop", unit).Run() })
-	var pid int
-	for i := 0; i < 50 && pid == 0; i++ {
-		pid, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(run(t, "systemctl", "show", "-p", "MainPID", unit), "MainPID=")))
-		if pid == 0 {
-			time.Sleep(100 * time.Millisecond)
-		}
-	}
-	if pid == 0 {
+	// Processes of the member's in no session: a transient system service,
+	// and a unit of the member's own service manager if it runs.
+	if pid := sleeper(t, nil, "systemd-run", "--uid", u.Uid, "--gid", u.Gid); pid != 0 {
+		out = append(out, noSession(t, u, "system service", pid))
+	} else {
 		t.Fatal("the no-session process didn't start")
 	}
-	// Judged by its own session if it has one; otherwise polkitd judges
-	// it as no session (allow_any) or, in some versions, by the member's
-	// display session (sd_uid_get_display): which one is read from its
-	// answers.
+	if exec.Command("systemctl", "is-active", "--quiet", "user@"+u.Uid+".service").Run() == nil {
+		m := u.Username + "@"
+		if pid := sleeper(t, []string{"--user", "--machine=" + m}, "systemd-run", "--user", "--machine="+m); pid != 0 {
+			out = append(out, noSession(t, u, "user service", pid))
+		} else {
+			t.Error("the user service didn't start: not checked")
+		}
+	} else {
+		t.Logf("%s's service manager isn't running: no user service asked", u.Username)
+	}
+	return out
+}
+
+// sleeper starts a transient unit that sleeps, with the given systemd-run
+// command (and systemctl scope), and returns its main pid.
+func sleeper(t *testing.T, scope []string, cmd ...string) int {
+	unit := fmt.Sprintf("vettid-polkit-probe-%d", time.Now().UnixNano())
+	args := append(cmd[1:], "--unit", unit, "--collect",
+		"--property=NoNewPrivileges=yes", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
+	run(t, cmd[0], args...)
+	ctl := append(append([]string{}, scope...), "stop", unit)
+	t.Cleanup(func() { _ = exec.Command("systemctl", ctl...).Run() })
+	show := append(append([]string{}, scope...), "show", "-p", "MainPID", "--value", unit)
+	for i := 0; i < 50; i++ {
+		if pid, _ := strconv.Atoi(strings.TrimSpace(run(t, "systemctl", show...))); pid != 0 {
+			return pid
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return 0
+}
+
+// noSession is the subject for a process of the member's in no session.
+// Judged by its own session if it has one; otherwise polkitd judges it as
+// no session (allow_any) or, in some versions, by the member's display
+// session (sd_uid_get_display): which one is read from its answers.
+func noSession(t *testing.T, u *user.User, what string, pid int) subject {
 	sub := subject{
-		name: "no-session process",
+		name: what,
 		arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
 		kind: NoSession,
 	}
 	if s := pidSession(pid); s != "" {
-		sub.kind, sub.name = sessionKind(t, s), "no-session process (in session "+s+")"
+		sub.kind, sub.name = sessionKind(t, s), what+" (in session "+s+")"
 	} else if d := displaySession(u.Username); d != "" {
 		if dk := sessionKind(t, d); dk != NoSession {
 			sub.candidates = []Kind{NoSession, dk}
-			sub.name = "no-session process (display session " + d + ")"
+			sub.name = what + " (display session " + d + ")"
 		}
 	}
-	out = append(out, sub)
-	return out
+	return sub
 }
 
 // conditions reads the facts the allowlist's conditional entries need.
@@ -317,7 +307,14 @@ func TestPolkitProbe(t *testing.T) {
 		}
 		if len(s.candidates) > 1 {
 			t.Logf("%s:", s.name)
-			s.kind = kindFrom(t, actions, these, s.candidates)
+			k, counts, ok := KindFrom(actions, these, s.candidates)
+			for i, c := range s.candidates {
+				t.Logf("  judged as %s: %d of %d answers refused as its defaults refuse", c, counts[i], len(these))
+			}
+			if !ok {
+				t.Fatalf("%s: can't tell which kind polkitd judged it by", s.name)
+			}
+			s.kind = k
 			for j := range these {
 				these[j].Kind = s.kind
 			}
