@@ -46,8 +46,13 @@ func ParsePkaction(out string) (map[string]Action, error) {
 		case "implicit active":
 			cur.Active = Default(val)
 		case "annotation":
-			if k, v, ok := strings.Cut(val, "->"); ok && strings.TrimSpace(k) == "org.freedesktop.policykit.exec.path" {
+			k, v, ok := strings.Cut(val, "->")
+			switch k = strings.TrimSpace(k); {
+			case !ok:
+			case k == "org.freedesktop.policykit.exec.path":
 				cur.ExecPath = strings.TrimSpace(v)
+			case k == "org.freedesktop.policykit.imply":
+				cur.Implies = append(cur.Implies, strings.Fields(v)...)
 			}
 		}
 	}

@@ -41,12 +41,15 @@ func (k Kind) String() string {
 	return [...]string{"active", "inactive", "no session"}[k]
 }
 
-// Action is one action polkit lists, with its shipped defaults and its
-// `org.freedesktop.policykit.exec.path` annotation, if any.
+// Action is one action polkit lists, with its shipped defaults, its
+// `org.freedesktop.policykit.exec.path` annotation, if any, and the
+// actions its `org.freedesktop.policykit.imply` annotation names (a
+// subject authorized for it is authorized for them too).
 type Action struct {
 	ID                    string
 	Any, Inactive, Active Default
 	ExecPath              string
+	Implies               []string
 }
 
 func (a Action) defaultFor(k Kind) Default {
@@ -88,6 +91,9 @@ type Verdict struct {
 	Answer
 	Result Result
 	Reason string
+	// adminDefault: refused only as an administrator's action granted
+	// with no password, so a grant implied by an accepted one may lift it.
+	adminDefault bool
 }
 
 // Judge applies §11.4 to every answer. An unknown action (one the list
@@ -97,6 +103,7 @@ func Judge(actions map[string]Action, answers []Answer) []Verdict {
 	for _, ans := range answers {
 		out = append(out, judge(actions, ans))
 	}
+	lift(actions, out)
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].Result != out[j].Result {
 			return rank(out[i].Result) < rank(out[j].Result)
@@ -142,10 +149,65 @@ func judge(actions map[string]Action, ans Answer) Verdict {
 			return v
 		}
 		v.Result, v.Reason = Refuse, "an administrator's action ("+string(def)+" for "+ans.Kind.String()+") granted with no password"
+		v.adminDefault = true
 		return v
 	}
 	v.Result, v.Reason = Nothing, "its default for "+ans.Kind.String()+" is "+string(def)
 	return v
+}
+
+// lift reports two kinds of refusal that follow from another answer for
+// the same subject (proposed for §11.4):
+//   - an administrator's action granted only because an accepted grant
+//     implies it (`org.freedesktop.policykit.imply`) is judged as that
+//     grant: reported when that grant is accepted (allowlisted, or its
+//     own default for the subject), followed through chains of
+//     implication;
+//   - an exec.path helper in ExecPathIf runs as root but checks each
+//     caller against another action: it is reported while that action
+//     still challenges for an administrator (auth_admin*) for the same
+//     subject.
+func lift(actions map[string]Action, vs []Verdict) {
+	type key struct{ subject, action string }
+	at := map[key]int{}
+	for i, v := range vs {
+		at[key{v.Subject, v.Action}] = i
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := range vs {
+			v := &vs[i]
+			if v.Result != Refuse || !v.adminDefault {
+				continue
+			}
+			for _, a := range actions {
+				j, ok := at[key{v.Subject, a.ID}]
+				if !ok || !vs[j].Authorized || vs[j].Result == Refuse || vs[j].Result == NotChecked {
+					continue
+				}
+				for _, implied := range a.Implies {
+					if implied == v.Action {
+						v.Result, v.Reason, v.adminDefault = Report, "implied by "+a.ID+" ("+string(vs[j].Result)+")", false
+						changed = true
+					}
+				}
+				if v.Result == Report {
+					break
+				}
+			}
+		}
+	}
+	for i := range vs {
+		v := &vs[i]
+		gate, ok := ExecPathIf[actions[v.Action].ExecPath]
+		if v.Result != Refuse || !ok {
+			continue
+		}
+		if j, ok := at[key{v.Subject, gate.action}]; ok && vs[j].Err == "" && !vs[j].Authorized && vs[j].Challenge &&
+			actions[gate.action].defaultFor(vs[j].Kind).admin() {
+			v.Result, v.Reason = Report, gate.why+", while "+gate.action+" asks"
+		}
+	}
 }
 
 // alwaysRefuses says whether a grant of a refuses whatever its defaults
@@ -225,6 +287,15 @@ var ExecPathAllow = map[string]string{
 	"/usr/libexec/gsd-backlight-helper":  "GNOME's backlight helper",
 	"/usr/libexec/gsd-wacom-oled-helper": "GNOME's Wacom helper",
 	"/usr/libexec/gsd-wacom-led-helper":  "GNOME's Wacom helper",
+	// proposed for §11.4: a fixed script that only runs fuser on apt's
+	// lock files
+	"/usr/lib/update-notifier/package-system-locked": "update-notifier's lock check",
+}
+
+// ExecPathIf names the exec.path helpers that run as root but check each
+// caller against another action of their own (proposed for §11.4).
+var ExecPathIf = map[string]struct{ action, why string }{
+	"/usr/libexec/gvfsd-admin": {"org.gtk.vfs.file-operations", "gvfs's admin backend"},
 }
 
 // Allowlist names the stock grants of an administrator's action measured

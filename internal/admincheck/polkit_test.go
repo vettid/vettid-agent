@@ -46,6 +46,40 @@ org.freedesktop.sysupdate1.check:
   implicit any:      auth_admin
   implicit inactive: auth_admin
   implicit active:   yes
+
+org.freedesktop.login1.power-off:
+  implicit any:      auth_admin_keep
+  implicit inactive: auth_admin_keep
+  implicit active:   yes
+  annotation:        org.freedesktop.policykit.imply -> org.freedesktop.login1.set-wall-message
+
+org.freedesktop.login1.power-off-ignore-inhibit:
+  implicit any:      auth_admin_keep
+  implicit inactive: auth_admin_keep
+  implicit active:   auth_admin_keep
+  annotation:        org.freedesktop.policykit.imply -> org.freedesktop.login1.power-off
+
+org.freedesktop.login1.set-wall-message:
+  implicit any:      auth_admin_keep
+  implicit inactive: auth_admin_keep
+  implicit active:   auth_admin_keep
+
+org.gtk.vfs.file-operations-helper:
+  implicit any:      no
+  implicit inactive: no
+  implicit active:   auth_admin_keep
+  annotation:        org.freedesktop.policykit.exec.path -> /usr/libexec/gvfsd-admin
+
+org.gtk.vfs.file-operations:
+  implicit any:      no
+  implicit inactive: no
+  implicit active:   auth_admin_keep
+
+com.ubuntu.update-notifier.pkexec.package-system-locked:
+  implicit any:      no
+  implicit inactive: yes
+  implicit active:   yes
+  annotation:        org.freedesktop.policykit.exec.path -> /usr/lib/update-notifier/package-system-locked
 `
 
 func TestParsePkaction(t *testing.T) {
@@ -60,8 +94,11 @@ func TestParsePkaction(t *testing.T) {
 	if got := a["org.example.helper"].ExecPath; got != "/usr/bin/example-helper" {
 		t.Errorf("exec.path: %q", got)
 	}
-	if len(a) != 7 {
-		t.Errorf("%d actions, want 7", len(a))
+	if len(a) != 13 {
+		t.Errorf("%d actions, want 13", len(a))
+	}
+	if got := a["org.freedesktop.login1.power-off"].Implies; len(got) != 1 || got[0] != "org.freedesktop.login1.set-wall-message" {
+		t.Errorf("imply: %q", got)
 	}
 	if _, err := ParsePkaction("org.x:\n  implicit active:   sometimes\n"); err == nil {
 		t.Error("an unknown default: no error")
@@ -114,9 +151,56 @@ func TestJudge(t *testing.T) {
 	want["org.example.admin/inactive"] = NotChecked
 	answers = append(answers, Answer{Action: "org.freedesktop.timedate1.set-time", Kind: Inactive, Authorized: true, Temporary: true})
 	want["org.freedesktop.timedate1.set-time/inactive"] = Report
+	add("com.ubuntu.update-notifier.pkexec.package-system-locked", Active, true, Nothing) // a fixed helper
 	for _, v := range Judge(actions, answers) {
 		if w := want[v.Action+"/"+v.Kind.String()]; v.Result != w {
 			t.Errorf("%s (%s): %s (%s), want %s", v.Action, v.Kind, v.Result, v.Reason, w)
+		}
+	}
+}
+
+// Grants that follow from another answer for the same subject.
+func TestJudgeLifts(t *testing.T) {
+	actions, err := ParsePkaction(pkactionSample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		wall   = "org.freedesktop.login1.set-wall-message"
+		off    = "org.freedesktop.login1.power-off"
+		offII  = "org.freedesktop.login1.power-off-ignore-inhibit"
+		helper = "org.gtk.vfs.file-operations-helper"
+		ops    = "org.gtk.vfs.file-operations"
+	)
+	ans := func(subject, id string, k Kind, auth, chal bool) Answer {
+		return Answer{Action: id, Kind: k, Subject: subject, Authorized: auth, Challenge: chal}
+	}
+	result := func(vs []Verdict, subject, id string) Result {
+		for _, v := range vs {
+			if v.Subject == subject && v.Action == id {
+				return v.Result
+			}
+		}
+		return ""
+	}
+	for _, c := range []struct {
+		name    string
+		answers []Answer
+		id      string
+		want    Result
+	}{
+		{"implied by a grant its default allows", []Answer{ans("s", off, Active, true, false), ans("s", wall, Active, true, false)}, wall, Report},
+		{"implied by a refused grant", []Answer{ans("s", offII, Active, true, false), ans("s", wall, Active, true, false)}, wall, Refuse},
+		{"the implying grant asked of another subject", []Answer{ans("t", off, Active, true, false), ans("s", wall, Active, true, false)}, wall, Refuse},
+		{"the implying action not granted", []Answer{ans("s", off, Active, false, true), ans("s", wall, Active, true, false)}, wall, Refuse},
+		{"the helper while operations challenge", []Answer{ans("s", helper, Active, true, false), ans("s", ops, Active, false, true)}, helper, Report},
+		{"the helper while operations are granted", []Answer{ans("s", helper, Active, true, false), ans("s", ops, Active, true, false)}, helper, Refuse},
+		{"the helper while operations are refused outright", []Answer{ans("s", helper, Active, true, false), ans("s", ops, Active, false, false)}, helper, Refuse},
+		{"the helper with operations unasked", []Answer{ans("s", helper, Active, true, false)}, helper, Refuse},
+		{"the helper with operations an error", []Answer{ans("s", helper, Active, true, false), {Action: ops, Kind: Active, Subject: "s", Err: "timeout"}}, helper, Refuse},
+	} {
+		if got := result(Judge(actions, c.answers), "s", c.id); got != c.want {
+			t.Errorf("%s: %s, want %s", c.name, got, c.want)
 		}
 	}
 }

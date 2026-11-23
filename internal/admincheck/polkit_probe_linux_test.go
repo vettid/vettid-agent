@@ -88,7 +88,6 @@ func sessionProcess(t *testing.T, u *user.User, id string) int {
 			}
 		}
 	}
-	t.Fatalf("session %s: no process of %s's in it", id, u.Username)
 	return 0
 }
 
@@ -124,6 +123,10 @@ func subjects(t *testing.T, u *user.User) []subject {
 			// aborts on a unix-session subject. (Not the leader: a tty
 			// session's leader is login, running as root.)
 			pid := sessionProcess(t, u, f[0])
+			if pid == 0 {
+				t.Errorf("session %s: not checked: no process of %s's in it", f[0], u.Username)
+				continue
+			}
 			out = append(out, subject{
 				name: fmt.Sprintf("session %s (pid %d)", f[0], pid),
 				arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
