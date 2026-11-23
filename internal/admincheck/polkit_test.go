@@ -118,6 +118,7 @@ org.gnome.software.dkms-test:
   implicit inactive: yes
   implicit active:   yes
   annotation:        org.freedesktop.policykit.exec.path -> /usr/libexec/gnome-software-dkms-helper
+  annotation:        org.freedesktop.policykit.exec.argv1 -> --test-dkms
 
 org.gnome.software.akmods-test:
   implicit any:      yes
@@ -461,5 +462,51 @@ func TestKindFrom(t *testing.T) {
 		if k != c.want || ok != c.ok {
 			t.Errorf("%s: %s %v, want %s %v (%v)", c.name, k, ok, c.want, c.ok, excl)
 		}
+	}
+}
+
+// Rules this branch added after the measurements: a grant over a default
+// of no refuses (and lifts like an administrator's); the key tests are
+// pinned to their mode; imply is split on single spaces.
+func TestJudgeNoDefaultAndArgv1(t *testing.T) {
+	actions := map[string]Action{
+		"org.x.no":      {ID: "org.x.no", Any: No, Inactive: No, Active: Yes},
+		"org.x.implier": {ID: "org.x.implier", Any: No, Inactive: No, Active: Yes, Implies: []string{"org.x.no"}},
+		"org.gnome.software.dkms-test": {ID: "org.gnome.software.dkms-test", Any: Yes, Inactive: Yes, Active: Yes,
+			ExecPath: "/usr/libexec/gnome-software-dkms-helper", ExecArgv1: "--enroll-dkms"},
+	}
+	one := func(as ...Answer) map[string]Result {
+		out := map[string]Result{}
+		for _, v := range Judge(actions, as, met) {
+			out[v.Action+"/"+v.Kind.String()] = v.Result
+		}
+		return out
+	}
+	got := one(Answer{Action: "org.x.no", Kind: Inactive, Authorized: true, Subject: "s"})
+	if got["org.x.no/inactive"] != Refuse {
+		t.Errorf("a grant over no: %v", got)
+	}
+	got = one(Answer{Action: "org.x.no", Kind: Active, Authorized: true, Subject: "s"})
+	if got["org.x.no/active"] != Nothing {
+		t.Errorf("yes for active: %v", got)
+	}
+	got = one(Answer{Action: "org.x.implier", Kind: Active, Authorized: true, Subject: "s"},
+		Answer{Action: "org.x.no", Kind: Active, Authorized: true, Subject: "s"})
+	if got["org.x.no/active"] != Nothing {
+		t.Errorf("implied, yes anyway: %v", got)
+	}
+	actions["org.x.yes-inactive"] = Action{ID: "org.x.yes-inactive", Any: No, Inactive: Yes, Active: Yes, Implies: []string{"org.x.no"}}
+	got = one(Answer{Action: "org.x.yes-inactive", Kind: Inactive, Authorized: true, Subject: "s"},
+		Answer{Action: "org.x.no", Kind: Inactive, Authorized: true, Subject: "s"})
+	if got["org.x.no/inactive"] != Report {
+		t.Errorf("a grant over no, implied by an accepted grant: %v", got)
+	}
+	got = one(Answer{Action: "org.gnome.software.dkms-test", Kind: Active, Authorized: true, Subject: "s"})
+	if got["org.gnome.software.dkms-test/active"] != Refuse {
+		t.Errorf("the key test's id in another mode: %v", got)
+	}
+	a, err := ParsePkaction("org.x:\n  implicit any:      no\n  implicit inactive: no\n  implicit active:   no\n  annotation:        org.freedesktop.policykit.imply -> a  b c\n")
+	if err != nil || len(a["org.x"].Implies) != 3 {
+		t.Errorf("imply split: %q %v", a["org.x"].Implies, err)
 	}
 }

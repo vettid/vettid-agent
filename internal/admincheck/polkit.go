@@ -51,6 +51,7 @@ type Action struct {
 	ID                    string
 	Any, Inactive, Active Default
 	ExecPath              string
+	ExecArgv1             string // org.freedesktop.policykit.exec.argv1
 	Implies               []string
 }
 
@@ -170,7 +171,9 @@ func judge(actions map[string]Action, ans Answer, c Conditions) Verdict {
 		v.Result, v.Reason = Refuse, why
 		return v
 	}
-	if def.admin() {
+	// An administrator's default, or no: granted with no password, either
+	// is a grant the stock defaults don't make.
+	if def.admin() || def == No {
 		if why, ok := Allowlist[a.ID]; ok {
 			if cond, ok := conditional[a.ID]; ok {
 				if met, unmet := cond(c); !met {
@@ -182,6 +185,9 @@ func judge(actions map[string]Action, ans Answer, c Conditions) Verdict {
 			return v
 		}
 		v.Result, v.Reason = Refuse, "an administrator's action ("+string(def)+" for "+ans.Kind.String()+") granted with no password"
+		if def == No {
+			v.Reason = "an action refused by default (no for " + ans.Kind.String() + ") granted with no password"
+		}
 		v.adminDefault = true
 		return v
 	}
@@ -358,7 +364,7 @@ func alwaysRefuses(a Action) (string, bool) {
 		}
 	}
 	if a.ExecPath != "" {
-		if allow, ok := ExecActionAllow[a.ID]; ok && allow.path == a.ExecPath {
+		if allow, ok := ExecActionAllow[a.ID]; ok && allow.path == a.ExecPath && allow.argv1 == a.ExecArgv1 {
 			return "", false
 		}
 		if _, ok := ExecPathAllow[a.ExecPath]; ok {
@@ -409,6 +415,10 @@ var AlwaysRefuse = map[string]string{
 	// proposed for §11.4: dnf5daemon's, which Fedora grants wheel
 	"org.rpm.dnf.v0.rpm.execute_trusted_transaction": "installs packages, whose scripts run as root (dnf5daemon)",
 	"org.rpm.dnf.v0.rpm.Repo.confirm_key":            "trusts a repository's signing key (dnf5daemon)",
+	"org.rpm.dnf.v0.rpm.execute_transaction":         "installs packages, untrusted ones too (dnf5daemon)",
+	"org.rpm.dnf.v0.rpm.Repo.conf_write":             "changes package sources (dnf5daemon)",
+	"org.rpm.dnf.v0.base.Config.override":            "overrides the package manager's configuration (dnf5daemon)",
+	"org.freedesktop.machine1.register-machine":      "registers a machine",
 }
 
 var alwaysRefusePrefix = map[string]string{
@@ -426,6 +436,8 @@ var RecordedYes = map[string]map[Kind]bool{
 	"org.freedesktop.sysupdate1.update":          {Active: true},
 	"org.freedesktop.machine1.host-login":        {Active: true},
 	"org.freedesktop.home1.update-home-by-owner": {Active: true},
+	// systemd 259's allow_active is yes
+	"org.freedesktop.machine1.register-machine": {Active: true},
 }
 
 // ExecPathAllow names the fixed helpers an exec.path action may run (§11.4).
@@ -450,12 +462,13 @@ var ExecPathAllow = map[string]string{
 // ExecActionAllow names exec.path actions allowed by id, where the
 // helper's other modes (other argv1 values) are other actions that stay
 // refused (proposed for §11.4).
-// Each is pinned to its helper: the same id with another exec.path refuses.
-var ExecActionAllow = map[string]struct{ path, why string }{
+// Each is pinned to its helper and its recorded exec.argv1: the same id
+// with another program or mode refuses.
+var ExecActionAllow = map[string]struct{ path, argv1, why string }{
 	// gnome-software's dkms helper: --test-dkms and --test-akmods only run
 	// mokutil --test-key on a fixed key file; --enroll-* stay refused
-	"org.gnome.software.dkms-test":   {"/usr/libexec/gnome-software-dkms-helper", "tests whether DKMS's key is enrolled"},
-	"org.gnome.software.akmods-test": {"/usr/libexec/gnome-software-dkms-helper", "tests whether akmods' key is enrolled"},
+	"org.gnome.software.dkms-test":   {"/usr/libexec/gnome-software-dkms-helper", "--test-dkms", "tests whether DKMS's key is enrolled"},
+	"org.gnome.software.akmods-test": {"/usr/libexec/gnome-software-dkms-helper", "--test-akmods", "tests whether akmods' key is enrolled"},
 }
 
 // ExecPathIf names the exec.path helpers that run as root but check each

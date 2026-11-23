@@ -15,6 +15,6 @@ polkit.addRule(function(action, subject) {
     case "org.opensuse.cupspkhelper.mechanism.printer-local-edit":
     case "org.opensuse.cupspkhelper.mechanism.printer-remote-edit":
     case "org.opensuse.cupspkhelper.mechanism.server-settings":
-        return polkit.Result.AUTH_ADMIN_KEEP;
+        return polkit.Result.AUTH_ADMIN;
     }
 });

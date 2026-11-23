@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -46,6 +47,11 @@ type subject struct {
 	// candidates: the kinds polkitd may judge it by, when they can't be
 	// read beforehand; the one its answers match is taken (KindFrom).
 	candidates []Kind
+	// want: for a session subject, the kind worked out beforehand, which
+	// its answers must confirm (KindFrom over every kind), or it is not
+	// checked.
+	want *Kind
+	pid  int
 }
 
 // sessionKind is the kind polkitd judges a logind session by. Its logind
@@ -181,10 +187,19 @@ func subjects(t *testing.T, u *user.User) []subject {
 				t.Errorf("session %s: not checked: no process of %s's in it", f[0], u.Username)
 				continue
 			}
+			all := []Kind{k}
+			for _, o := range []Kind{Active, Inactive, NoSession} {
+				if o != k {
+					all = append(all, o)
+				}
+			}
 			out = append(out, subject{
-				name: fmt.Sprintf("session %s (pid %d)", f[0], pid),
-				arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
-				kind: sessionKind(t, f[0]),
+				name:       fmt.Sprintf("session %s (pid %d)", f[0], pid),
+				arg:        fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
+				kind:       k,
+				candidates: all,
+				want:       &k,
+				pid:        pid,
 			})
 		}
 	}
@@ -241,6 +256,7 @@ func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) s
 		name: what,
 		arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
 		kind: NoSession,
+		pid:  pid,
 	}
 	if s := pidSession(pid); s != "" {
 		sub.kind, sub.name = sessionKind(t, s), what+" (in session "+s+")"
@@ -254,6 +270,30 @@ func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) s
 		sub.candidates = nil // no session to be judged by
 	}
 	return sub
+}
+
+// heldGroups are a process's supplementary groups, sorted, as one string.
+func heldGroups(pid int) string {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return "unreadable"
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Groups:"); ok {
+			g := strings.Fields(rest)
+			sort.Strings(g)
+			return strings.Join(g, " ")
+		}
+	}
+	return "none listed"
+}
+
+// dbGroups are the member's groups as the group database gives them
+// (getgrouplist, through id), sorted, as one string.
+func dbGroups(t *testing.T, u *user.User) string {
+	g := strings.Fields(run(t, "id", "-G", u.Username))
+	sort.Strings(g)
+	return strings.Join(g, " ")
 }
 
 // conditions reads the facts the allowlist's conditional entries need.
@@ -344,7 +384,13 @@ func TestPolkitProbe(t *testing.T) {
 					}
 				}
 			}
-			s.kind = k
+			if ok && s.want != nil && k != *s.want {
+				t.Logf("  judged as %s, but worked out as %s", k, *s.want)
+				ok = false
+			}
+			if s.want == nil || ok {
+				s.kind = k
+			}
 			if !ok {
 				// Not checked: every answer of this subject's.
 				t.Logf("  can't tell which kind polkitd judged it by")
@@ -356,6 +402,17 @@ func TestPolkitProbe(t *testing.T) {
 			}
 			for j := range these {
 				these[j].Kind = s.kind
+			}
+		}
+		// polkitd 124 and later judge a process subject by the group
+		// database (getgrouplist), a caller on the bus by the groups its
+		// process holds: where they differ, not checked.
+		if held, want := heldGroups(s.pid), dbGroups(t, u); held != want {
+			t.Logf("%s: holds groups %q, the group database gives %q: sign out and in again", s.name, held, want)
+			for j := range these {
+				if these[j].Err == "" {
+					these[j].Err = "the process's groups differ from the group database"
+				}
 			}
 		}
 		answers = append(answers, these...)

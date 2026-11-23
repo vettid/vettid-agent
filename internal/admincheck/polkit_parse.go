@@ -51,8 +51,15 @@ func ParsePkaction(out string) (map[string]Action, error) {
 			case !ok:
 			case k == "org.freedesktop.policykit.exec.path":
 				cur.ExecPath = strings.TrimSpace(v)
+			case k == "org.freedesktop.policykit.exec.argv1":
+				cur.ExecArgv1 = strings.TrimSpace(v)
 			case k == "org.freedesktop.policykit.imply":
-				cur.Implies = append(cur.Implies, strings.Fields(v)...)
+				// split on single spaces, as polkitd does (g_strsplit)
+				for _, id := range strings.Split(strings.TrimSpace(v), " ") {
+					if id != "" {
+						cur.Implies = append(cur.Implies, id)
+					}
+				}
 			}
 		}
 	}
