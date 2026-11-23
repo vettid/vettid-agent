@@ -38,7 +38,7 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 	var releaseOnce sync.Once
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	h := &serviceHost{Dir: dir, IdleStop: time.Minute, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
+		Protectors: serviceProtectors(dir),
 		resolve:    func(string) state.Protector { return cmdTestProtector{} },
 		runSessionFn: func(_ context.Context, s session) error {
 			s.OnManager(m)

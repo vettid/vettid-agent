@@ -35,7 +35,7 @@ func startHost(t *testing.T, idle time.Duration) *testHost {
 	dir := filepath.Join(t.TempDir(), "state")
 	th := &testHost{
 		h: &serviceHost{Dir: dir, AccessMinutes: 60, IdleStop: idle, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-			Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}},
+			Protectors: serviceProtectors(dir)},
 		clients: make(chan *hostConn),
 		done:    make(chan error, 1),
 	}
@@ -343,7 +343,7 @@ func TestHostStopNonReadingStub(t *testing.T) {
 func TestHostIdleRaceServesClient(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	h := &serviceHost{Dir: dir, IdleStop: 100 * time.Millisecond, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+		Protectors: serviceProtectors(dir)}
 	server, client := net.Pipe()
 	defer client.Close()
 	answered := make(chan string, 1)
@@ -473,7 +473,7 @@ func TestHostPairOutlivesRequestDeadline(t *testing.T) {
 func TestHostDrainTakesClientsAgain(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "state")
 	h := &serviceHost{Dir: dir, IdleStop: 100 * time.Millisecond, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+		Protectors: serviceProtectors(dir)}
 	type end struct {
 		c      *hostConn
 		client net.Conn
@@ -552,7 +552,7 @@ func TestHostClearsRecordAfterSession(t *testing.T) {
 	var rec *pairing.Record
 	var device []byte
 	h := &serviceHost{Dir: dir, IdleStop: time.Minute, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
+		Protectors: serviceProtectors(dir),
 		resolve:    func(string) state.Protector { return cmdTestProtector{} },
 		runSessionFn: func(_ context.Context, s session) error {
 			rec = s.Record
@@ -658,7 +658,7 @@ func TestHostLoadRecordClearsUnpaired(t *testing.T) {
 	}
 	var seen *pairing.Record
 	h := &serviceHost{Dir: dir, store: store, resolve: func(string) state.Protector { return cmdTestProtector{} },
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+		Protectors: serviceProtectors(dir)}
 	hostDecoded = func(r *pairing.Record) { seen = r }
 	t.Cleanup(func() { hostDecoded = nil })
 	defer store.Close()
@@ -695,5 +695,18 @@ func TestConsoleWriter(t *testing.T) {
 	code, err := channel.Relay(&b, &out)
 	if err != nil || code != 3 || out.String() != "one\ntwo\nthree\n" {
 		t.Fatalf("relay %d %v %q", code, err, out.String())
+	}
+}
+
+// The service has no passphrase source: its protectors must say so, or
+// pairing takes descriptor 0 for --passphrase-fd and refuses the platform
+// protector (on every platform a service runs on).
+func TestServiceProtectorsHaveNoPassphraseSource(t *testing.T) {
+	p := serviceProtectors(t.TempDir())
+	if p.Source.FD != -1 || p.Source.File != "" || p.Pass != nil {
+		t.Fatalf("the service's protectors name a passphrase source: FD %d, file %q, passphrase set %v", p.Source.FD, p.Source.File, p.Pass != nil)
+	}
+	if !p.NoPrompt {
+		t.Error("the service's protectors may prompt on a terminal")
 	}
 }
