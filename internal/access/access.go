@@ -135,10 +135,15 @@ type Manager struct {
 	suspectGen uint64
 	verifying  *flight
 	// vaultLive is the session id the vault last named current in a
-	// vault.status: that session is used without asking the phone, even
-	// when this computer's clock (possibly the wrong one) puts its end in
-	// the past, until session_required, an end, or the next status.
+	// vault.status at a moment when this computer's clock already put its
+	// end in the past: the clock is then known to be wrong, and that
+	// session is used without asking the phone until session_required, an
+	// end, or the next status. When the clock agreed with the vault, it is
+	// not set: the session ends at its expires_at, as usual.
 	vaultLive string
+	// vaultLiveMono is when (on the monotonic clock) the vault named it:
+	// its word holds for VaultWord only, then the session is checked again.
+	vaultLiveMono time.Duration
 
 	// clock reads the wall clock and a monotonic clock that stops while
 	// the computer sleeps (monoNow); baseWall and baseMono are the reading
@@ -255,6 +260,15 @@ func (m *Manager) checkClockLocked() {
 		m.suspectGen++
 		m.baseWall, m.baseMono = wall, mono
 	}
+	// The vault's word on a session the local clock puts past its end
+	// holds for VaultWord only: then the session is suspect, so whoever
+	// looks first (Ensure, Verify, Suspected, VaultNamed) checks it with
+	// vault.status rather than taking it as ended.
+	if m.vaultLive != "" && mono-m.vaultLiveMono > VaultWord {
+		m.vaultLive = ""
+		m.suspect = true
+		m.suspectGen++
+	}
 }
 
 // WatchClock looks at the clocks every clockEvery until ctx ends, so that
@@ -343,6 +357,8 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	m.mu.Lock()
 	gen := m.suspectGen
 	hook := m.statusHook
+	// The vault's word counts from when the question was sent.
+	_, sentMono := m.clock()
 	m.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
@@ -388,12 +404,17 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	// the session counts as live only if it is still the one the vault
 	// named.
 	m.conn.CompareAndSetAccess(before, a)
+	// The saved session is read under m.mu: an end event (OnEvent, which
+	// clears vaultLive under it) then comes either before the read or
+	// after vaultLive is set, never between. vaultconn takes its own lock
+	// only inside Access and never calls in here holding it.
+	m.mu.Lock()
 	cur := m.conn.Access()
 	live := a.State == pairing.AccessActive && cur.State == pairing.AccessActive && cur.SessionID == a.SessionID
-	m.mu.Lock()
 	m.vaultLive = ""
-	if live {
+	if live && !m.now().Before(a.ExpiresAt) {
 		m.vaultLive = a.SessionID
+		m.vaultLiveMono = sentMono
 	}
 	if m.suspectGen == gen {
 		m.suspect = false
@@ -410,10 +431,30 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	return live, nil
 }
 
-// vaultNamedLocked reports whether a is the session the vault last named
-// current (m.mu held).
+// VaultWord is how long the vault's word that a session is current holds,
+// on the monotonic clock, when this computer's clock disagrees (chosen;
+// not in the spec): a session that then ends by expiry sends no event, so
+// after it the session is suspect again and the next use checks it with
+// vault.status (which names it again if it still runs; no request to the
+// phone).
+const VaultWord = HoldRecheck
+
+// vaultNamedLocked reports whether a is the session the vault named
+// current while this computer's clock disagreed (m.mu held; the caller
+// ran checkClockLocked, which ends that word after VaultWord).
 func (m *Manager) vaultNamedLocked(a pairing.Access) bool {
 	return m.vaultLive != "" && a.State == pairing.AccessActive && a.SessionID == m.vaultLive
+}
+
+// VaultNamed reports whether a is the session the vault last named
+// current while this computer's clock put its end in the past: it is
+// live by the vault's word whatever the local clock says (for
+// internal/leash, which shows and uses the session as access does).
+func (m *Manager) VaultNamed(a pairing.Access) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkClockLocked()
+	return m.vaultNamedLocked(a)
 }
 
 // active reports whether a is a session usable at now.

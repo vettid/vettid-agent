@@ -96,6 +96,11 @@ func (m *Manager) ConnectionInfo() Info {
 	case activeAt(a, now):
 		in.AccessSession = "active"
 		in.AccessSessionUntil = timePtr(a.ExpiresAt)
+	case m.vaultNamed != nil && m.vaultNamed(a):
+		// Live by the vault's last word while this computer's clock puts
+		// its end in the past: active, without an "until" this clock would
+		// show as already gone.
+		in.AccessSession = "active"
 	case a.State == pairing.AccessActive, a.State == pairing.AccessNone:
 		in.AccessSession = "none"
 	}
