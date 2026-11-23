@@ -78,10 +78,8 @@ func TestVaultNamedSessionShownAndUsed(t *testing.T) {
 	g1 := grant(t, now, spec{id: gid(1)})
 	e.listing(t, false, g1)
 	mustPresent(t, e, gid(1))
-	ended := now.Add(-time.Minute)
-	_ = ended
 	e.f.mu.Lock()
-	e.f.access = pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: ended}
+	e.f.access = pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: now.Add(-time.Minute)}
 	e.f.mu.Unlock()
 	if in := e.m.ConnectionInfo(); in.AccessSession != "none" {
 		t.Fatalf("by the local clock: %+v", in)

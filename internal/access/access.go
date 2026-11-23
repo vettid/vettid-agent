@@ -260,6 +260,15 @@ func (m *Manager) checkClockLocked() {
 		m.suspectGen++
 		m.baseWall, m.baseMono = wall, mono
 	}
+	// The vault's word on a session the local clock puts past its end
+	// holds for VaultWord only: then the session is suspect, so whoever
+	// looks first (Ensure, Verify, Suspected, VaultNamed) checks it with
+	// vault.status rather than taking it as ended.
+	if m.vaultLive != "" && mono-m.vaultLiveMono > VaultWord {
+		m.vaultLive = ""
+		m.suspect = true
+		m.suspectGen++
+	}
 }
 
 // WatchClock looks at the clocks every clockEvery until ctx ends, so that
@@ -348,6 +357,8 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	m.mu.Lock()
 	gen := m.suspectGen
 	hook := m.statusHook
+	// The vault's word counts from when the question was sent.
+	_, sentMono := m.clock()
 	m.mu.Unlock()
 	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
 	defer cancel()
@@ -403,7 +414,7 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	m.vaultLive = ""
 	if live && !m.now().Before(a.ExpiresAt) {
 		m.vaultLive = a.SessionID
-		_, m.vaultLiveMono = m.clock()
+		m.vaultLiveMono = sentMono
 	}
 	if m.suspectGen == gen {
 		m.suspect = false
@@ -429,19 +440,10 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 const VaultWord = HoldRecheck
 
 // vaultNamedLocked reports whether a is the session the vault named
-// current, within VaultWord, while this computer's clock disagreed (m.mu
-// held). Past VaultWord it makes the session suspect and reports false.
+// current while this computer's clock disagreed (m.mu held; the caller
+// ran checkClockLocked, which ends that word after VaultWord).
 func (m *Manager) vaultNamedLocked(a pairing.Access) bool {
-	if m.vaultLive == "" || a.State != pairing.AccessActive || a.SessionID != m.vaultLive {
-		return false
-	}
-	if _, mono := m.clock(); mono-m.vaultLiveMono > VaultWord {
-		m.vaultLive = ""
-		m.suspect = true
-		m.suspectGen++
-		return false
-	}
-	return true
+	return m.vaultLive != "" && a.State == pairing.AccessActive && a.SessionID == m.vaultLive
 }
 
 // VaultNamed reports whether a is the session the vault last named
@@ -451,6 +453,7 @@ func (m *Manager) vaultNamedLocked(a pairing.Access) bool {
 func (m *Manager) VaultNamed(a pairing.Access) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.checkClockLocked()
 	return m.vaultNamedLocked(a)
 }
 
