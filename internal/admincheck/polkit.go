@@ -215,6 +215,9 @@ func lift(actions map[string]Action, vs []Verdict) {
 // disk or the packages' trust.
 func alwaysRefuses(a Action) (string, bool) {
 	if a.ExecPath != "" {
+		if _, ok := ExecActionAllow[a.ID]; ok {
+			return "", false
+		}
 		if _, ok := ExecPathAllow[a.ExecPath]; ok {
 			return "", false
 		}
@@ -268,6 +271,9 @@ var AlwaysRefuse = map[string]string{
 	"org.opensuse.cupspkhelper.mechanism.printer-local-edit":  "adds a printer from a file read as root",
 	"org.opensuse.cupspkhelper.mechanism.printer-remote-edit": "adds a printer from a file read as root",
 	"org.opensuse.cupspkhelper.mechanism.server-settings":     "replaces cupsd.conf (chosen)",
+	// proposed for §11.4: dnf5daemon's, which Fedora grants wheel
+	"org.rpm.dnf.v0.rpm.execute_trusted_transaction": "installs packages, whose scripts run as root (dnf5daemon)",
+	"org.rpm.dnf.v0.rpm.Repo.confirm_key":            "trusts a repository's signing key (dnf5daemon)",
 }
 
 var alwaysRefusePrefix = map[string]string{
@@ -280,6 +286,10 @@ var alwaysRefusePrefix = map[string]string{
 // yes (§11.4): a grant of one is reported.
 var RecordedYes = map[string]bool{
 	"org.freedesktop.sysupdate1.check": true,
+	// proposed for §11.4: upstream systemd 259's allow_active is yes
+	"org.freedesktop.sysupdate1.update":          true,
+	"org.freedesktop.machine1.host-login":        true,
+	"org.freedesktop.home1.update-home-by-owner": true,
 }
 
 // ExecPathAllow names the fixed helpers an exec.path action may run (§11.4).
@@ -297,6 +307,18 @@ var ExecPathAllow = map[string]string{
 	// then reconfigures keyboard-configuration; locale1.set-keyboard's
 	// effect
 	"/usr/libexec/gnome-control-center-set-debian-keyboard": "GNOME's keyboard layout (Debian)",
+	// §11.4 allowlists org.fedoraproject.thirdparty.opt-out
+	"/usr/lib/fedora-third-party/fedora-third-party-opt-out": "Fedora's third-party repositories off",
+}
+
+// ExecActionAllow names exec.path actions allowed by id, where the
+// helper's other modes (other argv1 values) are other actions that stay
+// refused (proposed for §11.4).
+var ExecActionAllow = map[string]string{
+	// gnome-software's dkms helper: --test-dkms and --test-akmods only run
+	// mokutil --test-key on a fixed key file; --enroll-* stay refused
+	"org.gnome.software.dkms-test":   "tests whether DKMS's key is enrolled",
+	"org.gnome.software.akmods-test": "tests whether akmods' key is enrolled",
 }
 
 // ExecPathIf names the exec.path helpers that run as root but check each
