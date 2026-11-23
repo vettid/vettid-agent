@@ -673,3 +673,42 @@ func TestPipeMemberIsAdmin(t *testing.T) {
 		r.f.Close()
 	}
 }
+
+// openRaw opens the pipe as a client would, at identification level, and
+// sends nothing.
+func openRaw(t *testing.T, pipe string) windows.Handle {
+	t.Helper()
+	p, _ := windows.UTF16PtrFromString(PipePath(pipe))
+	h, err := windows.CreateFile(p, clientAccess, 0, nil, windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
+// A client that connects and says nothing holds only its own place: a
+// real client behind it is served at once, not after the silent one's
+// helloWait. Each hello is read in a goroutine of its own.
+func TestSilentClientDoesNotBlock(t *testing.T) {
+	me := selfSID(t)
+	s := listen(t, me, "")
+	silent := openRaw(t, s.pipe)
+	defer windows.CloseHandle(silent)
+	// The silent client is connected before the real one dials.
+	time.Sleep(100 * time.Millisecond)
+	cfg := s.dial(memberOp(t))
+	cfg.Service = me
+	start := time.Now()
+	ch := dialAsync(cfg)
+	c := s.accepted(t)
+	_ = c.Accept()
+	r := <-ch
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	r.f.Close()
+	if d := time.Since(start); d >= helloWait/2 {
+		t.Fatalf("the real client waited %v behind a silent one", d)
+	}
+	t.Logf("served in %v with a silent client queued ahead", time.Since(start))
+}

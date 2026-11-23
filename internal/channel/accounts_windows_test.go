@@ -8,9 +8,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -336,4 +339,45 @@ func TestTokenIdentityElevation(t *testing.T) {
 	if id, err := tokenIdentity(denyOnly, me, admins); err != nil || id.ElevatedAdmin || !id.HoldsAdmins {
 		t.Fatalf("Administrators deny-only at high integrity: %+v, %v", id, err)
 	}
+}
+
+// A client the pipe's access list lets in (here, only through an entry
+// added for the test) but that is neither the member nor an elevated
+// administrator is refused from its token at once, before anything is
+// read from it: it sends nothing and still gets its refusal, well within
+// helloWait. So ImpersonateNamedPipeClient needs no read first.
+func TestNeitherMemberNorAdminRefusedBeforeHello(t *testing.T) {
+	other := newTestUser(t)
+	me := selfSID(t)
+	s := listen(t, me, fmt.Sprintf("(A;;0x%x;;;%s)", clientMask, other.sid.String()))
+	var h windows.Handle
+	other.as(t, func() { h = openRaw(t, s.pipe) })
+	if h == 0 {
+		t.FailNow()
+	}
+	f := os.NewFile(uintptr(h), "client")
+	defer f.Close()
+	start := time.Now()
+	line, err := readLine(f)
+	if err != nil {
+		t.Fatalf("no answer to a client that sent nothing: %v", err)
+	}
+	if d := time.Since(start); d >= helloWait/2 {
+		t.Fatalf("answered after %v: the server waited for a hello", d)
+	}
+	if !strings.Contains(string(line), `"refused":"`+refusalCode(ErrNotAllowed)+`"`) {
+		t.Fatalf("answer %s, want a not_allowed refusal", line)
+	}
+	got := s.refused.wait(t, 1)
+	if !errors.Is(got[0], errNeitherMemberNorAdmin) {
+		t.Fatalf("server: %v, want errNeitherMemberNorAdmin", got[0])
+	}
+	// And through Dial, which writes its hello first: the same refusal.
+	cfg := s.dial(OpStatus)
+	cfg.Service = me
+	other.as(t, func() { _, err = Dial(context.Background(), cfg) })
+	if !errors.Is(err, ErrNotAllowed) {
+		t.Fatalf("Dial as the other user: %v, want ErrNotAllowed", err)
+	}
+	t.Logf("refused in %v, before any read: %s", time.Since(start), line)
 }
