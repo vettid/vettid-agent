@@ -751,20 +751,78 @@ func TestRulesFileActionsAlwaysRefuse(t *testing.T) {
 }
 
 // The rules file applies to the VettID members it lists, by user name,
-// and to no other account (the owner's a, GC #16962): a name, unlike a
-// group, can't be dropped by a process of the member's.
+// and to a process of no account (a uid with no name, as a member's
+// rootless container's is), and to no other account (the owner's a, GC
+// #16962): a name, unlike a group, can't be dropped by a process of the
+// member's. The list and the rule are inside one function.
 func TestRulesFileScopedToTheMembers(t *testing.T) {
-	b, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	s, err := RenderRulesFile([]RulesEntry{{"member", "home"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(b)
-	for _, want := range []string{`"@MEMBER@",`, `vettidMembers.indexOf(subject.user) < 0`} {
+	for _, want := range []string{
+		"(function () {\n    var vettidMembers = [\n        \"member\", // home\n    ];",
+		`vettidMembers.indexOf(subject.user) < 0 && !/^[0-9]+$/.test(subject.user)`,
+		"})();\n",
+	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("no %q", want)
 		}
 	}
 	if strings.Index(s, "subject.user") > strings.Index(s, "switch (action.id)") {
 		t.Error("the member check comes after the actions")
+	}
+}
+
+func TestRulesFileRoundTrip(t *testing.T) {
+	es := []RulesEntry{{"alice", "home"}, {"alice", "work"}, {"bob.smith", "lab-2"}}
+	s, err := RenderRulesFile(es)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := ParseRulesFile(s)
+	if err != nil || len(back) != 3 || back[1] != es[1] {
+		t.Fatalf("%v %v", back, err)
+	}
+	// Two pairings for one member keep two entries; forgetting one keeps the other.
+	if left := WithoutPairing(back, "home"); len(left) != 2 || left[0] != es[1] {
+		t.Errorf("forget home: %v", left)
+	}
+	// A rewrite replaces the pairing's old entry.
+	if r := WithPairing(back, RulesEntry{"carol", "home"}); len(r) != 3 || r[2] != (RulesEntry{"carol", "home"}) {
+		t.Errorf("rewrite home: %v", r)
+	}
+	empty, err := RenderRulesFile(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, err := ParseRulesFile(empty); err != nil || len(e) != 0 {
+		t.Errorf("empty: %v %v", e, err)
+	}
+}
+
+func TestRulesFileRefusesNames(t *testing.T) {
+	for _, bad := range []string{`a"b`, `a\\b`, "", "-x", "a b", "a\nb", "a\u2028b", "é"} {
+		if _, err := RenderRulesFile([]RulesEntry{{bad, "home"}}); err == nil {
+			t.Errorf("member %q written", bad)
+		}
+		if _, err := RenderRulesFile([]RulesEntry{{"alice", bad}}); err == nil {
+			t.Errorf("pairing %q written", bad)
+		}
+	}
+}
+
+func TestRulesFileRefusesAnotherFormat(t *testing.T) {
+	good, _ := RenderRulesFile([]RulesEntry{{"alice", "home"}})
+	for _, s := range []string{
+		strings.Replace(good, `"alice", // home`, `"alice", "root", // home`, 1),
+		strings.Replace(good, "AUTH_ADMIN", "YES", 1),
+		good + "polkit.addRule(function () { return polkit.Result.YES; });\n",
+		strings.Replace(good, `"alice"`, `"al\"ice"`, 1),
+		"polkit.addRule(function () {});\n",
+	} {
+		if _, err := ParseRulesFile(s); err == nil {
+			t.Errorf("accepted:\n%s", s)
+		}
 	}
 }
