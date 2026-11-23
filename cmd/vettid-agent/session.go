@@ -73,6 +73,12 @@ func (s session) run(ctx context.Context) error {
 		return err
 	}
 	mgr = access.New(conn, s.AccessMinutes*60, nil)
+	// A session starts as after a resume: the saved session is not used on
+	// this computer's clock until a vault.status answers. The computer may
+	// have slept, or its clock moved, since it was saved, and a power event
+	// may have been missed (a service restarted across a sleep).
+	mgr.Suspect()
+	grants.SetSuspected(mgr.Suspected)
 	if s.OnManager != nil {
 		s.OnManager(mgr)
 		defer s.OnManager(nil)

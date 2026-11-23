@@ -91,6 +91,8 @@ func (m *Manager) ConnectionInfo() Info {
 		in.LastContact = timePtr(m.conn.LastContact())
 	}
 	switch {
+	case m.suspectedLocked():
+		// After a resume or a clock jump, until the vault answers: unknown.
 	case activeAt(a, now):
 		in.AccessSession = "active"
 		in.AccessSessionUntil = timePtr(a.ExpiresAt)

@@ -169,6 +169,10 @@ type Access interface {
 	// Held reports whether the vault was last seen held (AGENT-PLAN
 	// §4.4): then nothing is asked again.
 	Held() bool
+	// Verify, after a resume or a clock jump, checks the access session
+	// with the vault (vault.status) before a request is asked again; it
+	// never asks for a session, so nothing reaches the member's phone.
+	Verify(ctx context.Context) error
 }
 
 // Options configure New. Zero durations take the defaults.
@@ -710,6 +714,17 @@ func (c *Client) askAgain(e *entry) bool {
 		return false
 	case c.acc.Held():
 		c.finish(e, nil, ErrOwnerCheck)
+		return false
+	}
+	// After a resume or a clock jump the session is checked with the vault
+	// first; a request asked again without one is answered
+	// session_required.
+	if err := c.acc.Verify(c.life); err != nil {
+		if c.life.Err() != nil {
+			c.finish(e, nil, ErrStopped)
+		} else {
+			c.finish(e, nil, fromAccess(err))
+		}
 		return false
 	}
 	id, err := c.conn.NewID()

@@ -75,7 +75,7 @@ func TestSuspectUnreachable(t *testing.T) {
 	// A status that names no session (a vault before VAULT-MESSAGING
 	// 0.41.0) teaches nothing: still suspect.
 	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"}}`))
-	if err := ensure(t, m); err == nil || !m.Suspected() {
+	if err := ensure(t, m); !errors.Is(err, errStatusNoSession) || err.Error() != errStatusNoSession.Text || !m.Suspected() {
 		t.Fatalf("a status without session: %v, suspect %v", err, m.Suspected())
 	}
 }
@@ -126,8 +126,11 @@ func TestSuspectAgainDuringVerify(t *testing.T) {
 	m.Suspect()
 	done := make(chan error, 1)
 	go func() { done <- m.Ensure(context.Background()) }()
-	for f.count("vault.status") == 0 {
-		time.Sleep(time.Millisecond)
+	for end := time.Now().Add(5 * time.Second); f.count("vault.status") == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(end) {
+			close(block)
+			t.Fatal("no vault.status was sent")
+		}
 	}
 	m.Suspect() // a second resume while the first check waits
 	close(block)
@@ -175,17 +178,110 @@ func TestJumped(t *testing.T) {
 	}
 }
 
+// fakeClocks is a wall and a monotonic clock the test moves.
+type fakeClocks struct {
+	mu   sync.Mutex
+	wall time.Time
+	mono time.Duration
+}
+
+func (c *fakeClocks) read() (time.Time, time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wall, c.mono
+}
+
+func (c *fakeClocks) step(w, mo time.Duration) {
+	c.mu.Lock()
+	c.wall, c.mono = c.wall.Add(w), c.mono+mo
+	c.mu.Unlock()
+}
+
+// Ensure itself looks at the clocks before it uses the session: a call
+// that arrives at the jump, before WatchClock's next look, checks with
+// the vault first.
+func TestEnsureSeesJump(t *testing.T) {
+	live := pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)}
+	for _, c := range []struct {
+		name       string
+		wall, mono time.Duration
+	}{
+		{"set forward", 2 * time.Minute, time.Second},
+		{"set back", -2 * time.Minute, time.Second},
+		{"slept", 3 * time.Hour, 0},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f, _, m := setup(live)
+			f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(time.Hour).Format(time.RFC3339)+`"}}`))
+			clocks := &fakeClocks{wall: t0}
+			m.setClock(clocks.read)
+			if err := ensure(t, m); err != nil || f.count("vault.status") != 0 {
+				t.Fatalf("before the jump: %v, sent %v", err, f.sent)
+			}
+			clocks.step(c.wall, c.mono)
+			if err := ensure(t, m); err != nil {
+				t.Fatal(err)
+			}
+			if f.count("vault.status") != 1 || f.count("device.session.request") != 0 {
+				t.Fatalf("after the jump: sent %v", f.sent)
+			}
+			// The jump is taken as the new base: no second check for it.
+			if err := ensure(t, m); err != nil || f.count("vault.status") != 1 {
+				t.Fatalf("again: %v, sent %v", err, f.sent)
+			}
+		})
+	}
+}
+
+// The vault names a current session whose end this computer's clock,
+// set forward, puts in the past: it is used, and nothing is asked of the
+// phone.
+func TestVaultLiveSessionOverLocalClock(t *testing.T) {
+	f, c, m := setup(pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)})
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(time.Hour).Format(time.RFC3339)+`"}}`))
+	c.add(2 * time.Hour) // the clock was set two hours forward
+	m.Suspect()
+	if err := ensure(t, m); err != nil {
+		t.Fatalf("Ensure = %v, want the vault's session used", err)
+	}
+	if f.count("device.session.request") != 0 {
+		t.Fatalf("asked the phone: %v", f.sent)
+	}
+}
+
+// Verify checks with the vault while suspect and never asks for a
+// session; when not suspect it sends nothing.
+func TestVerify(t *testing.T) {
+	f, _, m := setup(none)
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":null}`))
+	if err := m.Verify(context.Background()); err != nil || len(f.sent) != 0 {
+		t.Fatalf("not suspect: %v, sent %v", err, f.sent)
+	}
+	m.Suspect()
+	if err := m.Verify(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.count("vault.status") != 1 || f.count("device.session.request") != 0 || m.Suspected() {
+		t.Fatalf("sent %v, suspect %v", f.sent, m.Suspected())
+	}
+	m.Suspect()
+	f.answer("vault.status", nil)
+	if err := m.Verify(context.Background()); !errors.Is(err, ErrUnreachable) || !m.Suspected() {
+		t.Fatalf("unreachable: %v, suspect %v", err, m.Suspected())
+	}
+}
+
 // WatchClock marks the session suspect when the wall clock moves apart
 // from the monotonic one, and not otherwise.
 func TestWatchClock(t *testing.T) {
 	_, _, m := setup(none)
 	var mu sync.Mutex
 	wall, mono := t0, time.Duration(0)
-	m.clock = func() (time.Time, time.Duration) {
+	m.setClock(func() (time.Time, time.Duration) {
 		mu.Lock()
 		defer mu.Unlock()
 		return wall, mono
-	}
+	})
 	m.clockEvery = 10 * time.Millisecond
 	step := func(w, mo time.Duration) {
 		mu.Lock()
@@ -198,6 +294,9 @@ func TestWatchClock(t *testing.T) {
 	go func() { defer close(done); m.WatchClock(ctx) }()
 	defer func() { cancel(); <-done }()
 	time.Sleep(20 * time.Millisecond)
+	if !m.Watching() {
+		t.Fatal("Watching false while WatchClock runs")
+	}
 	step(time.Second, time.Second)
 	if m.Suspected() {
 		t.Fatal("suspect with the clocks together")

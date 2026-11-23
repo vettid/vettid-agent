@@ -488,8 +488,11 @@ func TestMCPHeldRecheck(t *testing.T) {
 	callTool(t, cs, "leash.list_available", nil)
 	callTool(t, cs, "leash.connection_info", nil)
 	time.Sleep(200 * time.Millisecond)
-	if n := statuses(); n != 2 {
-		t.Errorf("%d vault.status, want 2 (at most one a minute)", n)
+	// Three: the connection's at start, the access session's check after
+	// start (internal/access Suspect: the saved session is not used on the
+	// local clock alone), and one hold recheck (at most one a minute).
+	if n := statuses(); n != 3 {
+		t.Errorf("%d vault.status, want 3 (start, the session check, one recheck a minute)", n)
 	}
 	_ = cs.Close()
 	inW.Close()

@@ -60,7 +60,11 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 	h.Resumed() // no session yet: nothing to tell
 	fc := th.connect(t, channel.OpMCP)
 	fc.waitAnswer(t)
-	<-running
+	select {
+	case <-running:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the session did not start")
+	}
 	if m.Suspected() {
 		t.Fatal("suspect before any resume")
 	}

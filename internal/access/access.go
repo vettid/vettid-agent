@@ -48,6 +48,10 @@ var (
 	ErrAccessDenied    = &Error{Code: "access_denied", Text: "Access was declined on your phone."}
 	ErrOwnerCheck      = &Error{Code: "owner_check_required", Text: "Your vault is waiting for your daily check. Open VettID on your phone."}
 	ErrUnreachable     = &Error{Code: "vault_unreachable", Text: "Your vault did not answer. It may be locked; unlock it on your phone."}
+	// errStatusNoSession: after a resume or a clock jump, the vault's
+	// status did not say whether this agent has an access session, so the
+	// session stays unknown (chosen text; the code is vault_unreachable's).
+	errStatusNoSession = &Error{Code: "vault_unreachable", Text: "Your vault's answer did not say whether this agent has an access session. Try again in a moment."}
 )
 
 // Error is an access outcome with a stable code (AGENT-PLAN §4.1).
@@ -131,9 +135,16 @@ type Manager struct {
 	suspectGen uint64
 	verifying  *flight
 
-	// clock and clockEvery are WatchClock's (tests replace them).
+	// clock reads the wall clock and a monotonic clock that stops while
+	// the computer sleeps (monoNow); baseWall and baseMono are the reading
+	// the next is compared with, taken at New and again at each jump.
+	// clockEvery is WatchClock's period, and watching is set while it
+	// runs. Tests replace clock with setClock.
 	clock      func() (wall time.Time, mono time.Duration)
+	baseWall   time.Time
+	baseMono   time.Duration
 	clockEvery time.Duration
+	watching   bool
 }
 
 // Wait waits for the requests this Manager runs in the background (an
@@ -150,6 +161,8 @@ func (m *Manager) Wait() { m.bg.Wait() }
 type flight struct {
 	done chan struct{}
 	err  error
+	// live: (a vault.status check) the vault named a current session.
+	live bool
 }
 
 func newFlight() *flight { return &flight{done: make(chan struct{})} }
@@ -174,10 +187,18 @@ func New(conn Conn, seconds int, now func() time.Time) *Manager {
 	if seconds == 0 {
 		seconds = DefaultSeconds
 	}
-	start := time.Now()
-	return &Manager{conn: conn, now: now, seconds: seconds,
-		clock:      func() (time.Time, time.Duration) { return time.Now().Round(0), time.Since(start) },
-		clockEvery: clockEvery}
+	m := &Manager{conn: conn, now: now, seconds: seconds, clockEvery: clockEvery,
+		clock: func() (time.Time, time.Duration) { return time.Now().Round(0), monoNow() }}
+	m.baseWall, m.baseMono = m.clock()
+	return m
+}
+
+// setClock replaces the clocks and takes a new base reading (tests).
+func (m *Manager) setClock(f func() (time.Time, time.Duration)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clock = f
+	m.baseWall, m.baseMono = f()
 }
 
 // After a resume from sleep or a jump in the system clock, the connector
@@ -189,8 +210,9 @@ func New(conn Conn, seconds int, now func() time.Time) *Manager {
 // decides, with the vault's own expiry.
 
 // ClockJump is how far the wall clock may move apart from the monotonic
-// clock between two of WatchClock's looks before the session is suspect
-// (chosen; not in the spec). clockEvery is how often it looks.
+// clock, since the last base reading, before the session is suspect
+// (chosen; not in the spec). clockEvery is how often WatchClock looks
+// between tool calls; each Ensure looks too, before it uses the session.
 const (
 	ClockJump  = time.Minute
 	clockEvery = 15 * time.Second
@@ -207,45 +229,109 @@ func (m *Manager) Suspect() {
 	m.mu.Unlock()
 }
 
-// Suspected reports whether the session waits for a vault.status.
-func (m *Manager) Suspected() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.suspect
-}
-
 // jumped reports whether the wall clock moved apart from the monotonic
-// clock by more than ClockJump between two looks: the clock was set, or
-// the computer slept (where the monotonic clock stops while it sleeps).
+// clock by more than ClockJump: the clock was set, or the computer slept
+// (monoNow stops while it sleeps).
 func jumped(wall, mono time.Duration) bool {
 	d := wall - mono
 	return d > ClockJump || d < -ClockJump
 }
 
-// WatchClock looks at the clocks every clockEvery until ctx ends, and
-// calls Suspect when they have moved apart (jumped).
+// checkClockLocked looks at the clocks (m.mu held) and makes the session
+// suspect if they moved apart since the base reading, which it then
+// takes again.
+func (m *Manager) checkClockLocked() {
+	wall, mono := m.clock()
+	if jumped(wall.Sub(m.baseWall), mono-m.baseMono) {
+		m.suspect = true
+		m.suspectGen++
+		m.baseWall, m.baseMono = wall, mono
+	}
+}
+
+// WatchClock looks at the clocks every clockEvery until ctx ends, so that
+// a jump is noticed between tool calls too (for the grants' work and
+// leash.connection_info).
 func (m *Manager) WatchClock(ctx context.Context) {
+	m.mu.Lock()
+	m.watching = true
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.watching = false
+		m.mu.Unlock()
+	}()
 	t := time.NewTicker(m.clockEvery)
 	defer t.Stop()
-	prevWall, prevMono := m.clock()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
-		wall, mono := m.clock()
-		if jumped(wall.Sub(prevWall), mono-prevMono) {
-			m.Suspect()
-		}
-		prevWall, prevMono = wall, mono
+		m.mu.Lock()
+		m.checkClockLocked()
+		m.mu.Unlock()
 	}
+}
+
+// Watching reports whether WatchClock runs (tests of its callers).
+func (m *Manager) Watching() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.watching
+}
+
+// Suspected reports whether the session waits for a vault.status, after
+// looking at the clocks.
+func (m *Manager) Suspected() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.checkClockLocked()
+	return m.suspect
+}
+
+// Verify, while the session is suspect, sends the vault.status check (or
+// waits for the one on its way) and returns its outcome; otherwise nil at
+// once. Unlike Ensure it never asks for a session: a request sent again
+// after it (internal/leash/request) is answered session_required by the
+// vault if there is none, and nothing reaches the member's phone.
+func (m *Manager) Verify(ctx context.Context) error {
+	m.mu.Lock()
+	m.checkClockLocked()
+	if !m.suspect {
+		m.mu.Unlock()
+		return nil
+	}
+	f := m.verifyFlightLocked(ctx)
+	m.mu.Unlock()
+	return f.wait(ctx)
+}
+
+// verifyFlightLocked returns the vault.status check on its way, or starts
+// one (m.mu held).
+func (m *Manager) verifyFlightLocked(ctx context.Context) *flight {
+	if f := m.verifying; f != nil {
+		return f
+	}
+	f := newFlight()
+	m.verifying = f
+	m.bg.Add(1)
+	go func() {
+		defer m.bg.Done()
+		live, err := m.verify(context.WithoutCancel(ctx))
+		m.mu.Lock()
+		f.err, f.live, m.verifying = err, live, nil
+		m.mu.Unlock()
+		close(f.done)
+	}()
+	return f
 }
 
 // verify sends vault.status and takes the session it names and its
 // owner check. It clears the suspicion only if no new one came while it
 // was on its way.
-func (m *Manager) verify(ctx context.Context) error {
+func (m *Manager) verify(ctx context.Context) (bool, error) {
 	m.mu.Lock()
 	gen := m.suspectGen
 	hook := m.statusHook
@@ -256,12 +342,12 @@ func (m *Manager) verify(ctx context.Context) error {
 	r, err := m.conn.Request(ctx, "vault.status", json.RawMessage(`{}`))
 	if err != nil {
 		if errors.Is(err, vaultconn.ErrRefused) {
-			return err
+			return false, err
 		}
-		return ErrUnreachable
+		return false, ErrUnreachable
 	}
 	if !r.OK {
-		return fmt.Errorf("the vault refused vault.status: %s", r.ErrorCode)
+		return false, fmt.Errorf("the vault refused vault.status: %s", r.ErrorCode)
 	}
 	var s struct {
 		Session    json.RawMessage `json:"session"`
@@ -273,7 +359,7 @@ func (m *Manager) verify(ctx context.Context) error {
 		// The vault's status must name the session (VAULT-MESSAGING
 		// 0.41.0); without it nothing is learned, and the session stays
 		// suspect.
-		return errors.New("the vault's status does not name the access session")
+		return false, errStatusNoSession
 	}
 	a := pairing.Access{State: pairing.AccessNone}
 	if string(s.Session) != "null" {
@@ -282,11 +368,11 @@ func (m *Manager) verify(ctx context.Context) error {
 			ExpiresAt string `json:"expires_at"`
 		}
 		if json.Unmarshal(s.Session, &sess) != nil || sess.SessionID == "" {
-			return errors.New("the vault's status names a session it does not describe")
+			return false, errStatusNoSession
 		}
 		exp, err := time.Parse(time.RFC3339, sess.ExpiresAt)
 		if err != nil {
-			return errors.New("the vault's status names a session without a readable end")
+			return false, errStatusNoSession
 		}
 		a = pairing.Access{State: pairing.AccessActive, SessionID: sess.SessionID, ExpiresAt: exp}
 	}
@@ -303,7 +389,7 @@ func (m *Manager) verify(ctx context.Context) error {
 		m.suspect = false
 	}
 	m.mu.Unlock()
-	return nil
+	return a.State == pairing.AccessActive, nil
 }
 
 // active reports whether a is a session usable at now.
@@ -391,23 +477,11 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return ErrUnreachable
 	}
 	m.mu.Lock()
+	m.checkClockLocked()
 	if m.suspect {
 		// After a resume or a clock jump: one vault.status at a time;
 		// callers that arrive meanwhile wait for it and take its outcome.
-		f := m.verifying
-		if f == nil {
-			f = newFlight()
-			m.verifying = f
-			m.bg.Add(1)
-			go func() {
-				defer m.bg.Done()
-				err := m.verify(context.WithoutCancel(ctx))
-				m.mu.Lock()
-				f.err, m.verifying = err, nil
-				m.mu.Unlock()
-				close(f.done)
-			}()
-		}
+		f := m.verifyFlightLocked(ctx)
 		m.mu.Unlock()
 		if err := f.wait(ctx); err != nil {
 			var ae *Error
@@ -415,6 +489,19 @@ func (m *Manager) Ensure(ctx context.Context) error {
 				return err
 			}
 			return ErrUnreachable
+		}
+		m.mu.Lock()
+		again, held := m.suspect, m.held
+		m.mu.Unlock()
+		if f.live && !again {
+			// The vault has just named a current session, and nothing was
+			// suspected since: it is used, even if this computer's clock
+			// (which may be the wrong one) puts its end in the past. No
+			// request is sent to the phone for it.
+			if held {
+				return ErrOwnerCheck
+			}
+			return nil
 		}
 		return m.Ensure(ctx)
 	}
