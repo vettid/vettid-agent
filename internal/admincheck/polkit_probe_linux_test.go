@@ -22,10 +22,10 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -123,15 +123,7 @@ func sessionProcess(t *testing.T, u *user.User, id string) int {
 
 func ownedBy(pid int, uid string) bool {
 	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(st), "\n") {
-		if ids := strings.Fields(strings.TrimPrefix(line, "Uid:")); strings.HasPrefix(line, "Uid:") {
-			return len(ids) == 4 && ids[0] == uid && ids[1] == uid && ids[2] == uid && ids[3] == uid
-		}
-	}
-	return false
+	return err == nil && statusUids(string(st), uid)
 }
 
 // inSession: logind's own answer (sd_pid_get_session, through ps).
@@ -448,14 +440,38 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 // manager's (sd-pam), which holds none.
 func groupsDiffer(t *testing.T, u *user.User) string {
 	want := dbGroups(t, u)
-	ents, _ := os.ReadDir("/proc")
+	// /proc mounted with hidepid hides other users' processes from a
+	// checker outside the mount's gid= group: the scan would see nothing.
+	mi, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return fmt.Sprintf("/proc/self/mountinfo can't be read (%v)", err)
+	}
+	if hidden, gid := hidepid(string(mi)); hidden && !holdsGroup(gid) {
+		return "/proc is mounted with hidepid and the checker isn't in its gid= group"
+	}
+	ents, err := os.ReadDir("/proc")
+	if err != nil {
+		return fmt.Sprintf("/proc can't be listed (%v)", err)
+	}
 	for _, e := range ents {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || !ownedBy(pid, u.Uid) {
+		if err != nil {
 			continue
 		}
-		held := heldGroups(pid)
-		if held == "unreadable" || held == want || (held == "" && sdPam(pid, u)) {
+		// Only ENOENT or ESRCH means the process is gone; any other read
+		// error is a process the checker can't see.
+		st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+			continue
+		}
+		if err != nil {
+			return fmt.Sprintf("/proc/%d/status can't be read (%v)", pid, err)
+		}
+		if !statusUids(string(st), u.Uid) {
+			continue
+		}
+		held := statusGroups(string(st))
+		if held == want || (held == "" && sdPam(pid, u)) {
 			continue
 		}
 		// Outside the first user namespace (a rootless container) fewer
@@ -520,12 +536,25 @@ func heldGroups(pid int) string {
 	if err != nil {
 		return "unreadable"
 	}
-	for _, line := range strings.Split(string(b), "\n") {
-		if rest, ok := strings.CutPrefix(line, "Groups:"); ok {
-			return set(strings.Fields(rest))
+	return statusGroups(string(b))
+}
+
+// holdsGroup: the checker's own process holds gid (its real or
+// supplementary groups).
+func holdsGroup(gid string) bool {
+	if gid == "" {
+		return false
+	}
+	if strconv.Itoa(os.Getgid()) == gid {
+		return true
+	}
+	gs, _ := os.Getgroups()
+	for _, g := range gs {
+		if strconv.Itoa(g) == gid {
+			return true
 		}
 	}
-	return "none listed"
+	return false
 }
 
 // dbGroups are the member's groups as the group database gives them
@@ -575,20 +604,6 @@ func sdPam(pid int, u *user.User) bool {
 	ppid := parentOf(st)
 	out, err := exec.Command("systemctl", "show", "-p", "MainPID", "--value", "user@"+u.Uid+".service").Output()
 	return err == nil && ppid != 0 && strconv.Itoa(ppid) == strings.TrimSpace(string(out))
-}
-
-// set is a list of ids without duplicates, sorted, as one string.
-func set(ids []string) string {
-	seen := map[string]bool{}
-	var out []string
-	for _, id := range ids {
-		if !seen[id] {
-			seen[id] = true
-			out = append(out, id)
-		}
-	}
-	sort.Strings(out)
-	return strings.Join(out, " ")
 }
 
 // conditions reads the facts the allowlist's conditional entries need.

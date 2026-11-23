@@ -6,6 +6,7 @@ package admincheck
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -160,4 +161,95 @@ func TestIdentityMap(t *testing.T) {
 			t.Errorf("%q: %v", c.m, got)
 		}
 	}
+}
+
+// statusUids: all four uids of a /proc/<pid>/status are uid.
+func statusUids(st, uid string) bool {
+	for _, line := range strings.Split(st, "\n") {
+		if rest, ok := strings.CutPrefix(line, "Uid:"); ok {
+			ids := strings.Fields(rest)
+			return len(ids) == 4 && ids[0] == uid && ids[1] == uid && ids[2] == uid && ids[3] == uid
+		}
+	}
+	return false
+}
+
+// statusGroups: a /proc/<pid>/status's supplementary groups, sorted, as
+// one string.
+func statusGroups(st string) string {
+	for _, line := range strings.Split(st, "\n") {
+		if rest, ok := strings.CutPrefix(line, "Groups:"); ok {
+			return set(strings.Fields(rest))
+		}
+	}
+	return "none listed"
+}
+
+// hidepid: the /proc mount (from /proc/self/mountinfo) hides other
+// users' processes, and its gid= option if any.
+func hidepid(mountinfo string) (hidden bool, gid string) {
+	for _, line := range strings.Split(mountinfo, "\n") {
+		pre, post, ok := strings.Cut(line, " - ")
+		f, g := strings.Fields(pre), strings.Fields(post)
+		if !ok || len(f) < 5 || f[4] != "/proc" || len(g) < 3 || g[0] != "proc" {
+			continue
+		}
+		hidden, gid = false, ""
+		for _, o := range strings.Split(g[2], ",") {
+			switch k, v, _ := strings.Cut(o, "="); k {
+			case "hidepid":
+				hidden = v != "0" && v != "off"
+			case "gid":
+				gid = v
+			}
+		}
+	}
+	return hidden, gid
+}
+
+func TestHidepid(t *testing.T) {
+	const plain = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
+	for _, c := range []struct {
+		mi     string
+		hidden bool
+		gid    string
+	}{
+		{plain, false, ""},
+		{"22 1 0:21 / /proc rw,relatime shared:12 - proc proc rw,hidepid=invisible,gid=10\n", true, "10"},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=2\n", true, ""},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=noaccess\n", true, ""},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=0\n", false, ""},
+		{"22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=off\n", false, ""},
+		// another proc mount elsewhere doesn't count; the last /proc does
+		{"30 1 0:40 / /run/x/proc rw - proc proc rw,hidepid=2\n" + plain, false, ""},
+		{plain + "40 22 0:50 / /proc rw - proc proc rw,hidepid=invisible\n", true, ""},
+	} {
+		if h, g := hidepid(c.mi); h != c.hidden || g != c.gid {
+			t.Errorf("%q: %v %q", c.mi, h, g)
+		}
+	}
+}
+
+func TestStatusFields(t *testing.T) {
+	st := "Name:\tsleep\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nGroups:\t10 1000 \n"
+	if !statusUids(st, "1000") || statusUids(st, "100") || statusUids(strings.Replace(st, "1000\t1000\t1000\t1000\nGid", "1000\t0\t1000\t1000\nGid", 1), "1000") {
+		t.Error("statusUids")
+	}
+	if g := statusGroups(st); g != set([]string{"10", "1000"}) {
+		t.Errorf("statusGroups: %q", g)
+	}
+}
+
+// set is a list of ids without duplicates, sorted, as one string.
+func set(ids []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, " ")
 }
