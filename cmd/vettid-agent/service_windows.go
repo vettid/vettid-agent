@@ -18,7 +18,6 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -103,19 +102,14 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	logger := slog.New(&eventLogHandler{sink: sink, name: s.name})
 	// Each refusal is logged with the code's fixed text, never an error's
 	// own text (it can name the pipe, a path or a SID).
-	fail := func(code uint32) (bool, uint32) {
-		logger.Error("the service refuses to run: "+serviceRefusalText(code), "code", code)
+	fail := func(code uint32, privileges ...string) (bool, uint32) {
+		logger.Error(refusalMessage(code, privileges), "code", code)
 		return true, code
 	}
 	if _, err := service.SelfCheck(s.name); err != nil {
 		var ce *service.CheckError
 		if errors.As(err, &ce) {
-			if ce.Code == service.CodePrivileges {
-				// Privilege names are not sensitive, and say what to cut.
-				logger.Error("the service refuses to run: "+serviceRefusalText(ce.Code)+": "+strings.Join(ce.Privileges, ", "), "code", ce.Code)
-				return true, ce.Code
-			}
-			return fail(ce.Code)
+			return fail(ce.Code, ce.Privileges...)
 		}
 		return fail(service.CodeTokenUnreadable)
 	}

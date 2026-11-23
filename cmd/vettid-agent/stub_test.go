@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vettid/vettid-vault/vms/invite"
+
 	"github.com/vettid/vettid-agent/internal/channel"
 	"github.com/vettid/vettid-agent/internal/mcp"
 )
@@ -286,11 +288,16 @@ func TestChannelCommands(t *testing.T) {
 			t.Fatalf("service got %+v, op %q", r, f.cfgs[0].Op)
 		}
 	})
+	v := newVault(t)
+	theCode, err := v.Code(invite.KindAgent, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Run("pair", func(t *testing.T) {
 		f := withFakeService(t)
 		got := serve(f, t, "Approve on your phone", 3)
 		oldIn := codeIn
-		codeIn = strings.NewReader("THE-CODE")
+		codeIn = strings.NewReader(theCode)
 		t.Cleanup(func() { codeIn = oldIn })
 		var out, errOut bytes.Buffer
 		rc := run([]string{"pair", "--name", "work", "--label", "Build box", "--restart"}, &out, &errOut)
@@ -298,10 +305,10 @@ func TestChannelCommands(t *testing.T) {
 			t.Fatalf("exit %d, stdout %q, stderr %q", rc, out.String(), errOut.String())
 		}
 		r := <-got
-		if r.err != nil || r.req != (channel.Request{Code: "THE-CODE", Label: "Build box", Restart: true}) || f.cfgs[0].Op != channel.OpPair {
+		if r.err != nil || r.req != (channel.Request{Code: theCode, Label: "Build box", Restart: true}) || f.cfgs[0].Op != channel.OpPair {
 			t.Fatalf("service got %+v, op %q", r, f.cfgs[0].Op)
 		}
-		if strings.Contains(errOut.String(), "THE-CODE") {
+		if strings.Contains(errOut.String(), theCode) {
 			t.Fatal("the code was shown")
 		}
 	})
@@ -317,7 +324,7 @@ func TestChannelCommands(t *testing.T) {
 				return 0, io.EOF
 			}
 			read = true
-			return copy(p, "THE-CODE"), nil
+			return copy(p, theCode), nil
 		})
 		stubDial = func(ctx context.Context, cfg channel.DialConfig) (io.ReadWriteCloser, error) {
 			if !read {
@@ -330,22 +337,35 @@ func TestChannelCommands(t *testing.T) {
 		if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 0 {
 			t.Fatalf("exit %d, stderr %q", rc, errOut.String())
 		}
-		if r := <-got; r.req.Code != "THE-CODE" {
+		if r := <-got; r.req.Code != theCode {
 			t.Fatalf("service got %+v", r.req)
 		}
-		// With no code, nothing is opened.
+		// With no code, a mistyped one, one of another kind or an expired
+		// one, nothing is opened: the agent's session is never ended for
+		// it.
 		f.mu.Lock()
 		n := len(f.cfgs)
 		f.mu.Unlock()
-		codeIn = strings.NewReader("")
 		read = true
-		if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 1 {
-			t.Fatalf("no code: exit %d", rc)
+		other, err := v.Code(invite.KindDesktop, 10*time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		expired, err := v.Code(invite.KindAgent, -time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, bad := range []string{"", "not-a-pairing-code", theCode[:len(theCode)-6], other, expired} {
+			codeIn = strings.NewReader(bad)
+			errOut.Reset()
+			if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 1 || errOut.Len() == 0 {
+				t.Fatalf("code %q: exit %d, stderr %q", bad, rc, errOut.String())
+			}
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		if len(f.cfgs) != n {
-			t.Fatal("the channel was opened without a code")
+			t.Fatal("the channel was opened for a code that isn't one")
 		}
 	})
 	t.Run("forget", func(t *testing.T) {
@@ -366,15 +386,15 @@ func TestChannelCommands(t *testing.T) {
 		err  error
 		want string
 	}{
-		{[]string{"pair", "--name", "work", "CODE"}, channel.ErrNotAllowed, TextNeedsAdmin},
+		{[]string{"pair", "--name", "work", theCode}, channel.ErrNotAllowed, TextNeedsAdmin},
 		{[]string{"forget", "--name", "work"}, channel.ErrNotAllowed, TextNeedsAdmin},
 		{[]string{"status", "--name", "work"}, channel.ErrNotAllowed, mcp.TextNotTheMember},
 		{[]string{"status", "--name", "work"}, channel.ErrAccessDenied, mcp.TextAccessDenied},
-		{[]string{"pair", "--name", "work", "CODE"}, channel.ErrAccessDenied, mcp.TextAccessDenied},
+		{[]string{"pair", "--name", "work", theCode}, channel.ErrAccessDenied, mcp.TextAccessDenied},
 		{[]string{"status", "--name", "work"}, channel.ErrBusy, channel.ErrBusy.Error()},
 		{[]string{"status", "--name", "work"}, channel.ErrVersionsDiffer, mcp.TextVersionsDiffer},
 		{[]string{"status", "--name", "work"}, channel.ErrNoService, mcp.NoService().Text},
-		{[]string{"pair", "--name", "work", "CODE"}, channel.ErrNotService, mcp.NoService().Text},
+		{[]string{"pair", "--name", "work", theCode}, channel.ErrNotService, mcp.NoService().Text},
 	} {
 		f := withFakeService(t)
 		f.dialErr = c.err

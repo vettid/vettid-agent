@@ -38,9 +38,17 @@ const (
 	// clients served at once are bounded by maxConns instead.
 	maxInstances = windows.PIPE_UNLIMITED_INSTANCES
 	// maxConns bounds the clients connected at once; one beyond it is
-	// told the channel is busy (chosen; not in the spec).
-	maxConns = 16
-	bufSize  = 64 << 10
+	// told the channel is busy (chosen; not in the spec). adminReserve
+	// more are kept for an elevated administrator who is not the member
+	// (chosen; not in the spec): the member's own processes (the agent
+	// among them) can fill maxConns, but can't hold the places an
+	// administrator needs for pair, forget or status. They can still
+	// contend for the one waiting instance: a member connecting in a loop
+	// may win it before an administrator's Dial, which retries for its
+	// Wait (5 s by default).
+	maxConns     = 16
+	adminReserve = 2
+	bufSize      = 64 << 10
 
 	// helloWait bounds each end's hello (chosen; not in the spec).
 	helloWait = 10 * time.Second
@@ -111,8 +119,8 @@ type Listener struct {
 
 	// ready holds clients whose hello was read and admitted, for Accept.
 	// Only a client counted in live is sent, and only under mu while the
-	// listener is open, so it never holds more than maxConns and a send
-	// never blocks.
+	// listener is open, so it never holds more than maxConns+adminReserve
+	// (the most clients live allows) and a send never blocks.
 	ready chan *ServerConn
 
 	mu sync.Mutex
@@ -162,7 +170,7 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 	l := &Listener{cfg: cfg, path: path, member: member, admins: admins,
 		sa:    &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd},
 		done:  make(chan struct{}),
-		ready: make(chan *ServerConn, maxConns)}
+		ready: make(chan *ServerConn, maxConns+adminReserve)}
 	h, err := l.instance(true)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_PIPE_BUSY) {
@@ -366,17 +374,20 @@ func (l *Listener) acceptOne() (*ServerConn, error) {
 		return nil, &clientError{err: cerr}
 	}
 	l.live++
-	busy := l.live > maxConns
+	live := l.live
 	l.mu.Unlock()
 
 	c := &ServerConn{File: os.NewFile(uintptr(h), PipePath(l.cfg.Pipe)), version: l.cfg.Version, l: l}
 	// Refusals before the hello is read are written at once: the client
 	// reads them after its own hello (Dial reads the answer even if its
 	// hello could not be written).
-	if busy {
+	busy := func() (*ServerConn, error) {
 		_ = refuse(c.File, l.cfg.Version, ErrBusy)
 		c.Close()
 		return nil, &clientError{err: ErrBusy}
+	}
+	if live > maxConns+adminReserve {
+		return busy()
 	}
 	id, err := identify(h, l.member, l.admins)
 	if err == nil && !id.Member && !id.ElevatedAdmin {
@@ -386,6 +397,9 @@ func (l *Listener) acceptOne() (*ServerConn, error) {
 		_ = refuse(c.File, l.cfg.Version, ErrNotAllowed)
 		c.Close()
 		return nil, &clientError{err: err}
+	}
+	if live > maxConns && !(id.ElevatedAdmin && !id.Member) {
+		return busy()
 	}
 	c.Identity = id
 	return c, nil

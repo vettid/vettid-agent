@@ -341,6 +341,122 @@ func TestTokenIdentityElevation(t *testing.T) {
 	}
 }
 
+// The member's processes can fill maxConns (each silent connection holds
+// its place for up to helloWait, and the member can connect again as
+// places free), but an elevated administrator who is not the member
+// still gets one of adminReserve more: pair, forget and status can't be
+// held off by the agent. Beyond those, the administrator is busy too.
+func TestAdminReserveBeyondMaxConns(t *testing.T) {
+	member := newTestUser(t)
+	me := selfSID(t)
+	s := listenN(t, member.sid.String(), maxConns+adminReserve+4)
+	var held []windows.Handle
+	defer func() {
+		for _, h := range held {
+			windows.CloseHandle(h)
+		}
+	}()
+	member.as(t, func() {
+		for i := 0; i < maxConns; i++ {
+			held = append(held, openRaw(t, s.pipe))
+		}
+	})
+	// The member's next connection is told the channel is busy, at once.
+	openedAll(t, held...)
+	var extra windows.Handle
+	member.as(t, func() { extra = openRaw(t, s.pipe) })
+	openedAll(t, extra)
+	f := os.NewFile(uintptr(extra), "extra")
+	line, err := readLine(f)
+	f.Close()
+	if err != nil || !strings.Contains(string(line), `"refused":"`+refusalCode(ErrBusy)+`"`) {
+		t.Fatalf("the member beyond maxConns: %s %v, want busy", line, err)
+	}
+	// The administrator is served, adminReserve times.
+	for i := 0; i < adminReserve; i++ {
+		cfg := s.dial(OpStatus)
+		cfg.Service = me
+		ch := dialAsync(cfg)
+		c := s.accepted(t)
+		if !c.Identity.ElevatedAdmin || c.Identity.Member {
+			t.Fatalf("server saw %+v", c.Identity)
+		}
+		_ = c.Accept()
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("the administrator with maxConns taken (%d): %v", i, r.err)
+		}
+		defer r.f.Close()
+	}
+	// Then the administrator is busy too.
+	cfg := s.dial(OpStatus)
+	cfg.Service = me
+	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrBusy) {
+		t.Fatalf("the administrator beyond the reserve: %v, want ErrBusy", err)
+	}
+}
+
+// With every place taken (maxConns by the member, adminReserve by an
+// administrator) and every hello sent, while nothing takes clients from
+// Accept, the listener still closes: the admitted clients' queue holds
+// them all, and no send blocks under its lock.
+func TestAdmittedQueueHoldsTheReserve(t *testing.T) {
+	member := newTestUser(t)
+	me := selfSID(t)
+	l, err := Listen(ListenConfig{Pipe: randomPipe(t), Owner: me, Member: member.sid.String(), Version: testVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Start the accepting goroutine, then take nothing from Accept.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = l.Accept(ctx)
+	hello := func(h windows.Handle) *os.File {
+		if h == 0 {
+			return nil
+		}
+		f := os.NewFile(uintptr(h), "client")
+		if err := writeLine(f, clientHello{Channel: helloVersion, Op: OpStatus, Version: testVersion}); err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+	var files []*os.File
+	defer func() {
+		for _, f := range files {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+	member.as(t, func() {
+		for i := 0; i < maxConns; i++ {
+			files = append(files, hello(openRaw(t, l.cfg.Pipe)))
+		}
+	})
+	for i := 0; i < adminReserve; i++ {
+		files = append(files, hello(openRaw(t, l.cfg.Pipe)))
+	}
+	for _, f := range files {
+		if f == nil {
+			t.FailNow()
+		}
+	}
+	// Every hello admitted and queued.
+	for end := time.Now().Add(5 * time.Second); len(l.ready) < maxConns+adminReserve; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("%d of %d clients queued", len(l.ready), maxConns+adminReserve)
+		}
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- l.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close hung with the reserve's clients queued")
+	}
+}
+
 // A client the pipe's access list lets in (here, only through an entry
 // added for the test) but that is neither the member nor an elevated
 // administrator is refused from its token at once, before anything is
