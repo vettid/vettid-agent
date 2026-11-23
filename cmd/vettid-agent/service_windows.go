@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -109,6 +110,11 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	if _, err := service.SelfCheck(s.name); err != nil {
 		var ce *service.CheckError
 		if errors.As(err, &ce) {
+			if ce.Code == service.CodePrivileges {
+				// Privilege names are not sensitive, and say what to cut.
+				logger.Error("the service refuses to run: "+serviceRefusalText(ce.Code)+": "+strings.Join(ce.Privileges, ", "), "code", ce.Code)
+				return true, ce.Code
+			}
 			return fail(ce.Code)
 		}
 		return fail(service.CodeTokenUnreadable)

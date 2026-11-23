@@ -35,6 +35,10 @@ const (
 type CheckError struct {
 	Code   uint32
 	Detail string
+	// Privileges are the privileges beyond SeChangeNotifyPrivilege
+	// (CodePrivileges only): their names are not sensitive, and the
+	// Event Log names them.
+	Privileges []string
 }
 
 func (e *CheckError) Error() string { return e.Detail }
@@ -161,7 +165,7 @@ func Check(t Token, serviceSID string) error {
 		}
 	}
 	if len(extra) > 0 {
-		return &CheckError{Code: CodePrivileges, Detail: "the service holds privileges beyond " + changeNotify + ": " + strings.Join(extra, ", ")}
+		return &CheckError{Code: CodePrivileges, Detail: "the service holds privileges beyond " + changeNotify + ": " + strings.Join(extra, ", "), Privileges: extra}
 	}
 	var groups []string
 	logon, label := 0, 0

@@ -21,13 +21,18 @@ type eventSink interface {
 // (AGENT-SEPARATE-ACCOUNT §3 "Logs"): never an error's text (which can
 // name the pipe, a path or a SID), a grant or a value.
 var eventLogKeys = map[string]bool{
-	"op":     true,
-	"tool":   true,
-	"type":   true,
-	"code":   true,
-	"result": true,
-	"status": true,
+	"outcome": true,
+	"op":      true,
+	"tool":    true,
+	"type":    true,
+	"code":    true,
+	"result":  true,
+	"status":  true,
 }
+
+// maxLogValue bounds each attribute's value in the log (chosen; not in
+// the spec): codes, tool names and types are short.
+const maxLogValue = 64
 
 // eventLogHandler writes the service's log to sink under the pairing's
 // name: the message, then the allowed attributes. The messages are the
@@ -45,7 +50,11 @@ func (h *eventLogHandler) Handle(_ context.Context, r slog.Record) error {
 	fmt.Fprintf(&b, "pairing %s: %s", h.name, r.Message)
 	add := func(a slog.Attr) bool {
 		if eventLogKeys[a.Key] {
-			fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
+			v := a.Value.String()
+			if len(v) > maxLogValue {
+				v = v[:maxLogValue] + "..."
+			}
+			fmt.Fprintf(&b, " %s=%s", a.Key, v)
 		}
 		return true
 	}

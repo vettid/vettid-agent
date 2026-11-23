@@ -20,12 +20,14 @@ func TestEventLogHandlerAllowlist(t *testing.T) {
 	log := slog.New(&eventLogHandler{sink: sink, name: "work"})
 	secretish := `\\.\pipe\vettid-agent-work-0123456789abcdef0123456789abcdef S-1-5-21-1-2-3-1001 C:\ProgramData\VettID\agent\work`
 	log.Warn("the MCP session ended", "err", errors.New(secretish), "grant", "g-123", "code", "session_required")
-	log.With("err", secretish).Info("tool answered", "tool", "leash.list_available", "result", "ok")
+	log.With("err", secretish).Info("tool call", "tool", "leash.list_available", "outcome", "ok")
+	log.Info("long", "code", strings.Repeat("x", 100))
 	log.Error("the service refuses to run: x", "code", uint32(111), "path", secretish)
 	log.Debug("not logged", "op", "mcp")
 	want := []string{
 		"W pairing work: the MCP session ended code=session_required",
-		"I pairing work: tool answered tool=leash.list_available result=ok",
+		"I pairing work: tool call tool=leash.list_available outcome=ok",
+		"I pairing work: long code=" + strings.Repeat("x", maxLogValue) + "...",
 		"E pairing work: the service refuses to run: x code=111",
 	}
 	if strings.Join(sink.lines, "\n") != strings.Join(want, "\n") {
