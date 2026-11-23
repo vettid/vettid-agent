@@ -24,6 +24,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -283,9 +284,15 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 		if pid, _ := strconv.Atoi(strings.TrimSpace(out)); pid != 0 {
 			// The pid came back from a hop running as the member:
 			// confirm it before asking polkitd (§11.4).
+			// systemd 255 and later start a unit through
+			// systemd-executor, which execs sleep a moment later: poll.
 			if !confirmSleeper(pid, u, unit, inManager) {
-				t.Errorf("pid %d isn't the probe's own %s, unchanged: not checked", pid, unit)
-				return 0
+				if i == 49 {
+					t.Errorf("pid %d isn't the probe's own %s, unchanged: not checked", pid, unit)
+					return 0
+				}
+				time.Sleep(100 * time.Millisecond)
+				continue
 			}
 			if inManager {
 				d := viaOut(append(append([]string{}, ctl...), "show", "-p", "DropInPaths", "--value", unit)...)
@@ -370,6 +377,9 @@ func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) s
 	return sub
 }
 
+// pidOnly logs once that busctl couldn't pass a pidfd.
+var pidOnly sync.Once
+
 // polkitVersion is polkitd's own, from the Authority's BackendVersion.
 func polkitVersion(t *testing.T) int {
 	out := run(t, "busctl", "get-property", "org.freedesktop.PolicyKit1", "/org/freedesktop/PolicyKit1/Authority",
@@ -415,6 +425,14 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 	}
 	cmd.Env = append(os.Environ(), "LC_ALL=C")
 	out, err := cmd.CombinedOutput()
+	if err != nil && version >= 124 && strings.Contains(string(out), "not supported as type") {
+		// busctl before systemd 256 can't pass a file descriptor
+		// (Ubuntu 24.04's 255): ask by pid, and say so.
+		pidOnly.Do(func() {
+			t.Log("busctl can't pass a pidfd here: subjects asked by pid and start time, so rules see no system_unit")
+		})
+		return ask(t, 0, s, id)
+	}
 	if err != nil {
 		ans.Err = strings.TrimSpace(string(out))
 	} else if ans.Authorized, ans.Challenge, ans.Temporary, err = parse(string(out)); err != nil {
