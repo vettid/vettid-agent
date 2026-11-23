@@ -13,9 +13,11 @@ package admincheck
 
 import (
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -50,46 +52,64 @@ func sessionKind(t *testing.T, id string) Kind {
 	return Inactive
 }
 
-// pidSession is the logind session a process belongs to, from its cgroup.
+// pidSession is the logind session a process belongs to, as logind says
+// (sd_pid_get_session, through ps): a session scope's, or a manager-class
+// session's for the user's service manager.
 func pidSession(pid int) string {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	out, err := exec.Command("ps", "-o", "lsession=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
 		return ""
 	}
-	for _, part := range strings.Split(string(b), "/") {
-		if strings.HasPrefix(part, "session-") && strings.HasSuffix(strings.TrimSpace(part), ".scope") {
-			return strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(part), "session-"), ".scope")
-		}
+	if s := strings.TrimSpace(string(out)); s != "-" {
+		return s
 	}
 	return ""
 }
 
-// sessionProcess is a process of the member's in a logind session, from
-// the session's scope.
+// sessionProcess is a process of the member's (all four uids) that logind
+// places in the session, found in the cgroup of the session's leader and
+// below it: a session scope, or for a manager-class session, the user's
+// service manager.
 func sessionProcess(t *testing.T, u *user.User, id string) int {
-	path := fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%s.slice/session-%s.scope/cgroup.procs", u.Uid, id)
-	b, err := os.ReadFile(path)
+	leader := strings.TrimSpace(run(t, "loginctl", "show-session", id, "-p", "Leader", "--value"))
+	b, err := os.ReadFile("/proc/" + leader + "/cgroup")
 	if err != nil {
-		t.Fatalf("session %s: %v", id, err)
+		t.Errorf("session %s: its leader: %v", id, err)
+		return 0
 	}
-	for _, f := range strings.Fields(string(b)) {
-		pid, err := strconv.Atoi(f)
-		if err != nil {
-			continue
+	_, cg, _ := strings.Cut(strings.TrimSpace(string(b)), "::")
+	found := 0
+	_ = filepath.WalkDir("/sys/fs/cgroup"+cg, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || found != 0 || d.Name() != "cgroup.procs" {
+			return nil
 		}
-		st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(st), "\n") {
-			if ids := strings.Fields(strings.TrimPrefix(line, "Uid:")); strings.HasPrefix(line, "Uid:") && len(ids) == 4 &&
-				ids[0] == u.Uid && ids[1] == u.Uid && ids[2] == u.Uid && ids[3] == u.Uid {
-				return pid
+		procs, _ := os.ReadFile(path)
+		for _, f := range strings.Fields(string(procs)) {
+			if pid, err := strconv.Atoi(f); err == nil && ownedBy(pid, u.Uid) && inSession(pid, id) {
+				found = pid
+				return fs.SkipAll
 			}
 		}
-	}
-	return 0
+		return nil
+	})
+	return found
 }
+
+func ownedBy(pid int, uid string) bool {
+	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(st), "\n") {
+		if ids := strings.Fields(strings.TrimPrefix(line, "Uid:")); strings.HasPrefix(line, "Uid:") {
+			return len(ids) == 4 && ids[0] == uid && ids[1] == uid && ids[2] == uid && ids[3] == uid
+		}
+	}
+	return false
+}
+
+// inSession: logind's own answer (sd_pid_get_session, through ps).
+func inSession(pid int, id string) bool { return pidSession(pid) == id }
 
 // displaySession is the member's display session, if it is signed in.
 func displaySession(name string) string {
