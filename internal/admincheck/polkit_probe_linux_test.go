@@ -477,6 +477,37 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 	return ""
 }
 
+// subgidOverlap names a group whose gid lies in one of the member's
+// /etc/subgid ranges, or is empty.
+func subgidOverlap(t *testing.T, u *user.User) string {
+	b, err := os.ReadFile("/etc/subgid")
+	if err != nil {
+		return "" // no ranges
+	}
+	groups := run(t, "getent", "group")
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Split(strings.TrimSpace(line), ":")
+		if len(f) != 3 || (f[0] != u.Username && f[0] != u.Uid) {
+			continue
+		}
+		start, err1 := strconv.ParseUint(f[1], 10, 32)
+		n, err2 := strconv.ParseUint(f[2], 10, 32)
+		if err1 != nil || err2 != nil {
+			return "an /etc/subgid line it can't read: " + line
+		}
+		for _, g := range strings.Split(groups, "\n") {
+			gf := strings.Split(g, ":")
+			if len(gf) < 3 {
+				continue
+			}
+			if gid, err := strconv.ParseUint(gf[2], 10, 32); err == nil && gid >= start && gid < start+n {
+				return fmt.Sprintf("the member's subgid range %s holds group %s (%d)", f[1]+":"+f[2], gf[0], gid)
+			}
+		}
+	}
+	return ""
+}
+
 // heldGroups are a process's supplementary groups, sorted, as one string.
 func heldGroups(pid int) string {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
@@ -673,8 +704,13 @@ func TestPolkitProbe(t *testing.T) {
 		answers = append(answers, these...)
 	}
 	// Every process of the member's, not only the subjects: one holding
-	// groups the database doesn't give makes polkit not checked.
-	if bad := groupsDiffer(t, u); bad != "" {
+	// groups the database doesn't give makes polkit not checked; so does
+	// a subgid range of the member's that holds a real group.
+	bad := groupsDiffer(t, u)
+	if bad == "" {
+		bad = subgidOverlap(t, u)
+	}
+	if bad != "" {
 		t.Logf("%s: not checked for every subject", bad)
 		for j := range answers {
 			if answers[j].Err == "" {
