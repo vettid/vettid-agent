@@ -241,7 +241,9 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 	start := []string{"systemd-run", "--uid", u.Uid, "--gid", u.Gid, "--property=NoNewPrivileges=yes"}
 	if inManager {
 		rt := "/run/user/" + u.Uid
-		hop = []string{"systemd-run", "--uid", u.Uid, "--gid", u.Gid, "--pipe", "--wait", "--quiet", "--collect",
+		// --wait, not --pipe (passing the caller's stdio through PID 1
+		// is refused on Fedora 44); output goes to a file PID 1 writes.
+		hop = []string{"systemd-run", "--uid", u.Uid, "--gid", u.Gid, "--wait", "--quiet", "--collect",
 			"-E", "XDG_RUNTIME_DIR=" + rt, "-E", "DBUS_SESSION_BUS_ADDRESS=unix:path=" + rt + "/bus"}
 		ctl = []string{"systemctl", "--user"}
 		start = []string{"systemd-run", "--user"} // as an ordinary user service: no NoNewPrivileges
@@ -250,6 +252,21 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 		all := append(append([]string{}, hop...), cmd...)
 		return exec.Command(all[0], all[1:]...)
 	}
+	// viaOut runs cmd through the hop and returns its standard output.
+	viaOut := func(cmd ...string) string {
+		if hop == nil {
+			out, _ := exec.Command(cmd[0], cmd[1:]...).Output()
+			return string(out)
+		}
+		f := fmt.Sprintf("/run/vettid-polkit-probe-%d.out", time.Now().UnixNano())
+		defer os.Remove(f)
+		all := append(append(append([]string{}, hop...), "--property=StandardOutput=file:"+f), cmd...)
+		if err := exec.Command(all[0], all[1:]...).Run(); err != nil {
+			return ""
+		}
+		b, _ := os.ReadFile(f)
+		return string(b)
+	}
 	args := append(append([]string{}, start...), "--unit", unit, "--collect", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
 	if out, err := via(args...).CombinedOutput(); err != nil {
 		t.Logf("%s: %v\n%s", strings.Join(args, " "), err, out)
@@ -257,8 +274,8 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 	}
 	t.Cleanup(func() { _ = via(append(append([]string{}, ctl...), "stop", unit)...).Run() })
 	for i := 0; i < 50; i++ {
-		out, _ := via(append(append([]string{}, ctl...), "show", "-p", "MainPID", "--value", unit)...).Output()
-		if pid, _ := strconv.Atoi(strings.TrimSpace(string(out))); pid != 0 {
+		out := viaOut(append(append([]string{}, ctl...), "show", "-p", "MainPID", "--value", unit)...)
+		if pid, _ := strconv.Atoi(strings.TrimSpace(out)); pid != 0 {
 			// The pid came back from a hop running as the member:
 			// confirm it before asking polkitd (§11.4).
 			if inManager && !inManagerUnit(pid, u) {
@@ -370,8 +387,9 @@ func startTimeOf(stat []byte) uint64 {
 	return v
 }
 
-// groupsDiffer names a process of the member's whose held groups aren't
-// exactly the group database's, or is empty.
+// groupsDiffer names a process of the member's that holds a group the
+// group database doesn't give, or is empty. Holding fewer can't widen a
+// grant ((sd-pam), the user manager's helper, holds none).
 func groupsDiffer(t *testing.T, u *user.User) string {
 	want := dbGroups(t, u)
 	ents, _ := os.ReadDir("/proc")
@@ -380,7 +398,7 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 		if err != nil || !ownedBy(pid, u.Uid) {
 			continue
 		}
-		if held := heldGroups(pid); held != want && held != "unreadable" {
+		if held := heldGroups(pid); held != "unreadable" && !subset(held, want) {
 			return fmt.Sprintf("pid %d holds groups %q, the group database gives %q", pid, held, want)
 		}
 	}
@@ -405,6 +423,20 @@ func heldGroups(pid int) string {
 // (getgrouplist, through id), sorted, as one string.
 func dbGroups(t *testing.T, u *user.User) string {
 	return set(strings.Fields(run(t, "id", "-G", u.Username)))
+}
+
+// subset: every id of a (a set string) is in b.
+func subset(a, b string) bool {
+	in := map[string]bool{}
+	for _, id := range strings.Fields(b) {
+		in[id] = true
+	}
+	for _, id := range strings.Fields(a) {
+		if !in[id] {
+			return false
+		}
+	}
+	return true
 }
 
 // set is a list of ids without duplicates, sorted, as one string.
@@ -535,7 +567,7 @@ func TestPolkitProbe(t *testing.T) {
 		// polkitd 124 and later judge a process subject by the group
 		// database (getgrouplist), a caller on the bus by the groups its
 		// process holds: where they differ, not checked.
-		if held, want := heldGroups(s.pid), dbGroups(t, u); held != want {
+		if held, want := heldGroups(s.pid), dbGroups(t, u); !subset(held, want) {
 			t.Logf("%s: holds groups %q, the group database gives %q: sign out and in again", s.name, held, want)
 			for j := range these {
 				if these[j].Err == "" {
