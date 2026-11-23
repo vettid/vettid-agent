@@ -135,9 +135,11 @@ type Manager struct {
 	suspectGen uint64
 	verifying  *flight
 	// vaultLive is the session id the vault last named current in a
-	// vault.status: that session is used without asking the phone, even
-	// when this computer's clock (possibly the wrong one) puts its end in
-	// the past, until session_required, an end, or the next status.
+	// vault.status at a moment when this computer's clock already put its
+	// end in the past: the clock is then known to be wrong, and that
+	// session is used without asking the phone until session_required, an
+	// end, or the next status. When the clock agreed with the vault, it is
+	// not set: the session ends at its expires_at, as usual.
 	vaultLive string
 
 	// clock reads the wall clock and a monotonic clock that stops while
@@ -392,7 +394,7 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	live := a.State == pairing.AccessActive && cur.State == pairing.AccessActive && cur.SessionID == a.SessionID
 	m.mu.Lock()
 	m.vaultLive = ""
-	if live {
+	if live && !m.now().Before(a.ExpiresAt) {
 		m.vaultLive = a.SessionID
 	}
 	if m.suspectGen == gen {
@@ -411,9 +413,19 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 }
 
 // vaultNamedLocked reports whether a is the session the vault last named
-// current (m.mu held).
+// current while this computer's clock disagreed (m.mu held).
 func (m *Manager) vaultNamedLocked(a pairing.Access) bool {
 	return m.vaultLive != "" && a.State == pairing.AccessActive && a.SessionID == m.vaultLive
+}
+
+// VaultNamed reports whether a is the session the vault last named
+// current while this computer's clock put its end in the past: it is
+// live by the vault's word whatever the local clock says (for
+// internal/leash, which shows and uses the session as access does).
+func (m *Manager) VaultNamed(a pairing.Access) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.vaultNamedLocked(a)
 }
 
 // active reports whether a is a session usable at now.

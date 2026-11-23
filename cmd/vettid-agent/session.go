@@ -79,6 +79,7 @@ func (s session) run(ctx context.Context) error {
 	// may have been missed (a service restarted across a sleep).
 	mgr.Suspect()
 	grants.SetSuspected(mgr.Suspected)
+	grants.SetVaultNamed(mgr.VaultNamed)
 	if s.OnManager != nil {
 		s.OnManager(mgr)
 		defer s.OnManager(nil)

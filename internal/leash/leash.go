@@ -158,6 +158,10 @@ type Manager struct {
 	// vault.status after a resume or a clock jump (internal/access): it is
 	// then neither used nor shown as live on this computer's clock.
 	suspected func() bool
+	// vaultNamed, if set, reports whether a session is live by the vault's
+	// last word although this computer's clock puts its end in the past
+	// (internal/access VaultNamed).
+	vaultNamed func(pairing.Access) bool
 	// waitedSuspect: step held the grants' work off for the suspicion;
 	// the next status (OnStatus) wakes it.
 	waitedSuspect bool
@@ -974,7 +978,7 @@ func (m *Manager) presentable(id string, now time.Time) (*Grant, error) {
 	if m.suspended {
 		return nil, ErrSuspended
 	}
-	if m.conn == nil || !activeAt(m.conn.Access(), now) || m.suspectedLocked() {
+	if m.conn == nil || !m.sessionLiveLocked(m.conn.Access(), now) || m.suspectedLocked() {
 		return nil, ErrNoSession
 	}
 	if !m.listed {
@@ -1094,7 +1098,7 @@ func (m *Manager) step(ctx context.Context) time.Time {
 		m.mu.Unlock()
 		return now.Add(idle)
 	}
-	if m.conn == nil || m.held || !activeAt(m.conn.Access(), now) {
+	if m.conn == nil || m.held || !m.sessionLiveLocked(m.conn.Access(), now) {
 		m.mu.Unlock()
 		return now.Add(idle)
 	}
@@ -1218,3 +1222,20 @@ func (m *Manager) SetSuspected(f func() bool) {
 // suspectedLocked reports SetSuspected's answer (m.mu held; the access
 // manager takes its own lock, never this one).
 func (m *Manager) suspectedLocked() bool { return m.suspected != nil && m.suspected() }
+
+// SetVaultNamed gives the access manager's VaultNamed (internal/access):
+// a session the vault has named live while this computer's clock put its
+// end in the past is used and shown as live, as tool calls use it. Call
+// it before Run.
+func (m *Manager) SetVaultNamed(f func(pairing.Access) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.vaultNamed = f
+}
+
+// sessionLiveLocked reports whether a is a live session at now (m.mu
+// held): by the local clock, or by the vault's last word when the local
+// clock disagrees.
+func (m *Manager) sessionLiveLocked(a pairing.Access, now time.Time) bool {
+	return activeAt(a, now) || (m.vaultNamed != nil && m.vaultNamed(a))
+}

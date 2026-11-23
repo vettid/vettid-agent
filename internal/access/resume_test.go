@@ -385,3 +385,26 @@ func TestStartVerifiesSuspect(t *testing.T) {
 		t.Fatalf("sent %v, suspect %v", f.sent, m.Suspected())
 	}
 }
+
+// With a correct clock (the vault's expires_at still ahead of it when
+// the vault named the session), the session ends at its expires_at as
+// usual: past it, the usual request goes out; it is not held on the
+// vault's word.
+func TestVaultNamedEndsAtExpiryWithGoodClock(t *testing.T) {
+	f, c, m := setup(pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)})
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(30*time.Minute).Format(time.RFC3339)+`"}}`))
+	m.Suspect()
+	if err := ensure(t, m); err != nil {
+		t.Fatal(err)
+	}
+	if m.VaultNamed(f.Access()) {
+		t.Fatal("held on the vault's word though the clock agreed")
+	}
+	c.add(31 * time.Minute) // past the session's end, the clock still right
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) {
+		t.Fatalf("past its end: %v, want the usual request", err)
+	}
+	if f.count("device.session.request") != 1 {
+		t.Fatalf("sent %v", f.sent)
+	}
+}

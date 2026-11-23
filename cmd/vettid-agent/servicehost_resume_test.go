@@ -36,7 +36,7 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 	running := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	h := &serviceHost{Dir: dir, IdleStop: time.Minute, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
 		resolve:    func(string) state.Protector { return cmdTestProtector{} },
@@ -59,7 +59,18 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 			}
 		})
 	}()
-	t.Cleanup(func() { cancel(); <-th.done })
+	// The handler is released before Serve is waited for: cleanups run
+	// last in, first out, so a separate release cleanup would run after
+	// this one, and a failed check would leave the test hanging.
+	t.Cleanup(func() {
+		unblock()
+		cancel()
+		select {
+		case <-th.done:
+		case <-time.After(10 * time.Second):
+			t.Error("the host did not stop")
+		}
+	})
 	h.Resumed() // no session yet: nothing to tell
 	fc := th.connect(t, channel.OpMCP)
 	fc.waitAnswer(t)
@@ -75,7 +86,7 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 	if !m.Suspected() {
 		t.Fatal("the running session's access manager was not told of the resume")
 	}
-	releaseOnce.Do(func() { close(release) })
+	unblock()
 	select {
 	case <-fc.closed:
 	case <-time.After(5 * time.Second):

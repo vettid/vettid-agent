@@ -93,7 +93,10 @@ func (m *Manager) ConnectionInfo() Info {
 	switch {
 	case m.suspectedLocked():
 		// After a resume or a clock jump, until the vault answers: unknown.
-	case activeAt(a, now):
+	case m.sessionLiveLocked(a, now):
+		// Live by the local clock, or by the vault's last word when the
+		// local clock disagrees (then its end is the vault's, which this
+		// clock puts in the past).
 		in.AccessSession = "active"
 		in.AccessSessionUntil = timePtr(a.ExpiresAt)
 	case a.State == pairing.AccessActive, a.State == pairing.AccessNone:

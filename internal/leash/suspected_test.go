@@ -3,6 +3,9 @@ package leash
 import (
 	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/vettid/vettid-agent/internal/pairing"
 )
 
 // After a resume or a clock jump, until the vault answers
@@ -63,5 +66,36 @@ func TestSuspicionEndWakes(t *testing.T) {
 	case <-e.m.wake:
 		t.Fatal("woken with nothing held off")
 	default:
+	}
+}
+
+// A session the vault named live while this computer's clock put its end
+// in the past is shown and used as live, as tool calls use it; without
+// the vault's word, the local clock decides.
+func TestVaultNamedSessionShownAndUsed(t *testing.T) {
+	e := newEnv(t)
+	now := e.c.Now()
+	g1 := grant(t, now, spec{id: gid(1)})
+	e.listing(t, false, g1)
+	mustPresent(t, e, gid(1))
+	ended := now.Add(-time.Minute)
+	e.f.mu.Lock()
+	e.f.access = pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: ended}
+	e.f.mu.Unlock()
+	if in := e.m.ConnectionInfo(); in.AccessSession != "none" {
+		t.Fatalf("by the local clock: %+v", in)
+	}
+	refused(t, e, gid(1), ErrNoSession)
+	var named atomic.Bool
+	named.Store(true)
+	e.m.SetVaultNamed(func(a pairing.Access) bool { return named.Load() && a.SessionID == "s1" })
+	in := e.m.ConnectionInfo()
+	if in.AccessSession != "active" || in.AccessSessionUntil == nil || !in.AccessSessionUntil.Equal(ended) {
+		t.Fatalf("by the vault's word: %+v", in)
+	}
+	mustPresent(t, e, gid(1))
+	named.Store(false)
+	if in := e.m.ConnectionInfo(); in.AccessSession != "none" {
+		t.Fatalf("after the vault's word lapsed: %+v", in)
 	}
 }
