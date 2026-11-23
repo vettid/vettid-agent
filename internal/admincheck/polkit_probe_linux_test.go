@@ -429,7 +429,7 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 		// busctl before systemd 256 can't pass a file descriptor
 		// (Ubuntu 24.04's 255): ask by pid, and say so.
 		pidOnly.Do(func() {
-			t.Log("busctl can't pass a pidfd here: subjects asked by pid and start time, so rules see no system_unit")
+			t.Log("busctl can't pass a pidfd here: every subject asked by pid and start time instead, so rules on system_unit and no_new_privileges go unexercised")
 		})
 		return ask(t, 0, s, id)
 	}
