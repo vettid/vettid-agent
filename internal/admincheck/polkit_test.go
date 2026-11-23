@@ -1,6 +1,7 @@
 package admincheck
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -616,7 +617,11 @@ func TestArch(t *testing.T) {
 		{"gvfsd-admin at /usr/lib while operations challenge", []Answer{{Action: helper, Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Challenge: true}}, helper, Report},
 		{"gvfsd-admin at /usr/lib while operations are granted", []Answer{{Action: helper, Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Authorized: true}}, helper, Refuse},
 		{"another id running /usr/lib/gvfsd-admin", []Answer{{Action: "org.x.other", Kind: Active, Subject: "s", Authorized: true}, {Action: ops, Kind: Active, Subject: "s", Challenge: true}}, "org.x.other", Refuse},
-		{"a cancel, active", []Answer{{Action: cancel, Kind: Active, Subject: "s", Authorized: true}}, cancel, Report},
+		// systemd 261's yes for an active session refuses: a cancel can be
+		// repeated, so anything running as the member could keep every
+		// update from installing (the owner, GC #16894).
+		{"a cancel, active, without the rules file", []Answer{{Action: cancel, Kind: Active, Subject: "s", Authorized: true}}, cancel, Refuse},
+		{"a cancel, active, with the rules file (asks for an administrator)", []Answer{{Action: cancel, Kind: Active, Subject: "s", Challenge: true}}, cancel, Nothing},
 		{"a cancel, inactive", []Answer{{Action: cancel, Kind: Inactive, Subject: "s", Authorized: true}}, cancel, Refuse},
 		{"a cancel, no session", []Answer{{Action: cancel, Kind: NoSession, Subject: "s", Authorized: true}}, cancel, Refuse},
 	} {
@@ -630,9 +635,17 @@ func TestArch(t *testing.T) {
 			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
+	rules, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, id := range []string{"cancel-check", "cancel-update", "cancel-update-to-version", "cancel-vacuum"} {
-		if !RecordedYes["org.freedesktop.sysupdate1."+id][Active] || RecordedYes["org.freedesktop.sysupdate1."+id][Inactive] {
-			t.Errorf("%s not recorded yes for active only", id)
+		id = "org.freedesktop.sysupdate1." + id
+		if len(RecordedYes[id]) != 0 {
+			t.Errorf("%s recorded yes", id)
+		}
+		if !strings.Contains(string(rules), `case "`+id+`":`) {
+			t.Errorf("%s not in the rules file", id)
 		}
 	}
 }

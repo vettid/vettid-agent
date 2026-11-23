@@ -456,12 +456,6 @@ var RecordedYes = map[string]map[Kind]bool{
 	"org.freedesktop.home1.update-home-by-owner": {Active: true},
 	// systemd 259's allow_active is yes
 	"org.freedesktop.machine1.register-machine": {Active: true},
-	// systemd 261's allow_active is yes: a cancel only signals a running
-	// update job to stop (the owner's call, GC #16724)
-	"org.freedesktop.sysupdate1.cancel-check":             {Active: true},
-	"org.freedesktop.sysupdate1.cancel-update":            {Active: true},
-	"org.freedesktop.sysupdate1.cancel-update-to-version": {Active: true},
-	"org.freedesktop.sysupdate1.cancel-vacuum":            {Active: true},
 }
 
 // ExecPathAllow names the fixed helpers an exec.path action may run (§11.4).

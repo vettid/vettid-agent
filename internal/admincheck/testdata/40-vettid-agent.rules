@@ -15,6 +15,10 @@ polkit.addRule(function(action, subject) {
     case "org.opensuse.cupspkhelper.mechanism.printer-local-edit":
     case "org.opensuse.cupspkhelper.mechanism.printer-remote-edit":
     case "org.opensuse.cupspkhelper.mechanism.server-settings":
+    case "org.freedesktop.sysupdate1.cancel-check":
+    case "org.freedesktop.sysupdate1.cancel-update":
+    case "org.freedesktop.sysupdate1.cancel-update-to-version":
+    case "org.freedesktop.sysupdate1.cancel-vacuum":
         return polkit.Result.AUTH_ADMIN;
     }
 });
