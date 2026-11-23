@@ -64,6 +64,34 @@ func pidSession(pid int) string {
 	return ""
 }
 
+// sessionProcess is a process of the member's in a logind session, from
+// the session's scope.
+func sessionProcess(t *testing.T, u *user.User, id string) int {
+	path := fmt.Sprintf("/sys/fs/cgroup/user.slice/user-%s.slice/session-%s.scope/cgroup.procs", u.Uid, id)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("session %s: %v", id, err)
+	}
+	for _, f := range strings.Fields(string(b)) {
+		pid, err := strconv.Atoi(f)
+		if err != nil {
+			continue
+		}
+		st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(st), "\n") {
+			if ids := strings.Fields(strings.TrimPrefix(line, "Uid:")); strings.HasPrefix(line, "Uid:") && len(ids) == 4 &&
+				ids[0] == u.Uid && ids[1] == u.Uid && ids[2] == u.Uid && ids[3] == u.Uid {
+				return pid
+			}
+		}
+	}
+	t.Fatalf("session %s: no process of %s's in it", id, u.Username)
+	return 0
+}
+
 // displaySession is the member's display session, if it is signed in.
 func displaySession(name string) string {
 	out, err := exec.Command("loginctl", "show-user", name, "-p", "Display").Output()
@@ -91,9 +119,14 @@ func subjects(t *testing.T, u *user.User) []subject {
 	for _, line := range strings.Split(run(t, "loginctl", "list-sessions", "--no-legend"), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 3 && f[1] == u.Uid {
+			// Asked by a process of the member's in the session, which
+			// polkit judges by that session: polkitd 124 on Ubuntu 24.04
+			// aborts on a unix-session subject. (Not the leader: a tty
+			// session's leader is login, running as root.)
+			pid := sessionProcess(t, u, f[0])
 			out = append(out, subject{
-				name: "session " + f[0],
-				arg:  fmt.Sprintf("('unix-session', {'session-id': <'%s'>})", f[0]),
+				name: fmt.Sprintf("session %s (pid %d)", f[0], pid),
+				arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
 				kind: sessionKind(t, f[0]),
 			})
 		}
