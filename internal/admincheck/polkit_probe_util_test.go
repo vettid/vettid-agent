@@ -106,3 +106,28 @@ func TestMemberDropIns(t *testing.T) {
 		t.Error("no drop-ins: refused")
 	}
 }
+
+// subset: every id of a (a set string) is in b.
+func subset(a, b string) bool {
+	in := map[string]bool{}
+	for _, id := range strings.Fields(b) {
+		in[id] = true
+	}
+	for _, id := range strings.Fields(a) {
+		if !in[id] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSubset(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{{"", "10 1001", true}, {"1001", "10 1001", true}, {"10 1001", "10 1001", true}, {"10 1001 27", "10 1001", false}, {"5", "", false}} {
+		if got := subset(c.a, c.b); got != c.want {
+			t.Errorf("subset(%q, %q) = %v", c.a, c.b, got)
+		}
+	}
+}

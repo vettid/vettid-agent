@@ -453,9 +453,18 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 		if err != nil || !ownedBy(pid, u.Uid) {
 			continue
 		}
-		if held := heldGroups(pid); held != "unreadable" && held != want && !(held == "" && sdPam(pid, u)) {
-			return fmt.Sprintf("pid %d holds groups %q, the group database gives %q", pid, held, want)
+		held := heldGroups(pid)
+		if held == "unreadable" || held == want || (held == "" && sdPam(pid, u)) {
+			continue
 		}
+		// Outside the first user namespace (a rootless container) fewer
+		// groups are accepted; a group beyond the database's still
+		// refuses (the lead's call, GC #16712).
+		if !inFirstUserNS(pid) && subset(held, want) {
+			continue
+		}
+		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		return fmt.Sprintf("pid %d (%s) holds groups %q, the group database gives %q", pid, strings.TrimSpace(string(comm)), held, want)
 	}
 	return ""
 }
@@ -480,13 +489,18 @@ func dbGroups(t *testing.T, u *user.User) string {
 	return set(strings.Fields(run(t, "id", "-G", u.Username)))
 }
 
+// inFirstUserNS: the process shares PID 1's user namespace.
+func inFirstUserNS(pid int) bool {
+	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
+	first, err2 := os.Readlink("/proc/1/ns/user")
+	return err1 == nil && err2 == nil && ns == first
+}
+
 // sdPam: the process is (sd-pam), a child of the member's manager, in
 // the first user namespace (a name and a parent can be had by any unit's
 // process; dropping groups needs a namespace of one's own).
 func sdPam(pid int, u *user.User) bool {
-	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
-	init, err2 := os.Readlink("/proc/1/ns/user")
-	if err1 != nil || err2 != nil || ns != init {
+	if !inFirstUserNS(pid) {
 		return false
 	}
 	comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
