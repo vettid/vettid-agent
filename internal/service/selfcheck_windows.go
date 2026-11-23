@@ -109,8 +109,15 @@ func SelfCheck(n string) (Token, error) {
 	return t, Check(t, channel.ServiceSID(channel.ServiceName(n)))
 }
 
-// seGroupIntegrity marks a token's mandatory label among its groups.
-const seGroupIntegrity = 0x20
+// Group attributes: a token's mandatory label (SE_GROUP_INTEGRITY), and
+// its logon SID (SE_GROUP_LOGON_ID).
+const (
+	seGroupIntegrity = 0x20
+	seGroupLogonID   = 0xC0000000
+)
+
+// highLabel is the integrity label the measured token holds (High).
+const highLabel = "S-1-16-12288"
 
 // defaultGroups are the groups a virtual service account's token holds
 // besides its logon SID and its integrity label: measured on
@@ -132,9 +139,10 @@ var defaultGroups = map[string]string{
 // Check refuses a token that is not the service's own (serviceSID), that
 // holds any privilege but SeChangeNotifyPrivilege, that holds
 // Administrators in any form (enabled or deny-only), or that holds any
-// group beyond defaultGroups, the service's own SID, a logon SID
-// (S-1-5-5-x-y) and its integrity label. Every privilege and group is
-// checked, so a Windows build that adds one fails closed.
+// group beyond exactly the measured set: defaultGroups by SID, one logon
+// SID (S-1-5-5-x-y, marked as the logon SID), and the High label (marked
+// as the label). Every privilege and group is checked, so a Windows build
+// that adds one fails closed.
 func Check(t Token, serviceSID string) error {
 	if !strings.EqualFold(t.User, serviceSID) {
 		return &CheckError{Code: CodeWrongAccount, Detail: fmt.Sprintf("the service runs as %s, not as its own account %s", t.User, serviceSID)}
@@ -149,12 +157,15 @@ func Check(t Token, serviceSID string) error {
 		return &CheckError{Code: CodePrivileges, Detail: "the service holds privileges beyond " + changeNotify + ": " + strings.Join(extra, ", ")}
 	}
 	var groups []string
+	logon := 0
 	for _, g := range t.Groups {
 		switch {
 		case g.SID == "S-1-5-32-544":
 			return &CheckError{Code: CodeAdministrators, Detail: "the service's account is in Administrators"}
-		case strings.EqualFold(g.SID, serviceSID), defaultGroups[g.SID] != "", isLogonSID(g.SID):
-		case g.Attributes&seGroupIntegrity != 0 && strings.HasPrefix(g.SID, "S-1-16-"):
+		case defaultGroups[g.SID] != "":
+		case isLogonSID(g.SID) && g.Attributes&seGroupLogonID == seGroupLogonID && logon == 0:
+			logon++
+		case g.SID == highLabel && g.Attributes&seGroupIntegrity != 0:
 		default:
 			groups = append(groups, g.SID)
 		}

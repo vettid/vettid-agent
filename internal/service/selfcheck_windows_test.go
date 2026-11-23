@@ -28,7 +28,7 @@ func okToken() Token {
 		User:       testServiceSID,
 		Privileges: []string{changeNotify},
 		Groups: []Group{
-			{SID: "S-1-16-12288", Attributes: seGroupIntegrity},
+			{SID: "S-1-16-12288", Attributes: 0x60},
 			{SID: "S-1-1-0", Attributes: 7},
 			{SID: "S-1-5-32-545", Attributes: 7},
 			{SID: "S-1-5-6", Attributes: 7},
@@ -37,7 +37,6 @@ func okToken() Token {
 			{SID: "S-1-2-1", Attributes: 7},
 			{SID: "S-1-5-11", Attributes: 7},
 			{SID: "S-1-5-15", Attributes: 7},
-			{SID: testServiceSID, Attributes: 0xe},
 			{SID: "S-1-5-80-0", Attributes: 7},
 		},
 	}
@@ -89,6 +88,27 @@ func TestCheck(t *testing.T) {
 		tok.Groups = append(tok.Groups, Group{SID: g, Attributes: 7})
 		checkCode(t, tok, CodeExtraGroup)
 	}
+
+	// Beyond the measured set: another label, a label SID without the
+	// label's attribute, a second logon SID, a logon SID not marked as
+	// one, and the service's own SID as a group.
+	for _, g := range []Group{
+		{SID: "S-1-16-16384", Attributes: 0x60},
+		{SID: "S-1-16-8192", Attributes: 0x60},
+		{SID: "S-1-5-5-0-999", Attributes: 0xc0000007},
+		{SID: testServiceSID, Attributes: 0xe},
+	} {
+		tok := okToken()
+		tok.Groups = append(tok.Groups, g)
+		checkCode(t, tok, CodeExtraGroup)
+	}
+	tok = okToken()
+	for i, g := range tok.Groups {
+		if isLogonSID(g.SID) {
+			tok.Groups[i].Attributes = 7
+		}
+	}
+	checkCode(t, tok, CodeExtraGroup)
 
 	tok = okToken()
 	tok.User = "S-1-5-80-9-9-9-9-9"
