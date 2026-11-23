@@ -84,7 +84,8 @@ func (th *testHost) connect(t *testing.T, op channel.Op) *fakeClient {
 			fc.answer <- err.Error()
 			return closeS()
 		},
-		close: closeS,
+		close:       closeS,
+		setDeadline: server.SetDeadline,
 	}
 	select {
 	case th.clients <- c:
@@ -201,11 +202,9 @@ func TestHostOneAtATime(t *testing.T) {
 	if a := first.waitAnswer(t); a != "accept" {
 		t.Fatalf("first: %s", a)
 	}
-	for _, op := range []channel.Op{channel.OpMCP, channel.OpPair, channel.OpForget} {
-		fc := th.connect(t, op)
-		if a := fc.waitAnswer(t); a != channel.ErrInUse.Error() {
-			t.Fatalf("%s while a stub is served: %s, want in use", op, a)
-		}
+	second := th.connect(t, channel.OpMCP)
+	if a := second.waitAnswer(t); a != channel.ErrInUse.Error() {
+		t.Fatalf("a second stub: %s, want in use", a)
 	}
 	// status is answered meanwhile.
 	st := th.connect(t, channel.OpStatus)
@@ -221,26 +220,169 @@ func TestHostOneAtATime(t *testing.T) {
 	if text, code := st.console(t); code != 0 || !strings.Contains(text, "Not paired") {
 		t.Fatalf("status: %d %q", code, text)
 	}
-	first.Close()
-	select {
-	case <-first.closed:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the host did not close the first stub's connection")
+}
+
+// An administrator's forget (or pair) comes before the member's agent:
+// the stub's session is ended, then forget runs, and no stub is taken
+// until it has.
+func TestHostAdminPreemptsStub(t *testing.T) {
+	th := startHost(t, time.Minute)
+	first := th.connect(t, channel.OpMCP)
+	if a := first.waitAnswer(t); a != "accept" {
+		t.Fatalf("stub: %s", a)
 	}
-	// forget holds the place: a stub is refused until it ends.
 	fg := th.connect(t, channel.OpForget)
 	if a := fg.waitAnswer(t); a != "accept" {
-		t.Fatalf("forget: %s", a)
+		t.Fatalf("forget while a stub is served: %s, want accept", a)
+	}
+	select {
+	case <-first.closed:
+	default:
+		t.Fatal("forget was accepted before the stub's session ended")
 	}
 	stub := th.connect(t, channel.OpMCP)
 	if a := stub.waitAnswer(t); a != channel.ErrInUse.Error() {
 		t.Fatalf("a stub while forget runs: %s, want in use", a)
+	}
+	pr := th.connect(t, channel.OpPair)
+	if a := pr.waitAnswer(t); a != channel.ErrInUse.Error() {
+		t.Fatalf("pair while forget runs: %s, want in use", a)
 	}
 	if err := channel.SendRequest(fg, channel.Request{}); err != nil {
 		t.Fatal(err)
 	}
 	if text, code := fg.console(t); code != 0 || !strings.Contains(text, "Nothing to forget") {
 		t.Fatalf("forget: %d %q", code, text)
+	}
+	// Then a stub is served again.
+	again := th.connect(t, channel.OpMCP)
+	if a := again.waitAnswer(t); a != "accept" {
+		t.Fatalf("a stub after forget: %s", a)
+	}
+}
+
+// A status client that never sends its request is closed after
+// requestWait, and gives its hold back.
+func TestHostSilentStatusClosed(t *testing.T) {
+	old := requestWait
+	requestWait = 200 * time.Millisecond
+	t.Cleanup(func() { requestWait = old })
+	th := startHost(t, time.Minute)
+	st := th.connect(t, channel.OpStatus)
+	st.waitAnswer(t)
+	select {
+	case <-st.closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a silent status client was not closed")
+	}
+	for end := time.Now().Add(5 * time.Second); th.h.Held() != 0; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatalf("held %d after the silent client was closed", th.h.Held())
+		}
+	}
+}
+
+// Clients that say nothing, or don't read their answers, don't keep the
+// host from stopping: on stop it closes them. (requestWait is long here,
+// so the close, not the deadline, is what ends them.)
+func TestHostStopClosesClients(t *testing.T) {
+	old := requestWait
+	requestWait = time.Hour
+	t.Cleanup(func() { requestWait = old })
+	th := startHost(t, time.Minute)
+	st := th.connect(t, channel.OpStatus)
+	st.waitAnswer(t)
+	fg := th.connect(t, channel.OpForget)
+	fg.waitAnswer(t)
+	stub := th.connect(t, channel.OpMCP)
+	stub.waitAnswer(t) // in use (forget holds the place): refused and closed
+	th.cancel()
+	start := time.Now()
+	if err := th.waitStopped(t, 10*time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve = %v", err)
+	}
+	t.Logf("stopped in %v with silent clients", time.Since(start))
+	for _, c := range []*fakeClient{st, fg} {
+		select {
+		case <-c.closed:
+		default:
+			t.Fatal("a client was left open")
+		}
+	}
+}
+
+// A stub that sends but never reads its answers doesn't keep the host
+// from stopping either (the not-paired path goes through stopSession).
+func TestHostStopNonReadingStub(t *testing.T) {
+	th := startHost(t, time.Minute)
+	stub := th.connect(t, channel.OpMCP)
+	stub.waitAnswer(t)
+	go func() {
+		for i := 0; i < 50; i++ {
+			if _, err := io.WriteString(stub, msgCall+"\n"); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	th.cancel()
+	if err := th.waitStopped(t, 15*time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Serve = %v", err)
+	}
+}
+
+// A client handed over just as the idle timer fires is served, not
+// dropped; the host stops once it has left.
+func TestHostIdleRaceServesClient(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	h := &serviceHost{Dir: dir, IdleStop: 100 * time.Millisecond, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+	server, client := net.Pipe()
+	defer client.Close()
+	answered := make(chan string, 1)
+	var once sync.Once
+	done := make(chan error, 1)
+	go func() {
+		done <- h.Serve(context.Background(), func(ctx context.Context) (*hostConn, error) {
+			// The channel had admitted a client when the stop began: it is
+			// handed over after accept's context ended.
+			<-ctx.Done()
+			var c *hostConn
+			once.Do(func() {
+				c = &hostConn{rw: server, op: channel.OpStatus,
+					accept:      func() error { answered <- "accept"; return nil },
+					refuse:      func(err error) error { answered <- err.Error(); return server.Close() },
+					close:       server.Close,
+					setDeadline: server.SetDeadline}
+			})
+			if c == nil {
+				return nil, ctx.Err()
+			}
+			return c, nil
+		})
+	}()
+	select {
+	case a := <-answered:
+		if a != "accept" {
+			t.Fatalf("answer %s", a)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client handed over at the stop was dropped")
+	}
+	if err := channel.SendRequest(client, channel.Request{}); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if code, err := channel.Relay(client, &out); err != nil || code != 0 {
+		t.Fatalf("status: %d %v %q", code, err, out.String())
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, errIdle) {
+			t.Fatalf("Serve = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the host did not stop after the client left")
 	}
 }
 

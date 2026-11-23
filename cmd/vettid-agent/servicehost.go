@@ -38,13 +38,26 @@ const (
 // (chosen; not in the spec: "a while", AGENT-SEPARATE-ACCOUNT §5).
 const defaultIdleStop = 5 * time.Minute
 
+var (
+	// requestWait bounds status, forget and pair until their request
+	// line is read (status and forget for their whole exchange), so that
+	// a client that says nothing holds neither a place nor the stop
+	// (chosen; not in the spec).
+	requestWait = 10 * time.Second
+	// preemptWait bounds how long an administrator's pair or forget waits
+	// for the stub's session it ended (chosen; not in the spec; the
+	// session's own stop is bounded by 2 × mcpStopWait).
+	preemptWait = 10 * time.Second
+)
+
 // hostConn is one admitted client of the channel.
 type hostConn struct {
-	rw     io.ReadWriter
-	op     channel.Op
-	accept func() error          // the operation may start
-	refuse func(err error) error // refused, and closed
-	close  func() error
+	rw          io.ReadWriter
+	op          channel.Op
+	accept      func() error          // the operation may start
+	refuse      func(err error) error // refused, and closed
+	close       func() error          // may be called more than once
+	setDeadline func(time.Time) error
 }
 
 // serviceHost runs one pairing's connector service.
@@ -66,10 +79,15 @@ type serviceHost struct {
 
 	store *state.Store
 
-	mu        sync.Mutex
-	mcpActive bool // a stub's session runs
-	exclusive bool // pair or forget runs
+	mu sync.Mutex
+	// The stub's session, if one runs: end ends it, and done is closed
+	// once it has.
+	mcpActive bool
+	mcpEnd    context.CancelFunc
+	mcpDone   chan struct{}
+	exclusive bool // pair or forget runs, or waits for the stub's session to end
 	holds     int  // clients being served, and what else holds the host
+	conns     map[*hostConn]struct{}
 	idle      chan struct{}
 }
 
@@ -110,11 +128,47 @@ func (h *serviceHost) Held() int {
 // errIdle: the host stopped because nothing held it for IdleStop.
 var errIdle = errors.New("idle")
 
+func (h *serviceHost) track(c *hostConn) {
+	h.mu.Lock()
+	if h.conns == nil {
+		h.conns = map[*hostConn]struct{}{}
+	}
+	h.conns[c] = struct{}{}
+	h.mu.Unlock()
+}
+
+func (h *serviceHost) untrack(c *hostConn) {
+	h.mu.Lock()
+	delete(h.conns, c)
+	h.mu.Unlock()
+}
+
+// closeAll closes every client still being served: on stop, nothing a
+// client does or fails to do (read its answers, send its request) keeps
+// its handler, and so the stop, waiting.
+func (h *serviceHost) closeAll() {
+	h.mu.Lock()
+	cs := make([]*hostConn, 0, len(h.conns))
+	for c := range h.conns {
+		cs = append(cs, c)
+	}
+	h.mu.Unlock()
+	for _, c := range cs {
+		_ = c.close()
+	}
+}
+
 // Serve opens the state directory and serves the clients accept returns
 // until ctx ends (it then returns ctx's error), accept fails (its error),
-// or nothing has held the host for IdleStop (errIdle). Every client's
-// operation has ended when it returns, and the state directory is
-// closed.
+// or nothing has held the host for IdleStop (errIdle). When it returns,
+// every client has been closed, every operation has ended, and the state
+// directory is closed.
+//
+// The idle stop stops taking clients first; a client accept had already
+// handed over is served, and the host stops once it and every other hold
+// have ended. A client the channel admitted but accept had not handed
+// over is closed with the channel, unanswered; the stub then starts the
+// service again (startService).
 func (h *serviceHost) Serve(ctx context.Context, accept func(context.Context) (*hostConn, error)) error {
 	store, err := state.Open(h.Dir)
 	if err != nil {
@@ -130,25 +184,34 @@ func (h *serviceHost) Serve(ctx context.Context, accept func(context.Context) (*
 		idleStop = defaultIdleStop
 	}
 	ctx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
+	acceptCtx, stopAccept := context.WithCancel(ctx)
 	var wg sync.WaitGroup
-	defer wg.Wait()
+	defer func() {
+		cancel(nil)
+		stopAccept()
+		h.closeAll()
+		wg.Wait()
+	}()
+	acceptDone := make(chan struct{})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		defer close(acceptDone)
 		for {
-			c, err := accept(ctx)
+			c, err := accept(acceptCtx)
 			if err != nil {
-				if ctx.Err() == nil {
+				if acceptCtx.Err() == nil {
 					cancel(err)
 				}
 				return
 			}
 			h.Hold()
+			h.track(c)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				defer h.Release()
+				defer h.untrack(c)
 				h.handle(ctx, c)
 			}()
 		}
@@ -164,10 +227,20 @@ func (h *serviceHost) Serve(ctx context.Context, accept func(context.Context) (*
 				t.Reset(idleStop)
 			}
 		case <-t.C:
-			if h.Held() == 0 {
-				cancel(errIdle)
-				return errIdle
+			if h.Held() != 0 {
+				continue
 			}
+			// Stop taking clients; one handed over meanwhile is served.
+			stopAccept()
+			<-acceptDone
+			for h.Held() != 0 {
+				select {
+				case <-ctx.Done():
+					return context.Cause(ctx)
+				case <-h.idle:
+				}
+			}
+			return errIdle
 		}
 	}
 }
@@ -176,34 +249,39 @@ func (h *serviceHost) Serve(ctx context.Context, accept func(context.Context) (*
 func (h *serviceHost) handle(ctx context.Context, c *hostConn) {
 	switch c.op {
 	case channel.OpMCP:
-		if !h.claim(&h.mcpActive) {
+		sessCtx, end := context.WithCancel(ctx)
+		defer end()
+		done := make(chan struct{})
+		if !h.claimSession(end, done) {
 			_ = c.refuse(channel.ErrInUse)
 			return
 		}
-		defer h.unclaim(&h.mcpActive)
+		defer h.releaseSession(done)
 		defer c.close()
 		if c.accept() != nil {
 			return
 		}
-		h.runSession(ctx, c.rw)
+		h.runSession(sessCtx, c.rw)
 	case channel.OpStatus:
 		defer c.close()
+		_ = c.setDeadline(time.Now().Add(requestWait))
 		if c.accept() != nil {
 			return
 		}
 		h.status(c.rw)
 	case channel.OpPair, channel.OpForget:
-		if !h.claim(&h.exclusive) {
+		if !h.claimExclusive(ctx, c.op) {
 			_ = c.refuse(channel.ErrInUse)
 			return
 		}
-		defer h.unclaim(&h.exclusive)
+		defer h.releaseExclusive()
 		defer c.close()
+		_ = c.setDeadline(time.Now().Add(requestWait))
 		if c.accept() != nil {
 			return
 		}
 		if c.op == channel.OpPair {
-			h.pair(ctx, c.rw)
+			h.pair(ctx, c.rw, func() { _ = c.setDeadline(time.Time{}) })
 		} else {
 			h.forget(c.rw)
 		}
@@ -212,35 +290,87 @@ func (h *serviceHost) handle(ctx context.Context, c *hostConn) {
 	}
 }
 
-// claim sets *flag if neither a session nor pair or forget runs: one
-// stub at a time, and pair and forget only while no stub is served.
-func (h *serviceHost) claim(flag *bool) bool {
+// claimSession takes the stub's place: one stub at a time, and none while
+// pair or forget runs or waits.
+func (h *serviceHost) claimSession(end context.CancelFunc, done chan struct{}) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.mcpActive || h.exclusive {
 		return false
 	}
-	*flag = true
+	h.mcpActive, h.mcpEnd, h.mcpDone = true, end, done
 	return true
 }
 
-func (h *serviceHost) unclaim(flag *bool) {
+func (h *serviceHost) releaseSession(done chan struct{}) {
 	h.mu.Lock()
-	*flag = false
+	h.mcpActive, h.mcpEnd, h.mcpDone = false, nil, nil
+	h.mu.Unlock()
+	close(done)
+}
+
+// claimExclusive takes pair's or forget's place. An administrator's pair
+// or forget comes before the member's agent: a stub's session that runs
+// is ended first, and no new stub is taken meanwhile. It fails only if
+// another pair or forget runs, or the session did not end within
+// preemptWait.
+func (h *serviceHost) claimExclusive(ctx context.Context, op channel.Op) bool {
+	h.mu.Lock()
+	if h.exclusive {
+		h.mu.Unlock()
+		return false
+	}
+	h.exclusive = true
+	end, done := h.mcpEnd, h.mcpDone
+	h.mu.Unlock()
+	if done == nil {
+		return true
+	}
+	h.Log.Info("an administrator's command ends the stub's session", "op", string(op))
+	end()
+	t := time.NewTimer(preemptWait)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	h.releaseExclusive()
+	return false
+}
+
+func (h *serviceHost) releaseExclusive() {
+	h.mu.Lock()
+	h.exclusive = false
 	h.mu.Unlock()
 }
 
 // runSession serves one stub: the paired record's MCP session over rw,
-// or, with no finished pairing, every tool answered not_paired.
+// or, with no finished pairing, every tool answered not_paired. It ends
+// when ctx does, within stopSession's bounds.
 func (h *serviceHost) runSession(ctx context.Context, rw io.ReadWriter) {
 	logger := h.Log
 	rec, err := h.loadRecord()
 	if err != nil {
-		logger.Warn("no MCP session", "err", err)
+		logger.Warn("no MCP session", "code", codeNotPaired)
 		srv := mcp.New(mcp.Options{Unavailable: &request.Error{Code: codeNotPaired, Text: textNotPaired}, Version: readVersion().Version, Log: logger})
-		_ = srv.Serve(ctx, rw, rw)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = srv.Serve(ctx, rw, rw)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+			stopSession(done, rw, logger)
+		}
 		return
 	}
+	defer func() {
+		clear(rec.Device)
+		clear(rec.Leash)
+	}()
 	err = session{
 		Store:         h.store,
 		Resolve:       h.Protectors.Resolve,
@@ -258,7 +388,8 @@ func (h *serviceHost) runSession(ctx context.Context, rw io.ReadWriter) {
 	}
 }
 
-// loadRecord reads the finished pairing.
+// loadRecord reads the finished pairing. The caller clears its Device
+// and Leash when done; a record that is not paired is cleared here.
 func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 	ok, err := h.store.Exists()
 	if err != nil {
@@ -277,6 +408,8 @@ func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 		return nil, err
 	}
 	if rec.Phase != pairing.PhasePaired {
+		clear(rec.Device)
+		clear(rec.Leash)
 		return nil, vaultconn.ErrNotPaired
 	}
 	return rec, nil
@@ -313,11 +446,14 @@ func (h *serviceHost) status(rw io.ReadWriter) {
 	}
 	writeStatus(out, h.Dir, v, rec, time.Now())
 	clear(rec.Device)
+	clear(rec.Leash)
 	out.exit(0)
 }
 
 // pair answers `pair --name`: the request carries the code once.
-func (h *serviceHost) pair(ctx context.Context, rw io.ReadWriter) {
+// requestRead lifts the request's deadline once it is read: a pairing
+// waits for the member's phone.
+func (h *serviceHost) pair(ctx context.Context, rw io.ReadWriter, requestRead func()) {
 	out := &consoleWriter{w: rw}
 	req, err := channel.ReadRequest(rw)
 	if err != nil {
@@ -325,6 +461,7 @@ func (h *serviceHost) pair(ctx context.Context, rw io.ReadWriter) {
 		out.exit(1)
 		return
 	}
+	requestRead()
 	code := req.Code
 	req.Code = ""
 	o := pairing.Options{
