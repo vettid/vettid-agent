@@ -408,3 +408,72 @@ func TestVaultNamedEndsAtExpiryWithGoodClock(t *testing.T) {
 		t.Fatalf("sent %v", f.sent)
 	}
 }
+
+// clockAhead: the saved session s1 ends at t0+1h, the vault names it live
+// with that end, and this computer's clock is two hours ahead; the
+// monotonic clock is the test's. It returns after the first check, with
+// the session held on the vault's word.
+func clockAhead(t *testing.T) (*fakeConn, *Manager, *fakeClocks) {
+	t.Helper()
+	f, c, m := setup(pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)})
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(time.Hour).Format(time.RFC3339)+`"}}`))
+	c.add(2 * time.Hour)
+	clocks := &fakeClocks{wall: t0}
+	m.setClock(clocks.read)
+	m.Suspect()
+	if err := ensure(t, m); err != nil {
+		t.Fatal(err)
+	}
+	if !m.VaultNamed(f.Access()) {
+		t.Fatal("not held on the vault's word with the clock two hours ahead")
+	}
+	return f, m, clocks
+}
+
+// The vault's word holds for VaultWord on the monotonic clock only: a
+// session that then ended by expiry sends no event, so past it the session
+// is suspect again, and its next use checks it with vault.status (no
+// request to the phone).
+func TestVaultWordLapses(t *testing.T) {
+	f, m, clocks := clockAhead(t)
+	clocks.step(VaultWord-time.Second, VaultWord-time.Second)
+	if !m.VaultNamed(f.Access()) {
+		t.Fatal("the vault's word lapsed before VaultWord")
+	}
+	clocks.step(2*time.Second, 2*time.Second) // past VaultWord; the clocks together
+	if m.VaultNamed(f.Access()) {
+		t.Fatal("the vault's word still holds past VaultWord")
+	}
+	if !m.Suspected() {
+		t.Fatal("not suspect once the vault's word lapsed")
+	}
+	if err := ensure(t, m); err != nil {
+		t.Fatal(err)
+	}
+	if f.count("vault.status") != 2 || f.count("device.session.request") != 0 {
+		t.Fatalf("sent %v, want a second vault.status and no request", f.sent)
+	}
+}
+
+// A later status resets the vault's word: one naming the session with an
+// end this clock agrees with leaves nothing held past it.
+func TestNextStatusResetsVaultWord(t *testing.T) {
+	f, m, _ := clockAhead(t)
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(5*time.Hour).Format(time.RFC3339)+`"}}`))
+	m.Suspect()
+	if err := ensure(t, m); err != nil {
+		t.Fatal(err)
+	}
+	if m.VaultNamed(pairing.Access{State: pairing.AccessActive, SessionID: "s1"}) {
+		t.Fatal("the earlier status's word outlived a new status")
+	}
+}
+
+// An end event clears the vault's word.
+func TestEndClearsVaultWord(t *testing.T) {
+	_, m, _ := clockAhead(t)
+	m.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: []byte(`{"reason":"ended"}`)})
+	if m.VaultNamed(pairing.Access{State: pairing.AccessActive, SessionID: "s1"}) {
+		t.Fatal("the vault's word outlived device.session.ended")
+	}
+}

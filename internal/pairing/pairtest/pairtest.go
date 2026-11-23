@@ -118,6 +118,10 @@ type Vault struct {
 	// device.session.ended was sent (sessionEnded): then null.
 	sessionJSON  string
 	sessionEnded bool
+	// StatusSession, if set, is the raw JSON vault.status names as the
+	// device's session, whatever else this Vault knows (tests of a clock
+	// that disagrees with the vault's).
+	StatusSession string
 	// OnRequest, if set, is called (without the lock held) for every
 	// message the device sends in session other than leash.grant.list
 	// and vault.status, with its inner id, type and body; it may answer
@@ -674,6 +678,8 @@ func (v *Vault) toVault(payload []byte) {
 					}
 					sess := v.sessionJSON
 					switch {
+					case v.StatusSession != "":
+						sess = v.StatusSession
 					case sess != "":
 					case v.sessionEnded || v.GrantListError == "session_required":
 						sess = "null"

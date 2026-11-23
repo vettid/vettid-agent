@@ -141,6 +141,9 @@ type Manager struct {
 	// end, or the next status. When the clock agreed with the vault, it is
 	// not set: the session ends at its expires_at, as usual.
 	vaultLive string
+	// vaultLiveMono is when (on the monotonic clock) the vault named it:
+	// its word holds for VaultWord only, then the session is checked again.
+	vaultLiveMono time.Duration
 
 	// clock reads the wall clock and a monotonic clock that stops while
 	// the computer sleeps (monoNow); baseWall and baseMono are the reading
@@ -390,12 +393,17 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	// the session counts as live only if it is still the one the vault
 	// named.
 	m.conn.CompareAndSetAccess(before, a)
+	// The saved session is read under m.mu: an end event (OnEvent, which
+	// clears vaultLive under it) then comes either before the read or
+	// after vaultLive is set, never between. vaultconn takes its own lock
+	// only inside Access and never calls in here holding it.
+	m.mu.Lock()
 	cur := m.conn.Access()
 	live := a.State == pairing.AccessActive && cur.State == pairing.AccessActive && cur.SessionID == a.SessionID
-	m.mu.Lock()
 	m.vaultLive = ""
 	if live && !m.now().Before(a.ExpiresAt) {
 		m.vaultLive = a.SessionID
+		_, m.vaultLiveMono = m.clock()
 	}
 	if m.suspectGen == gen {
 		m.suspect = false
@@ -412,10 +420,28 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 	return live, nil
 }
 
-// vaultNamedLocked reports whether a is the session the vault last named
-// current while this computer's clock disagreed (m.mu held).
+// VaultWord is how long the vault's word that a session is current holds,
+// on the monotonic clock, when this computer's clock disagrees (chosen;
+// not in the spec): a session that then ends by expiry sends no event, so
+// after it the session is suspect again and the next use checks it with
+// vault.status (which names it again if it still runs; no request to the
+// phone).
+const VaultWord = HoldRecheck
+
+// vaultNamedLocked reports whether a is the session the vault named
+// current, within VaultWord, while this computer's clock disagreed (m.mu
+// held). Past VaultWord it makes the session suspect and reports false.
 func (m *Manager) vaultNamedLocked(a pairing.Access) bool {
-	return m.vaultLive != "" && a.State == pairing.AccessActive && a.SessionID == m.vaultLive
+	if m.vaultLive == "" || a.State != pairing.AccessActive || a.SessionID != m.vaultLive {
+		return false
+	}
+	if _, mono := m.clock(); mono-m.vaultLiveMono > VaultWord {
+		m.vaultLive = ""
+		m.suspect = true
+		m.suspectGen++
+		return false
+	}
+	return true
 }
 
 // VaultNamed reports whether a is the session the vault last named
