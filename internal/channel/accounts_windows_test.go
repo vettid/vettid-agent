@@ -341,6 +341,59 @@ func TestTokenIdentityElevation(t *testing.T) {
 	}
 }
 
+// The member's processes can fill maxConns (each silent connection holds
+// its place for up to helloWait, and the member can connect again as
+// places free), but an elevated administrator who is not the member
+// still gets one of adminReserve more: pair, forget and status can't be
+// held off by the agent. Beyond those, the administrator is busy too.
+func TestAdminReserveBeyondMaxConns(t *testing.T) {
+	member := newTestUser(t)
+	me := selfSID(t)
+	s := listenN(t, member.sid.String(), maxConns+adminReserve+4)
+	var held []windows.Handle
+	defer func() {
+		for _, h := range held {
+			windows.CloseHandle(h)
+		}
+	}()
+	member.as(t, func() {
+		for i := 0; i < maxConns; i++ {
+			held = append(held, openRaw(t, s.pipe))
+		}
+	})
+	// The member's next connection is told the channel is busy, at once.
+	var extra windows.Handle
+	member.as(t, func() { extra = openRaw(t, s.pipe) })
+	f := os.NewFile(uintptr(extra), "extra")
+	line, err := readLine(f)
+	f.Close()
+	if err != nil || !strings.Contains(string(line), `"refused":"`+refusalCode(ErrBusy)+`"`) {
+		t.Fatalf("the member beyond maxConns: %s %v, want busy", line, err)
+	}
+	// The administrator is served, adminReserve times.
+	for i := 0; i < adminReserve; i++ {
+		cfg := s.dial(OpStatus)
+		cfg.Service = me
+		ch := dialAsync(cfg)
+		c := s.accepted(t)
+		if !c.Identity.ElevatedAdmin || c.Identity.Member {
+			t.Fatalf("server saw %+v", c.Identity)
+		}
+		_ = c.Accept()
+		r := <-ch
+		if r.err != nil {
+			t.Fatalf("the administrator with maxConns taken (%d): %v", i, r.err)
+		}
+		defer r.f.Close()
+	}
+	// Then the administrator is busy too.
+	cfg := s.dial(OpStatus)
+	cfg.Service = me
+	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrBusy) {
+		t.Fatalf("the administrator beyond the reserve: %v, want ErrBusy", err)
+	}
+}
+
 // A client the pipe's access list lets in (here, only through an entry
 // added for the test) but that is neither the member nor an elevated
 // administrator is refused from its token at once, before anything is

@@ -38,9 +38,15 @@ const (
 	// clients served at once are bounded by maxConns instead.
 	maxInstances = windows.PIPE_UNLIMITED_INSTANCES
 	// maxConns bounds the clients connected at once; one beyond it is
-	// told the channel is busy (chosen; not in the spec).
-	maxConns = 16
-	bufSize  = 64 << 10
+	// told the channel is busy (chosen; not in the spec). adminReserve
+	// more are kept for an elevated administrator who is not the member:
+	// the member's own processes (the agent among them) can fill
+	// maxConns, by connecting again as each place is freed, but never
+	// keep an administrator from pair, forget or status (chosen; not in
+	// the spec).
+	maxConns     = 16
+	adminReserve = 2
+	bufSize      = 64 << 10
 
 	// helloWait bounds each end's hello (chosen; not in the spec).
 	helloWait = 10 * time.Second
@@ -366,17 +372,20 @@ func (l *Listener) acceptOne() (*ServerConn, error) {
 		return nil, &clientError{err: cerr}
 	}
 	l.live++
-	busy := l.live > maxConns
+	live := l.live
 	l.mu.Unlock()
 
 	c := &ServerConn{File: os.NewFile(uintptr(h), PipePath(l.cfg.Pipe)), version: l.cfg.Version, l: l}
 	// Refusals before the hello is read are written at once: the client
 	// reads them after its own hello (Dial reads the answer even if its
 	// hello could not be written).
-	if busy {
+	busy := func() (*ServerConn, error) {
 		_ = refuse(c.File, l.cfg.Version, ErrBusy)
 		c.Close()
 		return nil, &clientError{err: ErrBusy}
+	}
+	if live > maxConns+adminReserve {
+		return busy()
 	}
 	id, err := identify(h, l.member, l.admins)
 	if err == nil && !id.Member && !id.ElevatedAdmin {
@@ -386,6 +395,9 @@ func (l *Listener) acceptOne() (*ServerConn, error) {
 		_ = refuse(c.File, l.cfg.Version, ErrNotAllowed)
 		c.Close()
 		return nil, &clientError{err: err}
+	}
+	if live > maxConns && !(id.ElevatedAdmin && !id.Member) {
+		return busy()
 	}
 	c.Identity = id
 	return c, nil
