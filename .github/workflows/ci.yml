@@ -162,7 +162,9 @@ jobs:
           VETTID_AGENT_TEST_OTHER_USER: "1"
         run: |
           set -o pipefail
-          go build -o "$RUNNER_TEMP/vettid-agent-e2e.exe" ./cmd/vettid-agent
+          # Without VCS stamping, the binary is the same version as the test
+          # binary, "(devel)", so the stub and the service agree.
+          go build -buildvcs=false -o "$RUNNER_TEMP/vettid-agent-e2e.exe" ./cmd/vettid-agent
           VETTID_AGENT_TEST_SERVICE_BINARY="$RUNNER_TEMP/vettid-agent-e2e.exe" \
             go test -count=1 -v -run 'TestServiceEndToEnd$' ./cmd/vettid-agent | tee "$RUNNER_TEMP/service-e2e.txt"
           for t in "another_user_can't_start_it" started_on_demand_by_the_member "the_member's_tools:_not_paired,_from_the_service" \

@@ -405,6 +405,9 @@ func TestServiceEndToEnd(t *testing.T) {
 	})
 
 	t.Run("the member can't reach the state folder or the process", func(t *testing.T) {
+		if pid == 0 {
+			t.Fatal("no service process (the on-demand start failed)")
+		}
 		if _, err := os.Stat(in.stateDir); err != nil {
 			t.Fatalf("the service made no state folder: %v", err)
 		}
@@ -475,6 +478,7 @@ func TestServiceEndToEnd(t *testing.T) {
 	})
 
 	t.Run("a squatted channel name stops it from starting", func(t *testing.T) {
+		in.stop(t)
 		pipe, err := channel.ReadPipe(in.n)
 		if err != nil {
 			t.Fatal(err)
@@ -513,6 +517,7 @@ func TestServiceEndToEnd(t *testing.T) {
 	})
 
 	t.Run("an account in Administrators refuses to run", func(t *testing.T) {
+		in.stop(t)
 		admins, _ := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
 		group, _, _, err := admins.LookupAccount("")
 		if err != nil {
