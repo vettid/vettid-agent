@@ -1,0 +1,20 @@
+// Written for the VettID agent's separate-account mode: these actions ask
+// for an administrator's password.
+polkit.addRule(function(action, subject) {
+    switch (action.id) {
+    case "org.freedesktop.packagekit.package-install":
+    case "org.freedesktop.packagekit.package-remove":
+    case "org.rpm.dnf.v0.rpm.execute_trusted_transaction":
+    case "org.rpm.dnf.v0.rpm.Repo.confirm_key":
+    case "org.fedoraproject.FirewallD1.all":
+    case "org.fedoraproject.FirewallD1.config":
+    case "org.fedoraproject.FirewallD1.direct":
+    case "org.fedoraproject.FirewallD1.policies":
+    case "org.opensuse.cupspkhelper.mechanism.all-edit":
+    case "org.opensuse.cupspkhelper.mechanism.printeraddremove":
+    case "org.opensuse.cupspkhelper.mechanism.printer-local-edit":
+    case "org.opensuse.cupspkhelper.mechanism.printer-remote-edit":
+    case "org.opensuse.cupspkhelper.mechanism.server-settings":
+        return polkit.Result.AUTH_ADMIN_KEEP;
+    }
+});

@@ -10,6 +10,9 @@ package admincheck
 //
 // It reads polkit with its own tools (pkaction, loginctl, systemd-run,
 // gdbus), so it needs no D-Bus library.
+//
+// The rules file §11.4 describes, for the runs with it, is
+// testdata/40-vettid-agent.rules (copied to /etc/polkit-1/rules.d/).
 
 import (
 	"fmt"
