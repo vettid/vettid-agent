@@ -220,13 +220,18 @@ func writeLine(w io.Writer, v any) error {
 }
 
 // clientHandshake sends the client's hello and reads the server's. A
-// refusal, or a server of another version, is an error.
+// refusal, or a server of another version, is an error. The server may
+// refuse before it reads the hello (Windows: a client it identified as
+// neither the member nor an administrator, or one beyond maxConns) and
+// close its end, so the hello's write can fail: the answer is read all
+// the same, and only if there is none is the write's error returned.
 func clientHandshake(rw io.ReadWriter, op Op, version string) error {
-	if err := writeLine(rw, clientHello{Channel: helloVersion, Op: op, Version: version}); err != nil {
-		return err
-	}
+	werr := writeLine(rw, clientHello{Channel: helloVersion, Op: op, Version: version})
 	line, err := readLine(rw)
 	if err != nil {
+		if werr != nil {
+			return werr
+		}
 		return err
 	}
 	var h serverHello

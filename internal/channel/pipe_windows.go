@@ -87,8 +87,14 @@ type ListenConfig struct {
 	noNetworkDeny bool   // tests only: leave out the NETWORK deny, to test PIPE_REJECT_REMOTE_CLIENTS alone
 }
 
-// Listener is the server end: the service's. Accept is called from one
-// goroutine at a time.
+// Listener is the server end: the service's. One goroutine of its own
+// (started by the first Accept) waits for clients, one at a time, and
+// identifies each from its token before reading anything from it: a
+// client that is neither the member nor an elevated administrator is
+// refused at once, without its hello being read. Each admitted
+// client's hello is then read in a goroutine of its own, so a client
+// that connects and says nothing holds only its own place (one of
+// maxConns, for at most helloWait), never the clients behind it.
 type Listener struct {
 	cfg    ListenConfig
 	path   *uint16
@@ -99,13 +105,23 @@ type Listener struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
+	start sync.Once
+	done  chan struct{} // closed when the accepting goroutine has ended
+	hello sync.WaitGroup
+
+	// ready holds clients whose hello was read and admitted, for Accept.
+	// Only a client counted in live is sent, and only under mu while the
+	// listener is open, so it never holds more than maxConns and a send
+	// never blocks.
+	ready chan *ServerConn
+
 	mu sync.Mutex
-	// next is the instance waiting for a client. While Accept waits on it
-	// (waiting), Accept alone may close it; otherwise Close does. There is
-	// always one while the listener is open, so the pipe's name is never
-	// free.
+	// next is the instance waiting for a client. Once the accepting
+	// goroutine has started, it alone closes it; before that, Close does.
+	// There is always one while the listener is open, so the pipe's name
+	// is never free.
 	next    windows.Handle
-	waiting bool
+	started bool
 	closed  bool
 	broken  error
 	live    int // clients connected and not yet closed (maxConns)
@@ -144,7 +160,9 @@ func Listen(cfg ListenConfig) (*Listener, error) {
 		return nil, err
 	}
 	l := &Listener{cfg: cfg, path: path, member: member, admins: admins,
-		sa: &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd}}
+		sa:    &windows.SecurityAttributes{Length: uint32(unsafe.Sizeof(windows.SecurityAttributes{})), SecurityDescriptor: sd},
+		done:  make(chan struct{}),
+		ready: make(chan *ServerConn, maxConns)}
 	h, err := l.instance(true)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_ACCESS_DENIED) || errors.Is(err, windows.ERROR_PIPE_BUSY) {
@@ -166,20 +184,32 @@ func (l *Listener) instance(first bool) (windows.Handle, error) {
 	return windows.CreateNamedPipe(l.path, flags, mode, maxInstances, bufSize, bufSize, 0, l.sa)
 }
 
-// Close stops Accept and closes the waiting instance (or has Accept
-// close it, if it is waiting on it). Connections already accepted stay
-// open.
+// Close stops accepting, closes the waiting instance and every admitted
+// client Accept has not yet returned, and waits for the listener's
+// goroutines to end. Connections Accept returned stay open.
 func (l *Listener) Close() error {
 	l.cancel()
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	l.closed = true
-	if l.next != 0 && !l.waiting {
-		h := l.next
+	started := l.started
+	var err error
+	if !started && l.next != 0 {
+		err = windows.CloseHandle(l.next)
 		l.next = 0
-		return windows.CloseHandle(h)
 	}
-	return nil
+	l.mu.Unlock()
+	if started {
+		<-l.done
+	}
+	l.hello.Wait()
+	for {
+		select {
+		case c := <-l.ready:
+			c.Close()
+		default:
+			return err
+		}
+	}
 }
 
 // ServerConn is an admitted client, waiting for the service's answer:
@@ -219,25 +249,44 @@ func (c *ServerConn) Close() error {
 	return err
 }
 
-// Accept waits for a client that names an operation it may run, from a
-// token the pipe can identify (Admit). Clients refused on the way are
-// told so and reported to OnRefused; Accept returns only an admitted
-// client, or an error once ctx ends, the listener is closed, or the pipe
-// can't go on (then the service should stop).
+// Accept waits for a client that named an operation it may run, from a
+// token the pipe could identify (Admit). Clients refused on the way are
+// told so and reported to OnRefused, which may then be called from
+// several goroutines at once. Accept returns only an admitted client, or
+// an error once ctx ends, the listener is closed, or the pipe can't go
+// on (then the service should stop). Clients keep being accepted while
+// no Accept waits, up to maxConns.
 func (l *Listener) Accept(ctx context.Context) (*ServerConn, error) {
-	for {
-		c, err := l.acceptOne(ctx)
-		if err == nil {
-			return c, nil
-		}
-		var ce *clientError
-		if !errors.As(err, &ce) {
-			return nil, err
-		}
-		if l.cfg.OnRefused != nil {
-			l.cfg.OnRefused(ce.op, ce.err)
-		}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil, errClosed
 	}
+	if !l.started {
+		l.started = true
+		go l.serve()
+	}
+	l.mu.Unlock()
+	select {
+	case c := <-l.ready:
+		return c, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-l.done:
+	}
+	// The accepting goroutine has ended; a client admitted before that
+	// may still be waiting.
+	select {
+	case c := <-l.ready:
+		return c, nil
+	default:
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.closed {
+		return nil, errClosed
+	}
+	return nil, l.broken
 }
 
 // clientError is one client's failure; Accept goes on to the next.
@@ -248,41 +297,49 @@ type clientError struct {
 
 func (e *clientError) Error() string { return e.err.Error() }
 
-func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
-	l.mu.Lock()
-	switch {
-	case l.closed:
-		l.mu.Unlock()
-		return nil, errClosed
-	case l.broken != nil:
-		l.mu.Unlock()
-		return nil, l.broken
-	case l.waiting:
-		l.mu.Unlock()
-		return nil, errors.New("the channel is already waiting for a client")
+// refused tells OnRefused of one client refused.
+func (l *Listener) refused(op Op, err error) {
+	if l.cfg.OnRefused != nil {
+		l.cfg.OnRefused(op, err)
 	}
-	h := l.next
-	l.waiting = true
-	l.mu.Unlock()
+}
 
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stop := context.AfterFunc(l.ctx, cancel)
-	defer stop()
-	cerr := connect(ctx, h)
+// serve is the accepting goroutine: it waits for one client at a time,
+// until the listener is closed or the pipe can't go on (l.broken).
+func (l *Listener) serve() {
+	defer close(l.done)
+	for {
+		c, err := l.acceptOne()
+		var ce *clientError
+		switch {
+		case err == nil:
+			l.hello.Add(1)
+			go l.readHello(c)
+		case errors.As(err, &ce):
+			l.refused(ce.op, ce.err)
+		default:
+			return
+		}
+	}
+}
+
+// acceptOne waits for the next client on the waiting instance, makes the
+// next instance, and identifies the client from its token. It returns a
+// client that is the member or an elevated administrator, whose hello is
+// still to be read; a *clientError for a client refused; or another
+// error when the listener is closed or broken.
+func (l *Listener) acceptOne() (*ServerConn, error) {
+	l.mu.Lock()
+	h := l.next
+	l.mu.Unlock()
+	cerr := connect(l.ctx, h)
 
 	l.mu.Lock()
-	l.waiting = false
-	if l.closed {
+	if l.closed || l.ctx.Err() != nil {
 		l.next = 0
 		l.mu.Unlock()
 		windows.CloseHandle(h)
 		return nil, errClosed
-	}
-	if cerr != nil && ctx.Err() != nil {
-		// Cancelled: h stays the waiting instance.
-		l.mu.Unlock()
-		return nil, ctx.Err()
 	}
 	// h is connected, or failed (a client that came and left before the
 	// connection, ERROR_NO_DATA): either way it is replaced. The next
@@ -292,14 +349,14 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 	if ierr != nil {
 		// h still holds the name; the service must stop.
 		l.broken = fmt.Errorf("the channel can't make a new instance: %w", ierr)
-		if cerr != nil {
-			l.mu.Unlock()
-			return nil, l.broken
-		}
 		l.next = 0
-	} else {
-		l.next = nh
+		broken := l.broken
+		l.mu.Unlock()
+		// A client connected on h is not served either.
+		windows.CloseHandle(h)
+		return nil, broken
 	}
+	l.next = nh
 	if cerr != nil {
 		l.mu.Unlock()
 		windows.CloseHandle(h)
@@ -310,42 +367,73 @@ func (l *Listener) acceptOne(ctx context.Context) (*ServerConn, error) {
 	}
 	l.live++
 	busy := l.live > maxConns
-	broken := l.broken
 	l.mu.Unlock()
 
 	c := &ServerConn{File: os.NewFile(uintptr(h), PipePath(l.cfg.Pipe)), version: l.cfg.Version, l: l}
-	if broken != nil {
-		c.Close()
-		return nil, broken
-	}
-	_ = c.SetDeadline(time.Now().Add(helloWait))
-	op, err := readClientHello(c.File, l.cfg.Version)
-	if err != nil {
-		c.Close()
-		return nil, &clientError{op: op, err: err}
-	}
+	// Refusals before the hello is read are written at once: the client
+	// reads them after its own hello (Dial reads the answer even if its
+	// hello could not be written).
 	if busy {
 		_ = refuse(c.File, l.cfg.Version, ErrBusy)
 		c.Close()
-		return nil, &clientError{op: op, err: ErrBusy}
+		return nil, &clientError{err: ErrBusy}
 	}
 	id, err := identify(h, l.member, l.admins)
-	if err == nil {
-		err = Admit(op, id)
+	if err == nil && !id.Member && !id.ElevatedAdmin {
+		err = errNeitherMemberNorAdmin
 	}
 	if err != nil {
-		// The client learns only not_allowed, or member_is_admin.
-		why := ErrNotAllowed
-		if errors.Is(err, ErrMemberIsAdmin) {
-			why = ErrMemberIsAdmin
-		}
-		_ = refuse(c.File, l.cfg.Version, why)
+		_ = refuse(c.File, l.cfg.Version, ErrNotAllowed)
 		c.Close()
-		return nil, &clientError{op: op, err: err}
+		return nil, &clientError{err: err}
+	}
+	c.Identity = id
+	return c, nil
+}
+
+// errNeitherMemberNorAdmin: the client's token is neither the member's
+// nor an elevated administrator's. Only an access entry added beyond
+// pipeSDDL's lets such a client open the pipe at all.
+var errNeitherMemberNorAdmin = errors.New("the client is neither the member nor an elevated administrator")
+
+// readHello reads an identified client's hello, within helloWait, and
+// hands the client to Accept if Admit lets it run its operation.
+func (l *Listener) readHello(c *ServerConn) {
+	defer l.hello.Done()
+	_ = c.SetDeadline(time.Now().Add(helloWait))
+	stop := context.AfterFunc(l.ctx, func() { _ = c.SetDeadline(time.Now()) })
+	op, err := readClientHello(c.File, l.cfg.Version)
+	if err == nil {
+		err = Admit(op, c.Identity)
+		if err != nil {
+			// The client learns only not_allowed, or member_is_admin.
+			why := ErrNotAllowed
+			if errors.Is(err, ErrMemberIsAdmin) {
+				why = ErrMemberIsAdmin
+			}
+			_ = refuse(c.File, l.cfg.Version, why)
+		}
+	}
+	if !stop() && err == nil {
+		err = errClosed
+	}
+	if err != nil {
+		c.Close()
+		if !errors.Is(err, errClosed) {
+			l.refused(op, err)
+		}
+		return
 	}
 	_ = c.SetDeadline(time.Time{})
-	c.Op, c.Identity = op, id
-	return c, nil
+	c.Op = op
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		c.Close()
+		return
+	}
+	l.ready <- c
+	l.mu.Unlock()
 }
 
 // connect waits for a client on instance h until ctx ends.

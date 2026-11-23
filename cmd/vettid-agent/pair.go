@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"golang.org/x/term"
@@ -76,12 +77,21 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 				return 1
 			}
 		}
-		// The service pairs; this command reads the code once the
-		// service has answered and sends it once (AGENT-PLAN §4.7: never
-		// stored or logged).
+		// The service pairs. This command reads the code first, before it
+		// opens the channel: nothing is typed while the service holds a
+		// stub's session off for it, and the service's request deadline
+		// never meets a person still pasting. The code is sent once
+		// (AGENT-PLAN §4.7: never stored or logged).
+		c, err := code()
+		if err == nil && strings.TrimSpace(c) == "" {
+			err = errors.New("no pairing code was given")
+		}
+		if err != nil {
+			fmt.Fprintf(stderr, "vettid-agent pair: %v\n", err)
+			return 1
+		}
 		return runChannelCommand("pair", *name, channel.OpPair, func() (channel.Request, error) {
-			c, err := code()
-			return channel.Request{Code: c, Label: *label, Restart: *restart}, err
+			return channel.Request{Code: c, Label: *label, Restart: *restart}, nil
 		}, stderr, stderr)
 	}
 	if *dir == "" || fs.NArg() > 1 {

@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -61,55 +62,115 @@ func ReadPipe(n string) (string, error) {
 }
 
 func readPipeAt(path, n string) (string, error) {
+	c, err := readConfigAt(path, n)
+	if err != nil {
+		return "", err
+	}
+	return c.Pipe, nil
+}
+
+// ServiceConfig is what the connector service reads from its pairing's
+// configuration file (AGENT-SEPARATE-ACCOUNT §3 "The operator's flags",
+// §4): the channel's name, the member it serves, and the access session
+// it asks for. Only an administrator can change the file.
+type ServiceConfig struct {
+	Pipe string `json:"pipe"`
+	// Member is the member's SID: only that user's processes may use the
+	// channel's tools (§3 "Bound to one member user").
+	Member string `json:"member"`
+	// AccessMinutes is the access session asked for (1 to 1440; 0 means
+	// 60, as mcp's --access-minutes).
+	AccessMinutes int `json:"access_minutes,omitempty"`
+	// IdleStopSeconds is how long the service runs once nothing holds it
+	// (10 to 86400; 0 means the service's default).
+	IdleStopSeconds int `json:"idle_stop_seconds,omitempty"`
+}
+
+// ReadServiceConfig reads pairing n's configuration file as the service:
+// the same checks as ReadPipe, and a member SID that parses and is not a
+// well-known account.
+func ReadServiceConfig(n string) (ServiceConfig, error) {
+	path, err := ConfigPath(n)
+	if err != nil {
+		return ServiceConfig{}, err
+	}
+	c, err := readConfigAt(path, n)
+	if err != nil {
+		return ServiceConfig{}, err
+	}
+	return checkServiceConfig(c, path)
+}
+
+// checkServiceConfig checks what the service needs beyond the pipe's
+// name.
+func checkServiceConfig(c ServiceConfig, path string) (ServiceConfig, error) {
+	sid, err := windows.StringToSid(c.Member)
+	// A local or domain account (S-1-5-21-…), or a Microsoft Entra ID
+	// account (S-1-12-1-…).
+	if err != nil || !(strings.HasPrefix(sid.String(), "S-1-5-21-") || strings.HasPrefix(sid.String(), "S-1-12-1-")) {
+		return ServiceConfig{}, fmt.Errorf("%s: \"member\" is not a user account's SID", path)
+	}
+	c.Member = sid.String()
+	switch {
+	case c.AccessMinutes == 0:
+		c.AccessMinutes = 60
+	case c.AccessMinutes < 1 || c.AccessMinutes > 1440:
+		return ServiceConfig{}, fmt.Errorf("%s: \"access_minutes\" must be 1 to 1440", path)
+	}
+	if c.IdleStopSeconds != 0 && (c.IdleStopSeconds < 10 || c.IdleStopSeconds > 86400) {
+		return ServiceConfig{}, fmt.Errorf("%s: \"idle_stop_seconds\" must be 10 to 86400", path)
+	}
+	return c, nil
+}
+
+func readConfigAt(path, n string) (ServiceConfig, error) {
+	var c ServiceConfig
 	noService := func(why string, a ...any) error {
 		return fmt.Errorf("%w: %s %s", ErrNoService, path, fmt.Sprintf(why, a...))
 	}
 	p, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return "", noService("is not a valid path")
+		return c, noService("is not a valid path")
 	}
 	h, err := windows.CreateFile(p, windows.GENERIC_READ, windows.FILE_SHARE_READ, nil, windows.OPEN_EXISTING,
 		windows.FILE_FLAG_OPEN_REPARSE_POINT, 0)
 	if err != nil {
 		if errors.Is(err, windows.ERROR_FILE_NOT_FOUND) || errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			return "", noService("does not exist")
+			return c, noService("does not exist")
 		}
-		return "", noService("can't be opened: %v", err)
+		return c, noService("can't be opened: %v", err)
 	}
 	f := os.NewFile(uintptr(h), path)
 	defer f.Close()
 	var info windows.ByHandleFileInformation
 	if err := windows.GetFileInformationByHandle(h, &info); err != nil {
-		return "", noService("can't be read: %v", err)
+		return c, noService("can't be read: %v", err)
 	}
 	if info.FileAttributes&(windows.FILE_ATTRIBUTE_REPARSE_POINT|windows.FILE_ATTRIBUTE_DIRECTORY) != 0 {
-		return "", noService("is a link or a folder")
+		return c, noService("is a link or a folder")
 	}
 	sd, err := windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT,
 		windows.OWNER_SECURITY_INFORMATION|windows.GROUP_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 	if err != nil {
-		return "", noService("its access can't be read: %v", err)
+		return c, noService("its access can't be read: %v", err)
 	}
 	if err := adminOnly(sd); err != nil {
-		return "", noService("%v", err)
+		return c, noService("%v", err)
 	}
 	b, err := io.ReadAll(io.LimitReader(f, maxConfig+1))
 	if err != nil {
-		return "", noService("can't be read: %v", err)
+		return c, noService("can't be read: %v", err)
 	}
 	if len(b) > maxConfig {
-		return "", noService("is too large")
-	}
-	var c struct {
-		Pipe string `json:"pipe"`
+		return c, noService("is too large")
 	}
 	if err := json.Unmarshal(b, &c); err != nil {
-		return "", noService("is not valid JSON")
+		return c, noService("is not valid JSON")
 	}
 	if !validPipe(n, c.Pipe) {
-		return "", noService("does not name this pairing's channel")
+		return c, noService("does not name this pairing's channel")
 	}
-	return c.Pipe, nil
+	return c, nil
 }
 
 // trustedInstaller is NT SERVICE\TrustedInstaller.
