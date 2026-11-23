@@ -194,17 +194,22 @@ func subjects(t *testing.T, u *user.User) []subject {
 }
 
 // sleeper starts a transient unit that sleeps, with the given systemd-run
-// command (and systemctl scope), and returns its main pid.
+// command (and systemctl scope), and returns its main pid, or 0 if it
+// didn't start.
 func sleeper(t *testing.T, scope []string, cmd ...string) int {
 	unit := fmt.Sprintf("vettid-polkit-probe-%d", time.Now().UnixNano())
-	args := append(cmd[1:], "--unit", unit, "--collect",
+	args := append(append([]string{}, cmd[1:]...), "--unit", unit, "--collect",
 		"--property=NoNewPrivileges=yes", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
-	run(t, cmd[0], args...)
+	if out, err := exec.Command(cmd[0], args...).CombinedOutput(); err != nil {
+		t.Logf("%s: %v\n%s", strings.Join(cmd, " "), err, out)
+		return 0
+	}
 	ctl := append(append([]string{}, scope...), "stop", unit)
 	t.Cleanup(func() { _ = exec.Command("systemctl", ctl...).Run() })
 	show := append(append([]string{}, scope...), "show", "-p", "MainPID", "--value", unit)
 	for i := 0; i < 50; i++ {
-		if pid, _ := strconv.Atoi(strings.TrimSpace(run(t, "systemctl", show...))); pid != 0 {
+		out, _ := exec.Command("systemctl", show...).Output()
+		if pid, _ := strconv.Atoi(strings.TrimSpace(string(out))); pid != 0 {
 			return pid
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -224,13 +229,39 @@ func noSession(t *testing.T, u *user.User, what string, pid int) subject {
 	}
 	if s := pidSession(pid); s != "" {
 		sub.kind, sub.name = sessionKind(t, s), what+" (in session "+s+")"
-	} else if d := displaySession(u.Username); d != "" {
-		if dk := sessionKind(t, d); dk != NoSession {
-			sub.candidates = []Kind{NoSession, dk}
-			sub.name = what + " (display session " + d + ")"
+		return sub
+	}
+	// Candidates: none, and the kind of each of the member's sessions
+	// (the display session's among them).
+	sub.candidates = []Kind{NoSession}
+	for _, id := range memberSessions(t, u) {
+		k := sessionKind(t, id)
+		dup := false
+		for _, c := range sub.candidates {
+			dup = dup || c == k
+		}
+		if !dup {
+			sub.candidates = append(sub.candidates, k)
 		}
 	}
+	if d := displaySession(u.Username); d != "" {
+		sub.name = what + " (display session " + d + ")"
+	}
+	if len(sub.candidates) == 1 {
+		sub.candidates = nil // no session to be judged by
+	}
 	return sub
+}
+
+// memberSessions are the member's logind sessions.
+func memberSessions(t *testing.T, u *user.User) []string {
+	var ids []string
+	for _, line := range strings.Split(run(t, "loginctl", "list-sessions", "--no-legend"), "\n") {
+		if f := strings.Fields(line); len(f) >= 3 && f[1] == u.Uid {
+			ids = append(ids, f[0])
+		}
+	}
+	return ids
 }
 
 // conditions reads the facts the allowlist's conditional entries need.
@@ -307,9 +338,13 @@ func TestPolkitProbe(t *testing.T) {
 		}
 		if len(s.candidates) > 1 {
 			t.Logf("%s:", s.name)
-			k, counts, ok := KindFrom(actions, these, s.candidates)
+			k, excl, ok := KindFrom(actions, these, s.candidates)
 			for i, c := range s.candidates {
-				t.Logf("  judged as %s: %d of %d answers refused as its defaults refuse", c, counts[i], len(these))
+				for j, o := range s.candidates {
+					if i != j {
+						t.Logf("  %d of %d refusals explained by %s and not %s", excl[i][j], len(these), c, o)
+					}
+				}
 			}
 			if !ok {
 				t.Fatalf("%s: can't tell which kind polkitd judged it by", s.name)

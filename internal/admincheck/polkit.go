@@ -258,40 +258,59 @@ func lift(actions map[string]Action, vs []Verdict) {
 }
 
 // KindFrom is the kind of subject polkitd judged one subject's answers
-// by, of the candidates: the one whose defaults account for the most of
-// its refusals (a challenge where the default is auth_*, an outright
-// refusal where it is no). Grants are never counted: a rule's grant could
-// otherwise vote for the kind under which it says nothing. A grant only
-// takes a vote away, so under the true kind the count is at least any
-// other's; a tie is not ok. counts is per candidate.
-func KindFrom(actions map[string]Action, answers []Answer, candidates []Kind) (k Kind, counts []int, ok bool) {
-	counts = make([]int, len(candidates))
-	for i, c := range candidates {
-		for _, a := range answers {
-			act, known := actions[a.Action]
-			if !known || a.Err != "" || a.Authorized {
-				continue
-			}
-			switch d := act.defaultFor(c); {
-			case d == No && !a.Challenge, d != No && d != Yes && a.Challenge:
-				counts[i]++
+// by, of the candidates, read from its refusals only: a refusal is
+// explained by a kind whose default for the action is no (an outright
+// refusal) or auth_* (a challenge). Grants are never counted, so a rule's
+// grants can't vote for the kind under which they say nothing. A kind is
+// taken only when, against every other candidate, it explains at least
+// MinKindSignal refusals the other doesn't, and the other explains none
+// it doesn't: a rule that refuses or asks where the defaults grant can
+// make the evidence mixed, and then it is not ok (the run fails rather
+// than guess). excl[i][j] is the refusals candidate i explains and j
+// doesn't. When ok is false, k is NoSession.
+func KindFrom(actions map[string]Action, answers []Answer, candidates []Kind) (k Kind, excl [][]int, ok bool) {
+	explains := func(c Kind, a Answer) bool {
+		act, known := actions[a.Action]
+		if !known || a.Err != "" || a.Authorized {
+			return false
+		}
+		d := act.defaultFor(c)
+		return (d == No && !a.Challenge) || (d.admin() || d == AuthSelf || d == AuthSelfKeep) && a.Challenge
+	}
+	excl = make([][]int, len(candidates))
+	for i := range candidates {
+		excl[i] = make([]int, len(candidates))
+		for j := range candidates {
+			for _, a := range answers {
+				if i != j && explains(candidates[i], a) && !explains(candidates[j], a) {
+					excl[i][j]++
+				}
 			}
 		}
 	}
-	best, tie := 0, false
-	for i := 1; i < len(counts); i++ {
-		switch {
-		case counts[i] > counts[best]:
-			best, tie = i, false
-		case counts[i] == counts[best]:
-			tie = true
+	found := -1
+	for i := range candidates {
+		clean := true
+		for j := range candidates {
+			if i != j && (excl[i][j] < MinKindSignal || excl[j][i] != 0) {
+				clean = false
+			}
+		}
+		if clean {
+			if found >= 0 {
+				return NoSession, excl, false
+			}
+			found = i
 		}
 	}
-	if len(candidates) == 0 || tie {
-		return 0, counts, false
+	if found < 0 || len(candidates) < 2 {
+		return NoSession, excl, false
 	}
-	return candidates[best], counts, true
+	return candidates[found], excl, true
 }
+
+// MinKindSignal is the fewest refusals that must tell a kind from another.
+const MinKindSignal = 5
 
 func implies(a Action, id string) bool {
 	for _, implied := range a.Implies {

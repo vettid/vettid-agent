@@ -1,7 +1,6 @@
 package admincheck
 
 import (
-	"fmt"
 	"strings"
 	"testing"
 )
@@ -399,40 +398,56 @@ func TestAllowlistNamed(t *testing.T) {
 	}
 }
 
-// KindFrom counts refusals only, so grants can't vote for a kind.
+// KindFrom reads the kind from refusals only, and refuses mixed evidence.
 func TestKindFrom(t *testing.T) {
-	actions := map[string]Action{}
 	ans := func(id string, auth, chal bool) Answer { return Answer{Action: id, Authorized: auth, Challenge: chal} }
-	var answers []Answer
-	// judged as any: these challenge (any auth_admin; active yes)
-	for _, id := range []string{"a1", "a2", "a3"} {
-		actions[id] = Action{ID: id, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
-		answers = append(answers, ans(id, false, true))
+	actions := map[string]Action{
+		// any auth_admin, active yes: a challenge says any
+		"ch": {Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes},
+		// any no, active auth_admin_keep: a challenge says active
+		"ak": {Any: No, Inactive: No, Active: AuthAdminKeep},
+		// the same for every kind: no signal
+		"same": {Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdmin},
+		// auth_self against auth_admin: both explain a challenge
+		"self": {Any: AuthSelf, Inactive: AuthSelf, Active: AuthAdmin},
+		// any no, active yes
+		"ny": {Any: No, Inactive: No, Active: Yes},
 	}
-	// a rule grants many that are yes for active and auth_admin for any
-	for i := 0; i < 50; i++ {
-		id := fmt.Sprintf("g%d", i)
-		actions[id] = Action{ID: id, Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
-		answers = append(answers, ans(id, true, false))
+	many := func(id string, n int, auth, chal bool) []Answer {
+		var out []Answer
+		for i := 0; i < n; i++ {
+			out = append(out, ans(id, auth, chal))
+		}
+		return out
 	}
-	// no signal: the same defaults for every kind
-	actions["same"] = Action{ID: "same", Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdmin}
-	answers = append(answers, ans("same", false, true))
-	k, counts, ok := KindFrom(actions, answers, []Kind{NoSession, Active})
-	if !ok || k != NoSession {
-		t.Errorf("rule grants steered it: %s %v %v", k, counts, ok)
-	}
-	// judged as active: outright refusals where active is no
-	actions["n"] = Action{ID: "n", Any: AuthAdmin, Inactive: No, Active: No}
-	if k, counts, ok := KindFrom(actions, []Answer{ans("n", false, false)}, []Kind{NoSession, Active}); !ok || k != Active {
-		t.Errorf("active: %s %v %v", k, counts, ok)
-	}
-	// everything distinguishing granted: a tie, not ok
-	if _, counts, ok := KindFrom(actions, []Answer{ans("g1", true, false), ans("same", false, true)}, []Kind{NoSession, Active}); ok {
-		t.Errorf("a tie was ok: %v", counts)
-	}
-	// errors and unknown actions count for nothing
-	if _, counts, ok := KindFrom(actions, []Answer{{Action: "a1", Err: "x"}, ans("zz", false, true)}, []Kind{NoSession, Active}); ok {
-		t.Errorf("no signal was ok: %v", counts)
+	both := []Kind{NoSession, Active}
+	for _, c := range []struct {
+		name    string
+		answers []Answer
+		cands   []Kind
+		want    Kind
+		ok      bool
+	}{
+		{"any, with 50 grants that are yes for active", append(many("ch", 6, false, true), append(many("ch", 50, true, false), ans("same", false, true), ans("self", false, true))...), both, NoSession, true},
+		{"active", many("ak", 6, false, true), both, Active, true},
+		{"any, from outright refusals", many("ny", 5, false, false), both, NoSession, true},
+		{"too little signal", many("ny", 4, false, false), both, NoSession, false},
+		{"mixed: a rule asks where any's default refuses", append(many("ch", 6, false, true), many("ak", 1, false, true)...), both, NoSession, false},
+		{"everything distinguishing granted", append(many("ch", 6, true, false), ans("same", false, true)), both, NoSession, false},
+		{"errors and unknown actions count for nothing", append(many("ny", 6, false, false)[:0], Answer{Action: "ny", Err: "x"}, ans("zz", false, false), ans("zz", false, true)), both, NoSession, false},
+		{"three candidates", many("ak", 6, false, true), []Kind{NoSession, Inactive, Active}, Active, true},
+		{"no candidates", many("ak", 6, false, true), nil, NoSession, false},
+		{"one candidate", many("ak", 6, false, true), []Kind{Active}, NoSession, false},
+	} {
+		if c.name == "three candidates" {
+			// inactive: no, so a challenge says active over inactive too
+			a := actions["ak"]
+			a.Inactive = No
+			actions["ak"] = a
+		}
+		k, excl, ok := KindFrom(actions, c.answers, c.cands)
+		if k != c.want || ok != c.ok {
+			t.Errorf("%s: %s %v, want %s %v (%v)", c.name, k, ok, c.want, c.ok, excl)
+		}
 	}
 }
