@@ -94,14 +94,39 @@ type Verdict struct {
 	// adminDefault: refused only as an administrator's action granted
 	// with no password, so a grant implied by an accepted one may lift it.
 	adminDefault bool
+	// accepted: granted, and accepted on its own: its default for the
+	// subject is yes, or it is allowlisted or recorded yes for that kind.
+	accepted bool
 }
 
-// Judge applies §11.4 to every answer. An unknown action (one the list
-// doesn't hold) is not checked.
-func Judge(actions map[string]Action, answers []Answer) []Verdict {
+// Conditions are the facts the conditional entries of §11.4's allowlist
+// need. The zero value meets none of them, so those entries refuse.
+type Conditions struct {
+	// FwupdOnlyTrusted: fwupd's OnlyTrusted isn't off.
+	FwupdOnlyTrusted bool
+	// LocalSudoRules: nsswitch.conf names no network source (LDAP, sssd)
+	// for sudo rules, so every host-scoped rule can be read (and §11.1
+	// counts a NOPASSWD rule for any host).
+	LocalSudoRules bool
+}
+
+// conditional names the allowlist entries that hold only under a
+// condition (§11.4), with that condition's name for the report.
+var conditional = map[string]func(Conditions) (bool, string){
+	"org.freedesktop.fwupd.update-internal":                 func(c Conditions) (bool, string) { return c.FwupdOnlyTrusted, "fwupd's OnlyTrusted is off" },
+	"org.freedesktop.hostname1.set-hostname":                func(c Conditions) (bool, string) { return c.LocalSudoRules, "sudo rules come from the network" },
+	"org.freedesktop.hostname1.set-static-hostname":         func(c Conditions) (bool, string) { return c.LocalSudoRules, "sudo rules come from the network" },
+	"org.freedesktop.NetworkManager.settings.modify.system": func(c Conditions) (bool, string) { return c.LocalSudoRules, "sudo rules come from the network" },
+}
+
+// Judge applies §11.4 to every answer, under the allowlist's conditions.
+// An unknown action (one the list doesn't hold) is not checked. The
+// upgrade-only condition of the allowlisted updates is a release's stock
+// test (§13), not an input here.
+func Judge(actions map[string]Action, answers []Answer, c Conditions) []Verdict {
 	out := make([]Verdict, 0, len(answers))
 	for _, ans := range answers {
-		out = append(out, judge(actions, ans))
+		out = append(out, judge(actions, ans, c))
 	}
 	lift(actions, out)
 	sort.SliceStable(out, func(i, j int) bool {
@@ -117,7 +142,7 @@ func rank(r Result) int {
 	return map[Result]int{Refuse: 0, NotChecked: 1, Report: 2, Nothing: 3}[r]
 }
 
-func judge(actions map[string]Action, ans Answer) Verdict {
+func judge(actions map[string]Action, ans Answer, c Conditions) Verdict {
 	v := Verdict{Answer: ans}
 	a, known := actions[ans.Action]
 	switch {
@@ -136,8 +161,8 @@ func judge(actions map[string]Action, ans Answer) Verdict {
 	}
 	def := a.defaultFor(ans.Kind)
 	if why, ok := alwaysRefuses(a); ok {
-		if RecordedYes[a.ID] {
-			v.Result, v.Reason = Report, "runs code as root, but its recorded default is yes"
+		if RecordedYes[a.ID][ans.Kind] {
+			v.Result, v.Reason, v.accepted = Report, "runs code as root, but its recorded default for "+ans.Kind.String()+" is yes", true
 			return v
 		}
 		v.Result, v.Reason = Refuse, why
@@ -145,7 +170,13 @@ func judge(actions map[string]Action, ans Answer) Verdict {
 	}
 	if def.admin() {
 		if why, ok := Allowlist[a.ID]; ok {
-			v.Result, v.Reason = Report, "allowlisted: "+why
+			if cond, ok := conditional[a.ID]; ok {
+				if met, unmet := cond(c); !met {
+					v.Result, v.Reason = Refuse, "allowlisted only while not: "+unmet
+					return v
+				}
+			}
+			v.Result, v.Reason, v.accepted = Report, "allowlisted: "+why, true
 			return v
 		}
 		v.Result, v.Reason = Refuse, "an administrator's action ("+string(def)+" for "+ans.Kind.String()+") granted with no password"
@@ -153,49 +184,53 @@ func judge(actions map[string]Action, ans Answer) Verdict {
 		return v
 	}
 	v.Result, v.Reason = Nothing, "its default for "+ans.Kind.String()+" is "+string(def)
+	v.accepted = def == Yes
 	return v
 }
 
-// lift reports two kinds of refusal that follow from another answer for
-// the same subject (proposed for §11.4):
-//   - an administrator's action granted only because an accepted grant
-//     implies it (`org.freedesktop.policykit.imply`) is judged as that
-//     grant: reported when that grant is accepted (allowlisted, or its
-//     own default for the subject), followed through chains of
-//     implication;
+// lift reports two kinds of refusal that follow from other answers
+// (proposed for §11.4):
+//   - an administrator's action granted only because a grant for the same
+//     subject implies it (`org.freedesktop.policykit.imply`) is reported
+//     when that grant is accepted on its own: its default for the subject
+//     is yes, or it is allowlisted or recorded yes. One level only, as
+//     polkitd follows an implication (it doesn't check the implying
+//     action's own implications);
 //   - an exec.path helper in ExecPathIf runs as root but checks each
 //     caller against another action: it is reported while that action
-//     still challenges for an administrator (auth_admin*) for the same
-//     subject.
+//     asks for an administrator (auth_admin*) of every subject asked,
+//     since the helper's caller may be any process of the member's.
 func lift(actions map[string]Action, vs []Verdict) {
 	type key struct{ subject, action string }
 	at := map[key]int{}
 	for i, v := range vs {
 		at[key{v.Subject, v.Action}] = i
 	}
-	for changed := true; changed; {
-		changed = false
-		for i := range vs {
-			v := &vs[i]
-			if v.Result != Refuse || !v.adminDefault {
+	// From the first pass's verdicts only: a lifted grant implies nothing.
+	var lifted []int
+	for i := range vs {
+		v := &vs[i]
+		if v.Result != Refuse || !v.adminDefault {
+			continue
+		}
+		for _, a := range actions {
+			j, ok := at[key{v.Subject, a.ID}]
+			if !ok || !vs[j].accepted {
 				continue
 			}
-			for _, a := range actions {
-				j, ok := at[key{v.Subject, a.ID}]
-				if !ok || !vs[j].Authorized || vs[j].Result == Refuse || vs[j].Result == NotChecked {
-					continue
-				}
-				for _, implied := range a.Implies {
-					if implied == v.Action {
-						v.Result, v.Reason, v.adminDefault = Report, "implied by "+a.ID+" ("+string(vs[j].Result)+")", false
-						changed = true
-					}
-				}
-				if v.Result == Report {
-					break
+			for _, implied := range a.Implies {
+				if implied == v.Action {
+					v.Reason = "implied by " + a.ID + " (" + string(vs[j].Result) + ")"
+					lifted = append(lifted, i)
 				}
 			}
+			if len(lifted) > 0 && lifted[len(lifted)-1] == i {
+				break
+			}
 		}
+	}
+	for _, i := range lifted {
+		vs[i].Result, vs[i].adminDefault = Report, false
 	}
 	for i := range vs {
 		v := &vs[i]
@@ -203,8 +238,16 @@ func lift(actions map[string]Action, vs []Verdict) {
 		if v.Result != Refuse || !ok {
 			continue
 		}
-		if j, ok := at[key{v.Subject, gate.action}]; ok && vs[j].Err == "" && !vs[j].Authorized && vs[j].Challenge &&
-			actions[gate.action].defaultFor(vs[j].Kind).admin() {
+		if _, asked := at[key{v.Subject, gate.action}]; !asked {
+			continue
+		}
+		asks := true
+		for _, w := range vs {
+			if w.Action == gate.action && (w.Err != "" || w.Authorized || !w.Challenge || !actions[gate.action].defaultFor(w.Kind).admin()) {
+				asks = false
+			}
+		}
+		if asks {
 			v.Result, v.Reason = Report, gate.why+", while "+gate.action+" asks"
 		}
 	}
@@ -214,15 +257,6 @@ func lift(actions map[string]Action, vs []Verdict) {
 // (§11.4): it runs code as root, makes a root service, or reaches the
 // disk or the packages' trust.
 func alwaysRefuses(a Action) (string, bool) {
-	if a.ExecPath != "" {
-		if _, ok := ExecActionAllow[a.ID]; ok {
-			return "", false
-		}
-		if _, ok := ExecPathAllow[a.ExecPath]; ok {
-			return "", false
-		}
-		return "runs " + a.ExecPath + " as root", true
-	}
 	if why, ok := AlwaysRefuse[a.ID]; ok {
 		return why, true
 	}
@@ -230,6 +264,15 @@ func alwaysRefuses(a Action) (string, bool) {
 		if strings.HasPrefix(a.ID, prefix) {
 			return why, true
 		}
+	}
+	if a.ExecPath != "" {
+		if allow, ok := ExecActionAllow[a.ID]; ok && allow.path == a.ExecPath {
+			return "", false
+		}
+		if _, ok := ExecPathAllow[a.ExecPath]; ok {
+			return "", false
+		}
+		return "runs " + a.ExecPath + " as root", true
 	}
 	return "", false
 }
@@ -283,13 +326,14 @@ var alwaysRefusePrefix = map[string]string{
 }
 
 // RecordedYes names the always-refusing actions whose recorded default is
-// yes (§11.4): a grant of one is reported.
-var RecordedYes = map[string]bool{
-	"org.freedesktop.sysupdate1.check": true,
+// yes, and for which kinds of subject (§11.4): a grant of one for such a
+// subject is reported, and for another kind refuses.
+var RecordedYes = map[string]map[Kind]bool{
+	"org.freedesktop.sysupdate1.check": {Active: true},
 	// proposed for §11.4: upstream systemd 259's allow_active is yes
-	"org.freedesktop.sysupdate1.update":          true,
-	"org.freedesktop.machine1.host-login":        true,
-	"org.freedesktop.home1.update-home-by-owner": true,
+	"org.freedesktop.sysupdate1.update":          {Active: true},
+	"org.freedesktop.machine1.host-login":        {Active: true},
+	"org.freedesktop.home1.update-home-by-owner": {Active: true},
 }
 
 // ExecPathAllow names the fixed helpers an exec.path action may run (§11.4).
@@ -314,11 +358,12 @@ var ExecPathAllow = map[string]string{
 // ExecActionAllow names exec.path actions allowed by id, where the
 // helper's other modes (other argv1 values) are other actions that stay
 // refused (proposed for §11.4).
-var ExecActionAllow = map[string]string{
+// Each is pinned to its helper: the same id with another exec.path refuses.
+var ExecActionAllow = map[string]struct{ path, why string }{
 	// gnome-software's dkms helper: --test-dkms and --test-akmods only run
 	// mokutil --test-key on a fixed key file; --enroll-* stay refused
-	"org.gnome.software.dkms-test":   "tests whether DKMS's key is enrolled",
-	"org.gnome.software.akmods-test": "tests whether akmods' key is enrolled",
+	"org.gnome.software.dkms-test":   {"/usr/libexec/gnome-software-dkms-helper", "tests whether DKMS's key is enrolled"},
+	"org.gnome.software.akmods-test": {"/usr/libexec/gnome-software-dkms-helper", "tests whether akmods' key is enrolled"},
 }
 
 // ExecPathIf names the exec.path helpers that run as root but check each
@@ -367,7 +412,7 @@ var Allowlist = map[string]string{
 	"org.freedesktop.packagekit.trigger-offline-update":       "offline updates (upgrade-only)",
 	"org.freedesktop.packagekit.trigger-offline-upgrade":      "offline upgrades (upgrade-only)",
 	"org.debian.apt.upgrade-packages":                         "upgrades (upgrade-only)",
-	"org.freedesktop.NetworkManager.settings.modify.system":   "system network settings",
+	"org.freedesktop.NetworkManager.settings.modify.system":   "system network settings (with local sudo rules)",
 	"org.fedoraproject.thirdparty.opt-out":                    "third-party repositories off",
 	"org.freedesktop.Flatpak.app-install":                     "Flatpak apps (sandboxed)",
 	"org.freedesktop.Flatpak.runtime-install":                 "Flatpak runtimes (sandboxed)",

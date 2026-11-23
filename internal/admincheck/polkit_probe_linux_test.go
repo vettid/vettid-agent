@@ -43,18 +43,26 @@ type subject struct {
 }
 
 // sessionKind is a logind session's kind for polkit: active and local, or
-// not.
+// not. polkitd's logind backend calls a session local when it has a seat
+// (sd_session_get_seat) and active when its state is active, so a
+// seatless session, which logind marks active, is judged as inactive.
 func sessionKind(t *testing.T, id string) Kind {
-	props := run(t, "loginctl", "show-session", id, "-p", "Active", "-p", "Remote")
-	if strings.Contains(props, "Active=yes") && strings.Contains(props, "Remote=no") {
+	props := map[string]string{}
+	for _, line := range strings.Split(run(t, "loginctl", "show-session", id, "-p", "Seat", "-p", "State", "-p", "Remote"), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			props[k] = strings.TrimSpace(v)
+		}
+	}
+	if props["Seat"] != "" && props["State"] == "active" && props["Remote"] == "no" {
 		return Active
 	}
 	return Inactive
 }
 
 // pidSession is the logind session a process belongs to, as logind says
-// (sd_pid_get_session, through ps): a session scope's, or a manager-class
-// session's for the user's service manager.
+// (sd_pid_get_session, through ps): a session scope's. The user's service
+// manager and its units are in none (measured on systemd 258 and 259,
+// where a manager-class session exists for them).
 func pidSession(pid int) string {
 	out, err := exec.Command("ps", "-o", "lsession=", "-p", strconv.Itoa(pid)).Output()
 	if err != nil {
@@ -68,8 +76,8 @@ func pidSession(pid int) string {
 
 // sessionProcess is a process of the member's (all four uids) that logind
 // places in the session, found in the cgroup of the session's leader and
-// below it: a session scope, or for a manager-class session, the user's
-// service manager.
+// below it (the session scope). It needs the unified cgroup hierarchy
+// (v2); on another, it finds none and the session is not checked.
 func sessionProcess(t *testing.T, u *user.User, id string) int {
 	leader := strings.TrimSpace(run(t, "loginctl", "show-session", id, "-p", "Leader", "--value"))
 	b, err := os.ReadFile("/proc/" + leader + "/cgroup")
@@ -143,6 +151,7 @@ func subjects(t *testing.T, u *user.User) []subject {
 			// polkit judges none by it; its processes are judged as the
 			// no-session subject is.
 			if class := strings.TrimSpace(run(t, "loginctl", "show-session", f[0], "-p", "Class", "--value")); strings.HasPrefix(class, "manager") {
+				t.Logf("session %s: skipped (class %s)", f[0], class)
 				continue
 			}
 			// Asked by a process of the member's in the session, which
@@ -163,7 +172,8 @@ func subjects(t *testing.T, u *user.User) []subject {
 	}
 	// A process of the member's in no session: a transient system service.
 	unit := fmt.Sprintf("vettid-polkit-probe-%d", time.Now().UnixNano())
-	run(t, "systemd-run", "--unit", unit, "--uid", u.Uid, "--gid", u.Gid, "--property=NoNewPrivileges=yes", "/bin/sleep", "600")
+	run(t, "systemd-run", "--unit", unit, "--uid", u.Uid, "--gid", u.Gid, "--collect",
+		"--property=NoNewPrivileges=yes", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
 	t.Cleanup(func() { _ = exec.Command("systemctl", "stop", unit).Run() })
 	var pid int
 	for i := 0; i < 50 && pid == 0; i++ {
@@ -191,6 +201,38 @@ func subjects(t *testing.T, u *user.User) []subject {
 	return out
 }
 
+// conditions reads the facts the allowlist's conditional entries need.
+func conditions(t *testing.T) Conditions {
+	c := Conditions{FwupdOnlyTrusted: true, LocalSudoRules: true}
+	// fwupd 2 reads fwupd.conf, earlier ones daemon.conf; OnlyTrusted is
+	// on unless set off.
+	for _, f := range []string{"/etc/fwupd/fwupd.conf", "/etc/fwupd/daemon.conf"} {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if k, v, ok := strings.Cut(line, "="); ok && strings.TrimSpace(k) == "OnlyTrusted" && !strings.EqualFold(strings.TrimSpace(v), "true") {
+				c.FwupdOnlyTrusted = false
+			}
+		}
+	}
+	b, err := os.ReadFile("/etc/nsswitch.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(k) == "sudoers" {
+			for _, src := range strings.Fields(strings.SplitN(v, "#", 2)[0]) {
+				if src != "files" {
+					c.LocalSudoRules = false
+				}
+			}
+		}
+	}
+	return c
+}
+
 func TestPolkitProbe(t *testing.T) {
 	member := os.Getenv("VETTID_TEST_POLKIT_PROBE")
 	if member == "" {
@@ -207,6 +249,7 @@ func TestPolkitProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	conds := conditions(t)
 	subs := subjects(t, u)
 	var answers []Answer
 	for _, s := range subs {
@@ -231,7 +274,9 @@ func TestPolkitProbe(t *testing.T) {
 		t.Logf("  %s: %s", s.name, s.kind)
 	}
 	refused := 0
-	for _, v := range Judge(actions, answers) {
+	t.Logf("conditions: %+v", conds)
+	t.Log("a passing run says nothing of a .policy file changed on disk: that is the package check's")
+	for _, v := range Judge(actions, answers, conds) {
 		if v.Result == Nothing {
 			continue
 		}
