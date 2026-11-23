@@ -4,6 +4,7 @@ package admincheck
 // their tests run everywhere.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -105,6 +106,67 @@ func TestMemberDropIns(t *testing.T) {
 	}
 	if memberDropIns(nil) != "" {
 		t.Error("no drop-ins: refused")
+	}
+}
+
+// subgidRanges: the member's /etc/subgid ranges ([start, start+count)),
+// by name or uid.
+func subgidRanges(content, name, uid string) ([][2]uint64, error) {
+	var out [][2]uint64
+	for _, line := range strings.Split(content, "\n") {
+		f := strings.Split(strings.TrimSpace(line), ":")
+		if len(f) != 3 || (f[0] != name && f[0] != uid) {
+			continue
+		}
+		start, err1 := strconv.ParseUint(f[1], 10, 32)
+		n, err2 := strconv.ParseUint(f[2], 10, 32)
+		if err1 != nil || err2 != nil {
+			return nil, fmt.Errorf("an /etc/subgid line it can't read: %s", line)
+		}
+		out = append(out, [2]uint64{start, start + n})
+	}
+	return out, nil
+}
+
+// subsetOrIn: every id of a is in b or inside one of the ranges.
+func subsetOrIn(a, b string, ranges [][2]uint64) bool {
+	in := map[string]bool{}
+	for _, id := range strings.Fields(b) {
+		in[id] = true
+	}
+	for _, id := range strings.Fields(a) {
+		if in[id] {
+			continue
+		}
+		g, err := strconv.ParseUint(id, 10, 32)
+		ok := false
+		for _, r := range ranges {
+			ok = ok || (err == nil && g >= r[0] && g < r[1])
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func TestSubgidRanges(t *testing.T) {
+	r, err := subgidRanges("other:100000:65536\nmember:524288:65536\n1000:700000:10\n", "member", "1000")
+	if err != nil || len(r) != 2 || r[0] != [2]uint64{524288, 589824} || r[1] != [2]uint64{700000, 700010} {
+		t.Errorf("%v %v", r, err)
+	}
+	if _, err := subgidRanges("member:x:1\n", "member", "1000"); err == nil {
+		t.Error("a bad line read")
+	}
+	held := set([]string{"1001", "524288", "524297", "589823"})
+	if !subsetOrIn(held, "10 1001", r) {
+		t.Error("gids in the ranges refused")
+	}
+	if subsetOrIn(set([]string{"1001", "589824"}), "10 1001", r) || subsetOrIn("10 27", "1001", r) || subsetOrIn("x", "1001", r) {
+		t.Error("a gid outside the ranges and the database accepted")
+	}
+	if !subsetOrIn("1001", "10 1001", nil) || subsetOrIn("524288", "10 1001", nil) {
+		t.Error("without ranges: subset")
 	}
 }
 

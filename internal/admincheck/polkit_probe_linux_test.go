@@ -452,6 +452,14 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 	if mode, gid := hidepid(string(mi)); procHidden(mode, gid, helperGroup) {
 		return fmt.Sprintf("/proc is mounted with hidepid=%s, gid=%s, which hides processes from the helper", mode, gid)
 	}
+	var ranges [][2]uint64
+	if b, err := os.ReadFile("/etc/subgid"); err == nil {
+		if ranges, err = subgidRanges(string(b), u.Username, u.Uid); err != nil {
+			return err.Error()
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Sprintf("/etc/subgid can't be read (%v)", err)
+	}
 	ents, err := os.ReadDir("/proc")
 	if err != nil {
 		return fmt.Sprintf("/proc can't be listed (%v)", err)
@@ -478,9 +486,11 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 			continue
 		}
 		// Outside the first user namespace (a rootless container) fewer
-		// groups are accepted; a group beyond the database's still
-		// refuses (the lead's call, GC #16712).
-		if !inFirstUserNS(pid) && subset(held, want) {
+		// groups are accepted, and so are gids inside the member's own
+		// /etc/subgid ranges (the owner's a, GC #16829), which rests on
+		// subgidOverlap finding no real group in them; any other group
+		// beyond the database's still refuses (GC #16712).
+		if !inFirstUserNS(pid) && subsetOrIn(held, want, ranges) {
 			continue
 		}
 		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
