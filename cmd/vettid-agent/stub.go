@@ -47,13 +47,75 @@ const TextStubRunFlags = "--run-path and --run-env are set in the connector serv
 // normal process, which the service refuses (chosen; not in the spec).
 const TextNeedsAdmin = "This needs an administrator: start it as an administrator, as the README says."
 
-// dialService opens pairing name's channel for op.
+// stubStartService, where set (Windows), starts pairing name's service
+// and waits until it runs: the service is started on demand
+// (AGENT-SEPARATE-ACCOUNT §5, question 5). It returns a
+// *serviceRefusedError if the service stopped with a code of its own.
+var stubStartService func(name string) error
+
+// stubServiceRefusal, where set (Windows), returns a *serviceRefusedError
+// if pairing name's service is stopped with a code of its own, else nil:
+// a channel that isn't the service's (a squatted name) is said with the
+// service's own reason (AGENT-PLAN A3.10b).
+var stubServiceRefusal func(name string) error
+
+// dialService opens pairing name's channel for op. If there is no channel
+// (the service is stopped), it starts the service and dials again.
 func dialService(ctx context.Context, name string, op channel.Op) (io.ReadWriteCloser, error) {
 	pipe, err := stubReadPipe(name)
 	if err != nil {
 		return nil, err
 	}
-	return stubDial(ctx, channel.DialConfig{Pipe: pipe, Service: stubService(name), Op: op, Version: readVersion().Version})
+	cfg := channel.DialConfig{Pipe: pipe, Service: stubService(name), Op: op, Version: readVersion().Version}
+	conn, err := stubDial(ctx, cfg)
+	if errors.Is(err, channel.ErrNotService) && stubServiceRefusal != nil {
+		if r := stubServiceRefusal(name); r != nil {
+			return nil, fmt.Errorf("%w: %w", err, r)
+		}
+	}
+	if !errors.Is(err, channel.ErrNoService) || stubStartService == nil {
+		return conn, err
+	}
+	if serr := stubStartService(name); serr != nil {
+		return nil, fmt.Errorf("%w: %w", channel.ErrNoService, serr)
+	}
+	return stubDial(ctx, cfg)
+}
+
+// serviceRefusedError: the service stopped with a code of its own (its
+// self-check, its configuration, its channel), which the service manager
+// keeps.
+type serviceRefusedError struct{ code uint32 }
+
+func (e *serviceRefusedError) Error() string {
+	return "the connector service refused to start: " + serviceRefusalText(e.code) +
+		". Windows' Event Log (Application) has an entry from it."
+}
+
+// serviceRefusalText says why the service refused to start, by its exit
+// code (chosen; not in the spec; the codes are service.Code* and
+// service_windows.go's).
+func serviceRefusalText(code uint32) string {
+	switch code {
+	case 101:
+		return "it could not read its own account's token"
+	case 102:
+		return "it was started under an account other than its own"
+	case 103:
+		return "its account holds privileges beyond the one it needs; an administrator should run `vettid-agent install --upgrade`"
+	case 104:
+		return "its account is in the Administrators group; an administrator should remove it from that group"
+	case 105:
+		return "its account is in groups beyond its defaults; an administrator should remove it from them"
+	case 110:
+		return "its configuration file is missing, or can be changed by someone other than an administrator"
+	case 111:
+		return "the name of its channel is taken by another program; restart the computer, and tell your administrator if it happens again"
+	case 112:
+		return "its channel or its state folder failed"
+	default:
+		return fmt.Sprintf("code %d", code)
+	}
 }
 
 // runStub is `vettid-agent mcp --name <n>`.

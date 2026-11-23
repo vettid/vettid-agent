@@ -152,3 +152,14 @@ func holdsAdministrators(t *testing.T) bool {
 	}
 	return false
 }
+
+// `service` outside the service manager refuses, and runs nothing.
+func TestServiceFromCommandLine(t *testing.T) {
+	var out, errOut strings.Builder
+	if rc := run([]string{"service", "--name", "work"}, &out, &errOut); rc != 2 || !strings.Contains(errOut.String(), textServiceFromSCM) {
+		t.Fatalf("exit %d, stderr %q", rc, errOut.String())
+	}
+	if rc := run([]string{"service", "--name", "Not A Name"}, &out, &errOut); rc != 2 {
+		t.Fatalf("a bad name: exit %d", rc)
+	}
+}
