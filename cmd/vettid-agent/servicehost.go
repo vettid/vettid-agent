@@ -286,6 +286,13 @@ func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 // directory, read without the vault.
 func (h *serviceHost) status(rw io.ReadWriter) {
 	out := &consoleWriter{w: rw}
+	// The client sends its request line before it reads the answer: read
+	// it first, so the answer and the close never race its write.
+	if _, err := channel.ReadRequest(rw); err != nil {
+		fmt.Fprintln(out, "The request could not be read.")
+		out.exit(1)
+		return
+	}
 	v, err := state.ReadOnly(h.Dir, h.Protectors.Resolve)
 	switch {
 	case errors.Is(err, state.ErrNotFound):

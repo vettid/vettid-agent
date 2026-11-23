@@ -212,6 +212,12 @@ func TestHostOneAtATime(t *testing.T) {
 	if a := st.waitAnswer(t); a != "accept" {
 		t.Fatalf("status: %s", a)
 	}
+	// The host answers only after the request line, as the client sends
+	// it (net.Pipe is unbuffered: a host that answered first and closed
+	// would fail this write).
+	if err := channel.SendRequest(st, channel.Request{}); err != nil {
+		t.Fatal(err)
+	}
 	if text, code := st.console(t); code != 0 || !strings.Contains(text, "Not paired") {
 		t.Fatalf("status: %d %q", code, text)
 	}
