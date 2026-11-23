@@ -732,3 +732,39 @@ func TestKindFromLeavesOutTheRulesFile(t *testing.T) {
 		}
 	}
 }
+
+// Every action the rules file covers refuses whatever its defaults, is
+// never a recorded yes and isn't allowlisted, so a grant of one never
+// passes without the file.
+func TestRulesFileActionsAlwaysRefuse(t *testing.T) {
+	for id := range RulesFile {
+		if _, ok := alwaysRefuses(Action{ID: id}); !ok {
+			t.Errorf("%s doesn't always refuse", id)
+		}
+		if len(RecordedYes[id]) != 0 {
+			t.Errorf("%s recorded yes", id)
+		}
+		if _, ok := Allowlist[id]; ok {
+			t.Errorf("%s allowlisted", id)
+		}
+	}
+}
+
+// The rules file applies to the VettID members it lists, by user name,
+// and to no other account (the owner's a, GC #16962): a name, unlike a
+// group, can't be dropped by a process of the member's.
+func TestRulesFileScopedToTheMembers(t *testing.T) {
+	b, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(b)
+	for _, want := range []string{`"@MEMBER@",`, `vettidMembers.indexOf(subject.user) < 0`} {
+		if !strings.Contains(s, want) {
+			t.Errorf("no %q", want)
+		}
+	}
+	if strings.Index(s, "subject.user") > strings.Index(s, "switch (action.id)") {
+		t.Error("the member check comes after the actions")
+	}
+}

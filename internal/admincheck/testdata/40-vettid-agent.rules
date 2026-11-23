@@ -1,6 +1,13 @@
-// Written for the VettID agent's separate-account mode: these actions ask
-// for an administrator's password.
+// Written for the VettID agent's separate-account mode: for the VettID
+// members listed (one per pairing), these actions ask for an
+// administrator's password; every other account keeps polkit's defaults.
+var vettidMembers = [
+    "@MEMBER@",
+];
 polkit.addRule(function(action, subject) {
+    if (vettidMembers.indexOf(subject.user) < 0) {
+        return;
+    }
     switch (action.id) {
     case "org.freedesktop.packagekit.package-install":
     case "org.freedesktop.packagekit.package-remove":
