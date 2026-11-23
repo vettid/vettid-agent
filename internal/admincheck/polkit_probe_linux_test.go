@@ -435,9 +435,11 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 }
 
 // groupsDiffer names a process of the member's whose held groups aren't
-// exactly the group database's, or is empty. (A rule can grant on a
-// group's absence, so fewer counts too.) The one exemption is the user
-// manager's (sd-pam), which holds none.
+// the group database's, or is empty. In the first user namespace they
+// must be exactly the database's (a rule can grant on a group's absence,
+// so fewer counts too), except the user manager's (sd-pam), which holds
+// none. Outside it, fewer are accepted, and so are gids inside the
+// member's own /etc/subgid ranges (GC #16712, #16829).
 func groupsDiffer(t *testing.T, u *user.User) string {
 	want := dbGroups(t, u)
 	// /proc mounted with hidepid hides other users' processes from a
