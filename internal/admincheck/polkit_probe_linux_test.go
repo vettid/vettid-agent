@@ -64,6 +64,15 @@ func pidSession(pid int) string {
 	return ""
 }
 
+// displaySession is the member's display session, if it is signed in.
+func displaySession(name string) string {
+	out, err := exec.Command("loginctl", "show-user", name, "-p", "Display").Output()
+	if err != nil {
+		return "" // not signed in
+	}
+	return strings.TrimSpace(strings.TrimPrefix(string(out), "Display="))
+}
+
 func startTime(t *testing.T, pid int) uint64 {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
@@ -108,7 +117,7 @@ func subjects(t *testing.T, u *user.User) []subject {
 	kind, how := NoSession, "no session"
 	if s := pidSession(pid); s != "" {
 		kind, how = sessionKind(t, s), "its session "+s
-	} else if d := strings.TrimSpace(strings.TrimPrefix(run(t, "loginctl", "show-user", u.Username, "-p", "Display"), "Display=")); d != "" {
+	} else if d := displaySession(u.Username); d != "" {
 		kind, how = sessionKind(t, d), "the display session "+d
 	}
 	out = append(out, subject{
