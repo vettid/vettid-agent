@@ -360,4 +360,6 @@ var Allowlist = map[string]string{
 	"com.endlessm.ParentalControls.AppFilter.ReadAny":     "parental controls (read-only)",
 	"com.endlessm.ParentalControls.SessionLimits.ReadAny": "parental controls (read-only)",
 	"org.freedesktop.Malcontent.WebFilter.ReadAny":        "parental controls (read-only)",
+	// proposed for §11.4, with its fixed helper above
+	"org.gnome.controlcenter.set-keyboard": "the keyboard layout (Debian)",
 }
