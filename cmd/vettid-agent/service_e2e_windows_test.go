@@ -432,7 +432,14 @@ func TestServiceEndToEnd(t *testing.T) {
 			t.Fatalf("the member opening the service's process to read it: %v, want access denied", openErr)
 		}
 		t.Logf("the member: state folder %v; process (read) %v; process (query limited) %v", readErr, openErr, limited)
-		sd, err := windows.GetNamedSecurityInfo(in.stateDir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		// The folder's access list grants only the service's account, so
+		// even this elevated administrator may be refused its owner and
+		// access list (Windows 11 refuses; the windows-2025 runner allows
+		// it): recorded, then read with the backup privilege, as an
+		// administrator reads a folder that isn't theirs.
+		_, plainErr := windows.GetNamedSecurityInfo(in.stateDir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
+		t.Logf("an elevated administrator reading the state folder's security without the backup privilege: %v", plainErr)
+		sd, err := securityWithBackup(t, in.stateDir)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -564,4 +571,37 @@ func TestServiceEndToEnd(t *testing.T) {
 		}
 		t.Logf("the Event Log:\n%s", text)
 	})
+}
+
+// securityWithBackup reads path's owner and access list with this
+// process's backup privilege enabled (FILE_FLAG_BACKUP_SEMANTICS), and
+// leaves the privilege as it found it.
+func securityWithBackup(t *testing.T, path string) (*windows.SECURITY_DESCRIPTOR, error) {
+	t.Helper()
+	var tok windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &tok); err != nil {
+		return nil, err
+	}
+	defer tok.Close()
+	var luid windows.LUID
+	name, _ := windows.UTF16PtrFromString("SeBackupPrivilege")
+	if err := windows.LookupPrivilegeValue(nil, name, &luid); err != nil {
+		return nil, err
+	}
+	on := windows.Tokenprivileges{PrivilegeCount: 1}
+	on.Privileges[0] = windows.LUIDAndAttributes{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED}
+	var before windows.Tokenprivileges
+	var n uint32
+	// The result is judged by the open below: AdjustTokenPrivileges can
+	// report ERROR_NOT_ALL_ASSIGNED whatever it did.
+	adjErr := windows.AdjustTokenPrivileges(tok, false, &on, uint32(unsafe.Sizeof(before)), &before, &n)
+	defer func() { _ = windows.AdjustTokenPrivileges(tok, false, &before, 0, nil, nil) }()
+	p, _ := windows.UTF16PtrFromString(path)
+	h, err := windows.CreateFile(p, windows.READ_CONTROL, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE,
+		nil, windows.OPEN_EXISTING, windows.FILE_FLAG_BACKUP_SEMANTICS, 0)
+	if err != nil {
+		return nil, fmt.Errorf("opening %s with the backup privilege: %w (enabling it: %v)", path, err, adjErr)
+	}
+	defer windows.CloseHandle(h)
+	return windows.GetSecurityInfo(h, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION|windows.DACL_SECURITY_INFORMATION)
 }
