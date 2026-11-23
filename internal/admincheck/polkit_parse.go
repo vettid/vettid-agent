@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -102,8 +103,8 @@ func ParseBusctlCheck(out string) (authorized, challenge, temporary bool, err er
 	if len(f) < 4 || f[0] != "(bba{ss})" || (f[1] != "true" && f[1] != "false") || (f[2] != "true" && f[2] != "false") {
 		return false, false, false, fmt.Errorf("an answer it can't read: %q", out)
 	}
-	n := 0
-	if _, err := fmt.Sscanf(f[3], "%d", &n); err != nil || len(f) != 4+2*n {
+	n, err := strconv.Atoi(f[3])
+	if err != nil || n < 0 || len(f) != 4+2*n {
 		return false, false, false, fmt.Errorf("an answer it can't read: %q", out)
 	}
 	for i := 0; i < n; i++ {

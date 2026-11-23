@@ -579,3 +579,12 @@ func TestJudgeAuthSelf(t *testing.T) {
 		}
 	}
 }
+
+// pkaction's "-> " is dropped and nothing more: a tab after it stays part
+// of the first id, as polkitd's g_strsplit on " " leaves it.
+func TestImplyExact(t *testing.T) {
+	a, err := ParsePkaction("org.x:\n  implicit any:      no\n  implicit inactive: no\n  implicit active:   no\n  annotation:        org.freedesktop.policykit.imply ->\ta b\n")
+	if err != nil || len(a["org.x"].Implies) != 2 || a["org.x"].Implies[0] != "\ta" {
+		t.Errorf("%q %v", a["org.x"].Implies, err)
+	}
+}

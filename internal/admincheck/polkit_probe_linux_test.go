@@ -283,9 +283,15 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 		if pid, _ := strconv.Atoi(strings.TrimSpace(out)); pid != 0 {
 			// The pid came back from a hop running as the member:
 			// confirm it before asking polkitd (§11.4).
-			if inManager && !inManagerUnit(pid, u) {
-				t.Errorf("the user service reported pid %d, which isn't in user@%s.service with the member's uids", pid, u.Uid)
+			if !confirmSleeper(pid, u, unit, inManager) {
+				t.Errorf("pid %d isn't the probe's own %s, unchanged: not checked", pid, unit)
 				return 0
+			}
+			if inManager {
+				if d := strings.TrimSpace(viaOut(append(append([]string{}, ctl...), "show", "-p", "DropInPaths", "--value", unit)...)); d != "" {
+					t.Errorf("the user service has drop-ins (%s): not checked", d)
+					return 0
+				}
 			}
 			return pid
 		}
@@ -311,9 +317,26 @@ func managerContext(u *user.User) string {
 	return strings.TrimRight(string(b), "\x00\n")
 }
 
-func inManagerUnit(pid int, u *user.User) bool {
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-	return err == nil && strings.Contains(string(b), "/user@"+u.Uid+".service/") && ownedBy(pid, u.Uid)
+// confirmSleeper: the pid is the probe's own unit's sleep, the member's,
+// in user@<uid>.service for the manager's (no_new_privs off, as an
+// ordinary user service) or else in a system unit (no_new_privs on).
+func confirmSleeper(pid int, u *user.User, unit string, inManager bool) bool {
+	cg, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil || !strings.HasSuffix(strings.TrimSpace(string(cg)), "/"+unit+".service") || !ownedBy(pid, u.Uid) {
+		return false
+	}
+	if inManager && !strings.Contains(string(cg), "/user@"+u.Uid+".service/") {
+		return false
+	}
+	if exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid)); err != nil || !strings.HasSuffix(exe, "/sleep") {
+		return false
+	}
+	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	want := "NoNewPrivs:\t1"
+	if inManager {
+		want = "NoNewPrivs:\t0"
+	}
+	return err == nil && strings.Contains(string(st), want)
 }
 
 // noSession is the subject for a process of the member's in no session.
@@ -396,22 +419,10 @@ func ask(t *testing.T, version int, s *subject, id string) Answer {
 	return ans
 }
 
-func startTimeOf(stat []byte) uint64 {
-	i := strings.LastIndexByte(string(stat), ')')
-	if i < 0 {
-		return 0
-	}
-	f := strings.Fields(string(stat[i+2:]))
-	if len(f) < 20 {
-		return 0
-	}
-	v, _ := strconv.ParseUint(f[19], 10, 64)
-	return v
-}
-
-// groupsDiffer names a process of the member's that holds a group the
-// group database doesn't give, or is empty. Holding fewer can't widen a
-// grant ((sd-pam), the user manager's helper, holds none).
+// groupsDiffer names a process of the member's whose held groups aren't
+// exactly the group database's, or is empty. (A rule can grant on a
+// group's absence, so fewer counts too.) The one exemption is the user
+// manager's (sd-pam), which holds none.
 func groupsDiffer(t *testing.T, u *user.User) string {
 	want := dbGroups(t, u)
 	ents, _ := os.ReadDir("/proc")
@@ -420,7 +431,7 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 		if err != nil || !ownedBy(pid, u.Uid) {
 			continue
 		}
-		if held := heldGroups(pid); held != "unreadable" && !subset(held, want) {
+		if held := heldGroups(pid); held != "unreadable" && held != want && !sdPam(pid, u) {
 			return fmt.Sprintf("pid %d holds groups %q, the group database gives %q", pid, held, want)
 		}
 	}
@@ -447,18 +458,19 @@ func dbGroups(t *testing.T, u *user.User) string {
 	return set(strings.Fields(run(t, "id", "-G", u.Username)))
 }
 
-// subset: every id of a (a set string) is in b.
-func subset(a, b string) bool {
-	in := map[string]bool{}
-	for _, id := range strings.Fields(b) {
-		in[id] = true
+// sdPam: the process is (sd-pam), a child of the member's manager.
+func sdPam(pid int, u *user.User) bool {
+	comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+	if strings.TrimSpace(string(comm)) != "(sd-pam)" {
+		return false
 	}
-	for _, id := range strings.Fields(a) {
-		if !in[id] {
-			return false
-		}
+	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
 	}
-	return true
+	ppid := parentOf(st)
+	out, err := exec.Command("systemctl", "show", "-p", "MainPID", "--value", "user@"+u.Uid+".service").Output()
+	return err == nil && ppid != 0 && strconv.Itoa(ppid) == strings.TrimSpace(string(out))
 }
 
 // set is a list of ids without duplicates, sorted, as one string.
@@ -589,7 +601,7 @@ func TestPolkitProbe(t *testing.T) {
 		// polkitd 124 and later judge a process subject by the group
 		// database (getgrouplist), a caller on the bus by the groups its
 		// process holds: where they differ, not checked.
-		if held, want := heldGroups(s.pid), dbGroups(t, u); !subset(held, want) {
+		if held, want := heldGroups(s.pid), dbGroups(t, u); held != want {
 			t.Logf("%s: holds groups %q, the group database gives %q: sign out and in again", s.name, held, want)
 			for j := range these {
 				if these[j].Err == "" {
