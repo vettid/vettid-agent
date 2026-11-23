@@ -416,6 +416,8 @@ func TestKindFrom(t *testing.T) {
 		"ak3": {Any: No, Inactive: No, Active: AuthAdminKeep},
 		// any and inactive the same
 		"ai": {Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes},
+		// recorded yes for active only, the same defaults for every kind
+		"org.freedesktop.sysupdate1.check": {Any: AuthAdmin, Inactive: AuthAdmin, Active: AuthAdmin},
 	}
 	many := func(id string, n int, auth, chal bool) []Answer {
 		var out []Answer
@@ -451,6 +453,7 @@ func TestKindFrom(t *testing.T) {
 		{"unknown actions count for nothing", append(many("ny", 4, false, false), many("zz", 6, false, false)...), both, NoSession, false},
 		{"three candidates", many("ak3", 6, false, true), []Kind{NoSession, Inactive, Active}, Active, true},
 		{"candidates whose defaults agree are one", many("ai", 2, false, true), []Kind{NoSession, Inactive}, NoSession, true},
+		{"not one where a recorded yes differs", append(many("same", 2, false, true), ans("org.freedesktop.sysupdate1.check", true, false)), []Kind{Active, Inactive}, NoSession, false},
 		{"no candidates", many("ak", 6, false, true), nil, NoSession, false},
 		{"one candidate", many("ak", 6, false, true), []Kind{Active}, NoSession, false},
 	} {

@@ -266,8 +266,9 @@ func lift(actions map[string]Action, vs []Verdict) {
 // MinKindSignal refusals the other doesn't, and the other explains none
 // it doesn't: a rule that refuses or asks where the defaults grant can
 // make the evidence mixed, and then it is not ok (the run fails rather
-// than guess). Candidates whose defaults agree on every action answered
-// are one: the choice between them changes no verdict. excl[i][j] is the
+// than guess). Candidates whose defaults, and recorded yes defaults, agree
+// on every action answered are one: the choice between them changes no
+// verdict. excl[i][j] is the
 // refusals candidate i explains and j doesn't, for the candidates kept.
 // When ok is false, k is NoSession.
 func KindFrom(actions map[string]Action, answers []Answer, all []Kind) (k Kind, candidates []Kind, excl [][]int, ok bool) {
@@ -276,7 +277,7 @@ func KindFrom(actions map[string]Action, answers []Answer, all []Kind) (k Kind, 
 		for _, d := range candidates {
 			agree := true
 			for _, a := range answers {
-				if act, known := actions[a.Action]; known && act.defaultFor(c) != act.defaultFor(d) {
+				if act, known := actions[a.Action]; known && (act.defaultFor(c) != act.defaultFor(d) || RecordedYes[a.Action][c] != RecordedYes[a.Action][d]) {
 					agree = false
 					break
 				}
