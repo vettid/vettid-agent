@@ -517,7 +517,7 @@ func subgidOverlap(t *testing.T, u *user.User) string {
 			// but also what a network source that can't be reached gives
 			// (getent can't tell them apart). Anything else, or no getent,
 			// is a lookup that didn't run.
-			out, err := exec.Command("getent", args...).Output()
+			out, err := exec.Command("/usr/bin/getent", args...).Output()
 			var ee *exec.ExitError
 			if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 2) {
 				return fmt.Sprintf("the subgid lookup failed (%v)", err)
