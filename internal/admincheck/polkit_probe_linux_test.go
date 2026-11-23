@@ -245,6 +245,11 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 		// is refused on Fedora 44); output goes to a file PID 1 writes.
 		hop = []string{"systemd-run", "--uid", u.Uid, "--gid", u.Gid, "--wait", "--quiet", "--collect",
 			"-E", "XDG_RUNTIME_DIR=" + rt, "-E", "DBUS_SESSION_BUS_ADDRESS=unix:path=" + rt + "/bus"}
+		// Under SELinux the user bus refuses a system service's context
+		// (Fedora 44, measured): the hop takes the member's manager's.
+		if ctx := managerContext(u); ctx != "" {
+			hop = append(hop, "--property=SELinuxContext="+ctx)
+		}
 		ctl = []string{"systemctl", "--user"}
 		start = []string{"systemd-run", "--user"} // as an ordinary user service: no NoNewPrivileges
 	}
@@ -287,6 +292,23 @@ func sleeper(t *testing.T, u *user.User, inManager bool) int {
 		time.Sleep(100 * time.Millisecond)
 	}
 	return 0
+}
+
+// managerContext is the SELinux context of the member's service manager,
+// where SELinux is enabled; else empty.
+func managerContext(u *user.User) string {
+	if _, err := os.Stat("/sys/fs/selinux/enforce"); err != nil {
+		return ""
+	}
+	out, err := exec.Command("systemctl", "show", "-p", "MainPID", "--value", "user@"+u.Uid+".service").Output()
+	if err != nil {
+		return ""
+	}
+	b, err := os.ReadFile("/proc/" + strings.TrimSpace(string(out)) + "/attr/current")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimRight(string(b), "\x00\n")
 }
 
 func inManagerUnit(pid int, u *user.User) bool {
