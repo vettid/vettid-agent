@@ -122,6 +122,18 @@ type Manager struct {
 	statusHook func(ownerCheck string)
 	// bg counts the requests running in goroutines of their own (Wait).
 	bg sync.WaitGroup
+
+	// suspect: since a resume or a clock jump (Suspect), the session is
+	// not used on this computer's clock until a vault.status answers;
+	// suspectGen counts the suspicions, so that an answer to a check sent
+	// before a later one does not clear it. verifying is that check.
+	suspect    bool
+	suspectGen uint64
+	verifying  *flight
+
+	// clock and clockEvery are WatchClock's (tests replace them).
+	clock      func() (wall time.Time, mono time.Duration)
+	clockEvery time.Duration
 }
 
 // Wait waits for the requests this Manager runs in the background (an
@@ -162,7 +174,136 @@ func New(conn Conn, seconds int, now func() time.Time) *Manager {
 	if seconds == 0 {
 		seconds = DefaultSeconds
 	}
-	return &Manager{conn: conn, now: now, seconds: seconds}
+	start := time.Now()
+	return &Manager{conn: conn, now: now, seconds: seconds,
+		clock:      func() (time.Time, time.Duration) { return time.Now().Round(0), time.Since(start) },
+		clockEvery: clockEvery}
+}
+
+// After a resume from sleep or a jump in the system clock, the connector
+// treats its access session as unknown until a vault.status answers
+// (AGENT-SEPARATE-ACCOUNT §5 "Sleep and resume, and a wrong clock";
+// AGENT-PLAN §4.4; VAULT-MESSAGING §6.8): it never uses the session as
+// live on its own clock alone. The answer's `session` (§10.2, to
+// desktops and agents: the device's own current session or null) then
+// decides, with the vault's own expiry.
+
+// ClockJump is how far the wall clock may move apart from the monotonic
+// clock between two of WatchClock's looks before the session is suspect
+// (chosen; not in the spec). clockEvery is how often it looks.
+const (
+	ClockJump  = time.Minute
+	clockEvery = 15 * time.Second
+)
+
+// Suspect marks the access session as not to be trusted on this
+// computer's clock (a resume, a clock jump): the next Ensure first sends
+// vault.status and takes the session it names. Nothing is sent to the
+// member's phone for it.
+func (m *Manager) Suspect() {
+	m.mu.Lock()
+	m.suspect = true
+	m.suspectGen++
+	m.mu.Unlock()
+}
+
+// Suspected reports whether the session waits for a vault.status.
+func (m *Manager) Suspected() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.suspect
+}
+
+// jumped reports whether the wall clock moved apart from the monotonic
+// clock by more than ClockJump between two looks: the clock was set, or
+// the computer slept (where the monotonic clock stops while it sleeps).
+func jumped(wall, mono time.Duration) bool {
+	d := wall - mono
+	return d > ClockJump || d < -ClockJump
+}
+
+// WatchClock looks at the clocks every clockEvery until ctx ends, and
+// calls Suspect when they have moved apart (jumped).
+func (m *Manager) WatchClock(ctx context.Context) {
+	t := time.NewTicker(m.clockEvery)
+	defer t.Stop()
+	prevWall, prevMono := m.clock()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		wall, mono := m.clock()
+		if jumped(wall.Sub(prevWall), mono-prevMono) {
+			m.Suspect()
+		}
+		prevWall, prevMono = wall, mono
+	}
+}
+
+// verify sends vault.status and takes the session it names and its
+// owner check. It clears the suspicion only if no new one came while it
+// was on its way.
+func (m *Manager) verify(ctx context.Context) error {
+	m.mu.Lock()
+	gen := m.suspectGen
+	hook := m.statusHook
+	m.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	defer cancel()
+	before := m.conn.Access()
+	r, err := m.conn.Request(ctx, "vault.status", json.RawMessage(`{}`))
+	if err != nil {
+		if errors.Is(err, vaultconn.ErrRefused) {
+			return err
+		}
+		return ErrUnreachable
+	}
+	if !r.OK {
+		return fmt.Errorf("the vault refused vault.status: %s", r.ErrorCode)
+	}
+	var s struct {
+		Session    json.RawMessage `json:"session"`
+		OwnerCheck struct {
+			State string `json:"state"`
+		} `json:"owner_check"`
+	}
+	if json.Unmarshal(r.Body, &s) != nil || len(s.Session) == 0 {
+		// The vault's status must name the session (VAULT-MESSAGING
+		// 0.41.0); without it nothing is learned, and the session stays
+		// suspect.
+		return errors.New("the vault's status does not name the access session")
+	}
+	a := pairing.Access{State: pairing.AccessNone}
+	if string(s.Session) != "null" {
+		var sess struct {
+			SessionID string `json:"session_id"`
+			ExpiresAt string `json:"expires_at"`
+		}
+		if json.Unmarshal(s.Session, &sess) != nil || sess.SessionID == "" {
+			return errors.New("the vault's status names a session it does not describe")
+		}
+		exp, err := time.Parse(time.RFC3339, sess.ExpiresAt)
+		if err != nil {
+			return errors.New("the vault's status names a session without a readable end")
+		}
+		a = pairing.Access{State: pairing.AccessActive, SessionID: sess.SessionID, ExpiresAt: exp}
+	}
+	// An event that changed the session meanwhile is newer: it stays.
+	m.conn.CompareAndSetAccess(before, a)
+	if s.OwnerCheck.State != "" {
+		m.OnStatus(s.OwnerCheck.State)
+		if hook != nil {
+			hook(s.OwnerCheck.State)
+		}
+	}
+	m.mu.Lock()
+	if m.suspectGen == gen {
+		m.suspect = false
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 // active reports whether a is a session usable at now.
@@ -249,8 +390,35 @@ func (m *Manager) Ensure(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ErrUnreachable
 	}
-	now := m.now()
 	m.mu.Lock()
+	if m.suspect {
+		// After a resume or a clock jump: one vault.status at a time;
+		// callers that arrive meanwhile wait for it and take its outcome.
+		f := m.verifying
+		if f == nil {
+			f = newFlight()
+			m.verifying = f
+			m.bg.Add(1)
+			go func() {
+				defer m.bg.Done()
+				err := m.verify(context.WithoutCancel(ctx))
+				m.mu.Lock()
+				f.err, m.verifying = err, nil
+				m.mu.Unlock()
+				close(f.done)
+			}()
+		}
+		m.mu.Unlock()
+		if err := f.wait(ctx); err != nil {
+			var ae *Error
+			if errors.As(err, &ae) || errors.Is(err, vaultconn.ErrRefused) {
+				return err
+			}
+			return ErrUnreachable
+		}
+		return m.Ensure(ctx)
+	}
+	now := m.now()
 	if m.held {
 		m.mu.Unlock()
 		return ErrOwnerCheck
