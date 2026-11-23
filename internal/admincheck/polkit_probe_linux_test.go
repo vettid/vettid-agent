@@ -15,6 +15,7 @@ package admincheck
 // testdata/40-vettid-agent.rules (copied to /etc/polkit-1/rules.d/).
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -501,8 +502,13 @@ func subgidOverlap(t *testing.T, u *user.User) string {
 			for g := lo; g < lo+4096 && g < start+n; g++ {
 				args = append(args, strconv.FormatUint(g, 10))
 			}
-			// exit 2: some keys not found, which is the usual case
-			out, _ := exec.Command("getent", args...).Output()
+			// exit 0: every key found; 2: some not found, the usual case.
+			// Anything else, or no getent, is a lookup that didn't run.
+			out, err := exec.Command("getent", args...).Output()
+			var ee *exec.ExitError
+			if err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 2) {
+				return fmt.Sprintf("the subgid lookup failed (%v)", err)
+			}
 			if g := strings.TrimSpace(string(out)); g != "" {
 				return fmt.Sprintf("the member's subgid range %s:%s holds group %s", f[1], f[2], strings.SplitN(g, "\n", 2)[0])
 			}
@@ -717,7 +723,7 @@ func TestPolkitProbe(t *testing.T) {
 		t.Logf("%s: not checked for every subject", bad)
 		for j := range answers {
 			if answers[j].Err == "" {
-				answers[j].Err = "a process of the member's holds groups the group database doesn't give"
+				answers[j].Err = bad
 			}
 		}
 	}
