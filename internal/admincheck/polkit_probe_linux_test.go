@@ -228,8 +228,14 @@ func subjects(t *testing.T, u *user.User) []subject {
 // didn't start.
 func sleeper(t *testing.T, scope []string, cmd ...string) int {
 	unit := fmt.Sprintf("vettid-polkit-probe-%d", time.Now().UnixNano())
-	args := append(append([]string{}, cmd[1:]...), "--unit", unit, "--collect",
-		"--property=NoNewPrivileges=yes", "--property=RuntimeMaxSec=600", "/bin/sleep", "600")
+	args := append(append([]string{}, cmd[1:]...), "--unit", unit, "--collect", "--property=RuntimeMaxSec=600")
+	// The system service, as the helper's child is, has no_new_privs; a
+	// unit of the member's manager is left as an ordinary user service
+	// is, since a rule can read subject.no_new_privileges.
+	if scope == nil {
+		args = append(args, "--property=NoNewPrivileges=yes")
+	}
+	args = append(args, "/bin/sleep", "600")
 	if out, err := exec.Command(cmd[0], args...).CombinedOutput(); err != nil {
 		t.Logf("%s: %v\n%s", strings.Join(cmd, " "), err, out)
 		return 0
@@ -280,9 +286,7 @@ func heldGroups(pid int) string {
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		if rest, ok := strings.CutPrefix(line, "Groups:"); ok {
-			g := strings.Fields(rest)
-			sort.Strings(g)
-			return strings.Join(g, " ")
+			return set(strings.Fields(rest))
 		}
 	}
 	return "none listed"
@@ -291,9 +295,21 @@ func heldGroups(pid int) string {
 // dbGroups are the member's groups as the group database gives them
 // (getgrouplist, through id), sorted, as one string.
 func dbGroups(t *testing.T, u *user.User) string {
-	g := strings.Fields(run(t, "id", "-G", u.Username))
-	sort.Strings(g)
-	return strings.Join(g, " ")
+	return set(strings.Fields(run(t, "id", "-G", u.Username)))
+}
+
+// set is a list of ids without duplicates, sorted, as one string.
+func set(ids []string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return strings.Join(out, " ")
 }
 
 // conditions reads the facts the allowlist's conditional entries need.
@@ -384,9 +400,22 @@ func TestPolkitProbe(t *testing.T) {
 					}
 				}
 			}
-			if ok && s.want != nil && k != *s.want {
-				t.Logf("  judged as %s, but worked out as %s", k, *s.want)
-				ok = false
+			if s.want != nil {
+				// A session's kind, worked out from logind, needs only
+				// to be consistent with its answers: no other kind
+				// explains a refusal its kind doesn't (the want is the
+				// first candidate, so it is kept[0]), and no other kind
+				// is identified instead.
+				ok = !ok || k == *s.want
+				for i := 1; i < len(kept); i++ {
+					if excl[i][0] != 0 {
+						ok = false
+					}
+				}
+				if !ok {
+					t.Logf("  inconsistent with %s, worked out from logind", *s.want)
+				}
+				k = *s.want
 			}
 			if s.want == nil || ok {
 				s.kind = k

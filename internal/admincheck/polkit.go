@@ -26,6 +26,18 @@ const (
 
 func (d Default) admin() bool { return d == AuthAdmin || d == AuthAdminKeep }
 
+// unkept is the default without its keep: the two judge alike, and a
+// challenge doesn't tell them apart.
+func (d Default) unkept() Default {
+	switch d {
+	case AuthAdminKeep:
+		return AuthAdmin
+	case AuthSelfKeep:
+		return AuthSelf
+	}
+	return d
+}
+
 // Kind is the kind of subject polkit judged an answer for.
 type Kind int
 
@@ -283,7 +295,7 @@ func KindFrom(actions map[string]Action, answers []Answer, all []Kind) (k Kind, 
 		for _, d := range candidates {
 			agree := true
 			for _, a := range answers {
-				if act, known := actions[a.Action]; known && (act.defaultFor(c) != act.defaultFor(d) || RecordedYes[a.Action][c] != RecordedYes[a.Action][d]) {
+				if act, known := actions[a.Action]; known && (act.defaultFor(c).unkept() != act.defaultFor(d).unkept() || RecordedYes[a.Action][c] != RecordedYes[a.Action][d]) {
 					agree = false
 					break
 				}

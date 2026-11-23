@@ -125,6 +125,7 @@ org.gnome.software.akmods-test:
   implicit inactive: yes
   implicit active:   yes
   annotation:        org.freedesktop.policykit.exec.path -> /usr/libexec/another-helper
+  annotation:        org.freedesktop.policykit.exec.argv1 -> --test-akmods
 
 org.freedesktop.import1.pull-tar:
   implicit any:      auth_admin
@@ -224,6 +225,13 @@ func TestJudge(t *testing.T) {
 	add("org.freedesktop.import1.pull-tar", Active, true, Refuse)      // a prefix, though yes for active
 	add("org.freedesktop.fwupd.update-internal", Active, true, Report) // its condition met
 	add("org.freedesktop.hostname1.set-hostname", Active, true, Report)
+	for _, id := range []string{"org.rpm.dnf.v0.rpm.execute_transaction", "org.rpm.dnf.v0.rpm.Repo.conf_write", "org.rpm.dnf.v0.base.Config.override"} {
+		actions[id] = Action{ID: id, Any: Yes, Inactive: Yes, Active: Yes}
+		add(id, Active, true, Refuse) // always refuses, whatever its defaults
+	}
+	actions["org.freedesktop.machine1.register-machine"] = Action{ID: "org.freedesktop.machine1.register-machine", Any: AuthAdmin, Inactive: AuthAdmin, Active: Yes}
+	add("org.freedesktop.machine1.register-machine", Active, true, Report)
+	add("org.freedesktop.machine1.register-machine", Inactive, true, Refuse)
 	for _, v := range Judge(actions, answers, met) {
 		if w := want[v.Action+"/"+v.Kind.String()]; v.Result != w {
 			t.Errorf("%s (%s): %s (%s), want %s", v.Action, v.Kind, v.Result, v.Reason, w)
@@ -505,8 +513,8 @@ func TestJudgeNoDefaultAndArgv1(t *testing.T) {
 	if got["org.gnome.software.dkms-test/active"] != Refuse {
 		t.Errorf("the key test's id in another mode: %v", got)
 	}
-	a, err := ParsePkaction("org.x:\n  implicit any:      no\n  implicit inactive: no\n  implicit active:   no\n  annotation:        org.freedesktop.policykit.imply -> a  b c\n")
-	if err != nil || len(a["org.x"].Implies) != 3 {
+	a, err := ParsePkaction("org.x:\n  implicit any:      no\n  implicit inactive: no\n  implicit active:   no\n  annotation:        org.freedesktop.policykit.imply -> a\tb c\n")
+	if err != nil || len(a["org.x"].Implies) != 2 || a["org.x"].Implies[0] != "a\tb" {
 		t.Errorf("imply split: %q %v", a["org.x"].Implies, err)
 	}
 }
