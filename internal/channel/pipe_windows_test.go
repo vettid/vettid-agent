@@ -676,14 +676,34 @@ func TestPipeMemberIsAdmin(t *testing.T) {
 
 // openRaw opens the pipe as a client would, at identification level, and
 // sends nothing.
+// While the listener identifies a client, the next instance may not be
+// waiting yet (ERROR_PIPE_BUSY): it waits and tries again, as Dial does,
+// for 5 s. It may run on an impersonating goroutine, so a failure is
+// reported with Errorf and a zero handle, which the caller checks.
 func openRaw(t *testing.T, pipe string) windows.Handle {
 	t.Helper()
 	p, _ := windows.UTF16PtrFromString(PipePath(pipe))
-	h, err := windows.CreateFile(p, clientAccess, 0, nil, windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
-	if err != nil {
-		t.Fatal(err)
+	for end := time.Now().Add(5 * time.Second); ; {
+		h, err := windows.CreateFile(p, clientAccess, 0, nil, windows.OPEN_EXISTING, windows.SECURITY_SQOS_PRESENT|windows.SECURITY_IDENTIFICATION, 0)
+		if err == nil {
+			return h
+		}
+		if !errors.Is(err, windows.ERROR_PIPE_BUSY) || time.Now().After(end) {
+			t.Errorf("opening the pipe: %v", err)
+			return 0
+		}
+		_, _, _ = procWaitNamedPipeW.Call(uintptr(unsafe.Pointer(p)), 1000)
 	}
-	return h
+}
+
+// openedAll fails the test, on its own goroutine, if any handle is zero.
+func openedAll(t *testing.T, hs ...windows.Handle) {
+	t.Helper()
+	for _, h := range hs {
+		if h == 0 {
+			t.FailNow()
+		}
+	}
 }
 
 // A client that connects and says nothing holds only its own place: a

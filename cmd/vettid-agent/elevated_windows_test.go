@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vettid/vettid-vault/vms/invite"
 	"golang.org/x/sys/windows"
 
 	"github.com/vettid/vettid-agent/internal/channel"
@@ -130,7 +131,12 @@ func TestElevatedPairEndToEnd(t *testing.T) {
 	oldService := stubService
 	stubService = func(string) string { return me }
 	var out, errOut bytes.Buffer
-	rc := run([]string{"pair", "--name", name, "--label", "CI", "THE-CODE"}, &out, &errOut)
+	v := newVault(t)
+	theCode, err := v.Code(invite.KindAgent, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc := run([]string{"pair", "--name", name, "--label", "CI", theCode}, &out, &errOut)
 	stubService = oldService
 	if rc != 0 || !strings.Contains(errOut.String(), "Paired as a test.") {
 		t.Fatalf("elevated pair --name: exit %d, stderr %q", rc, errOut.String())
@@ -138,7 +144,7 @@ func TestElevatedPairEndToEnd(t *testing.T) {
 	select {
 	case s := <-got:
 		if s.err != nil || s.c.Op != channel.OpPair || !s.c.Identity.ElevatedAdmin ||
-			s.req != (channel.Request{Code: "THE-CODE", Label: "CI"}) {
+			s.req != (channel.Request{Code: theCode, Label: "CI"}) {
 			t.Fatalf("the service's side: op %q identity %+v request %+v, %v", s.c.Op, s.c.Identity, s.req, s.err)
 		}
 	case <-time.After(5 * time.Second):
@@ -149,7 +155,7 @@ func TestElevatedPairEndToEnd(t *testing.T) {
 	// listener (owned by the test's account) is not the service: refused
 	// before any byte, and said as "not running".
 	errOut.Reset()
-	if rc := run([]string{"pair", "--name", name, "THE-CODE"}, &out, &errOut); rc != 1 || !strings.Contains(errOut.String(), mcp.NoService().Text) {
+	if rc := run([]string{"pair", "--name", name, theCode}, &out, &errOut); rc != 1 || !strings.Contains(errOut.String(), mcp.NoService().Text) {
 		t.Fatalf("pair against a channel that isn't the service's: exit %d, stderr %q", rc, errOut.String())
 	}
 	select {

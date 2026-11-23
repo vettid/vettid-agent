@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/term"
 
@@ -85,6 +86,13 @@ func runPair(args []string, stdout, stderr io.Writer) int {
 		c, err := code()
 		if err == nil && strings.TrimSpace(c) == "" {
 			err = errors.New("no pairing code was given")
+		}
+		if err == nil {
+			// The code's form is checked here, before the channel opens: a
+			// mistyped or expired code then never ends the agent's session,
+			// which the service does before it pairs. The service checks
+			// it again.
+			_, err = pairing.ParseCode(c, time.Now())
 		}
 		if err != nil {
 			fmt.Fprintf(stderr, "vettid-agent pair: %v\n", err)

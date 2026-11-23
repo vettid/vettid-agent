@@ -137,6 +137,9 @@ func (h *serviceHost) Held() int {
 	return h.holds
 }
 
+// hostDecoded, set only by tests, sees each record loadRecord decodes.
+var hostDecoded func(*pairing.Record)
+
 // errIdle: the host stopped because nothing held it for IdleStop.
 var errIdle = errors.New("idle")
 
@@ -441,6 +444,9 @@ func (h *serviceHost) loadRecord() (*pairing.Record, error) {
 	clear(raw)
 	if err != nil {
 		return nil, err
+	}
+	if hostDecoded != nil {
+		hostDecoded(rec)
 	}
 	if rec.Phase != pairing.PhasePaired {
 		clear(rec.Device)

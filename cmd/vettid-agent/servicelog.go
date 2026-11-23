@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"unicode/utf8"
 )
 
 // eventSink is where the service's log goes: the Windows Event Log
@@ -34,6 +35,30 @@ var eventLogKeys = map[string]bool{
 // the spec): codes, tool names and types are short.
 const maxLogValue = 64
 
+// capValue cuts v to at most maxLogValue bytes, on a character's
+// boundary: never inside a UTF-8 sequence.
+func capValue(v string) string {
+	if len(v) <= maxLogValue {
+		return v
+	}
+	i := maxLogValue
+	for i > 0 && !utf8.RuneStart(v[i]) {
+		i--
+	}
+	return v[:i] + "..."
+}
+
+// refusalMessage is the Event Log's text for a refusal to start with
+// code: the code's fixed text, and for a privilege refusal (103) the
+// privileges' names, which are not sensitive and say what to cut.
+func refusalMessage(code uint32, privileges []string) string {
+	m := "the service refuses to run: " + serviceRefusalText(code)
+	if code == 103 && len(privileges) > 0 {
+		m += ": " + strings.Join(privileges, ", ")
+	}
+	return m
+}
+
 // eventLogHandler writes the service's log to sink under the pairing's
 // name: the message, then the allowed attributes. The messages are the
 // service's own fixed texts.
@@ -50,10 +75,7 @@ func (h *eventLogHandler) Handle(_ context.Context, r slog.Record) error {
 	fmt.Fprintf(&b, "pairing %s: %s", h.name, r.Message)
 	add := func(a slog.Attr) bool {
 		if eventLogKeys[a.Key] {
-			v := a.Value.String()
-			if len(v) > maxLogValue {
-				v = v[:maxLogValue] + "..."
-			}
+			v := capValue(a.Value.String())
 			fmt.Fprintf(&b, " %s=%s", a.Key, v)
 		}
 		return true
