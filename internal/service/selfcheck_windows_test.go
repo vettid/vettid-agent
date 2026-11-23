@@ -28,12 +28,13 @@ func okToken() Token {
 		User:       testServiceSID,
 		Privileges: []string{changeNotify},
 		Groups: []Group{
-			{SID: "S-1-16-16384", Attributes: seGroupIntegrity},
+			{SID: "S-1-16-12288", Attributes: seGroupIntegrity},
 			{SID: "S-1-1-0", Attributes: 7},
 			{SID: "S-1-5-32-545", Attributes: 7},
 			{SID: "S-1-5-6", Attributes: 7},
 			{SID: "S-1-5-5-0-123456", Attributes: 0xc0000007},
 			{SID: "S-1-2-0", Attributes: 7},
+			{SID: "S-1-2-1", Attributes: 7},
 			{SID: "S-1-5-11", Attributes: 7},
 			{SID: "S-1-5-15", Attributes: 7},
 			{SID: testServiceSID, Attributes: 0xe},
@@ -83,7 +84,7 @@ func TestCheck(t *testing.T) {
 	}
 
 	for _, g := range []string{"S-1-5-32-547" /* Power Users */, "S-1-5-21-1-2-3-1001", "S-1-5-80-9-9-9-9-9",
-		"S-1-5-5-0", "S-1-5-5-x-1", "S-1-16-8192" /* a label SID without the label attribute */, "S-1-2-1"} {
+		"S-1-5-5-0", "S-1-5-5-x-1", "S-1-16-8192" /* a label SID without the label attribute */, "S-1-5-4" /* INTERACTIVE */} {
 		tok := okToken()
 		tok.Groups = append(tok.Groups, Group{SID: g, Attributes: 7})
 		checkCode(t, tok, CodeExtraGroup)

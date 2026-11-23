@@ -113,12 +113,15 @@ func SelfCheck(n string) (Token, error) {
 const seGroupIntegrity = 0x20
 
 // defaultGroups are the groups a virtual service account's token holds
-// besides its own SID, its logon SID and its integrity label (measured
-// on windows-2025 by this package's service test; chosen as the
-// self-check's list, AGENT-SEPARATE-ACCOUNT §3).
+// besides its logon SID and its integrity label: measured on
+// windows-2025 by this package's service test (TestSelfCheckService,
+// privileges cut to SeChangeNotifyPrivilege, SidType unrestricted),
+// which read exactly these, a logon SID and the label S-1-16-12288
+// (High). The self-check's list (AGENT-SEPARATE-ACCOUNT §3).
 var defaultGroups = map[string]string{
 	"S-1-1-0":      "Everyone",
 	"S-1-2-0":      "LOCAL",
+	"S-1-2-1":      "CONSOLE LOGON",
 	"S-1-5-6":      "SERVICE",
 	"S-1-5-11":     "Authenticated Users",
 	"S-1-5-15":     "This Organization",
