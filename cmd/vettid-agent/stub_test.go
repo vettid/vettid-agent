@@ -305,6 +305,49 @@ func TestChannelCommands(t *testing.T) {
 			t.Fatal("the code was shown")
 		}
 	})
+	// pair --name reads the code before it opens the channel: nothing is
+	// typed while the service holds a stub's session off for it.
+	t.Run("pair reads the code first", func(t *testing.T) {
+		f := withFakeService(t)
+		got := serve(f, t, "ok", 0)
+		read := false
+		oldIn, oldDial := codeIn, stubDial
+		codeIn = readerFunc(func(p []byte) (int, error) {
+			if read {
+				return 0, io.EOF
+			}
+			read = true
+			return copy(p, "THE-CODE"), nil
+		})
+		stubDial = func(ctx context.Context, cfg channel.DialConfig) (io.ReadWriteCloser, error) {
+			if !read {
+				t.Error("the channel was opened before the code was read")
+			}
+			return oldDial(ctx, cfg)
+		}
+		t.Cleanup(func() { codeIn, stubDial = oldIn, oldDial })
+		var out, errOut bytes.Buffer
+		if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 0 {
+			t.Fatalf("exit %d, stderr %q", rc, errOut.String())
+		}
+		if r := <-got; r.req.Code != "THE-CODE" {
+			t.Fatalf("service got %+v", r.req)
+		}
+		// With no code, nothing is opened.
+		f.mu.Lock()
+		n := len(f.cfgs)
+		f.mu.Unlock()
+		codeIn = strings.NewReader("")
+		read = true
+		if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 1 {
+			t.Fatalf("no code: exit %d", rc)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if len(f.cfgs) != n {
+			t.Fatal("the channel was opened without a code")
+		}
+	})
 	t.Run("forget", func(t *testing.T) {
 		f := withFakeService(t)
 		got := serve(f, t, "Forgotten", 0)
