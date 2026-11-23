@@ -25,7 +25,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -485,11 +484,6 @@ func dbGroups(t *testing.T, u *user.User) string {
 // the first user namespace (a name and a parent can be had by any unit's
 // process; dropping groups needs a namespace of one's own).
 func sdPam(pid int, u *user.User) bool {
-	// /proc/<pid> is root's for a non-dumpable process, as (sd-pam) is;
-	// a process the member starts is its own
-	if fi, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); err != nil || fi.Sys().(*syscall.Stat_t).Uid != 0 {
-		return false
-	}
 	ns, err1 := os.Readlink(fmt.Sprintf("/proc/%d/ns/user", pid))
 	init, err2 := os.Readlink("/proc/1/ns/user")
 	if err1 != nil || err2 != nil || ns != init {
