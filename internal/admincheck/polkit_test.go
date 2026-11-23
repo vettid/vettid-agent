@@ -356,8 +356,6 @@ func TestAllowlistNamed(t *testing.T) {
 		"org.freedesktop.Malcontent.WebFilter.ReadAny",
 		"org.freedesktop.NetworkManager.settings.modify.system",
 		"org.freedesktop.packagekit.system-update",
-		"org.freedesktop.packagekit.trigger-offline-update",
-		"org.freedesktop.packagekit.trigger-offline-upgrade",
 		"org.freedesktop.packagekit.upgrade-system",
 		"org.freedesktop.timedate1.set-local-rtc",
 		"org.freedesktop.timedate1.set-ntp",
@@ -647,5 +645,40 @@ func TestArch(t *testing.T) {
 		if !strings.Contains(string(rules), `case "`+id+`":`) {
 			t.Errorf("%s not in the rules file", id)
 		}
+	}
+}
+
+// PackageKit's offline trigger refuses when granted, whatever its
+// defaults, and passes with the rules file (the owner, GC #16914);
+// clear-offline-update is no administrator's action.
+func TestPackageKitOffline(t *testing.T) {
+	rules, err := os.ReadFile("testdata/40-vettid-agent.rules")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"org.freedesktop.packagekit.trigger-offline-update", "org.freedesktop.packagekit.trigger-offline-upgrade"} {
+		for _, d := range []Default{Yes, AuthAdminKeep} {
+			actions := map[string]Action{id: {ID: id, Any: AuthAdmin, Inactive: d, Active: d}}
+			if v := Judge(actions, []Answer{{Action: id, Kind: Active, Subject: "s", Authorized: true}}, met); v[0].Result != Refuse {
+				t.Errorf("%s granted over %s: %s", id, d, v[0].Result)
+			}
+			if v := Judge(actions, []Answer{{Action: id, Kind: Active, Subject: "s", Challenge: true}}, met); v[0].Result != Nothing {
+				t.Errorf("%s asking (the rules file): %s", id, v[0].Result)
+			}
+		}
+		if _, ok := Allowlist[id]; ok {
+			t.Errorf("%s allowlisted", id)
+		}
+		if !strings.Contains(string(rules), `case "`+id+`":`) {
+			t.Errorf("%s not in the rules file", id)
+		}
+	}
+	clear := "org.freedesktop.packagekit.clear-offline-update"
+	actions := map[string]Action{clear: {ID: clear, Any: AuthAdmin, Inactive: Yes, Active: Yes}}
+	if v := Judge(actions, []Answer{{Action: clear, Kind: Active, Subject: "s", Authorized: true}}, met); v[0].Result == Refuse {
+		t.Errorf("clear-offline-update refused")
+	}
+	if n := strings.Count(string(rules), "    case \""); n != 19 {
+		t.Errorf("the rules file has %d actions, want 19", n)
 	}
 }

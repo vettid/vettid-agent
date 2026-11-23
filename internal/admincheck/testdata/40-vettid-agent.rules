@@ -4,6 +4,8 @@ polkit.addRule(function(action, subject) {
     switch (action.id) {
     case "org.freedesktop.packagekit.package-install":
     case "org.freedesktop.packagekit.package-remove":
+    case "org.freedesktop.packagekit.trigger-offline-update":
+    case "org.freedesktop.packagekit.trigger-offline-upgrade":
     case "org.rpm.dnf.v0.rpm.execute_trusted_transaction":
     case "org.rpm.dnf.v0.rpm.Repo.confirm_key":
     case "org.fedoraproject.FirewallD1.all":
