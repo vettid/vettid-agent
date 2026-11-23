@@ -146,9 +146,21 @@ func startTime(t *testing.T, pid int) uint64 {
 
 func subjects(t *testing.T, u *user.User) []subject {
 	var out []subject
+	// The candidate kinds for a process in no session: none, and the kind
+	// of each of the member's sessions, read once here, before any of the
+	// probe's own units start (one may open a transient session).
+	cands := []Kind{NoSession}
 	for _, line := range strings.Split(run(t, "loginctl", "list-sessions", "--no-legend"), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 3 && f[1] == u.Uid {
+			k := sessionKind(t, f[0])
+			dup := false
+			for _, c := range cands {
+				dup = dup || c == k
+			}
+			if !dup {
+				cands = append(cands, k)
+			}
 			// A manager-class session (systemd 258 and later: the user's
 			// service manager) holds no process logind places in it, so
 			// polkit judges none by it; its processes are asked as the user
@@ -176,14 +188,14 @@ func subjects(t *testing.T, u *user.User) []subject {
 	// Processes of the member's in no session: a transient system service,
 	// and a unit of the member's own service manager if it runs.
 	if pid := sleeper(t, nil, "systemd-run", "--uid", u.Uid, "--gid", u.Gid); pid != 0 {
-		out = append(out, noSession(t, u, "system service", pid))
+		out = append(out, noSession(t, u, "system service", pid, cands))
 	} else {
 		t.Fatal("the no-session process didn't start")
 	}
 	if exec.Command("systemctl", "is-active", "--quiet", "user@"+u.Uid+".service").Run() == nil {
 		m := u.Username + "@"
 		if pid := sleeper(t, []string{"--user", "--machine=" + m}, "systemd-run", "--user", "--machine="+m); pid != 0 {
-			out = append(out, noSession(t, u, "user service", pid))
+			out = append(out, noSession(t, u, "user service", pid, cands))
 		} else {
 			t.Error("the user service didn't start: not checked")
 		}
@@ -221,7 +233,7 @@ func sleeper(t *testing.T, scope []string, cmd ...string) int {
 // Judged by its own session if it has one; otherwise polkitd judges it as
 // no session (allow_any) or, in some versions, by the member's display
 // session (sd_uid_get_display): which one is read from its answers.
-func noSession(t *testing.T, u *user.User, what string, pid int) subject {
+func noSession(t *testing.T, u *user.User, what string, pid int, cands []Kind) subject {
 	sub := subject{
 		name: what,
 		arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
@@ -231,22 +243,7 @@ func noSession(t *testing.T, u *user.User, what string, pid int) subject {
 		sub.kind, sub.name = sessionKind(t, s), what+" (in session "+s+")"
 		return sub
 	}
-	// Candidates: none, and the kind of each of the member's sessions
-	// (the display session's among them).
-	sub.candidates = []Kind{NoSession}
-	for _, id := range memberSessions(t, u) {
-		if exec.Command("loginctl", "show-session", id).Run() != nil {
-			continue // closed since the listing
-		}
-		k := sessionKind(t, id)
-		dup := false
-		for _, c := range sub.candidates {
-			dup = dup || c == k
-		}
-		if !dup {
-			sub.candidates = append(sub.candidates, k)
-		}
-	}
+	sub.candidates = cands
 	if d := displaySession(u.Username); d != "" {
 		sub.name = what + " (display session " + d + ")"
 	}
@@ -254,17 +251,6 @@ func noSession(t *testing.T, u *user.User, what string, pid int) subject {
 		sub.candidates = nil // no session to be judged by
 	}
 	return sub
-}
-
-// memberSessions are the member's logind sessions.
-func memberSessions(t *testing.T, u *user.User) []string {
-	var ids []string
-	for _, line := range strings.Split(run(t, "loginctl", "list-sessions", "--no-legend"), "\n") {
-		if f := strings.Fields(line); len(f) >= 3 && f[1] == u.Uid {
-			ids = append(ids, f[0])
-		}
-	}
-	return ids
 }
 
 // conditions reads the facts the allowlist's conditional entries need.
