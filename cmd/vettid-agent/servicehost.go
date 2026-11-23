@@ -61,6 +61,15 @@ type hostConn struct {
 	setDeadline func(time.Time) error
 }
 
+// serviceProtectors is the service's protector choice for its state in
+// dir: the platform protector, never a terminal prompt, and no passphrase
+// source. The source must be marked unset (FD -1) here, as the command-line
+// flags do: its zero value names descriptor 0, which pairing would take
+// for a --passphrase-fd given, and refuse the platform protector.
+func serviceProtectors(dir string) *pairing.Protectors {
+	return &pairing.Protectors{NoPrompt: true, Dir: dir, Source: protect.PassphraseSource{FD: -1}}
+}
+
 // serviceHost runs one pairing's connector service.
 type serviceHost struct {
 	// Dir is the state directory, private to the service's account.

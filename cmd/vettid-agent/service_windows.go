@@ -25,7 +25,6 @@ import (
 	"golang.org/x/sys/windows/svc/eventlog"
 
 	"github.com/vettid/vettid-agent/internal/channel"
-	"github.com/vettid/vettid-agent/internal/pairing"
 	"github.com/vettid/vettid-agent/internal/service"
 )
 
@@ -145,7 +144,7 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	defer cancel()
 	h := &serviceHost{Dir: dir, AccessMinutes: cfg.AccessMinutes, Log: logger,
 		IdleStop:   time.Duration(cfg.IdleStopSeconds) * time.Second,
-		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir}}
+		Protectors: serviceProtectors(dir)}
 	stopped := make(chan struct{})
 	defer close(stopped)
 	go func() {
