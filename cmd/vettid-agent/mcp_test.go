@@ -553,7 +553,7 @@ func stopWithUnreadStdout(t *testing.T, w io.Writer) string {
 	return errOut.buf.String()
 }
 
-const textUnreadStdout = "does not read standard output"
+const textUnreadStdout = "does not read its answers"
 
 // TestMCPSignalUnreadStdout: a signal stops `mcp` within a bounded time
 // although a write to standard output is blocked (the MCP client keeps

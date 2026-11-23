@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -32,7 +33,8 @@ type fakeService struct {
 func withFakeService(t *testing.T) *fakeService {
 	t.Helper()
 	f := &fakeService{ends: make(chan net.Conn, 4)}
-	oldRead, oldDial, oldIn := stubReadPipe, stubDial, mcpIn
+	oldRead, oldDial, oldIn, oldStart, oldRefusal := stubReadPipe, stubDial, mcpIn, stubStartService, stubServiceRefusal
+	stubStartService, stubServiceRefusal = nil, nil
 	stubReadPipe = func(n string) (string, error) {
 		if f.pipeErr != nil {
 			return "", f.pipeErr
@@ -50,7 +52,9 @@ func withFakeService(t *testing.T) *fakeService {
 		f.ends <- s
 		return c, nil
 	}
-	t.Cleanup(func() { stubReadPipe, stubDial, mcpIn = oldRead, oldDial, oldIn })
+	t.Cleanup(func() {
+		stubReadPipe, stubDial, mcpIn, stubStartService, stubServiceRefusal = oldRead, oldDial, oldIn, oldStart, oldRefusal
+	})
 	return f
 }
 
@@ -301,6 +305,49 @@ func TestChannelCommands(t *testing.T) {
 			t.Fatal("the code was shown")
 		}
 	})
+	// pair --name reads the code before it opens the channel: nothing is
+	// typed while the service holds a stub's session off for it.
+	t.Run("pair reads the code first", func(t *testing.T) {
+		f := withFakeService(t)
+		got := serve(f, t, "ok", 0)
+		read := false
+		oldIn, oldDial := codeIn, stubDial
+		codeIn = readerFunc(func(p []byte) (int, error) {
+			if read {
+				return 0, io.EOF
+			}
+			read = true
+			return copy(p, "THE-CODE"), nil
+		})
+		stubDial = func(ctx context.Context, cfg channel.DialConfig) (io.ReadWriteCloser, error) {
+			if !read {
+				t.Error("the channel was opened before the code was read")
+			}
+			return oldDial(ctx, cfg)
+		}
+		t.Cleanup(func() { codeIn, stubDial = oldIn, oldDial })
+		var out, errOut bytes.Buffer
+		if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 0 {
+			t.Fatalf("exit %d, stderr %q", rc, errOut.String())
+		}
+		if r := <-got; r.req.Code != "THE-CODE" {
+			t.Fatalf("service got %+v", r.req)
+		}
+		// With no code, nothing is opened.
+		f.mu.Lock()
+		n := len(f.cfgs)
+		f.mu.Unlock()
+		codeIn = strings.NewReader("")
+		read = true
+		if rc := run([]string{"pair", "--name", "work"}, &out, &errOut); rc != 1 {
+			t.Fatalf("no code: exit %d", rc)
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if len(f.cfgs) != n {
+			t.Fatal("the channel was opened without a code")
+		}
+	})
 	t.Run("forget", func(t *testing.T) {
 		f := withFakeService(t)
 		got := serve(f, t, "Forgotten", 0)
@@ -347,5 +394,82 @@ func TestChannelCommands(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if rc := run([]string{"status", "--name", "work"}, &out, &errOut); rc != 1 || !strings.Contains(errOut.String(), channel.ErrNoAnswer.Error()) {
 		t.Fatalf("exit %d, stderr %q", rc, errOut.String())
+	}
+}
+
+// With no channel, the stub starts the service and dials again; a
+// service that refuses to start is said with its reason, and the
+// connector never runs in the stub's process instead.
+func TestStubStartsService(t *testing.T) {
+	f := withFakeService(t)
+	f.dialErr = channel.ErrNoService
+	started := 0
+	stubStartService = func(name string) error {
+		started++
+		if name != "work" {
+			t.Errorf("started %q", name)
+		}
+		f.mu.Lock()
+		f.dialErr = nil
+		f.mu.Unlock()
+		return nil
+	}
+	conn, err := dialService(context.Background(), "work", channel.OpStatus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	if started != 1 || len(f.cfgs) != 2 {
+		t.Fatalf("started %d times, dialed %d times", started, len(f.cfgs))
+	}
+
+	// A channel that closed unanswered (the service stopping as it was
+	// reached) is retried once, with a start.
+	started = 0
+	f.dialErr = channel.ErrBadHello
+	conn, err = dialService(context.Background(), "work", channel.OpStatus)
+	if err != nil || started != 1 {
+		t.Fatalf("after an unanswered close: %v, started %d", err, started)
+	}
+	conn.Close()
+
+	// Another refusal than these never starts it.
+	started = 0
+	f.dialErr = channel.ErrNotService
+	if _, err := dialService(context.Background(), "work", channel.OpStatus); !errors.Is(err, channel.ErrNotService) || started != 0 {
+		t.Fatalf("%v, started %d", err, started)
+	}
+
+	// A service that stops with a code of its own.
+	f.dialErr = channel.ErrNoService
+	stubStartService = func(string) error { return &serviceRefusedError{code: 104} }
+	rc, ans, _, errOut := mcpSession(t, []string{"mcp", "--name", "work"}, msgInit, msgCall)
+	if rc != 1 || len(ans) != 2 {
+		t.Fatalf("exit %d, %d answers", rc, len(ans))
+	}
+	if sc := ans[1]["result"].(map[string]any)["structuredContent"].(map[string]any); sc["code"] != mcp.CodeServiceNotRunning {
+		t.Fatalf("tool answer %v", sc)
+	}
+	if !strings.Contains(errOut, serviceRefusalText(104)) {
+		t.Fatalf("stderr %q does not say why", errOut)
+	}
+	var out, serr bytes.Buffer
+	if rc := run([]string{"status", "--name", "work"}, &out, &serr); rc != 1 || !strings.Contains(serr.String(), serviceRefusalText(104)) {
+		t.Fatalf("status: exit %d, stderr %q", rc, serr.String())
+	}
+
+	// A squatted name (a channel that isn't the service's) with the
+	// service stopped by its own refusal: said with that reason.
+	f.dialErr = channel.ErrNotService
+	stubStartService = func(string) error { t.Error("started for a squatted name"); return nil }
+	stubServiceRefusal = func(string) error { return &serviceRefusedError{code: 111} }
+	serr.Reset()
+	if rc := run([]string{"status", "--name", "work"}, &out, &serr); rc != 1 || !strings.Contains(serr.String(), serviceRefusalText(111)) {
+		t.Fatalf("status, squatted: exit %d, stderr %q", rc, serr.String())
+	}
+	stubServiceRefusal = func(string) error { return nil }
+	serr.Reset()
+	if rc := run([]string{"status", "--name", "work"}, &out, &serr); rc != 1 || !strings.Contains(serr.String(), mcp.NoService().Text) {
+		t.Fatalf("status, squatted, service not stopped by a refusal: exit %d, stderr %q", rc, serr.String())
 	}
 }

@@ -176,16 +176,17 @@ func newGrants(rec *pairing.Record, logger *slog.Logger, onAnswer func(string, p
 
 // stopSession waits for the MCP session (serveDone) to end once its
 // context has: its tool calls are cancelled, and it ends at once unless
-// a write to standard output is blocked because the MCP client keeps
-// standard output open but does not read it. Then, after mcpStopWait, a
-// write deadline in the past makes that write fail where standard
-// output supports deadlines (a pipe or socket the Go runtime polls; not
-// a blocking pipe, which is what most MCP clients hand over). If the
-// session still has not ended after mcpStopWait more, the connector
-// stops without it: the blocked write is abandoned (the process exits
-// right after), so a client that never reads cannot keep the connector
-// running after a signal.
-func stopSession(serveDone <-chan struct{}, stdout io.Writer, logger *slog.Logger) {
+// a write to out is blocked because the MCP client keeps its end open
+// but does not read it. Then, after mcpStopWait, a write deadline in the
+// past makes that write fail where out supports deadlines (a pipe or
+// socket the Go runtime polls, such as the channel's pipe; not a
+// blocking pipe, which is what most MCP clients hand over as standard
+// output). If the session still has not ended after mcpStopWait more, it
+// is left: the blocked write is abandoned. For `mcp` the process exits
+// right after, so a client that never reads cannot keep the connector
+// running after a signal; the service closes the connection once run
+// returns, which ends the write and its goroutine.
+func stopSession(serveDone <-chan struct{}, out io.Writer, logger *slog.Logger) {
 	t := time.NewTimer(mcpStopWait)
 	defer t.Stop()
 	select {
@@ -193,13 +194,13 @@ func stopSession(serveDone <-chan struct{}, stdout io.Writer, logger *slog.Logge
 		return
 	case <-t.C:
 	}
-	if f, ok := stdout.(*os.File); ok {
-		_ = f.SetWriteDeadline(time.Now())
+	if w, ok := out.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		_ = w.SetWriteDeadline(time.Now())
 	}
 	t.Reset(mcpStopWait)
 	select {
 	case <-serveDone:
 	case <-t.C:
-		logger.Warn("the MCP client does not read standard output; stopping without finishing the write")
+		logger.Warn("the MCP client does not read its answers; stopping without finishing the write")
 	}
 }
