@@ -138,10 +138,17 @@ func subjects(t *testing.T, u *user.User) []subject {
 	for _, line := range strings.Split(run(t, "loginctl", "list-sessions", "--no-legend"), "\n") {
 		f := strings.Fields(line)
 		if len(f) >= 3 && f[1] == u.Uid {
+			// A manager-class session (systemd 258 and later: the user's
+			// service manager) holds no process logind places in it, so
+			// polkit judges none by it; its processes are judged as the
+			// no-session subject is.
+			if class := strings.TrimSpace(run(t, "loginctl", "show-session", f[0], "-p", "Class", "--value")); strings.HasPrefix(class, "manager") {
+				continue
+			}
 			// Asked by a process of the member's in the session, which
-			// polkit judges by that session: polkitd 124 on Ubuntu 24.04
-			// aborts on a unix-session subject. (Not the leader: a tty
-			// session's leader is login, running as root.)
+			// polkit judges by that session: polkitd 124 and 127 abort on
+			// a unix-session subject. (Not the leader: a tty session's
+			// leader is login, running as root.)
 			pid := sessionProcess(t, u, f[0])
 			if pid == 0 {
 				t.Errorf("session %s: not checked: no process of %s's in it", f[0], u.Username)

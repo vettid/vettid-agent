@@ -290,6 +290,13 @@ var ExecPathAllow = map[string]string{
 	// proposed for §11.4: a fixed script that only runs fuser on apt's
 	// lock files
 	"/usr/lib/update-notifier/package-system-locked": "update-notifier's lock check",
+	// proposed for §11.4: GNOME 49 and later's backlight helper (mutter's)
+	"/usr/libexec/mutter-backlight-helper": "mutter's backlight helper",
+	// proposed for §11.4: writes only the XKB lines of
+	// /etc/default/keyboard from arguments limited to [a-zA-Z0-9,_:-],
+	// then reconfigures keyboard-configuration; locale1.set-keyboard's
+	// effect
+	"/usr/libexec/gnome-control-center-set-debian-keyboard": "GNOME's keyboard layout (Debian)",
 }
 
 // ExecPathIf names the exec.path helpers that run as root but check each
@@ -348,4 +355,9 @@ var Allowlist = map[string]string{
 	"org.fedoraproject.FirewallD1.config.info":                "firewall status (read-only)",
 	"org.fedoraproject.FirewallD1.direct.info":                "firewall status (read-only)",
 	"org.fedoraproject.FirewallD1.policies.info":              "firewall status (read-only)",
+	// proposed for §11.4: libmalcontent's rule lets sudo read any
+	// account's parental controls
+	"com.endlessm.ParentalControls.AppFilter.ReadAny":     "parental controls (read-only)",
+	"com.endlessm.ParentalControls.SessionLimits.ReadAny": "parental controls (read-only)",
+	"org.freedesktop.Malcontent.WebFilter.ReadAny":        "parental controls (read-only)",
 }
