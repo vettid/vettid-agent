@@ -40,20 +40,57 @@ type subject struct {
 	name string // for the report
 	arg  string // gdbus's subject argument
 	kind Kind
+	// candidates: the kinds polkitd may judge it by, when they can't be
+	// read beforehand; the one its answers match is taken (kindFrom).
+	candidates []Kind
 }
 
-// sessionKind is a logind session's kind for polkit: active and local, or
-// not. polkitd's logind backend calls a session local when it has a seat
-// (sd_session_get_seat) and active when its state is active, so a
-// seatless session, which logind marks active, is judged as inactive.
-func sessionKind(t *testing.T, id string) Kind {
-	props := map[string]string{}
-	for _, line := range strings.Split(run(t, "loginctl", "show-session", id, "-p", "Seat", "-p", "State", "-p", "Remote"), "\n") {
-		if k, v, ok := strings.Cut(line, "="); ok {
-			props[k] = strings.TrimSpace(v)
+// kindFrom is the kind of subject polkitd judged these answers by: of the
+// candidates, the one whose defaults match the most answers (a default of
+// yes is a grant, no a refusal, auth_* a challenge). A rule's grant can
+// only move a few; a tie fails the run.
+func kindFrom(t *testing.T, actions map[string]Action, answers []Answer, candidates []Kind) Kind {
+	best, bestN, tie := candidates[0], -1, false
+	for _, k := range candidates {
+		n := 0
+		for _, a := range answers {
+			act, ok := actions[a.Action]
+			if !ok || a.Err != "" || a.Temporary {
+				continue
+			}
+			switch d := act.defaultFor(k); {
+			case d == Yes && a.Authorized && !a.Challenge,
+				d == No && !a.Authorized && !a.Challenge,
+				d != Yes && d != No && !a.Authorized && a.Challenge:
+				n++
+			}
+		}
+		t.Logf("  judged as %s: %d of %d answers match the defaults", k, n, len(answers))
+		switch {
+		case n > bestN:
+			best, bestN, tie = k, n, false
+		case n == bestN:
+			tie = true
 		}
 	}
-	if props["Seat"] != "" && props["State"] == "active" && props["Remote"] == "no" {
+	if tie {
+		t.Fatalf("can't tell which kind polkitd judged the subject by")
+	}
+	return best
+}
+
+// sessionKind is the kind polkitd judges a logind session by. Its logind
+// backend calls a session local when it has a seat (sd_session_get_seat),
+// and active when the session's user is active (sd_uid_get_state: any of
+// the user's sessions is active); a session that isn't local is judged by
+// allow_any, whatever its state (polkitbackendinteractiveauthority.c).
+// Remote isn't consulted.
+func sessionKind(t *testing.T, id string) Kind {
+	if seat := strings.TrimSpace(run(t, "loginctl", "show-session", id, "-p", "Seat", "--value")); seat == "" {
+		return NoSession
+	}
+	uid := strings.TrimSpace(run(t, "loginctl", "show-session", id, "-p", "User", "--value"))
+	if strings.TrimSpace(run(t, "loginctl", "show-user", uid, "-p", "State", "--value")) == "active" {
 		return Active
 	}
 	return Inactive
@@ -185,28 +222,35 @@ func subjects(t *testing.T, u *user.User) []subject {
 	if pid == 0 {
 		t.Fatal("the no-session process didn't start")
 	}
-	// Judged as polkit judges it: its own session, else the member's
-	// display session, else none.
-	kind, how := NoSession, "no session"
-	if s := pidSession(pid); s != "" {
-		kind, how = sessionKind(t, s), "its session "+s
-	} else if d := displaySession(u.Username); d != "" {
-		kind, how = sessionKind(t, d), "the display session "+d
-	}
-	out = append(out, subject{
-		name: "no-session process (judged by " + how + ")",
+	// Judged by its own session if it has one; otherwise polkitd judges
+	// it as no session (allow_any) or, in some versions, by the member's
+	// display session (sd_uid_get_display): which one is read from its
+	// answers.
+	sub := subject{
+		name: "no-session process",
 		arg:  fmt.Sprintf("('unix-process', {'pid': <uint32 %d>, 'start-time': <uint64 %d>, 'uid': <int32 %s>})", pid, startTime(t, pid), u.Uid),
-		kind: kind,
-	})
+		kind: NoSession,
+	}
+	if s := pidSession(pid); s != "" {
+		sub.kind, sub.name = sessionKind(t, s), "no-session process (in session "+s+")"
+	} else if d := displaySession(u.Username); d != "" {
+		if dk := sessionKind(t, d); dk != NoSession {
+			sub.candidates = []Kind{NoSession, dk}
+			sub.name = "no-session process (display session " + d + ")"
+		}
+	}
+	out = append(out, sub)
 	return out
 }
 
 // conditions reads the facts the allowlist's conditional entries need.
 func conditions(t *testing.T) Conditions {
 	c := Conditions{FwupdOnlyTrusted: true, LocalSudoRules: true}
-	// fwupd 2 reads fwupd.conf, earlier ones daemon.conf; OnlyTrusted is
-	// on unless set off.
-	for _, f := range []string{"/etc/fwupd/fwupd.conf", "/etc/fwupd/daemon.conf"} {
+	// fwupd 2 reads fwupd.conf, then its mutable copy under /var/etc
+	// (where fwupdmgr modify-config writes when /etc is read-only), earlier
+	// ones daemon.conf; OnlyTrusted is on unless set off (any value but a
+	// case-insensitive "true" is off here).
+	for _, f := range []string{"/etc/fwupd/fwupd.conf", "/var/etc/fwupd/fwupd.conf", "/etc/fwupd/daemon.conf"} {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			continue
@@ -222,9 +266,10 @@ func conditions(t *testing.T) Conditions {
 		t.Fatal(err)
 	}
 	for _, line := range strings.Split(string(b), "\n") {
-		if k, v, ok := strings.Cut(line, ":"); ok && strings.TrimSpace(k) == "sudoers" {
+		// sudo matches the database and its sources case-insensitively.
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "sudoers") {
 			for _, src := range strings.Fields(strings.SplitN(v, "#", 2)[0]) {
-				if src != "files" {
+				if !strings.EqualFold(src, "files") && !strings.HasPrefix(src, "[") {
 					c.LocalSudoRules = false
 				}
 			}
@@ -252,7 +297,9 @@ func TestPolkitProbe(t *testing.T) {
 	conds := conditions(t)
 	subs := subjects(t, u)
 	var answers []Answer
-	for _, s := range subs {
+	for i := range subs {
+		s := &subs[i]
+		var these []Answer
 		for id := range actions {
 			ans := Answer{Action: id, Kind: s.kind, Subject: s.name}
 			cmd := exec.Command("gdbus", "call", "--system", "--dest", "org.freedesktop.PolicyKit1",
@@ -266,8 +313,16 @@ func TestPolkitProbe(t *testing.T) {
 			} else if ans.Authorized, ans.Challenge, ans.Temporary, err = ParseCheckAuthorization(string(out)); err != nil {
 				ans.Err = err.Error()
 			}
-			answers = append(answers, ans)
+			these = append(these, ans)
 		}
+		if len(s.candidates) > 1 {
+			t.Logf("%s:", s.name)
+			s.kind = kindFrom(t, actions, these, s.candidates)
+			for j := range these {
+				these[j].Kind = s.kind
+			}
+		}
+		answers = append(answers, these...)
 	}
 	t.Logf("%d actions; subjects:", len(actions))
 	for _, s := range subs {
@@ -275,6 +330,13 @@ func TestPolkitProbe(t *testing.T) {
 	}
 	refused := 0
 	t.Logf("conditions: %+v", conds)
+	for _, a := range answers {
+		for _, gate := range ExecPathIf {
+			if a.Action == gate.action {
+				t.Logf("gate %s for %s (%s): authorized %v, challenge %v, err %q", a.Action, a.Subject, a.Kind, a.Authorized, a.Challenge, a.Err)
+			}
+		}
+	}
 	t.Log("a passing run says nothing of a .policy file changed on disk: that is the package check's")
 	for _, v := range Judge(actions, answers, conds) {
 		if v.Result == Nothing {

@@ -29,8 +29,10 @@ func (d Default) admin() bool { return d == AuthAdmin || d == AuthAdminKeep }
 // Kind is the kind of subject polkit judged an answer for.
 type Kind int
 
-// The kinds of subject (§11.4): an active local session, an inactive one,
-// and none.
+// The kinds of subject (§11.4), by the default polkit judges them by: an
+// active local session (allow_active), an inactive local one
+// (allow_inactive), and none or one that isn't local, having no seat
+// (allow_any).
 const (
 	Active Kind = iota
 	Inactive
@@ -38,7 +40,7 @@ const (
 )
 
 func (k Kind) String() string {
-	return [...]string{"active", "inactive", "no session"}[k]
+	return [...]string{"active", "inactive", "any"}[k]
 }
 
 // Action is one action polkit lists, with its shipped defaults, its
@@ -198,8 +200,10 @@ func judge(actions map[string]Action, ans Answer, c Conditions) Verdict {
 //     action's own implications);
 //   - an exec.path helper in ExecPathIf runs as root but checks each
 //     caller against another action: it is reported while that action
-//     asks for an administrator (auth_admin*) of every subject asked,
-//     since the helper's caller may be any process of the member's.
+//     asks for an administrator (auth_admin*) of the same subject and
+//     grants no other subject asked without one (it asks for an
+//     administrator, or refuses outright), since the helper's caller may
+//     be any process of the member's.
 func lift(actions map[string]Action, vs []Verdict) {
 	type key struct{ subject, action string }
 	at := map[key]int{}
@@ -218,13 +222,9 @@ func lift(actions map[string]Action, vs []Verdict) {
 			if !ok || !vs[j].accepted {
 				continue
 			}
-			for _, implied := range a.Implies {
-				if implied == v.Action {
-					v.Reason = "implied by " + a.ID + " (" + string(vs[j].Result) + ")"
-					lifted = append(lifted, i)
-				}
-			}
-			if len(lifted) > 0 && lifted[len(lifted)-1] == i {
+			if implies(a, v.Action) {
+				v.Reason = "implied by " + a.ID + " (" + string(vs[j].Result) + ")"
+				lifted = append(lifted, i)
 				break
 			}
 		}
@@ -238,12 +238,16 @@ func lift(actions map[string]Action, vs []Verdict) {
 		if v.Result != Refuse || !ok {
 			continue
 		}
-		if _, asked := at[key{v.Subject, gate.action}]; !asked {
+		j, asked := at[key{v.Subject, gate.action}]
+		if !asked {
 			continue
 		}
-		asks := true
+		adminAsks := func(w Verdict) bool {
+			return w.Err == "" && !w.Authorized && w.Challenge && actions[gate.action].defaultFor(w.Kind).admin()
+		}
+		asks := adminAsks(vs[j])
 		for _, w := range vs {
-			if w.Action == gate.action && (w.Err != "" || w.Authorized || !w.Challenge || !actions[gate.action].defaultFor(w.Kind).admin()) {
+			if w.Action == gate.action && !adminAsks(w) && (w.Err != "" || w.Authorized || w.Challenge) {
 				asks = false
 			}
 		}
@@ -251,6 +255,15 @@ func lift(actions map[string]Action, vs []Verdict) {
 			v.Result, v.Reason = Report, gate.why+", while "+gate.action+" asks"
 		}
 	}
+}
+
+func implies(a Action, id string) bool {
+	for _, implied := range a.Implies {
+		if implied == id {
+			return true
+		}
+	}
+	return false
 }
 
 // alwaysRefuses says whether a grant of a refuses whatever its defaults
