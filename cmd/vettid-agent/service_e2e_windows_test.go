@@ -550,13 +550,17 @@ func TestServiceEndToEnd(t *testing.T) {
 			t.Fatalf("wevtutil: %v: %s", err, out)
 		}
 		text := string(out)
-		for _, want := range []string{"pairing " + in.n + ": started", "stopped: idle", "the channel's name is taken", "the service refuses to run"} {
+		for _, want := range []string{"pairing " + in.n + ": started", "stopped: idle",
+			"the service refuses to run: " + serviceRefusalText(codePipeTaken), "the service refuses to run: " + serviceRefusalText(104)} {
 			if !strings.Contains(text, want) {
 				t.Errorf("the Event Log has no %q", want)
 			}
 		}
-		if strings.Contains(text, in.member.sid.String()) {
-			t.Errorf("the Event Log names the member's SID")
+		pipe, _ := channel.ReadPipe(in.n)
+		for _, never := range []string{in.member.sid.String(), in.sid, pipe, in.stateDir} {
+			if never != "" && strings.Contains(text, never) {
+				t.Errorf("the Event Log holds %q", never)
+			}
 		}
 		t.Logf("the Event Log:\n%s", text)
 	})

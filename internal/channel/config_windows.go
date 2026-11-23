@@ -105,8 +105,10 @@ func ReadServiceConfig(n string) (ServiceConfig, error) {
 // name.
 func checkServiceConfig(c ServiceConfig, path string) (ServiceConfig, error) {
 	sid, err := windows.StringToSid(c.Member)
-	if err != nil || !strings.HasPrefix(sid.String(), "S-1-5-21-") {
-		return ServiceConfig{}, fmt.Errorf("%s: \"member\" is not a local or domain user's SID", path)
+	// A local or domain account (S-1-5-21-…), or a Microsoft Entra ID
+	// account (S-1-12-1-…).
+	if err != nil || !(strings.HasPrefix(sid.String(), "S-1-5-21-") || strings.HasPrefix(sid.String(), "S-1-12-1-")) {
+		return ServiceConfig{}, fmt.Errorf("%s: \"member\" is not a user account's SID", path)
 	}
 	c.Member = sid.String()
 	switch {

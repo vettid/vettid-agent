@@ -380,7 +380,17 @@ func TestStubStartsService(t *testing.T) {
 		t.Fatalf("started %d times, dialed %d times", started, len(f.cfgs))
 	}
 
-	// Another refusal than "no channel" never starts it.
+	// A channel that closed unanswered (the service stopping as it was
+	// reached) is retried once, with a start.
+	started = 0
+	f.dialErr = channel.ErrBadHello
+	conn, err = dialService(context.Background(), "work", channel.OpStatus)
+	if err != nil || started != 1 {
+		t.Fatalf("after an unanswered close: %v, started %d", err, started)
+	}
+	conn.Close()
+
+	// Another refusal than these never starts it.
 	started = 0
 	f.dialErr = channel.ErrNotService
 	if _, err := dialService(context.Background(), "work", channel.OpStatus); !errors.Is(err, channel.ErrNotService) || started != 0 {

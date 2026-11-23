@@ -73,7 +73,10 @@ func dialService(ctx context.Context, name string, op channel.Op) (io.ReadWriteC
 			return nil, fmt.Errorf("%w: %w", err, r)
 		}
 	}
-	if !errors.Is(err, channel.ErrNoService) || stubStartService == nil {
+	// A service stopping when idle may close a client it had admitted
+	// without answering (ErrBadHello, after the owner check passed): that
+	// is retried once, like a missing channel.
+	if !(errors.Is(err, channel.ErrNoService) || errors.Is(err, channel.ErrBadHello)) || stubStartService == nil {
 		return conn, err
 	}
 	if serr := stubStartService(name); serr != nil {

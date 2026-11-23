@@ -18,7 +18,6 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -96,37 +95,41 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	if elog != nil {
 		defer elog.Close()
 	}
-	logger := slog.New(&eventLogHandler{elog: elog, name: s.name})
-	fail := func(code uint32, text string) (bool, uint32) {
-		logger.Error(text, "code", code)
+	var sink eventSink
+	if elog != nil {
+		sink = elog
+	}
+	logger := slog.New(&eventLogHandler{sink: sink, name: s.name})
+	// Each refusal is logged with the code's fixed text, never an error's
+	// own text (it can name the pipe, a path or a SID).
+	fail := func(code uint32) (bool, uint32) {
+		logger.Error("the service refuses to run: "+serviceRefusalText(code), "code", code)
 		return true, code
 	}
 	if _, err := service.SelfCheck(s.name); err != nil {
 		var ce *service.CheckError
 		if errors.As(err, &ce) {
-			return fail(ce.Code, "the service refuses to run: "+ce.Detail)
+			return fail(ce.Code)
 		}
-		return fail(service.CodeTokenUnreadable, "the service refuses to run: "+err.Error())
+		return fail(service.CodeTokenUnreadable)
 	}
 	cfg, err := channel.ReadServiceConfig(s.name)
 	if err != nil {
-		return fail(codeConfig, "the configuration: "+err.Error())
+		return fail(codeConfig)
 	}
 	dir, err := stateDir(s.name)
 	if err != nil {
-		return fail(codeConfig, err.Error())
+		return fail(codeConfig)
 	}
 	l, err := channel.Listen(channel.ListenConfig{
 		Pipe: cfg.Pipe, Owner: channel.ServiceAccount(s.name), Member: cfg.Member, Version: readVersion().Version,
-		OnRefused: func(op channel.Op, err error) {
-			logger.Warn("a client was refused", "op", string(op), "why", err.Error())
-		},
+		OnRefused: func(op channel.Op, _ error) { logger.Warn("a client was refused", "op", string(op)) },
 	})
 	if errors.Is(err, channel.ErrNameTaken) {
-		return fail(codePipeTaken, "the channel's name is taken by another account: "+err.Error())
+		return fail(codePipeTaken)
 	}
 	if err != nil {
-		return fail(codeChannel, "the channel: "+err.Error())
+		return fail(codeChannel)
 	}
 	defer l.Close()
 
@@ -159,7 +162,7 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 		if err != nil {
 			return nil, err
 		}
-		return &hostConn{rw: c, op: c.Op, accept: c.Accept, refuse: c.Refuse, close: c.Close}, nil
+		return &hostConn{rw: c, op: c.Op, accept: c.Accept, refuse: c.Refuse, close: c.Close, setDeadline: c.SetDeadline}, nil
 	})
 	st <- svc.Status{State: svc.StopPending}
 	switch {
@@ -168,53 +171,10 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	case ctx.Err() != nil:
 		logger.Info("stopped by the service manager")
 	default:
-		return fail(codeChannel, "stopped: "+err.Error())
+		return fail(codeChannel)
 	}
 	return false, 0
 }
-
-// eventLogHandler writes the service's log to the Event Log under the
-// pairing's name: the message and its attributes as text. The service's
-// log carries ids, types, sizes and codes only (CLAUDE.md, Conventions;
-// AGENT-SEPARATE-ACCOUNT §3 "Logs").
-type eventLogHandler struct {
-	elog  *eventlog.Log
-	name  string
-	attrs []slog.Attr
-}
-
-func (h *eventLogHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= slog.LevelInfo }
-
-func (h *eventLogHandler) Handle(_ context.Context, r slog.Record) error {
-	var b strings.Builder
-	fmt.Fprintf(&b, "pairing %s: %s", h.name, r.Message)
-	add := func(a slog.Attr) bool {
-		fmt.Fprintf(&b, " %s=%s", a.Key, a.Value.String())
-		return true
-	}
-	for _, a := range h.attrs {
-		add(a)
-	}
-	r.Attrs(add)
-	if h.elog == nil {
-		return nil
-	}
-	const eventID = 1
-	switch {
-	case r.Level >= slog.LevelError:
-		return h.elog.Error(eventID, b.String())
-	case r.Level >= slog.LevelWarn:
-		return h.elog.Warning(eventID, b.String())
-	default:
-		return h.elog.Info(eventID, b.String())
-	}
-}
-
-func (h *eventLogHandler) WithAttrs(as []slog.Attr) slog.Handler {
-	return &eventLogHandler{elog: h.elog, name: h.name, attrs: append(append([]slog.Attr(nil), h.attrs...), as...)}
-}
-
-func (h *eventLogHandler) WithGroup(string) slog.Handler { return h }
 
 func init() {
 	stubStartService = startService
@@ -264,9 +224,18 @@ func startService(n string) error {
 		return fmt.Errorf("the connector service %s: %w", channel.ServiceName(n), err)
 	}
 	defer windows.CloseServiceHandle(h)
-	if err := windows.StartService(h, 0, nil); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
-		return fmt.Errorf("starting the connector service: %w", err)
+	start := func() error {
+		if err := windows.StartService(h, 0, nil); err != nil && !errors.Is(err, windows.ERROR_SERVICE_ALREADY_RUNNING) {
+			return fmt.Errorf("starting the connector service: %w", err)
+		}
+		return nil
 	}
+	if err := start(); err != nil {
+		return err
+	}
+	// A service that was stopping (idle) when it was started stops once
+	// more; it is started again, once.
+	restarted := false
 	for end := time.Now().Add(startWait); ; time.Sleep(100 * time.Millisecond) {
 		var ss windows.SERVICE_STATUS
 		if err := windows.QueryServiceStatus(h, &ss); err != nil {
@@ -281,6 +250,13 @@ func startService(n string) error {
 			}
 			if ss.Win32ExitCode != 0 {
 				return fmt.Errorf("the connector service stopped: %w", windows.Errno(ss.Win32ExitCode))
+			}
+			if !restarted {
+				restarted = true
+				if err := start(); err != nil {
+					return err
+				}
+				continue
 			}
 			// Started and already stopped again (idle): dial anyway.
 			return nil

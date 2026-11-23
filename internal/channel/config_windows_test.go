@@ -166,6 +166,10 @@ func TestCheckServiceConfig(t *testing.T) {
 	if _, err := checkServiceConfig(ok, "f"); err != nil {
 		t.Fatal(err)
 	}
+	// A Microsoft Entra ID member.
+	if _, err := checkServiceConfig(ServiceConfig{Member: "S-1-12-1-1234567890-1234567890-1234567890-1234567890"}, "f"); err != nil {
+		t.Fatalf("an Entra ID member: %v", err)
+	}
 	for _, bad := range []ServiceConfig{
 		{Member: ""},
 		{Member: "not a sid"},
@@ -173,6 +177,7 @@ func TestCheckServiceConfig(t *testing.T) {
 		{Member: "S-1-5-32-544"}, // Administrators
 		{Member: "S-1-1-0"},      // Everyone
 		{Member: "S-1-5-80-1-2-3-4-5"},
+		{Member: "S-1-12-2-1"}, // not S-1-12-1
 		{Member: "S-1-5-21-1-2-3-1001", AccessMinutes: -1},
 		{Member: "S-1-5-21-1-2-3-1001", AccessMinutes: 1441},
 		{Member: "S-1-5-21-1-2-3-1001", IdleStopSeconds: 9},
