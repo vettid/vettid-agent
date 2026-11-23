@@ -158,10 +158,13 @@ type Manager struct {
 	// vault.status after a resume or a clock jump (internal/access): it is
 	// then neither used nor shown as live on this computer's clock.
 	suspected func() bool
-	o         Options
-	now       func() time.Time
-	log       *slog.Logger
-	wake      chan struct{}
+	// waitedSuspect: step held the grants' work off for the suspicion;
+	// the next status (OnStatus) wakes it.
+	waitedSuspect bool
+	o             Options
+	now           func() time.Time
+	log           *slog.Logger
+	wake          chan struct{}
 
 	mu       sync.Mutex
 	conn     Conn
@@ -674,6 +677,12 @@ func (m *Manager) OnStatus(ownerCheck string) {
 		m.held = false
 		m.signal()
 	}
+	// A status ends the suspicion of internal/access (it calls this after
+	// clearing it): work held off for it starts now, not after idle.
+	if m.waitedSuspect && !m.suspectedLocked() {
+		m.waitedSuspect = false
+		m.signal()
+	}
 }
 
 // Relist asks the background loop for a fresh list of the grants at once
@@ -1080,7 +1089,12 @@ func (m *Manager) Run(ctx context.Context) {
 func (m *Manager) step(ctx context.Context) time.Time {
 	now := m.now()
 	m.mu.Lock()
-	if m.conn == nil || m.held || !activeAt(m.conn.Access(), now) || m.suspectedLocked() {
+	if m.suspectedLocked() {
+		m.waitedSuspect = true
+		m.mu.Unlock()
+		return now.Add(idle)
+	}
+	if m.conn == nil || m.held || !activeAt(m.conn.Access(), now) {
 		m.mu.Unlock()
 		return now.Add(idle)
 	}

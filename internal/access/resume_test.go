@@ -297,12 +297,91 @@ func TestWatchClock(t *testing.T) {
 	if !m.Watching() {
 		t.Fatal("Watching false while WatchClock runs")
 	}
+	// The field is read, not Suspected, which looks at the clocks itself:
+	// this tests WatchClock's own look.
+	suspect := func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.suspect
+	}
 	step(time.Second, time.Second)
-	if m.Suspected() {
+	if suspect() {
 		t.Fatal("suspect with the clocks together")
 	}
 	step(3*time.Hour, time.Second) // a sleep, or the clock set forward
-	if !m.Suspected() {
-		t.Fatal("not suspect after the wall clock jumped")
+	if !suspect() {
+		t.Fatal("WatchClock did not mark the session suspect after the wall clock jumped")
+	}
+}
+
+// An end that lands while the check is on its way wins: the session the
+// vault named is not used, though the vault called it live.
+func TestVerifyLosesToEndEvent(t *testing.T) {
+	live := pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)}
+	f, _, m := setup(live)
+	block := make(chan struct{})
+	f.answer("vault.status", func() (*vaultconn.Response, error) {
+		<-block
+		return ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"` + t0.Add(time.Hour).Format(time.RFC3339) + `"}}`)()
+	})
+	m.Suspect()
+	done := make(chan error, 1)
+	go func() { done <- m.Ensure(context.Background()) }()
+	for end := time.Now().Add(5 * time.Second); f.count("vault.status") == 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(end) {
+			close(block)
+			t.Fatal("no vault.status was sent")
+		}
+	}
+	// device.session.ended, saved by vaultconn while the check waits.
+	f.SetAccess(pairing.Access{State: pairing.AccessNone})
+	m.OnEvent(vaultconn.Event{Type: "device.session.ended", Body: []byte(`{"reason":"ended"}`)})
+	close(block)
+	if err := <-done; err == nil {
+		t.Fatal("Ensure used the session an end event had ended")
+	}
+	if f.Access().State != pairing.AccessNone {
+		t.Fatalf("session %+v, want none", f.Access())
+	}
+}
+
+// With the clock set forward, the session the vault named live is used
+// on every call, not only the first, without asking the phone; until the
+// vault answers session_required.
+func TestVaultNamedSessionKept(t *testing.T) {
+	f, c, m := setup(pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)})
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(time.Hour).Format(time.RFC3339)+`"}}`))
+	c.add(2 * time.Hour)
+	m.Suspect()
+	for i := 0; i < 3; i++ {
+		if err := ensure(t, m); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	if f.count("device.session.request") != 0 || f.count("vault.status") != 1 {
+		t.Fatalf("sent %v", f.sent)
+	}
+	// The vault says the session ended: then the usual request.
+	m.OnAnswer("session_required", m.Snapshot())
+	if err := ensure(t, m); !errors.Is(err, ErrAccessRequested) {
+		t.Fatalf("after session_required: %v", err)
+	}
+	if f.count("device.session.request") != 1 {
+		t.Fatalf("sent %v", f.sent)
+	}
+}
+
+// Start checks a suspect session with vault.status at once (not the
+// grant-list probe), so nothing waits for a tool call.
+func TestStartVerifiesSuspect(t *testing.T) {
+	live := pairing.Access{State: pairing.AccessActive, SessionID: "s1", ExpiresAt: t0.Add(time.Hour)}
+	f, _, m := setup(live)
+	f.answer("vault.status", ok(`{"owner_check":{"state":"ok"},"session":{"session_id":"s1","expires_at":"`+t0.Add(time.Hour).Format(time.RFC3339)+`"}}`))
+	m.Suspect()
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if f.count("vault.status") != 1 || f.count("leash.grant.list") != 0 || m.Suspected() {
+		t.Fatalf("sent %v, suspect %v", f.sent, m.Suspected())
 	}
 }

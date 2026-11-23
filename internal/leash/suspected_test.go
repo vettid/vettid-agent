@@ -37,3 +37,31 @@ func TestNothingWhileSuspected(t *testing.T) {
 		t.Fatalf("after: %+v", in)
 	}
 }
+
+// The grants' work held off for the suspicion starts at the status that
+// ends it (OnStatus wakes the loop), not after the idle pause.
+func TestSuspicionEndWakes(t *testing.T) {
+	e := newEnv(t)
+	var suspect atomic.Bool
+	e.m.SetSuspected(suspect.Load)
+	suspect.Store(true)
+	e.m.step(ctx)
+	select {
+	case <-e.m.wake:
+	default:
+	}
+	suspect.Store(false)
+	e.m.OnStatus("ok")
+	select {
+	case <-e.m.wake:
+	default:
+		t.Fatal("the end of the suspicion did not wake the grants' work")
+	}
+	// A status with nothing held off wakes nothing.
+	e.m.OnStatus("ok")
+	select {
+	case <-e.m.wake:
+		t.Fatal("woken with nothing held off")
+	default:
+	}
+}

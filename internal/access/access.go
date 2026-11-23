@@ -134,6 +134,11 @@ type Manager struct {
 	suspect    bool
 	suspectGen uint64
 	verifying  *flight
+	// vaultLive is the session id the vault last named current in a
+	// vault.status: that session is used without asking the phone, even
+	// when this computer's clock (possibly the wrong one) puts its end in
+	// the past, until session_required, an end, or the next status.
+	vaultLive string
 
 	// clock reads the wall clock and a monotonic clock that stops while
 	// the computer sleeps (monoNow); baseWall and baseMono are the reading
@@ -211,7 +216,10 @@ func (m *Manager) setClock(f func() (time.Time, time.Duration)) {
 
 // ClockJump is how far the wall clock may move apart from the monotonic
 // clock, since the last base reading, before the session is suspect
-// (chosen; not in the spec). clockEvery is how often WatchClock looks
+// (chosen; not in the spec). The monotonic clock is not disciplined by
+// NTP (on Windows, the unbiased interrupt time), so over days of uptime
+// the two can drift apart by a minute with no jump: at worst that is one
+// extra vault.status, after which the base is taken again. clockEvery is how often WatchClock looks
 // between tool calls; each Ensure looks too, before it uses the session.
 const (
 	ClockJump  = time.Minute
@@ -376,20 +384,36 @@ func (m *Manager) verify(ctx context.Context) (bool, error) {
 		}
 		a = pairing.Access{State: pairing.AccessActive, SessionID: sess.SessionID, ExpiresAt: exp}
 	}
-	// An event that changed the session meanwhile is newer: it stays.
+	// An event that changed the session meanwhile is newer: it stays, and
+	// the session counts as live only if it is still the one the vault
+	// named.
 	m.conn.CompareAndSetAccess(before, a)
+	cur := m.conn.Access()
+	live := a.State == pairing.AccessActive && cur.State == pairing.AccessActive && cur.SessionID == a.SessionID
+	m.mu.Lock()
+	m.vaultLive = ""
+	if live {
+		m.vaultLive = a.SessionID
+	}
+	if m.suspectGen == gen {
+		m.suspect = false
+	}
+	m.mu.Unlock()
+	// The owner check, and the status hook, after the suspicion is cleared:
+	// the hook's taker (internal/leash) may resume work it held off for it.
 	if s.OwnerCheck.State != "" {
 		m.OnStatus(s.OwnerCheck.State)
 		if hook != nil {
 			hook(s.OwnerCheck.State)
 		}
 	}
-	m.mu.Lock()
-	if m.suspectGen == gen {
-		m.suspect = false
-	}
-	m.mu.Unlock()
-	return a.State == pairing.AccessActive, nil
+	return live, nil
+}
+
+// vaultNamedLocked reports whether a is the session the vault last named
+// current (m.mu held).
+func (m *Manager) vaultNamedLocked(a pairing.Access) bool {
+	return m.vaultLive != "" && a.State == pairing.AccessActive && a.SessionID == m.vaultLive
 }
 
 // active reports whether a is a session usable at now.
@@ -405,6 +429,13 @@ func active(a pairing.Access, now time.Time) bool {
 // from vaultconn's vault.status at start (OnStatus). An unknown session
 // (after pairing) is checked on the first Ensure instead.
 func (m *Manager) Start(ctx context.Context) error {
+	// A suspect session (every session starts so, and after a resume) is
+	// checked with vault.status at once, not on the first tool call, so
+	// that leash.connection_info and the grants' work need not wait for
+	// one.
+	if m.Suspected() {
+		return m.Verify(ctx)
+	}
 	if !active(m.conn.Access(), m.now()) {
 		return nil
 	}
@@ -511,7 +542,7 @@ func (m *Manager) Ensure(ctx context.Context) error {
 		return ErrOwnerCheck
 	}
 	a := m.conn.Access()
-	if active(a, now) {
+	if active(a, now) || m.vaultNamedLocked(a) {
 		m.mu.Unlock()
 		return nil
 	}
@@ -659,6 +690,7 @@ func (m *Manager) OnEvent(ev vaultconn.Event) {
 	case "device.session.granted":
 		m.outstanding = false
 	case "device.session.ended":
+		m.vaultLive = ""
 		var b struct {
 			Reason string `json:"reason"`
 		}
@@ -774,6 +806,11 @@ func (m *Manager) Snapshot() pairing.Access { return m.conn.Access() }
 func (m *Manager) OnAnswer(code string, sentWith pairing.Access) {
 	switch code {
 	case "session_required":
+		m.mu.Lock()
+		if sentWith.SessionID != "" && sentWith.SessionID == m.vaultLive {
+			m.vaultLive = ""
+		}
+		m.mu.Unlock()
 		m.conn.CompareAndSetAccess(sentWith, pairing.Access{State: pairing.AccessNone})
 	case "owner_check_required":
 		m.mu.Lock()

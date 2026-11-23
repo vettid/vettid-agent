@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,8 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 	m := access.New(noVault{}, 0, nil)
 	running := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	h := &serviceHost{Dir: dir, IdleStop: time.Minute, Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Protectors: &pairing.Protectors{NoPrompt: true, Dir: dir},
 		resolve:    func(string) state.Protector { return cmdTestProtector{} },
@@ -72,7 +75,7 @@ func TestHostResumedSuspectsSession(t *testing.T) {
 	if !m.Suspected() {
 		t.Fatal("the running session's access manager was not told of the resume")
 	}
-	close(release)
+	releaseOnce.Do(func() { close(release) })
 	select {
 	case <-fc.closed:
 	case <-time.After(5 * time.Second):
