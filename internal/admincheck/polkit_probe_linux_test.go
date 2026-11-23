@@ -449,7 +449,7 @@ func groupsDiffer(t *testing.T, u *user.User) string {
 	if err != nil {
 		return fmt.Sprintf("/proc/self/mountinfo can't be read (%v)", err)
 	}
-	if mode, gid := hidepid(string(mi)); procHidden(mode, gid, holdsGroup) {
+	if mode, gid := hidepid(string(mi)); procHidden(mode, gid, helperGroup) {
 		return fmt.Sprintf("/proc is mounted with hidepid=%s, gid=%s, which hides processes from the helper", mode, gid)
 	}
 	ents, err := os.ReadDir("/proc")
@@ -542,23 +542,10 @@ func heldGroups(pid int) string {
 	return statusGroups(string(b))
 }
 
-// holdsGroup: the checker's own process holds gid (its real or
-// supplementary groups).
-func holdsGroup(gid string) bool {
-	if gid == "" {
-		return false
-	}
-	if strconv.Itoa(os.Getegid()) == gid {
-		return true
-	}
-	gs, _ := os.Getgroups()
-	for _, g := range gs {
-		if strconv.Itoa(g) == gid {
-			return true
-		}
-	}
-	return false
-}
+// helperGroup: the helper, a root service, holds gid 0 and no
+// supplementary groups; the probe judges hidepid as for it, not by its
+// own groups under sudo.
+func helperGroup(gid string) bool { return gid == "0" }
 
 // dbGroups are the member's groups as the group database gives them
 // (getgrouplist, through id), sorted, as one string.
