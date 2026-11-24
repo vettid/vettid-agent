@@ -7,112 +7,53 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
-	"unsafe"
 
-	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 
 	"github.com/vettid/vettid-agent/internal/access"
 )
 
-// displaySetting is a POWERBROADCAST_SETTING with a DWORD value, as
-// Windows sends for GUID_CONSOLE_DISPLAY_STATE.
-type displaySetting struct {
-	Setting    windows.GUID
-	DataLength uint32
-	Value      uint32
-}
-
-func displayEvent(v uint32) *displaySetting {
-	return &displaySetting{Setting: guidConsoleDisplayState, DataLength: 4, Value: v}
-}
-
-func TestDisplayWatch(t *testing.T) {
-	const dimmed = 2
-	other := windows.GUID{Data1: 1}
-	steps := []struct {
+// Each power event that may follow a sleep or a standby makes the running
+// session's access session suspect, with one log line; the event's data is
+// never read (it is 0 here). Other power events do neither.
+func TestPowerEventSuspectsSession(t *testing.T) {
+	const pbtAPMPowerStatusChange = 0xA // the battery or AC state changed
+	for _, c := range []struct {
 		name string
 		t    uint32
-		s    *displaySetting
-		want bool
+		want string // the log line's start, "" for none
 	}{
-		{"on at registration", pbtPowerSettingChange, displayEvent(displayOn), false},
-		{"dimmed", pbtPowerSettingChange, displayEvent(dimmed), false},
-		{"on after dimmed", pbtPowerSettingChange, displayEvent(displayOn), false},
-		{"off", pbtPowerSettingChange, displayEvent(displayOff), false},
-		{"another setting", pbtPowerSettingChange, &displaySetting{Setting: other, DataLength: 4, Value: displayOn}, false},
-		{"too short", pbtPowerSettingChange, &displaySetting{Setting: guidConsoleDisplayState, DataLength: 1, Value: displayOn}, false},
-		{"another event", pbtResumeAutomatic, displayEvent(displayOn), false},
-		{"no data", pbtPowerSettingChange, nil, false},
-		{"on after off", pbtPowerSettingChange, displayEvent(displayOn), true},
-		{"on again", pbtPowerSettingChange, displayEvent(displayOn), false},
-		{"off again", pbtPowerSettingChange, displayEvent(displayOff), false},
-		{"dimmed while off", pbtPowerSettingChange, displayEvent(dimmed), false},
-		{"on after off and dimmed", pbtPowerSettingChange, displayEvent(displayOn), true},
-	}
-	var w displayWatch
-	for _, s := range steps {
-		var p unsafe.Pointer
-		if s.s != nil {
-			p = unsafe.Pointer(s.s)
-		}
-		if got := w.event(s.t, p); got != s.want {
-			t.Errorf("%s: event = %v, want %v", s.name, got, s.want)
-		}
-	}
-}
-
-// changeRequest is the power event the service manager hands Execute,
-// with data s.
-func changeRequest(t uint32, s *displaySetting) svc.ChangeRequest {
-	c := svc.ChangeRequest{Cmd: svc.PowerEvent, EventType: t}
-	if s != nil {
-		c.EventData = uintptr(unsafe.Pointer(s))
-	}
-	return c
-}
-
-// The display coming on after it was off makes the running session's
-// access session suspect, and says so in one log line; the display going
-// off, or on with no off before it, does not.
-func TestPowerEventDisplaySuspectsSession(t *testing.T) {
-	m := access.New(noVault{}, 0, nil)
-	h := &serviceHost{mgr: m}
-	var buf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&buf, nil))
-	var display displayWatch
-	on, off := displayEvent(displayOn), displayEvent(displayOff)
-
-	powerEvent(h, &display, logger, changeRequest(pbtPowerSettingChange, on))
-	powerEvent(h, &display, logger, changeRequest(pbtPowerSettingChange, off))
-	if m.Suspected() {
-		t.Fatal("suspect before the display came on again")
-	}
-	if buf.Len() != 0 {
-		t.Fatalf("logged before the display came on again: %q", buf.String())
-	}
-	powerEvent(h, &display, logger, changeRequest(pbtPowerSettingChange, on))
-	if !m.Suspected() {
-		t.Fatal("not suspect after the display came on after it was off")
-	}
-	if n := strings.Count(buf.String(), "the display came on"); n != 1 {
-		t.Fatalf("logged %d display lines, want 1: %q", n, buf.String())
-	}
-}
-
-// The resume events still make the session suspect.
-func TestPowerEventResumeSuspectsSession(t *testing.T) {
-	for _, e := range []uint32{pbtResumeAutomatic, pbtResumeSuspend} {
+		{"resume automatic", pbtResumeAutomatic, "resumed from sleep"},
+		{"resume suspend", pbtResumeSuspend, "resumed from sleep"},
+		{"display state", pbtPowerSettingChange, "the display's state changed"},
+		{"power status", pbtAPMPowerStatusChange, ""},
+	} {
 		m := access.New(noVault{}, 0, nil)
 		h := &serviceHost{mgr: m}
 		var buf bytes.Buffer
-		var display displayWatch
-		powerEvent(h, &display, slog.New(slog.NewTextHandler(&buf, nil)), changeRequest(e, nil))
-		if !m.Suspected() {
-			t.Errorf("event %#x: not suspect", e)
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		if m.Suspected() {
+			t.Fatalf("%s: suspect before the event", c.name)
 		}
-		if !strings.Contains(buf.String(), "resumed from sleep") {
-			t.Errorf("event %#x: no log line: %q", e, buf.String())
+		powerEvent(h, logger, svc.ChangeRequest{Cmd: svc.PowerEvent, EventType: c.t})
+		if got := m.Suspected(); got != (c.want != "") {
+			t.Errorf("%s: suspect = %v, want %v", c.name, got, c.want != "")
+		}
+		if c.want == "" {
+			if buf.Len() != 0 {
+				t.Errorf("%s: logged %q", c.name, buf.String())
+			}
+			continue
+		}
+		if n := strings.Count(buf.String(), c.want); n != 1 || strings.Count(buf.String(), "\n") != 1 {
+			t.Errorf("%s: log = %q, want one line with %q", c.name, buf.String(), c.want)
 		}
 	}
+}
+
+// With no session running, a power event changes nothing and does not fail.
+func TestPowerEventNoSession(t *testing.T) {
+	h := &serviceHost{}
+	powerEvent(h, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+		svc.ChangeRequest{Cmd: svc.PowerEvent, EventType: pbtPowerSettingChange})
 }
