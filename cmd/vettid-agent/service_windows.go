@@ -169,11 +169,8 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	// Windows sends the display's state at once; if that event is lost
 	// because the Running status has not reached the service manager yet,
 	// nothing is missed: the next change makes the session suspect too.
-	if end, err := registerDisplayNotice(svc.StatusHandle()); err != nil {
-		logger.Warn("the display's state can't be followed: a standby is noticed by the clock only")
-	} else {
-		defer end()
-	}
+	defer followDisplay(ctx, logger, func() (func(), error) { return registerDisplayNotice(svc.StatusHandle()) },
+		h.Resumed, unregisteredEvery)()
 	err = h.Serve(ctx, func(ctx context.Context) (*hostConn, error) {
 		c, err := l.Accept(ctx)
 		if err != nil {

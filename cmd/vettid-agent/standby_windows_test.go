@@ -4,9 +4,13 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 
@@ -56,4 +60,47 @@ func TestPowerEventNoSession(t *testing.T) {
 	h := &serviceHost{}
 	powerEvent(h, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
 		svc.ChangeRequest{Cmd: svc.PowerEvent, EventType: pbtPowerSettingChange})
+}
+
+// When the registration fails, the failure is logged once and the session
+// is made suspect every interval until the end function runs; when it
+// succeeds, nothing is made suspect and its end function is returned.
+func TestFollowDisplayRegistrationFails(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	var n atomic.Int32
+	m := access.New(noVault{}, 0, nil)
+	end := followDisplay(context.Background(), logger,
+		func() (func(), error) { return nil, errors.New("refused") },
+		func() { n.Add(1); m.Suspect() }, 10*time.Millisecond)
+	for deadline := time.Now().Add(5 * time.Second); n.Load() < 3; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("suspect called %d times in 5 s, want at least 3", n.Load())
+		}
+	}
+	end()
+	if !m.Suspected() {
+		t.Fatal("not suspect")
+	}
+	after := n.Load()
+	time.Sleep(50 * time.Millisecond)
+	if n.Load() != after {
+		t.Fatal("suspect still called after the end")
+	}
+	if c := strings.Count(buf.String(), "can't be followed"); c != 1 || strings.Count(buf.String(), "\n") != 1 {
+		t.Fatalf("log = %q, want the failure once", buf.String())
+	}
+	if strings.Contains(buf.String(), "refused") {
+		t.Fatalf("the error's own text was logged: %q", buf.String())
+	}
+
+	ended := false
+	end = followDisplay(context.Background(), logger,
+		func() (func(), error) { return func() { ended = true }, nil },
+		func() { t.Error("suspect called with the registration in place") }, time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	end()
+	if !ended {
+		t.Fatal("the registration's end function was not returned")
+	}
 }

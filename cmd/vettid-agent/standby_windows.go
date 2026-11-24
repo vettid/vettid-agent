@@ -22,6 +22,9 @@ package main
 // registered, so every power setting change is the display's.
 
 import (
+	"context"
+	"log/slog"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -58,4 +61,37 @@ func registerDisplayNotice(h windows.Handle) (func(), error) {
 		return nil, err
 	}
 	return func() { procUnregisterPowerSettingNotif.Call(r) }, nil
+}
+
+// unregisteredEvery is how often the session is made suspect while the
+// display's state can't be followed: as often as the clock check looks
+// (internal/access's clockEvery).
+const unregisteredEvery = 15 * time.Second
+
+// followDisplay registers for the display's state changes (register). If
+// that fails it logs it once and, until ctx ends, calls suspect every
+// every instead: a standby can't be ruled out, so the session is treated
+// as if one may have happened. It returns the function that ends either.
+func followDisplay(ctx context.Context, logger *slog.Logger, register func() (func(), error), suspect func(), every time.Duration) func() {
+	end, err := register()
+	if err == nil {
+		return end
+	}
+	logger.Warn("the display's state can't be followed: the access session is checked with the vault every few seconds while it is used")
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				suspect()
+			}
+		}
+	}()
+	return func() { cancel(); <-done }
 }
