@@ -148,6 +148,7 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	stopped := make(chan struct{})
 	defer close(stopped)
 	go func() {
+		var display displayWatch
 		for {
 			select {
 			case <-stopped:
@@ -159,16 +160,20 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 				case svc.Stop, svc.Shutdown:
 					cancel()
 				case svc.PowerEvent:
-					if c.EventType == pbtResumeAutomatic || c.EventType == pbtResumeSuspend {
-						logger.Info("resumed from sleep: the access session is checked with the vault")
-						h.Resumed()
-					}
+					powerEvent(h, &display, logger, c)
 				}
 			}
 		}
 	}()
 	st <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown | svc.AcceptPowerEvent}
 	logger.Info("started")
+	// After the service accepts power events, so the display's state at
+	// registration, which Windows sends at once, is seen.
+	if end, err := registerDisplayNotice(svc.StatusHandle()); err != nil {
+		logger.Warn("the display's state can't be followed: a standby is noticed by the clock only")
+	} else {
+		defer end()
+	}
 	err = h.Serve(ctx, func(ctx context.Context) (*hostConn, error) {
 		c, err := l.Accept(ctx)
 		if err != nil {
@@ -186,6 +191,20 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 		return fail(codeChannel)
 	}
 	return false, 0
+}
+
+// powerEvent makes the stub's session's access session suspect after a
+// resume from sleep, or when the display comes on after it was off (a
+// Modern Standby may have ended; see standby_windows.go), and logs it.
+func powerEvent(h *serviceHost, display *displayWatch, logger *slog.Logger, c svc.ChangeRequest) {
+	switch {
+	case c.EventType == pbtResumeAutomatic || c.EventType == pbtResumeSuspend:
+		logger.Info("resumed from sleep: the access session is checked with the vault")
+		h.Resumed()
+	case display.event(c.EventType, eventPointer(&c.EventData)):
+		logger.Info("the display came on, perhaps after a standby: the access session is checked with the vault")
+		h.Resumed()
+	}
 }
 
 func init() {
