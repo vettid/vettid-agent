@@ -27,9 +27,9 @@ func TestPowerEventSuspectsSession(t *testing.T) {
 		t    uint32
 		want string // the log line's start, "" for none
 	}{
-		{"resume automatic", pbtResumeAutomatic, "resumed from sleep"},
-		{"resume suspend", pbtResumeSuspend, "resumed from sleep"},
-		{"display state", pbtPowerSettingChange, "the display's state changed"},
+		{"resume automatic", pbtResumeAutomatic, "resumed from sleep: the access session is checked"},
+		{"resume suspend", pbtResumeSuspend, "resumed from sleep: the access session is checked"},
+		{"display state", pbtPowerSettingChange, "the display's state changed, perhaps for a standby: the access session is checked"},
 		{"power status", pbtAPMPowerStatusChange, ""},
 	} {
 		m := access.New(noVault{}, 0, nil)
@@ -55,11 +55,16 @@ func TestPowerEventSuspectsSession(t *testing.T) {
 	}
 }
 
-// With no session running, a power event changes nothing and does not fail.
+// With no session running, a power event says so in its one line.
 func TestPowerEventNoSession(t *testing.T) {
 	h := &serviceHost{}
-	powerEvent(h, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)),
+	var buf bytes.Buffer
+	powerEvent(h, slog.New(slog.NewTextHandler(&buf, nil)),
 		svc.ChangeRequest{Cmd: svc.PowerEvent, EventType: pbtPowerSettingChange})
+	if !strings.Contains(buf.String(), "no session runs") || strings.Contains(buf.String(), "checked") ||
+		strings.Count(buf.String(), "\n") != 1 {
+		t.Fatalf("log = %q", buf.String())
+	}
 }
 
 // When the registration fails, the failure is logged once and the session

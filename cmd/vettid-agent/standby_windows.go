@@ -7,7 +7,7 @@ package main
 // so Resumed is never called for it, and the clock check (internal/access)
 // misses a short one: the unbiased interrupt time keeps counting through
 // part of it. PowerRegisterSuspendResumeNotification would not help: it
-// delivers the same PBT_APM* events. What a Modern Standby always does is
+// delivers the same PBT_APM* events. What a Modern Standby normally does is
 // turn the console's display off as it begins and on as it ends, and a
 // service can be told of that (GUID_CONSOLE_DISPLAY_STATE, through
 // RegisterPowerSettingNotification with the service's status handle). So
@@ -15,6 +15,16 @@ package main
 // beginning or ending: the access session is checked with the vault, as
 // after a resume. A display that only went off for its idle timeout costs
 // the same one vault.status per change, nothing more.
+//
+// Not covered, where the clock check alone applies (the vault still
+// enforces the session's own end): a standby during which the display
+// does not change again after one vault.status has cleared the suspicion
+// (no console display, Remote Desktop only, an agent working while the
+// display is off); the stub's own session when it is not a service
+// (`vettid-agent mcp --state-dir`); and the 15 s between the fallback's
+// checks when the registration failed.
+//
+// This loads user32.dll into the service, for the registration only.
 //
 // The event's data (the new state) is not read: x/sys/windows/svc hands it
 // to Execute after the service's control handler has returned, when

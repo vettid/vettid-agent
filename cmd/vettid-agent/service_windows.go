@@ -169,8 +169,9 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 	// Windows sends the display's state at once; if that event is lost
 	// because the Running status has not reached the service manager yet,
 	// nothing is missed: the next change makes the session suspect too.
-	defer followDisplay(ctx, logger, func() (func(), error) { return registerDisplayNotice(svc.StatusHandle()) },
-		h.Resumed, unregisteredEvery)()
+	stopFollowing := followDisplay(ctx, logger, func() (func(), error) { return registerDisplayNotice(svc.StatusHandle()) },
+		func() { h.Resumed() }, unregisteredEvery)
+	defer stopFollowing()
 	err = h.Serve(ctx, func(ctx context.Context) (*hostConn, error) {
 		c, err := l.Accept(ctx)
 		if err != nil {
@@ -194,13 +195,20 @@ func (s *winService) Execute(_ []string, reqs <-chan svc.ChangeRequest, st chan<
 // resume from sleep, or when the display's state changes (a Modern
 // Standby may have begun or ended; see standby_windows.go), and logs it.
 func powerEvent(h *serviceHost, logger *slog.Logger, c svc.ChangeRequest) {
+	var what string
 	switch c.EventType {
 	case pbtResumeAutomatic, pbtResumeSuspend:
-		logger.Info("resumed from sleep: the access session is checked with the vault")
-		h.Resumed()
+		what = "resumed from sleep"
 	case pbtPowerSettingChange:
-		logger.Info("the display's state changed, perhaps for a standby: the access session is checked with the vault")
-		h.Resumed()
+		what = "the display's state changed, perhaps for a standby"
+	default:
+		return
+	}
+	// The session is made suspect first, then the line is written.
+	if h.Resumed() {
+		logger.Info(what + ": the access session is checked with the vault")
+	} else {
+		logger.Info(what + ": no session runs")
 	}
 }
 

@@ -152,16 +152,18 @@ func (h *serviceHost) Held() int {
 var hostDecoded func(*pairing.Record)
 
 // Resumed tells the stub's session, if one runs, that the computer
-// resumed from sleep: its access session is unknown until a vault.status
-// answers (AGENT-SEPARATE-ACCOUNT §5). A session started later checks its
-// saved session at start anyway.
-func (h *serviceHost) Resumed() {
+// resumed from sleep or may have (on Windows, also a change of the
+// display's state): its access session is unknown until a vault.status
+// answers (AGENT-SEPARATE-ACCOUNT §5). It reports whether a session ran.
+// A session started later checks its saved session at start anyway.
+func (h *serviceHost) Resumed() bool {
 	h.mu.Lock()
 	m := h.mgr
 	h.mu.Unlock()
 	if m != nil {
 		m.Suspect()
 	}
+	return m != nil
 }
 
 // errIdle: the host stopped because nothing held it for IdleStop.
