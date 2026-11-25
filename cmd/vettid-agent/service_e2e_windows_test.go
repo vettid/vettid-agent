@@ -552,7 +552,7 @@ func TestServiceEndToEnd(t *testing.T) {
 	})
 
 	t.Run("the Event Log", func(t *testing.T) {
-		out, err := exec.Command("wevtutil", "qe", "Application", "/q:*[System[Provider[@Name='"+in.name+"']]]", "/f:text", "/c:50").CombinedOutput()
+		out, err := exec.Command("wevtutil", "qe", "Application", "/q:*[System[Provider[@Name='"+in.name+"']]]", "/f:text", "/rd:true", "/c:50").CombinedOutput()
 		if err != nil {
 			t.Fatalf("wevtutil: %v: %s", err, out)
 		}
