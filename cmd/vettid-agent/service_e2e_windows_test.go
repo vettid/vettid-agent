@@ -552,7 +552,7 @@ func TestServiceEndToEnd(t *testing.T) {
 	})
 
 	t.Run("the Event Log", func(t *testing.T) {
-		out, err := exec.Command("wevtutil", "qe", "Application", "/q:*[System[Provider[@Name='"+in.name+"']]]", "/f:text", "/c:50").CombinedOutput()
+		out, err := exec.Command("wevtutil", "qe", "Application", "/q:*[System[Provider[@Name='"+in.name+"']]]", "/f:text", "/rd:true", "/c:50").CombinedOutput()
 		if err != nil {
 			t.Fatalf("wevtutil: %v: %s", err, out)
 		}
@@ -564,7 +564,9 @@ func TestServiceEndToEnd(t *testing.T) {
 			}
 		}
 		pipe, _ := channel.ReadPipe(in.n)
-		for _, never := range []string{in.member.sid.String(), in.sid, pipe, in.stateDir} {
+		// The registration for the display's state works under the real
+		// service manager and account.
+		for _, never := range []string{in.member.sid.String(), in.sid, pipe, in.stateDir, "the display's state can't be followed"} {
 			if never != "" && strings.Contains(text, never) {
 				t.Errorf("the Event Log holds %q", never)
 			}
